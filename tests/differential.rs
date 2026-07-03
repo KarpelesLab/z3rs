@@ -187,6 +187,29 @@ const CORPUS: &[Case] = &[
                  (declare-const x Int)(declare-const y Int)
                  (assert (= a b))(assert (= (f a) x))(assert (= (f b) y))(assert (> x y))(check-sat)",
     },
+    Case {
+        name: "nary_xor",
+        script: "(assert (xor true true true))(check-sat)",
+    },
+    Case {
+        name: "nary_xor_vars",
+        script: "(declare-const a Bool)(declare-const b Bool)(declare-const c Bool)
+                 (assert (xor a b c))(assert (= a b))(assert c)(check-sat)",
+    },
+    Case {
+        name: "congruence_int_fn_to_arith",
+        script: "(declare-sort U 0)(declare-fun f (U) Int)(declare-const a U)(declare-const b U)
+                 (assert (= a b))(assert (> (f a) (f b)))(check-sat)",
+    },
+    Case {
+        name: "arith_eq_to_uf_compound",
+        script: "(declare-fun f (Int) Int)(declare-const x Int)(declare-const y Int)
+                 (assert (= (+ x y) 0))(assert (= x 0))(assert (distinct (f x) (f (- y))))(check-sat)",
+    },
+    Case {
+        name: "lia_strict_between_unsat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (< x y))(assert (< y (+ x 1)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

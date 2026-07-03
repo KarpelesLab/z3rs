@@ -92,6 +92,10 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
         {
             let args = m.app_args(atom);
             arith_atoms.push(ArithAtom::cmp(lit, op, args[0], args[1]));
+            // The compared terms are EUF terms too, so uninterpreted applications
+            // among them (e.g. f(a) in f(a) > f(b)) get congruence.
+            euf_roots.push(args[0]);
+            euf_roots.push(args[1]);
         }
     }
 
@@ -268,27 +272,22 @@ fn flip(lit: Lit, sat: &Solver) -> Lit {
     if sat.model_holds(lit) { !lit } else { lit }
 }
 
-/// The shared (interface) terms of a combined problem: arithmetic leaf variables
-/// that also occur inside some EUF equality. These are the terms whose equality
-/// the two theories exchange in the Nelson–Oppen combination.
-fn interface_terms(m: &AstManager, euf_roots: &[AstId], arith_atoms: &[ArithAtom]) -> Vec<AstId> {
+/// The shared (interface) terms of a combined problem: the arithmetic-sorted
+/// terms occurring in the EUF universe (function arguments, compared or equated
+/// terms, and their arithmetic subterms). These are exactly the terms both
+/// theories reason about, whose equalities they exchange in Nelson–Oppen —
+/// including compound terms like `(- y)`, not just leaf variables.
+fn interface_terms(m: &AstManager, euf_roots: &[AstId]) -> Vec<AstId> {
     let mut euf_universe: BTreeSet<AstId> = BTreeSet::new();
     for &r in euf_roots {
         for t in m.postorder(r) {
             euf_universe.insert(t);
         }
     }
-    let mut shared: BTreeSet<AstId> = BTreeSet::new();
-    for atom in arith_atoms {
-        for side in [atom.a, atom.b] {
-            for v in ast_to_lin(m, side).vars() {
-                if euf_universe.contains(&v) {
-                    shared.insert(v);
-                }
-            }
-        }
-    }
-    shared.into_iter().collect()
+    euf_universe
+        .into_iter()
+        .filter(|&t| m.is_arith_sort(m.get_sort(t)))
+        .collect()
 }
 
 /// An arithmetic theory atom: either a comparison or an equality.
@@ -383,8 +382,25 @@ fn arith_feasible(sys: &ArithSystem) -> Feas {
             return Feas::Unsat;
         }
     }
+    // Integer strict-inequality tightening: `expr < 0` over integer variables is
+    // `expr ≤ -1`. This lets Fourier–Motzkin decide many QF_LIA systems directly
+    // (e.g. x < y ∧ y < x+1 becomes x+1 ≤ y ∧ y ≤ x, immediately infeasible)
+    // instead of relying on branch-and-bound.
+    let cons: Vec<Constraint> = sys
+        .cons
+        .iter()
+        .map(|c| {
+            let all_int = !c.expr.is_constant() && c.expr.vars().all(|v| sys.int_set.contains(&v));
+            if c.rel == Rel::Lt && all_int {
+                Constraint::le(c.expr.integer_strict_tighten())
+            } else {
+                c.clone()
+            }
+        })
+        .collect();
     let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
-    integer_feasible(&sys.cons, &sys.diseqs, &int_vars, 0)
+    let mut budget = BB_NODE_LIMIT;
+    integer_feasible(&cons, &sys.diseqs, &int_vars, &mut budget, 0)
 }
 
 /// Does the arithmetic system *entail* `u = v`? True iff neither `u < v` nor
@@ -439,7 +455,7 @@ fn theory_check(
         }
     }
     let base = build_arith_system(m, arith_atoms, sat);
-    let interface = interface_terms(m, euf_roots, arith_atoms);
+    let interface = interface_terms(m, euf_roots);
 
     // Equalities shared across the theory boundary, grown to a fixpoint.
     let mut euf_extra: Vec<(AstId, AstId)> = Vec::new(); // arith → EUF
@@ -505,24 +521,34 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
     }
 }
 
-/// A recursion-depth budget for branch-and-bound. Naive B&B is not guaranteed to
-/// terminate on unbounded integer problems (it can chase a fractional value along
-/// an unbounded direction), so we cap the depth — small enough to stay well
-/// within the stack, large enough that every bounded QF_LIA problem in scope
-/// closes first. On exhaustion the search returns [`Feas::Unknown`] rather than
-/// guessing, so the overall verdict stays sound; a complete integer procedure
-/// (Omega/Cooper, or B&B with derived bounds) is future work.
-const BB_NODE_LIMIT: u32 = 1_000;
+/// A *total* node budget for branch-and-bound. Naive B&B is not guaranteed to
+/// terminate on unbounded integer problems, and its search tree can be
+/// exponential, so we bound the total number of nodes explored (not just the
+/// depth — a depth cap alone still admits a 2^depth tree). On exhaustion the
+/// search returns [`Feas::Unknown`] rather than guessing, so the overall verdict
+/// stays sound; a complete integer procedure (Omega/Cooper, or B&B with derived
+/// bounds) is future work.
+const BB_NODE_LIMIT: u32 = 20_000;
+
+/// A depth cap for branch-and-bound recursion, keeping the stack bounded
+/// independently of the total-node budget (a single deep chain must not overflow).
+const BB_DEPTH_CAP: u32 = 800;
 
 /// Decide integer feasibility of `cons` ∧ `diseqs` with `int_vars` integral, by
-/// branch-and-bound over the LRA relaxation. Returns [`Feas::Unknown`] if the
-/// node budget is exhausted (rather than guessing), keeping the caller sound.
+/// branch-and-bound over the LRA relaxation. `budget` is decremented per node and
+/// bounds total work; `depth` bounds recursion for stack safety. On exhaustion of
+/// either the result is [`Feas::Unknown`].
 fn integer_feasible(
     cons: &[Constraint],
     diseqs: &[LinExpr],
     int_vars: &[AstId],
+    budget: &mut u32,
     depth: u32,
 ) -> Feas {
+    if *budget == 0 || depth >= BB_DEPTH_CAP {
+        return Feas::Unknown; // budget/stack exhausted: don't guess
+    }
+    *budget -= 1;
     let Some(model) = model_with_diseqs(cons, diseqs) else {
         return Feas::Unsat; // relaxation infeasible
     };
@@ -534,21 +560,18 @@ fn integer_feasible(
     let Some((v, val)) = fractional else {
         return Feas::Sat(model); // all integer variables are already integral
     };
-    if depth >= BB_NODE_LIMIT {
-        return Feas::Unknown; // budget exhausted: don't guess
-    }
     // Branch: v ≤ ⌊val⌋  OR  v ≥ ⌈val⌉.
     let floor = Rational::from_integer(val.floor());
     let ceil = Rational::from_integer(val.ceil());
     let mut low = cons.to_vec();
     low.push(Constraint::le(LinExpr::var(v).sub(&LinExpr::constant(floor)))); // v - ⌊val⌋ ≤ 0
-    let lo = integer_feasible(&low, diseqs, int_vars, depth + 1);
+    let lo = integer_feasible(&low, diseqs, int_vars, budget, depth + 1);
     if let Feas::Sat(a) = lo {
         return Feas::Sat(a);
     }
     let mut high = cons.to_vec();
     high.push(Constraint::le(LinExpr::constant(ceil).sub(&LinExpr::var(v)))); // ⌈val⌉ - v ≤ 0
-    let hi = integer_feasible(&high, diseqs, int_vars, depth + 1);
+    let hi = integer_feasible(&high, diseqs, int_vars, budget, depth + 1);
     match hi {
         Feas::Sat(a) => Feas::Sat(a),
         // Both branches exhausted with no witness: unsat only if *both* were

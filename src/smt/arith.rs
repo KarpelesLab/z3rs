@@ -142,6 +142,22 @@ impl LinExpr {
         !b.rem_euclid(&g).is_zero()
     }
 
+    /// The left-hand side of the integer-tightened form of a strict constraint
+    /// `self < 0`. Over the integers (all variables integral) `self < 0` is
+    /// equivalent to `L·self ≤ -1`, i.e. `L·self + 1 ≤ 0`, where `L` clears the
+    /// coefficient denominators so `L·self` is integer-valued. Returns that
+    /// `L·self + 1`, so the caller can assert it as a non-strict `≤ 0`.
+    pub fn integer_strict_tighten(&self) -> LinExpr {
+        let mut l = Int::from(1);
+        for c in self.coeffs.values() {
+            l = l.lcm(c.denominator());
+        }
+        l = l.lcm(self.constant.denominator());
+        let mut e = self.scale(&Rational::from_integer(l));
+        e.constant = &e.constant + &Rational::from_integer(Int::from(1));
+        e
+    }
+
     /// Evaluate the expression at `assign` (variables absent from the map read
     /// as zero).
     pub fn eval(&self, assign: &Assignment) -> Rational {

@@ -725,7 +725,12 @@ impl Context {
                 1 => args[0],
                 _ => m.mk_or(&args),
             }),
-            "xor" => Ok(m.mk_xor(args[0], args[1])),
+            "xor" => Ok(match args.len() {
+                0 => m.mk_false(),
+                1 => args[0],
+                // left-associative: (xor a b c) = ((a xor b) xor c)
+                _ => args[1..].iter().fold(args[0], |acc, &a| m.mk_xor(acc, a)),
+            }),
             "=>" => {
                 // right associative
                 let mut acc = *args.last().unwrap();
