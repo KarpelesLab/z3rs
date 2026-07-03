@@ -200,19 +200,32 @@ fn parse_one(toks: &[String], pos: &mut usize) -> Result<SExpr, String> {
 
 // --- interpreter ----------------------------------------------------------
 
+/// A saved assertion-stack level (`push` records one; `pop` restores it),
+/// capturing the sizes of the assertion and declaration lists so that `pop`
+/// discards everything asserted or declared since the matching `push` — SMT-LIB
+/// scopes declarations, not just assertions.
+struct Scope {
+    assertions: usize,
+    decls: usize,
+    sorts: usize,
+}
+
 struct Context {
     m: AstManager,
     sorts: BTreeMap<String, AstId>,
     funcs: BTreeMap<String, AstId>,
     assertions: Vec<AstId>,
-    /// Assertion counts saved at each `push` (for `pop` to restore).
-    assert_stack: Vec<usize>,
+    /// Saved scope levels (for `pop` to restore).
+    scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
     scopes: Vec<Vec<(String, AstId)>>,
     /// `define-fun` macros: name → (parameter names, body).
     macros: BTreeMap<String, (Vec<String>, SExpr)>,
-    /// Declared constants/functions in declaration order (for `get-model`).
+    /// Declared constants/functions in declaration order (for `get-model` and
+    /// declaration scoping).
     decl_order: Vec<String>,
+    /// Declared (uninterpreted) sort names in declaration order, for scoping.
+    sort_order: Vec<String>,
     /// The model from the most recent satisfiable `check-sat`, if still current.
     last_model: Option<Model>,
     /// Counter for the fresh constants introduced by term-ITE elimination.
@@ -234,10 +247,11 @@ impl Context {
             sorts,
             funcs: BTreeMap::new(),
             assertions: Vec::new(),
-            assert_stack: Vec::new(),
+            scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
+            sort_order: Vec::new(),
             last_model: None,
             fresh_counter: 0,
         }
@@ -280,7 +294,11 @@ impl Context {
             "push" => {
                 let n = Self::level_arg(list)?;
                 for _ in 0..n {
-                    self.assert_stack.push(self.assertions.len());
+                    self.scope_stack.push(Scope {
+                        assertions: self.assertions.len(),
+                        decls: self.decl_order.len(),
+                        sorts: self.sort_order.len(),
+                    });
                 }
                 self.last_model = None;
                 Ok(None)
@@ -289,24 +307,32 @@ impl Context {
                 let n = Self::level_arg(list)?;
                 for _ in 0..n {
                     let mark = self
-                        .assert_stack
+                        .scope_stack
                         .pop()
                         .ok_or_else(|| "pop with no matching push".to_string())?;
-                    self.assertions.truncate(mark); // discard scoped assertions
+                    self.assertions.truncate(mark.assertions); // discard scoped assertions
+                    // Undeclare constants/functions and sorts made since the push.
+                    for name in self.decl_order.drain(mark.decls..) {
+                        self.funcs.remove(&name);
+                    }
+                    for name in self.sort_order.drain(mark.sorts..) {
+                        self.sorts.remove(&name);
+                    }
                 }
                 self.last_model = None;
                 Ok(None)
             }
             "reset" => {
                 self.assertions.clear();
-                self.assert_stack.clear();
+                self.scope_stack.clear();
                 self.last_model = None;
                 Ok(None)
             }
             "declare-sort" => {
                 let name = Self::sym(&list[1])?.to_string();
                 let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
-                self.sorts.insert(name, s);
+                self.sorts.insert(name.clone(), s);
+                self.sort_order.push(name);
                 Ok(None)
             }
             "declare-const" => {
@@ -1107,6 +1133,30 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn pop_undeclares_scoped_constants() {
+        // x is declared inside a push; after pop it is out of scope, so the
+        // reference errors (matching SMT-LIB declaration scoping).
+        let script = "
+            (push 1)
+              (declare-const x Int)
+              (assert (> x 0))
+            (pop 1)
+            (assert (> x 0))
+            (check-sat)
+        ";
+        assert!(run(script).is_err());
+    }
+
+    #[test]
+    fn scoped_declaration_can_be_reused_after_pop() {
+        let script = "
+            (push 1) (declare-const x Int) (assert (> x 0)) (check-sat) (pop 1)
+            (declare-const y Int) (assert (> y 0)) (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
     }
 
     #[test]
