@@ -1,5 +1,5 @@
 //! A lazy SMT solver for quantifier-free equality + uninterpreted functions and
-//! linear real arithmetic (QF_UF / QF_LRA).
+//! linear arithmetic over the reals and integers (QF_UF / QF_LRA / QF_LIA).
 //!
 //! This is the offline (lazy) DPLL(T) loop — the conceptual core of
 //! `z3/src/smt/smt_context` (Z3 4.17.0, MIT), in its simplest complete form: the
@@ -8,6 +8,9 @@
 //! [`Egraph`] for equality/congruence over uninterpreted sorts, and the
 //! Fourier–Motzkin core ([`crate::smt::arith`]) for the linear-arithmetic
 //! atoms — and a theory-conflict blocking clause drives the next round.
+//!
+//! Integer-sorted variables are handled by branch-and-bound on top of the LRA
+//! relaxation, so integrality constraints (`QF_LIA`) are decided too.
 //!
 //! The two theories are checked independently; this is complete when they do not
 //! share terms (pure QF_UF, pure QF_LRA, or a disjoint union). Full theory
@@ -23,8 +26,12 @@ use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
-use crate::smt::arith::{Constraint, LinExpr, feasible_with_diseqs};
+use crate::smt::arith::{Constraint, LinExpr, model_with_diseqs};
 use crate::smt::euf::Egraph;
+
+use alloc::collections::BTreeSet;
+
+use puremp::{Int, Rational};
 
 /// The result of an SMT check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -164,7 +171,70 @@ fn arith_consistent(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> bool {
             cons.push(comparison_constraint(atom.op, holds, diff));
         }
     }
-    feasible_with_diseqs(&cons, &diseqs)
+    // Integer-sorted leaf variables must take integral values; enforce that with
+    // branch-and-bound on top of the rational (LRA) relaxation.
+    let mut int_vars: BTreeSet<AstId> = BTreeSet::new();
+    for c in &cons {
+        collect_int_vars(m, &c.expr, &mut int_vars);
+    }
+    for d in &diseqs {
+        collect_int_vars(m, d, &mut int_vars);
+    }
+    let int_vars: Vec<AstId> = int_vars.into_iter().collect();
+    integer_feasible(&cons, &diseqs, &int_vars, 0)
+}
+
+/// Record the integer-sorted variables of `e` into `set`.
+fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
+    for v in e.vars() {
+        if m.is_int_sort(m.get_sort(v)) {
+            set.insert(v);
+        }
+    }
+}
+
+/// A node budget for branch-and-bound: bounded QF_LIA problems close well within
+/// this, and it caps the search on unbounded ones (where the relaxation answer
+/// is returned as a best effort).
+const BB_NODE_LIMIT: u32 = 20_000;
+
+/// Is there an assignment satisfying `cons` and `diseqs` in which every variable
+/// of `int_vars` is integral? Branch-and-bound over the LRA relaxation.
+fn integer_feasible(
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+    depth: u32,
+) -> bool {
+    let Some(model) = model_with_diseqs(cons, diseqs) else {
+        return false; // the relaxation itself is infeasible
+    };
+    // Find an integer variable whose relaxed value is fractional.
+    let fractional = int_vars.iter().find_map(|&v| {
+        let val = model.get(&v).cloned().unwrap_or_else(rat_zero);
+        (!val.is_integer()).then_some((v, val))
+    });
+    let Some((v, val)) = fractional else {
+        return true; // all integer variables are already integral
+    };
+    if depth >= BB_NODE_LIMIT {
+        return true; // budget exhausted: fall back to the relaxation (best effort)
+    }
+    // Branch: v ≤ ⌊val⌋  OR  v ≥ ⌈val⌉.
+    let floor = Rational::from_integer(val.floor());
+    let ceil = Rational::from_integer(val.ceil());
+    let mut low = cons.to_vec();
+    low.push(Constraint::le(LinExpr::var(v).sub(&LinExpr::constant(floor)))); // v - ⌊val⌋ ≤ 0
+    if integer_feasible(&low, diseqs, int_vars, depth + 1) {
+        return true;
+    }
+    let mut high = cons.to_vec();
+    high.push(Constraint::le(LinExpr::constant(ceil).sub(&LinExpr::var(v)))); // ⌈val⌉ - v ≤ 0
+    integer_feasible(&high, diseqs, int_vars, depth + 1)
+}
+
+fn rat_zero() -> Rational {
+    Rational::from_integer(Int::from(0))
 }
 
 /// The linear constraint for `(op a b)` (with `diff = a - b`) at truth `holds`.
@@ -405,6 +475,48 @@ mod tests {
         let eq5 = m.mk_eq(x, five);
         let f = m.mk_and(&[or, eq5]);
         assert_eq!(check(&m, f), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn qf_lia_no_integer_between_zero_and_one() {
+        // (and (< 0 x) (< x 1)) with x : Int — real-feasible but integer-infeasible.
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let zero = m.mk_int(0);
+        let one = m.mk_int(1);
+        let lo = m.mk_lt(zero, x);
+        let hi = m.mk_lt(x, one);
+        let f = m.mk_and(&[lo, hi]);
+        assert_eq!(check(&m, f), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn qf_lia_fractional_relaxation_has_integer_point() {
+        // (and (<= 3 (* 2 x)) (<= (* 2 x) 5)) with x : Int — x ∈ [1.5, 2.5], so
+        // x = 2 witnesses satisfiability though the relaxation corner is fractional.
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let two = m.mk_int(2);
+        let three = m.mk_int(3);
+        let five = m.mk_int(5);
+        let twox = m.mk_mul(&[two, x]);
+        let lo = m.mk_le(three, twox);
+        let hi = m.mk_le(twox, five);
+        let f = m.mk_and(&[lo, hi]);
+        assert_eq!(check(&m, f), SmtResult::Sat);
+    }
+
+    #[test]
+    fn real_variable_between_zero_and_one_is_sat() {
+        // The same bounds over Real are satisfiable (x = 1/2): no integrality.
+        let mut m = AstManager::new();
+        let x = m.mk_real_const("x");
+        let zero = m.mk_int(0);
+        let one = m.mk_int(1);
+        let lo = m.mk_lt(zero, x);
+        let hi = m.mk_lt(x, one);
+        let f = m.mk_and(&[lo, hi]);
+        assert_eq!(check(&m, f), SmtResult::Sat);
     }
 
     #[test]

@@ -105,6 +105,11 @@ impl LinExpr {
     pub fn as_constant(&self) -> Option<Rational> {
         self.is_constant().then(|| self.constant.clone())
     }
+
+    /// The variables (with nonzero coefficient) mentioned by this expression.
+    pub fn vars(&self) -> impl Iterator<Item = AstId> + '_ {
+        self.coeffs.keys().copied()
+    }
 }
 
 /// Is the conjunction of `constraints` and `disequalities` (each `expr ≠ 0`)

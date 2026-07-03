@@ -622,6 +622,31 @@ mod tests {
     }
 
     #[test]
+    fn qf_lia_integrality_unsat() {
+        // No integer strictly between 3 and 4, but a real fits — the Int
+        // declaration makes this unsat where QF_LRA would be sat.
+        let script = "
+            (set-logic QF_LIA)
+            (declare-const x Int)
+            (assert (< 3 x)) (assert (< x 4))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn qf_lia_divisibility_sat() {
+        // 3 ≤ 2x ≤ 5 has the integer solution x = 2 (relaxation corner is 1.5).
+        let script = "
+            (set-logic QF_LIA)
+            (declare-const x Int)
+            (assert (<= 3 (* 2 x))) (assert (<= (* 2 x) 5))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
     fn define_fun_macros() {
         // A 0-ary abbreviation and an n-ary macro, both inlined.
         let script = "
