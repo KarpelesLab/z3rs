@@ -10,6 +10,10 @@
 //! `char` signedness).
 
 /// Bob Jenkins' `mix` — reversibly mixes three 32-bit words.
+///
+/// Laid out one round-triple per line (matching the upstream macro), so it is
+/// `rustfmt::skip`ped to keep it diffable against `z3/src/util/hash.h`.
+#[rustfmt::skip]
 #[inline]
 fn mix(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
     a = a.wrapping_sub(b); a = a.wrapping_sub(c); a ^= c >> 13;
@@ -50,9 +54,12 @@ pub fn hash_ull(mut a: u64) -> u32 {
 /// Combine two hash codes into one (order-sensitive).
 #[inline]
 pub fn combine_hash(mut h1: u32, mut h2: u32) -> u32 {
-    h2 = h2.wrapping_sub(h1); h2 ^= h1 << 8;
-    h1 = h1.wrapping_sub(h2); h2 ^= h1 << 16;
-    h2 = h2.wrapping_sub(h1); h2 ^= h1 << 10;
+    h2 = h2.wrapping_sub(h1);
+    h2 ^= h1 << 8;
+    h1 = h1.wrapping_sub(h2);
+    h2 ^= h1 << 16;
+    h2 = h2.wrapping_sub(h1);
+    h2 ^= h1 << 10;
     h2
 }
 
@@ -92,17 +99,39 @@ pub fn string_hash(data: &[u8], init_value: u32) -> u32 {
     // Trailing 0..=11 bytes; sign-extend each like a signed `char`.
     let sb = |i: usize| data[off + i] as i8 as i32 as u32;
     // Fall-through switch: a length `len` runs every case `<= len`.
-    if len >= 11 { c = c.wrapping_add(sb(10) << 24); }
-    if len >= 10 { c = c.wrapping_add(sb(9) << 16); }
-    if len >= 9  { c = c.wrapping_add(sb(8) << 8); }
-    if len >= 8  { b = b.wrapping_add(sb(7) << 24); }
-    if len >= 7  { b = b.wrapping_add(sb(6) << 16); }
-    if len >= 6  { b = b.wrapping_add(sb(5) << 8); }
-    if len >= 5  { b = b.wrapping_add(sb(4)); }
-    if len >= 4  { a = a.wrapping_add(sb(3) << 24); }
-    if len >= 3  { a = a.wrapping_add(sb(2) << 16); }
-    if len >= 2  { a = a.wrapping_add(sb(1) << 8); }
-    if len >= 1  { a = a.wrapping_add(sb(0)); }
+    if len >= 11 {
+        c = c.wrapping_add(sb(10) << 24);
+    }
+    if len >= 10 {
+        c = c.wrapping_add(sb(9) << 16);
+    }
+    if len >= 9 {
+        c = c.wrapping_add(sb(8) << 8);
+    }
+    if len >= 8 {
+        b = b.wrapping_add(sb(7) << 24);
+    }
+    if len >= 7 {
+        b = b.wrapping_add(sb(6) << 16);
+    }
+    if len >= 6 {
+        b = b.wrapping_add(sb(5) << 8);
+    }
+    if len >= 5 {
+        b = b.wrapping_add(sb(4));
+    }
+    if len >= 4 {
+        a = a.wrapping_add(sb(3) << 24);
+    }
+    if len >= 3 {
+        a = a.wrapping_add(sb(2) << 16);
+    }
+    if len >= 2 {
+        a = a.wrapping_add(sb(1) << 8);
+    }
+    if len >= 1 {
+        a = a.wrapping_add(sb(0));
+    }
 
     (_, _, c) = mix(a, b, c);
     c

@@ -123,7 +123,10 @@ mod tests {
 
         // Dyadic (Z3's `mpbq`): `new(n, k)` is n·2⁻ᵏ, so new(3, 1) == 3/2.
         let three_halves = Dyadic::new(Int::from(3), 1);
-        assert_eq!(three_halves.to_rational(), Rational::new(Int::from(3), Int::from(2)));
+        assert_eq!(
+            three_halves.to_rational(),
+            Rational::new(Int::from(3), Int::from(2))
+        );
         // canonical form has an odd numerator: 3·2⁻¹.
         assert_eq!(*three_halves.numerator(), Int::from(3));
         assert_eq!(three_halves.scale(), 1);

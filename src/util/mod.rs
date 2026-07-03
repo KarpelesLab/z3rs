@@ -21,7 +21,7 @@
 //!
 //! ## Upstream C++ components to port
 //! - [x] `z3/src/util/{mpn,mpz,mpq,rational,inf_rational,mpbq,mpf,mpff,mpfx}`
-//!       → all provided by `puremp`
+//!   → all provided by `puremp`
 //! - [x] `z3/src/util/hash.{h,cpp}` → [`hash`]
 //! - [x] `z3/src/util/lbool.{h,cpp}` → [`lbool`]
 //! - [x] `z3/src/util/symbol.{h,cpp}` → [`symbol`] (+ `no_std` [`sync`])

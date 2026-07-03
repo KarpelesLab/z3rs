@@ -29,8 +29,7 @@ struct Interned {
 
 /// Global intern table, keyed by the interned text. `const`-constructible so it
 /// can back a `static` without lazy-init machinery.
-static INTERN: SpinLock<BTreeMap<&'static str, &'static Interned>> =
-    SpinLock::new(BTreeMap::new());
+static INTERN: SpinLock<BTreeMap<&'static str, &'static Interned>> = SpinLock::new(BTreeMap::new());
 
 fn intern(s: &str) -> &'static Interned {
     let mut table = INTERN.lock();
