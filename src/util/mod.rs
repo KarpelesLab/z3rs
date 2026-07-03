@@ -22,9 +22,17 @@
 //! ## Upstream C++ components to port
 //! - [x] `z3/src/util/{mpn,mpz,mpq,rational,inf_rational,mpbq,mpf,mpff,mpfx}`
 //!       → all provided by `puremp`
-//! - [ ] `z3/src/util` containers/hashtables/symbol/vector/params/rlimit/…
+//! - [x] `z3/src/util/hash.{h,cpp}` → [`hash`]
+//! - [x] `z3/src/util/lbool.{h,cpp}` → [`lbool`]
+//! - [x] `z3/src/util/symbol.{h,cpp}` → [`symbol`] (+ `no_std` [`sync`])
+//! - [ ] `z3/src/util` containers/hashtables/vector/params/rlimit/…
 //!
-//! ## Status: SCAFFOLD (numerals fully provided by `puremp`; rest to port)
+//! ## Status: IN PROGRESS (numerals via `puremp`; foundation being ported)
 
-// Submodules are declared here as components are ported, mirroring the upstream
-// file layout (e.g. `pub mod symbol;` for `z3/src/util/symbol.{h,cpp}`).
+pub mod hash;
+pub mod lbool;
+pub mod symbol;
+pub mod sync;
+
+pub use lbool::LBool;
+pub use symbol::Symbol;
