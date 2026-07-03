@@ -31,6 +31,43 @@ pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Optio
         Some(m.mk_true())
     } else if kind == BasicOp::Ite as DeclKind {
         Some(simplify_ite(m, decl, args))
+    } else if kind == BasicOp::Implies as DeclKind {
+        simplify_implies(m, args)
+    } else if kind == BasicOp::Xor as DeclKind {
+        simplify_xor(m, args)
+    } else {
+        None
+    }
+}
+
+/// `(=> a b)`: fold the constant cases and normalize `a => b` to `or(not a, b)`
+/// only when a constant is involved (leave symbolic implications intact).
+fn simplify_implies(m: &mut AstManager, args: &[AstId]) -> Option<AstId> {
+    let (a, b) = (args[0], args[1]);
+    if m.is_false(a) || m.is_true(b) {
+        Some(m.mk_true())
+    } else if m.is_true(a) {
+        Some(b) // true => b  ==  b
+    } else if m.is_false(b) {
+        Some(m.mk_not(a)) // a => false  ==  not a
+    } else {
+        None
+    }
+}
+
+/// `(xor a b)`: fold constant cases and reflexivity.
+fn simplify_xor(m: &mut AstManager, args: &[AstId]) -> Option<AstId> {
+    let (a, b) = (args[0], args[1]);
+    if a == b {
+        Some(m.mk_false())
+    } else if m.is_false(a) {
+        Some(b) // xor(false, b) = b
+    } else if m.is_false(b) {
+        Some(a)
+    } else if m.is_true(a) {
+        Some(m.mk_not(b)) // xor(true, b) = not b
+    } else if m.is_true(b) {
+        Some(m.mk_not(a))
     } else {
         None
     }
@@ -169,5 +206,30 @@ mod tests {
         let and = m.mk_and(&[p, q]);
         // Nothing to fold: result is the same hash-consed node.
         assert_eq!(simplify(&mut m, and), and);
+    }
+
+    #[test]
+    fn folds_implies_and_xor() {
+        let mut m = AstManager::new();
+        let p = m.mk_bool_const("p");
+        let t = m.mk_true();
+        let f = m.mk_false();
+        let notp = m.mk_not(p);
+
+        // (=> false p) = true ; (=> true p) = p ; (=> p false) = (not p)
+        let i1 = m.mk_implies(f, p);
+        assert_eq!(simplify(&mut m, i1), t);
+        let i2 = m.mk_implies(t, p);
+        assert_eq!(simplify(&mut m, i2), p);
+        let i3 = m.mk_implies(p, f);
+        assert_eq!(simplify(&mut m, i3), notp);
+
+        // (xor p p) = false ; (xor false p) = p ; (xor true p) = (not p)
+        let x1 = m.mk_xor(p, p);
+        assert_eq!(simplify(&mut m, x1), f);
+        let x2 = m.mk_xor(f, p);
+        assert_eq!(simplify(&mut m, x2), p);
+        let x3 = m.mk_xor(t, p);
+        assert_eq!(simplify(&mut m, x3), notp);
     }
 }
