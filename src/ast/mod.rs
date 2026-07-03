@@ -16,6 +16,7 @@ pub mod basic;
 pub mod manager;
 pub mod node;
 pub mod parameter;
+pub mod pp;
 
 pub use basic::{BasicOp, BasicSortKind};
 pub use manager::AstManager;
