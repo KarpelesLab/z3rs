@@ -111,7 +111,15 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
 
     let has_theory =
         !euf_eq.is_empty() || !arith_atoms.is_empty() || !pred_atoms.is_empty();
+    // The offline lazy loop enumerates theory-atom assignments via blocking
+    // clauses; that is worst-case exponential, so cap the number of rounds and
+    // return a sound `unknown` on exhaustion (rather than looping indefinitely).
+    let mut rounds: u32 = 0;
     loop {
+        rounds += 1;
+        if rounds > DPLL_ROUND_LIMIT {
+            return (SmtResult::Unknown, None);
+        }
         match sat.solve() {
             SatResult::Unsat => return (SmtResult::Unsat, None),
             SatResult::Sat => {
@@ -566,13 +574,18 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
     }
 }
 
+/// A cap on lazy DPLL(T) conflict rounds (blocking-clause iterations). Bounds the
+/// worst-case exponential enumeration of theory-atom assignments; on exhaustion
+/// the result is a sound [`SmtResult::Unknown`].
+const DPLL_ROUND_LIMIT: u32 = 5_000;
+
 /// A total work budget for the integer feasibility search: the number of base
 /// `model` solves permitted across all branch-and-bound nodes *and* the
 /// disequality case split (both worst-case exponential). Bounding their shared
 /// total guarantees termination; on exhaustion the search returns
 /// [`Feas::Unknown`] rather than guessing, so the verdict stays sound. A complete
 /// integer procedure (Omega/Cooper, or B&B with derived bounds) is future work.
-const BB_WORK_BUDGET: u64 = 1_000;
+const BB_WORK_BUDGET: u64 = 300_000;
 
 /// A depth cap for branch-and-bound recursion, keeping the stack bounded
 /// independently of the work budget (a single deep chain must not overflow).

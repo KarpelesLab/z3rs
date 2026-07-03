@@ -1794,6 +1794,23 @@ mod tests {
     }
 
     #[test]
+    fn store_equality_terminates() {
+        // Equality of two stores over distinct base arrays must terminate (the
+        // Fourier–Motzkin blow-up is budget-bounded); a sound verdict is fine.
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const b (Array Int Int))
+            (assert (= (store a 0 1) (store b 0 1)))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert!(
+            matches!(out[0].as_str(), "sat" | "unknown"),
+            "expected a sound verdict, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
     fn array_satisfiable() {
         let script = "
             (declare-const a (Array Int Int)) (declare-const i Int) (declare-const v Int)

@@ -208,10 +208,8 @@ pub fn model_with_diseqs_budgeted(
                 return SolveOutcome::Exhausted;
             }
             *budget -= 1;
-            match model(constraints) {
-                Some(a) => SolveOutcome::Sat(a),
-                None => SolveOutcome::Unsat,
-            }
+            // FM elimination shares the same budget so a single blow-up can't hang.
+            model_budgeted(constraints, budget)
         }
         Some((d, rest)) => {
             let mut lt = constraints.to_vec();
@@ -327,6 +325,19 @@ pub fn feasible(constraints: &[Constraint]) -> bool {
 /// remaining bound on the current variable evaluates to a rational, and any point
 /// in the resulting interval works.
 pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
+    let mut unbounded = u64::MAX;
+    match model_budgeted(constraints, &mut unbounded) {
+        SolveOutcome::Sat(a) => Some(a),
+        _ => None, // Unsat (Exhausted is unreachable with an unbounded budget)
+    }
+}
+
+/// Like [`model`], but bounds the (worst-case doubly-exponential) Fourier–Motzkin
+/// elimination: `budget` is decremented per resolvent generated, and on
+/// exhaustion the search returns [`SolveOutcome::Exhausted`] rather than
+/// continuing. This keeps a single feasibility check terminating even when the
+/// constraint system blows up.
+pub fn model_budgeted(constraints: &[Constraint], budget: &mut u64) -> SolveOutcome {
     let mut ineqs: Vec<Ineq> = constraints.iter().flat_map(|c| c.to_ineqs()).collect();
 
     // The inequalities that constrained each eliminated variable, newest last.
@@ -354,6 +365,10 @@ pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
         for u in &upper {
             let au = u.expr.coeff(v); // > 0
             for l in &lower {
+                if *budget == 0 {
+                    return SolveOutcome::Exhausted; // FM blow-up: give up
+                }
+                *budget -= 1;
                 let al = l.expr.coeff(v); // < 0
                 // resolvent = (-al)·U + (au)·L  (v cancels), keeping strictness.
                 let mut e = u.expr.scale(&al.neg());
@@ -377,7 +392,7 @@ pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
         let k = &i.expr.constant;
         let violated = if i.strict { *k >= zero() } else { *k > zero() };
         if violated {
-            return None;
+            return SolveOutcome::Unsat;
         }
     }
 
@@ -414,7 +429,7 @@ pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
         }
         assign.insert(v, pick_between(lo, hi));
     }
-    Some(assign)
+    SolveOutcome::Sat(assign)
 }
 
 /// Choose a rational strictly (or non-strictly) inside `(lo, hi)`. Feasibility
