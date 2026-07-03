@@ -273,6 +273,26 @@ const CORPUS: &[Case] = &[
         script: "(declare-const i Int)
                  (assert (not (= (select (store ((as const (Array Int Int)) 0) i 5) (+ i 1)) 0)))(check-sat)",
     },
+    Case {
+        name: "array_uf_arith_combo_unsat",
+        script: "(declare-const a (Array Int Int))(declare-fun f (Int) Int)(declare-const i Int)
+                 (assert (= (select a i) (f i)))(assert (> (select a i) 5))(assert (< (f i) 3))(check-sat)",
+    },
+    Case {
+        name: "nested_array_unsat",
+        script: "(declare-const a (Array Int (Array Int Int)))(declare-const i Int)(declare-const j Int)
+                 (assert (not (= (select (select (store a i (store (select a i) j 5)) i) j) 5)))(check-sat)",
+    },
+    Case {
+        name: "array_ite_unsat",
+        script: "(declare-const a (Array Int Int))(declare-const b (Array Int Int))(declare-const c Bool)(declare-const i Int)
+                 (assert (= (select (ite c a b) i) 9))(assert c)(assert (not (= (select a i) 9)))(check-sat)",
+    },
+    Case {
+        name: "array_index_arith_unsat",
+        script: "(declare-const a (Array Int Int))(declare-const i Int)(declare-const j Int)
+                 (assert (= i (+ j 1)))(assert (= (select a i) 1))(assert (not (= (select a (+ j 1)) 1)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
