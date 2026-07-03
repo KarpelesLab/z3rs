@@ -85,6 +85,15 @@ fn euclid_div_mod(a: &Int, b: &Int) -> (Int, Int) {
     }
 }
 
+/// The SMT-LIB response word for a verdict.
+fn verdict_word(res: SmtResult) -> &'static str {
+    match res {
+        SmtResult::Sat => "sat",
+        SmtResult::Unsat => "unsat",
+        SmtResult::Unknown => "unknown",
+    }
+}
+
 /// The content of an SMT-LIB string literal token (`"…"`), with the surrounding
 /// quotes removed and doubled `""` collapsed to a single quote. Non-string tokens
 /// are returned unchanged.
@@ -506,15 +515,10 @@ impl Context {
             }
             "check-sat" => {
                 let goal = self.goal();
-                let (res, model) = check_model(&self.m, goal);
+                let (res, model) = self.decide(goal);
                 self.last_model = model;
                 self.last_verdict = Some(res);
-                let resp = match res {
-                    SmtResult::Sat => "sat",
-                    SmtResult::Unsat => "unsat",
-                    SmtResult::Unknown => "unknown",
-                };
-                Ok(Some(resp.to_string()))
+                Ok(Some(verdict_word(res).to_string()))
             }
             "check-sat-assuming" => {
                 // (check-sat-assuming (a1 a2 …)) — decide the assertions together
@@ -529,17 +533,10 @@ impl Context {
                 }
                 let base = self.m.mk_and(&conj);
                 let goal = self.lift(base);
-                let (res, model) = check_model(&self.m, goal);
+                let (res, model) = self.decide(goal);
                 self.last_model = model;
                 self.last_verdict = Some(res);
-                Ok(Some(
-                    match res {
-                        SmtResult::Sat => "sat",
-                        SmtResult::Unsat => "unsat",
-                        SmtResult::Unknown => "unknown",
-                    }
-                    .to_string(),
-                ))
+                Ok(Some(verdict_word(res).to_string()))
             }
             "get-value" => self.get_value(list).map(Some),
             "get-model" => self.get_model().map(Some),
@@ -799,6 +796,42 @@ impl Context {
         }
     }
 
+    /// Decide `goal`, capping a `sat` verdict to `unknown` when the formula
+    /// contains genuine nonlinear arithmetic the linear core over-approximates
+    /// (so a definite `sat`/`unsat` is always sound).
+    fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        let (res, model) = check_model(&self.m, goal);
+        if res == SmtResult::Sat && self.arith_nonlinear(goal) {
+            (SmtResult::Unknown, None)
+        } else {
+            (res, model)
+        }
+    }
+
+    /// Does `goal` contain nonlinear arithmetic the linear solver treats as an
+    /// unconstrained variable (a product of two non-constants, a non-constant
+    /// divisor, or a power)? Such terms make a `sat` verdict unsound.
+    fn arith_nonlinear(&self, goal: AstId) -> bool {
+        for t in self.m.postorder(goal) {
+            let Some(op) = self.m.arith_op(t) else {
+                continue;
+            };
+            let args = self.m.app_args(t);
+            let nonconst = |a: &AstId| self.m.as_numeral(*a).is_none();
+            match op {
+                ArithOp::Mul if args.iter().filter(|a| nonconst(a)).count() >= 2 => return true,
+                ArithOp::Div | ArithOp::Idiv | ArithOp::Mod | ArithOp::Rem
+                    if nonconst(&args[1]) =>
+                {
+                    return true;
+                }
+                ArithOp::Power => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// Decide a subset of the current assertions (by index).
     fn check_subset(&mut self, keep: &[bool]) -> SmtResult {
         let subset: Vec<AstId> = self
@@ -813,7 +846,7 @@ impl Context {
             _ => self.m.mk_and(&subset),
         };
         let goal = self.lift(base);
-        check_model(&self.m, goal).0
+        self.decide(goal).0
     }
 
     /// `(get-unsat-core)` — the `:named` assertions in a minimal unsatisfiable
@@ -1764,6 +1797,26 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nonlinear_is_unknown_not_wrong() {
+        // The linear core over-approximates x*y, so a sat verdict would be
+        // unsound; report unknown instead. Linear multiplication still decides.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= x 2))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unknown"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(assert (= (* x x) 2))(check-sat)").unwrap(),
+            alloc::vec!["unknown"]
+        );
+        // Constant coefficient is linear — still decided.
+        assert_eq!(
+            run("(declare-const x Int)(assert (= (* 3 x) 9))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
