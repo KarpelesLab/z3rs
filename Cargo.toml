@@ -1,8 +1,8 @@
 [package]
 name = "z3rs"
 version = "0.0.1"
-edition = "2021"
-rust-version = "1.96"
+edition = "2024"
+rust-version = "1.88"
 description = "A pure-Rust, zero-dependency port of the Z3 theorem prover"
 license = "MIT"
 readme = "README.md"
