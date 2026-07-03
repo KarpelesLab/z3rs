@@ -77,6 +77,9 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
     let mut euf_eq: Vec<(Lit, AstId, AstId)> = Vec::new();
     let mut euf_roots: Vec<AstId> = Vec::new();
     let mut arith_atoms: Vec<ArithAtom> = Vec::new();
+    // Boolean-sorted uninterpreted applications (predicates): congruent instances
+    // must share a truth value, so they need the congruence closure too.
+    let mut pred_atoms: Vec<(Lit, AstId)> = Vec::new();
     for (&atom, &lit) in &atoms {
         if m.is_eq(atom) {
             let args = m.app_args(atom);
@@ -96,10 +99,15 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
             // among them (e.g. f(a) in f(a) > f(b)) get congruence.
             euf_roots.push(args[0]);
             euf_roots.push(args[1]);
+        } else if m.is_app(atom) && !m.app_args(atom).is_empty() {
+            // A predicate application p(…): a congruence term whose truth is `lit`.
+            pred_atoms.push((lit, atom));
+            euf_roots.push(atom);
         }
     }
 
-    let has_theory = !euf_eq.is_empty() || !arith_atoms.is_empty();
+    let has_theory =
+        !euf_eq.is_empty() || !arith_atoms.is_empty() || !pred_atoms.is_empty();
     loop {
         match sat.solve() {
             SatResult::Unsat => return (SmtResult::Unsat, None),
@@ -115,7 +123,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     };
                     return (SmtResult::Sat, Some(model));
                 }
-                match theory_check(m, &euf_eq, &euf_roots, &arith_atoms, &sat) {
+                match theory_check(m, &euf_eq, &euf_roots, &arith_atoms, &pred_atoms, &sat) {
                     // Both theories consistent under this assignment → SAT.
                     TheoryOutcome::Sat(arith, euf) => {
                         let model = Model { bools, arith, euf };
@@ -128,6 +136,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         let mut block: Vec<Lit> =
                             euf_eq.iter().map(|&(lit, _, _)| flip(lit, &sat)).collect();
                         block.extend(arith_atoms.iter().map(|a| flip(a.lit, &sat)));
+                        block.extend(pred_atoms.iter().map(|&(lit, _)| flip(lit, &sat)));
                         sat.add_clause(&block);
                     }
                 }
@@ -442,6 +451,7 @@ fn theory_check(
     euf_eq: &[(Lit, AstId, AstId)],
     euf_roots: &[AstId],
     arith_atoms: &[ArithAtom],
+    pred_atoms: &[(Lit, AstId)],
     sat: &Solver,
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
@@ -482,6 +492,19 @@ fn theory_check(
         let mut g = Egraph::new(m, euf_roots);
         if !g.is_consistent(m, &all_eqs, &diseqs) {
             return TheoryOutcome::Unsat;
+        }
+        // Predicate congruence: two congruent predicate applications (same class)
+        // must have the same truth value; a clash is a conflict.
+        for i in 0..pred_atoms.len() {
+            for j in (i + 1)..pred_atoms.len() {
+                let (li, ti) = pred_atoms[i];
+                let (lj, tj) = pred_atoms[j];
+                if g.class_of(m, ti) == g.class_of(m, tj)
+                    && sat.model_holds(li) != sat.model_holds(lj)
+                {
+                    return TheoryOutcome::Unsat;
+                }
+            }
         }
 
         let mut changed = false;
@@ -986,6 +1009,24 @@ mod tests {
         let e2 = m.mk_eq(fy, a);
         let ne2 = m.mk_not(e2);
         let formula = m.mk_and(&[le1, le2, e1, ne2]);
+        assert_eq!(check(&m, formula), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn predicate_congruence_unsat() {
+        // p : U -> Bool, a = b, p(a), ¬p(b): congruence forces p(a) = p(b),
+        // so the truth values clash. Requires predicate congruence.
+        let mut m = AstManager::new();
+        let s = m.mk_uninterpreted_sort(Symbol::new("U"));
+        let bool_s = m.mk_bool_sort();
+        let a = constant(&mut m, "a", s);
+        let b = constant(&mut m, "b", s);
+        let p = m.mk_func_decl(Symbol::new("p"), &[s], bool_s);
+        let pa = m.mk_app(p, &[a]);
+        let pb = m.mk_app(p, &[b]);
+        let ab = m.mk_eq(a, b);
+        let npb = m.mk_not(pb);
+        let formula = m.mk_and(&[ab, pa, npb]);
         assert_eq!(check(&m, formula), SmtResult::Unsat);
     }
 

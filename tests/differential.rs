@@ -210,6 +210,21 @@ const CORPUS: &[Case] = &[
         name: "lia_strict_between_unsat",
         script: "(declare-const x Int)(declare-const y Int)(assert (< x y))(assert (< y (+ x 1)))(check-sat)",
     },
+    Case {
+        name: "predicate_congruence_unsat",
+        script: "(declare-sort U 0)(declare-fun p (U) Bool)(declare-const a U)(declare-const b U)
+                 (assert (= a b))(assert (p a))(assert (not (p b)))(check-sat)",
+    },
+    Case {
+        name: "predicate_congruence_2ary_unsat",
+        script: "(declare-sort U 0)(declare-fun p (U U) Bool)(declare-const a U)(declare-const b U)(declare-const c U)
+                 (assert (= a b))(assert (p a c))(assert (not (p b c)))(check-sat)",
+    },
+    Case {
+        name: "predicate_no_congruence_sat",
+        script: "(declare-sort U 0)(declare-fun p (U) Bool)(declare-const a U)(declare-const b U)
+                 (assert (p a))(assert (not (p b)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
