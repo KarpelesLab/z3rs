@@ -127,6 +127,8 @@ struct Context {
     sorts: BTreeMap<String, AstId>,
     funcs: BTreeMap<String, AstId>,
     assertions: Vec<AstId>,
+    /// Active `let` binding scopes (innermost last).
+    scopes: Vec<Vec<(String, AstId)>>,
 }
 
 impl Context {
@@ -140,6 +142,7 @@ impl Context {
             sorts,
             funcs: BTreeMap::new(),
             assertions: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -225,6 +228,17 @@ impl Context {
         }
     }
 
+    /// Look up a name in the active `let` scopes (innermost first).
+    fn lookup_bound(&self, name: &str) -> Option<AstId> {
+        self.scopes.iter().rev().find_map(|scope| {
+            scope
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, id)| *id)
+        })
+    }
+
     /// Build a term from an s-expression.
     fn term(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
@@ -232,6 +246,9 @@ impl Context {
                 "true" => Ok(self.m.mk_true()),
                 "false" => Ok(self.m.mk_false()),
                 name => {
+                    if let Some(id) = self.lookup_bound(name) {
+                        return Ok(id);
+                    }
                     let d = *self
                         .funcs
                         .get(name)
@@ -241,6 +258,9 @@ impl Context {
             },
             SExpr::List(l) if !l.is_empty() => {
                 let head = Self::sym(&l[0])?.to_string();
+                if head == "let" {
+                    return self.term_let(&l[1], &l[2]);
+                }
                 let args: Vec<AstId> = l[1..]
                     .iter()
                     .map(|a| self.term(a))
@@ -249,6 +269,30 @@ impl Context {
             }
             SExpr::List(_) => Err("empty application".to_string()),
         }
+    }
+
+    /// `(let ((v t) ...) body)` — parallel binding, then evaluate `body`.
+    fn term_let(&mut self, bindings: &SExpr, body: &SExpr) -> Result<AstId, String> {
+        let bs = match bindings {
+            SExpr::List(bs) => bs,
+            _ => return Err("let: expected a binding list".to_string()),
+        };
+        // Evaluate every RHS in the *outer* scope (parallel `let` semantics).
+        let mut scope: Vec<(String, AstId)> = Vec::new();
+        for b in bs {
+            match b {
+                SExpr::List(pair) if pair.len() == 2 => {
+                    let name = Self::sym(&pair[0])?.to_string();
+                    let val = self.term(&pair[1])?;
+                    scope.push((name, val));
+                }
+                _ => return Err("let: expected (name term) bindings".to_string()),
+            }
+        }
+        self.scopes.push(scope);
+        let result = self.term(body);
+        self.scopes.pop();
+        result
     }
 
     fn apply(&mut self, head: &str, args: Vec<AstId>) -> Result<AstId, String> {
@@ -357,6 +401,29 @@ mod tests {
             ; a comment
             (declare-const p Bool)
             (assert (or p (not p))) ; tautology
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn let_bindings() {
+        // (let ((x (= a b))) (and x (not x))) is unsat regardless of a,b.
+        let script = "
+            (declare-sort S 0)
+            (declare-const a S) (declare-const b S)
+            (assert (let ((x (= a b))) (and x (not x))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn nested_and_shadowing_lets() {
+        // Inner let shadows the outer binding; result stays consistent → sat.
+        let script = "
+            (declare-const p Bool) (declare-const q Bool)
+            (assert (let ((x p)) (let ((x q)) (or x (not x)))))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
