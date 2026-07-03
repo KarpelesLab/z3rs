@@ -412,9 +412,15 @@ enum TheoryOutcome {
     Unknown,
 }
 
-/// The combined EUF + arithmetic theory check for one Boolean assignment, with
-/// Nelson–Oppen sharing of arithmetic-implied equalities into the congruence
-/// closure.
+/// The combined EUF + arithmetic theory check for one Boolean assignment.
+///
+/// The theories exchange implied equalities between shared (interface) terms in
+/// both directions until a fixpoint (deterministic Nelson–Oppen). arith → EUF:
+/// an equality the arithmetic theory *entails* is added to the congruence closure
+/// (so implied equalities fire congruence). EUF → arith: two interface terms that
+/// congruence puts in one class have their equality added to the arithmetic
+/// constraints. Each direction only adds genuinely new equalities, so the loop
+/// converges.
 fn theory_check(
     m: &AstManager,
     euf_eq: &[(Lit, AstId, AstId)],
@@ -432,33 +438,62 @@ fn theory_check(
             diseqs.push((a, b));
         }
     }
-    // Arithmetic feasibility (definitive Unsat ends this assignment early).
-    let sys = build_arith_system(m, arith_atoms, sat);
-    let arith = arith_feasible(&sys);
-    if matches!(arith, Feas::Unsat) {
-        return TheoryOutcome::Unsat;
-    }
-    // Nelson–Oppen: add every arithmetic-implied equality between shared
-    // (interface) terms to the EUF equalities, so congruence sees them.
+    let base = build_arith_system(m, arith_atoms, sat);
     let interface = interface_terms(m, euf_roots, arith_atoms);
-    let mut all_eqs = eqs;
-    for i in 0..interface.len() {
-        for j in (i + 1)..interface.len() {
-            let (u, v) = (interface[i], interface[j]);
-            if arith_entails_eq(m, &sys, u, v) {
-                all_eqs.push((u, v));
+
+    // Equalities shared across the theory boundary, grown to a fixpoint.
+    let mut euf_extra: Vec<(AstId, AstId)> = Vec::new(); // arith → EUF
+    let mut arith_extra: Vec<Constraint> = Vec::new(); // EUF → arith
+    // Each round adds at least one new equality (bounded by the interface pairs),
+    // so this cap is only a backstop against surprises.
+    let max_rounds = interface.len() * interface.len() + 4;
+
+    for _ in 0..max_rounds {
+        // Arithmetic system augmented with the EUF-implied equalities so far.
+        let mut sys = ArithSystem {
+            cons: base.cons.clone(),
+            diseqs: base.diseqs.clone(),
+            int_set: base.int_set.clone(),
+        };
+        sys.cons.extend(arith_extra.iter().cloned());
+        let arith = arith_feasible(&sys);
+        if matches!(arith, Feas::Unsat) {
+            return TheoryOutcome::Unsat;
+        }
+        // Congruence closure augmented with the arithmetic-implied equalities.
+        let mut all_eqs = eqs.clone();
+        all_eqs.extend(euf_extra.iter().cloned());
+        let mut g = Egraph::new(m, euf_roots);
+        if !g.is_consistent(m, &all_eqs, &diseqs) {
+            return TheoryOutcome::Unsat;
+        }
+
+        let mut changed = false;
+        for i in 0..interface.len() {
+            for j in (i + 1)..interface.len() {
+                let (u, v) = (interface[i], interface[j]);
+                let same_class = g.class_of(m, u) == g.class_of(m, v);
+                let entailed = arith_entails_eq(m, &sys, u, v);
+                if entailed && !same_class {
+                    euf_extra.push((u, v)); // arith → EUF
+                    changed = true;
+                } else if same_class && !entailed {
+                    // EUF → arith: add u − v = 0.
+                    let diff = ast_to_lin(m, u).sub(&ast_to_lin(m, v));
+                    arith_extra.push(Constraint::eq(diff));
+                    changed = true;
+                }
             }
         }
+        if !changed {
+            return match arith {
+                Feas::Sat(assign) => TheoryOutcome::Sat(assign, g),
+                Feas::Unknown => TheoryOutcome::Unknown,
+                Feas::Unsat => unreachable!(),
+            };
+        }
     }
-    let mut g = Egraph::new(m, euf_roots);
-    if !g.is_consistent(m, &all_eqs, &diseqs) {
-        return TheoryOutcome::Unsat;
-    }
-    match arith {
-        Feas::Sat(assign) => TheoryOutcome::Sat(assign, g),
-        Feas::Unknown => TheoryOutcome::Unknown,
-        Feas::Unsat => unreachable!(),
-    }
+    TheoryOutcome::Unknown // did not converge within the round budget
 }
 
 /// Record the integer-sorted variables of `e` into `set`.
@@ -928,6 +963,29 @@ mod tests {
         let e2 = m.mk_eq(fy, a);
         let ne2 = m.mk_not(e2);
         let formula = m.mk_and(&[le1, le2, e1, ne2]);
+        assert_eq!(check(&m, formula), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn nelson_oppen_euf_to_arith_unsat() {
+        // a = b ⇒ f(a) = f(b) by congruence; with f(a) = x, f(b) = y that forces
+        // x = y in the arithmetic theory, contradicting x > y. Requires the
+        // EUF→arith direction of equality sharing.
+        let mut m = AstManager::new();
+        let s = m.mk_uninterpreted_sort(Symbol::new("S"));
+        let int = m.mk_int_sort();
+        let a = constant(&mut m, "a", s);
+        let b = constant(&mut m, "b", s);
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let f = m.mk_func_decl(Symbol::new("f"), &[s], int);
+        let fa = m.mk_app(f, &[a]);
+        let fb = m.mk_app(f, &[b]);
+        let ab = m.mk_eq(a, b);
+        let e1 = m.mk_eq(fa, x);
+        let e2 = m.mk_eq(fb, y);
+        let gt = m.mk_gt(x, y);
+        let formula = m.mk_and(&[ab, e1, e2, gt]);
         assert_eq!(check(&m, formula), SmtResult::Unsat);
     }
 

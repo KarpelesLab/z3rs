@@ -181,6 +181,12 @@ const CORPUS: &[Case] = &[
                  (declare-const x Int)(declare-const y Int)
                  (assert (<= x y))(assert (= (f x) a))(assert (not (= (f y) a)))(check-sat)",
     },
+    Case {
+        name: "nelson_oppen_euf_to_arith_unsat",
+        script: "(declare-sort S 0)(declare-fun f (S) Int)(declare-const a S)(declare-const b S)
+                 (declare-const x Int)(declare-const y Int)
+                 (assert (= a b))(assert (= (f a) x))(assert (= (f b) y))(assert (> x y))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
