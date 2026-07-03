@@ -153,8 +153,10 @@ struct Context {
     assertions: Vec<AstId>,
     /// Assertion counts saved at each `push` (for `pop` to restore).
     assert_stack: Vec<usize>,
-    /// Active `let` binding scopes (innermost last).
+    /// Active `let`/macro-parameter binding scopes (innermost last).
     scopes: Vec<Vec<(String, AstId)>>,
+    /// `define-fun` macros: name → (parameter names, body).
+    macros: BTreeMap<String, (Vec<String>, SExpr)>,
 }
 
 impl Context {
@@ -174,6 +176,7 @@ impl Context {
             assertions: Vec::new(),
             assert_stack: Vec::new(),
             scopes: Vec::new(),
+            macros: BTreeMap::new(),
         }
     }
 
@@ -263,6 +266,24 @@ impl Context {
                 self.funcs.insert(name, d);
                 Ok(None)
             }
+            "define-fun" => {
+                // (define-fun name ((p S) ...) R body)
+                let name = Self::sym(&list[1])?.to_string();
+                let params: Vec<String> = match &list[2] {
+                    SExpr::List(ps) => ps
+                        .iter()
+                        .map(|p| match p {
+                            SExpr::List(pair) if !pair.is_empty() => {
+                                Ok(Self::sym(&pair[0])?.to_string())
+                            }
+                            _ => Err("define-fun: bad parameter".to_string()),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    _ => return Err("define-fun: expected a parameter list".to_string()),
+                };
+                self.macros.insert(name, (params, list[4].clone()));
+                Ok(None)
+            }
             "assert" => {
                 let t = self.term(&list[1])?;
                 self.assertions.push(t);
@@ -316,6 +337,9 @@ impl Context {
                     if let Some((r, is_int)) = parse_numeral(name) {
                         return Ok(self.m.mk_numeral(r, is_int));
                     }
+                    if self.macros.contains_key(name) {
+                        return self.expand_macro(name, Vec::new());
+                    }
                     let d = *self
                         .funcs
                         .get(name)
@@ -332,10 +356,33 @@ impl Context {
                     .iter()
                     .map(|a| self.term(a))
                     .collect::<Result<_, _>>()?;
+                if self.macros.contains_key(&head) {
+                    return self.expand_macro(&head, args);
+                }
                 self.apply(&head, args)
             }
             SExpr::List(_) => Err("empty application".to_string()),
         }
+    }
+
+    /// Expand a `define-fun` macro applied to `args`.
+    fn expand_macro(&mut self, name: &str, args: Vec<AstId>) -> Result<AstId, String> {
+        let (params, body) = self.macros.get(name).cloned().unwrap();
+        if params.len() != args.len() {
+            return Err(alloc::format!(
+                "macro {name:?} expects {} argument(s), got {}",
+                params.len(),
+                args.len()
+            ));
+        }
+        let scope: Vec<(String, AstId)> = params.into_iter().zip(args).collect();
+        // Hygiene: the body sees only its parameters and globals, not the
+        // caller's `let` bindings.
+        let saved = core::mem::take(&mut self.scopes);
+        self.scopes.push(scope);
+        let result = self.term(&body);
+        self.scopes = saved;
+        result
     }
 
     /// `(let ((v t) ...) body)` — parallel binding, then evaluate `body`.
@@ -572,6 +619,20 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn define_fun_macros() {
+        // A 0-ary abbreviation and an n-ary macro, both inlined.
+        let script = "
+            (declare-const x Int) (declare-const y Int)
+            (define-fun bound () Int 10)
+            (define-fun below ((a Int) (b Int)) Bool (< a b))
+            (assert (below x bound))
+            (assert (>= x 10))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
