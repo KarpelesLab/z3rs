@@ -282,8 +282,8 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 
 | Phase | Area                         | Status | Notes |
 |------:|------------------------------|:------:|-------|
-| 0     | `util` foundation            | 🟨     | numerals via `puremp` (wired); containers/symbols/params to port |
-| 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/nodes/hash-consing manager + basic bool family |
+| 0     | `util` foundation            | 🟨     | done: numerals (`puremp`), hash, lbool, symbol, spinlock, bit_vector, zstring · to do: containers/params/rlimit |
+| 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/SortSize, node types, hash-consing manager, basic + arith families, traversal/recognizers, s-expr pp · to do: bv/array/datatype/… theories, quantifiers, `math`, `params` |
 | 2     | `rewriter`                   | ⬜     |       |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | ⬜     |       |
