@@ -12,12 +12,14 @@
 //!
 //! ## Status: IN PROGRESS
 
+pub mod arith;
 pub mod basic;
 pub mod manager;
 pub mod node;
 pub mod parameter;
 pub mod pp;
 
+pub use arith::{ArithOp, ArithSortKind};
 pub use basic::{BasicOp, BasicSortKind};
 pub use manager::AstManager;
 pub use node::{AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData};
