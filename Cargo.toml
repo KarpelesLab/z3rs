@@ -3,18 +3,31 @@ name = "z3rs"
 version = "0.0.1"
 edition = "2024"
 rust-version = "1.88"
-description = "A pure-Rust, zero-dependency port of the Z3 theorem prover"
+description = "A pure-Rust port of the Z3 theorem prover, free of third-party and native dependencies"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/KarpelesLab/z3rs"
 keywords = ["smt", "solver", "z3", "theorem-prover", "satisfiability"]
 categories = ["mathematics", "algorithms"]
 
-# HARD CONSTRAINT: this crate depends on NO external library.
-# `[dependencies]` must stay empty. std only. Do not add crates here.
+# HARD CONSTRAINT: no third-party / native dependencies. The ONLY permitted
+# dependency is our own pure-Rust, dependency-free numeric core `puremp`
+# (arbitrary-precision integers/rationals/floats). `puremp` is pinned to its
+# dependency-free feature set (no serde/rand/cli) and to `no_std` here — z3rs is
+# `no_std + alloc` by default (see [features]), so `cargo tree` stays free of any
+# external crate. Enforced by tests/no_external_deps.rs. Add nothing else here.
 [dependencies]
+puremp = { version = "0.1.1", default-features = false, features = ["rational", "float"] }
 
 [dev-dependencies]
+
+[features]
+# z3rs is `no_std` by default; the reasoning core needs only `alloc` (always on).
+# `std` is opt-in and enables std-only functionality — wall-clock timeouts,
+# threads/parallelism, filesystem helpers, and `std::error::Error` impls — and
+# turns on `puremp`'s std layer. The `z3rs` binary links std itself regardless.
+default = []
+std = ["puremp/std"]
 
 [lib]
 name = "z3rs"

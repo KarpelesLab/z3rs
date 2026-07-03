@@ -1,9 +1,12 @@
 //! # z3rs — a pure-Rust port of the Z3 theorem prover
 //!
-//! `z3rs` is a from-scratch, **zero-external-dependency** reimplementation of
+//! `z3rs` is a from-scratch reimplementation of
 //! [Z3](https://github.com/Z3Prover/z3) (v4.17.0) in safe, idiomatic Rust.
-//! The goal is a 1:1 behavioural port of 100% of Z3 that links against nothing
-//! but the Rust standard library — no GMP, no C, no third-party crates.
+//! The goal is a 1:1 behavioural port of 100% of Z3 with **no third-party or
+//! native dependency** — no GMP, no C. The crate is `no_std` (needs only
+//! `alloc`) by default; the optional `std` feature adds std-backed conveniences.
+//! Its sole dependency is our own pure-Rust, dependency-free numeric core
+//! [`puremp`], re-exported below and used directly throughout the port.
 //!
 //! This is a large, multi-phase effort. See [`ROADMAP.md`](../ROADMAP.md) for the
 //! staged plan, and [`PORTING.md`](../PORTING.md) for the porting methodology and
@@ -41,10 +44,23 @@
 //!
 //! Nothing below is functional yet — every module is a documented scaffold.
 
-// Keep the zero-dependency, safety-first posture visible and enforced.
+// `no_std` by default; `alloc` is always required. `std` (feature) or `test`
+// builds pull in the standard library.
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
+// Keep the dependency-free, safety-first posture visible and enforced.
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![deny(rust_2018_idioms)]
 #![allow(dead_code)] // expected while modules are scaffolds
+
+// Established now so the `no_std` posture holds from the start; used as modules land.
+#[allow(unused_extern_crates)]
+extern crate alloc;
+
+/// The arbitrary-precision numeric core, re-exported so consumers of z3rs's API
+/// get the numeral types (`puremp::Int`, `puremp::Rational`, `puremp::Float`)
+/// without adding their own dependency. z3rs uses these types directly — there
+/// is no wrapper layer.
+pub use puremp;
 
 // --- Phase 0: foundation ---
 pub mod util;
@@ -88,3 +104,20 @@ pub const Z3_UPSTREAM_VERSION: &str = "4.17.0";
 
 /// z3rs crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod tests {
+    use puremp::{Int, Rational};
+
+    /// Smoke-test that the `puremp` numeric backend is wired and usable.
+    #[test]
+    fn numeric_backend_is_wired() {
+        let a: Int = "123456789012345678901234567890".parse().unwrap();
+        let b: Int = Int::from(1_000_000_007i64);
+        assert!(&a * &b > a);
+
+        let half = Rational::new(Int::from(1), Int::from(2));
+        let third = Rational::new(Int::from(1), Int::from(3));
+        assert_eq!(&half + &third, Rational::new(Int::from(5), Int::from(6)));
+    }
+}

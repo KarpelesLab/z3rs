@@ -1,11 +1,12 @@
 # z3rs — Roadmap to a 100% pure-Rust Z3
 
 > **Mission:** reimplement **all** of [Z3](https://github.com/Z3Prover/z3) (pinned
-> at **v4.17.0**, ~695k LOC of C++) as a single Rust crate, `z3rs`, that depends
-> on **nothing but the Rust standard library** — no GMP, no C, no third-party
-> crates — while remaining behaviourally faithful to upstream Z3.
+> at **v4.17.0**, ~695k LOC of C++) as a single Rust crate, `z3rs`, free of any
+> third-party or native dependency — no GMP, no C — while remaining
+> behaviourally faithful to upstream Z3. Its only dependency is our own
+> pure-Rust, dependency-free numeric core, [`puremp`](https://github.com/KarpelesLab/puremp).
 
-This document is the master plan: scope, architecture, the zero-dependency
+This document is the master plan: scope, architecture, the dependency-freedom
 strategy, the phase-by-phase porting order, and a live progress tracker.
 Methodology and per-module conventions live in [`PORTING.md`](PORTING.md).
 
@@ -13,9 +14,11 @@ Methodology and per-module conventions live in [`PORTING.md`](PORTING.md).
 
 ## 1. Goals & hard constraints
 
-1. **Zero external dependencies.** `[dependencies]` in `Cargo.toml` stays empty,
-   forever. `std` only. This is enforced by CI (see §7). The single biggest
-   consequence: we must ship our own bignum/rational/float layer instead of GMP.
+1. **No third-party / native dependencies.** `std` only, plus the single
+   first-party crate `puremp` (itself dependency-free) for arbitrary-precision
+   arithmetic — pinned to its `default-features = false` core so the resolved
+   tree stays free of any external crate. No GMP, no C, no `-sys` crates. This is
+   enforced by the guard tests and CI (see §7).
 2. **Single crate, single binary.** One crate `z3rs` exposing a library and the
    `z3rs` executable (the CLI-compatible counterpart of the `z3` shell).
 3. **100% coverage.** Every upstream `src/` component (theory solvers, tactics,
@@ -103,34 +106,45 @@ util
 
 ---
 
-## 4. The zero-dependency strategy
+## 4. The dependency-freedom strategy
 
 The only place "no external library" is genuinely hard is **arbitrary-precision
-arithmetic**, which upstream Z3 delegates to **GMP by default**. Critical
-discovery that makes this project tractable:
+arithmetic**, which upstream Z3 delegates to **GMP by default**. We solve it with
+a first-party, pure-Rust, dependency-free crate,
+[`puremp`](https://github.com/KarpelesLab/puremp), which provides:
 
-> Z3's `util/mpz.{h,cpp}` already ships a **GMP-free internal backend**
-> (`#ifndef _MP_GMP` / `_MP_INTERNAL`), built on its own multi-precision natural
-> layer `util/mpn.{h,cpp}`.
+- `puremp::Nat` / `puremp::Int` — arbitrary-precision naturals / signed integers
+  (Z3's `mpn` / `mpz`)
+- `puremp::Rational` — exact rationals (Z3's `mpq` / `rational`)
+- `puremp::Float` — MPFR-class binary floats with directed rounding (backs Z3's
+  `mpf` / the FloatingPoint theory)
 
-So we port the `_MP_INTERNAL` path directly — no algorithm invention required:
+z3rs depends on `puremp` with `default-features = false, features =
+["std","rational","float"]`, so it pulls in **no** transitive crate
+(`cargo tree` for z3rs is just `z3rs → puremp`). The dependency-free arithmetic
+core keeps the whole "no GMP / no native code" guarantee intact.
 
-- `util::mpn`  — multi-precision naturals (add/sub/mul/div, base conversion)
-- `util::mpz`  — signed big integers (on top of `mpn`)
-- `util::mpq`  — rationals
-- `util::mpf`  — arbitrary-precision IEEE-754 (FloatingPoint theory)
-- `util::mpff`, `mpfx`, `mpbq`, `hwf` — fixed/bounded/binary-rational/hardware floats
-- `util::rational`, `inf_rational`, … — the numeral facades everything else uses
+z3rs uses `puremp`'s types (`puremp::Int`, `puremp::Rational`, `puremp::Float`)
+**directly** throughout — `puremp` is ours, so there is no wrapper/facade layer;
+the crate is re-exported as [`z3rs::puremp`](src/lib.rs) for API consumers. Z3's
+specialized numerals that `puremp` does not provide are ported in-tree **on top
+of** `puremp::Int`:
+- `util::mpbq` — dyadic rationals `n·2^-k` (nlsat / realclosure / intervals)
+- `util::mpff`, `util::mpfx` — Z3's fixed-precision perf specializations
+- `util::inf_rational`, … — the ε-augmented numerals
 
 Everything above this layer (`ast`, `smt`, …) manipulates numerals through these
-facades, so once the bignum layer is faithful and fuzz-tested, the rest of the
-port never touches GMP concerns again. **This is the critical path and Phase 0's
-central deliverable.**
+types, so the port never touches GMP concerns.
 
-Other "external"-looking pieces and how we avoid deps:
-- Timers / rlimit / ctrl-c → `std::time`, `std::thread`, `std::sync`.
-- Memory manager / regions → Rust allocator + arena modules in `util`.
-- Hashing / containers → ported to `std::collections` + custom open-addressing
+Other "external"-looking pieces and how we avoid deps (the reasoning core stays
+`no_std + alloc`; each std-only mechanism is gated behind the `std` feature):
+- Logical resource limit (`rlimit`, an operation counter) → pure `alloc`; only
+  wall-clock timeouts / `scoped_timer` / ctrl-c need `std` (feature-gated).
+- Threads / parallel solver / `par` tactic → `std` feature (`std::thread`, `sync`).
+- File I/O → confined to the `z3rs` binary and parser entry points (readers/`&str`);
+  the library never opens files.
+- Memory manager / regions → global allocator + arena modules in `util`.
+- Hashing / containers → `alloc`-backed maps + custom open-addressing
   maps where Z3's `hashtable.h`/`chashtable.h` semantics matter for iteration
   order (which can affect heuristic determinism).
 
@@ -143,11 +157,12 @@ strictly dependency-ordered; later phases may begin their scaffolding early but
 cannot pass their exit criterion until predecessors do.
 
 ### Phase 0 — Foundation (`util`)
-Bignum layer (§4), core containers, `symbol` interning, `vector`/`buffer`,
-`hashtable`, `rational`, `params`/`gparams`, `rlimit`, `sexpr`, `region`,
-`memory`, `lbool`, `statistics`.
-- **Exit:** `util::rational`/`mpz`/`mpq`/`mpf` pass a differential fuzz suite vs.
-  GMP-backed Z3 over millions of random operations; container semantics tested.
+Numerals are provided by `puremp` (§4) — so Phase 0 is the rest of `util`: core
+containers, `symbol` interning, `vector`/`buffer`, `hashtable`, `params`/`gparams`,
+`rlimit`, `sexpr`, `region`, `memory`, `lbool`, `statistics`, plus the specialized
+numerals layered on `puremp::Int` (`mpbq`, `mpff`/`mpfx`, `inf_rational`).
+- **Exit:** container/symbol/params semantics tested; the specialized numerals
+  pass a fuzz suite; the whole `util` layer builds `no_std + alloc`.
 
 ### Phase 1 — Terms & exact math (`ast`, `math`, `params`)
 `ast` core (`ast`, `sort`, `func_decl`, `app`, `quantifier`, `ast_manager`,
@@ -230,7 +245,7 @@ documentation.
 
 ## 6. Milestones (usable checkpoints)
 
-- **M1 "It counts"** — Phase 0 done: bignum + rational usable and fuzzed.
+- **M1 "It counts"** — Phase 0 done: `util` foundation over `puremp` numerals.
 - **M2 "It thinks in terms"** — Phases 1–2: build, rewrite, simplify expressions.
 - **M3 "It decides propositions"** — Phase 4: standalone SAT solver.
 - **M4 "It solves QF"** — Phases 5–6: `z3rs file.smt2` on quantifier-free logics.
@@ -249,9 +264,11 @@ documentation.
   (built once, GMP-backed, kept in `z3/`). Every phase compares z3rs output to it:
   numerals (fuzz), rewriter normal forms, and `(check-sat)`/model/core/proof
   results over SMT-LIB.
-- **Zero-dep enforcement in CI:** `cargo tree` must show no non-std deps; a test
-  asserts `[dependencies]` is empty; `#![forbid(...)]`-style lints keep `unsafe`
-  contained.
+- **Dependency-freedom enforcement:** `tests/no_external_deps.rs` allowlists
+  exactly one dependency (`puremp`) and asserts the resolved lockfile contains
+  nothing else; CI additionally runs `cargo tree -e normal` (must be just
+  `z3rs → puremp`) and a `no_std` build for a bare target (e.g.
+  `thumbv7em-none-eabi`) to prove no std leaks into the library.
 - **Determinism:** container iteration order and tie-breaking are ported
   faithfully where they influence search, to keep differential noise low.
 
@@ -263,7 +280,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 
 | Phase | Area                         | Status | Notes |
 |------:|------------------------------|:------:|-------|
-| 0     | `util` (bignum foundation)   | ⬜     | critical path: `mpn`→`mpz`→`mpq`→`mpf` |
+| 0     | `util` foundation            | 🟨     | numerals via `puremp` (wired); containers/symbols/params to port |
 | 1     | `ast` / `math` / `params`    | ⬜     |       |
 | 2     | `rewriter`                   | ⬜     |       |
 | 3     | `model` / `tactic`           | ⬜     |       |
@@ -284,9 +301,10 @@ for `- [ ]`).
 
 - **Scale.** ~695k LOC is a multi-person-year effort. The layering above lets work
   proceed in parallel *within* a phase once the phase's dependencies are stable.
-- **Bignum performance.** GMP is highly optimized; a naive `mpn` port may be slow.
-  Mitigation: port Z3's `_MP_INTERNAL` algorithms first for correctness, then
-  optimize the hot paths (mul/div) with profiling, still in pure Rust.
+- **Bignum performance.** GMP is highly optimized; a pure-Rust core may be slower
+  on some workloads. This is now `puremp`'s concern (small-value inlining, hot
+  mul/div paths), decoupled from the port. Mitigation: profile against
+  GMP-backed Z3 and push optimizations into `puremp` behind its stable API.
 - **Heuristic drift → differential noise.** Small ordering differences can flip
   `unknown` vs a definite answer under resource limits. Mitigation: port hash/
   container ordering faithfully; compare with generous limits first.
