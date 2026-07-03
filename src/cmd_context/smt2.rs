@@ -83,6 +83,29 @@ fn euclid_div_mod(a: &Int, b: &Int) -> (Int, Int) {
     }
 }
 
+/// The `:named` label of an assertion written `(! term :named name …)`, if any.
+fn named_label(s: &SExpr) -> Option<String> {
+    let SExpr::List(l) = s else { return None };
+    if l.first().and_then(|h| match h {
+        SExpr::Atom(a) => Some(a.as_str()),
+        _ => None,
+    }) != Some("!")
+    {
+        return None;
+    }
+    // Scan for `:named <name>`.
+    let mut it = l[1..].iter();
+    while let Some(part) = it.next() {
+        if let SExpr::Atom(k) = part
+            && k == ":named"
+            && let Some(SExpr::Atom(name)) = it.next()
+        {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 /// Working state for [`Context::lift_terms`]: the defining constraints collected
 /// so far, a memo of already-lifted subterms, and a memo of `(a, divisor)` pairs
 /// sharing a `(quotient, remainder)`.
@@ -225,6 +248,11 @@ struct Context {
     sorts: BTreeMap<String, AstId>,
     funcs: BTreeMap<String, AstId>,
     assertions: Vec<AstId>,
+    /// The `:named` label of each assertion (parallel to `assertions`), if any —
+    /// used to report an unsat core.
+    assert_names: Vec<Option<String>>,
+    /// The verdict of the most recent `check-sat`.
+    last_verdict: Option<SmtResult>,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -257,6 +285,8 @@ impl Context {
             sorts,
             funcs: BTreeMap::new(),
             assertions: Vec::new(),
+            assert_names: Vec::new(),
+            last_verdict: None,
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -321,6 +351,7 @@ impl Context {
                         .pop()
                         .ok_or_else(|| "pop with no matching push".to_string())?;
                     self.assertions.truncate(mark.assertions); // discard scoped assertions
+                    self.assert_names.truncate(mark.assertions);
                     // Undeclare constants/functions and sorts made since the push.
                     for name in self.decl_order.drain(mark.decls..) {
                         self.funcs.remove(&name);
@@ -334,16 +365,20 @@ impl Context {
             }
             "reset" => {
                 self.assertions.clear();
+                self.assert_names.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
+                self.last_verdict = None;
                 Ok(None)
             }
             "reset-assertions" => {
                 // Drop assertions and the assertion stack, but keep declarations
                 // and options (unlike `reset`).
                 self.assertions.clear();
+                self.assert_names.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
+                self.last_verdict = None;
                 Ok(None)
             }
             "declare-sort" => {
@@ -400,14 +435,18 @@ impl Context {
             }
             "assert" => {
                 let t = self.term(&list[1])?;
+                let name = named_label(&list[1]);
                 self.assertions.push(t);
+                self.assert_names.push(name);
                 self.last_model = None;
+                self.last_verdict = None;
                 Ok(None)
             }
             "check-sat" => {
                 let goal = self.goal();
                 let (res, model) = check_model(&self.m, goal);
                 self.last_model = model;
+                self.last_verdict = Some(res);
                 let resp = match res {
                     SmtResult::Sat => "sat",
                     SmtResult::Unsat => "unsat",
@@ -417,6 +456,7 @@ impl Context {
             }
             "get-value" => self.get_value(list).map(Some),
             "get-model" => self.get_model().map(Some),
+            "get-unsat-core" => self.get_unsat_core().map(Some),
             other => Err(alloc::format!("unsupported command {other:?}")),
         }
     }
@@ -549,6 +589,65 @@ impl Context {
         }
     }
 
+    /// Decide a subset of the current assertions (by index).
+    fn check_subset(&mut self, keep: &[bool]) -> SmtResult {
+        let subset: Vec<AstId> = self
+            .assertions
+            .iter()
+            .zip(keep)
+            .filter_map(|(&a, &k)| k.then_some(a))
+            .collect();
+        let base = match subset.len() {
+            0 => self.m.mk_true(),
+            1 => subset[0],
+            _ => self.m.mk_and(&subset),
+        };
+        let mut ctx = LiftCtx {
+            defs: Vec::new(),
+            cache: BTreeMap::new(),
+            dm: BTreeMap::new(),
+        };
+        let lifted = self.lift_terms(base, &mut ctx);
+        let goal = if ctx.defs.is_empty() {
+            lifted
+        } else {
+            ctx.defs.push(lifted);
+            self.m.mk_and(&ctx.defs)
+        };
+        check_model(&self.m, goal).0
+    }
+
+    /// `(get-unsat-core)` — the `:named` assertions in a minimal unsatisfiable
+    /// core of the last (unsatisfiable) check. Computed by deletion-based
+    /// minimization: drop each named assertion; keep it only if the remainder is
+    /// still unsatisfiable. Unnamed assertions are always retained.
+    fn get_unsat_core(&mut self) -> Result<String, String> {
+        if self.last_verdict != Some(SmtResult::Unsat) {
+            return Err("get-unsat-core requires a preceding unsatisfiable check-sat".to_string());
+        }
+        let n = self.assertions.len();
+        let mut keep = alloc::vec![true; n];
+        for i in 0..n {
+            if self.assert_names[i].is_none() {
+                continue; // unnamed assertions are not core candidates
+            }
+            keep[i] = false;
+            // Keep the assertion unless the remainder is *still* unsatisfiable.
+            if self.check_subset(&keep) != SmtResult::Unsat {
+                keep[i] = true;
+            }
+        }
+        let mut names = Vec::new();
+        for (k, label) in keep.iter().zip(&self.assert_names) {
+            if *k
+                && let Some(name) = label
+            {
+                names.push(name.clone());
+            }
+        }
+        Ok(alloc::format!("({})", names.join(" ")))
+    }
+
     /// `(get-value (t1 t2 …))` — evaluate each term under the current model and
     /// return `((t1 v1) (t2 v2) …)`.
     fn get_value(&mut self, list: &[SExpr]) -> Result<String, String> {
@@ -653,6 +752,11 @@ impl Context {
                 let head = Self::sym(&l[0])?.to_string();
                 if head == "let" {
                     return self.term_let(&l[1], &l[2]);
+                }
+                if head == "!" {
+                    // (! t :annotation value …) — annotations are transparent to
+                    // the term's meaning; evaluate the annotated term.
+                    return self.term(&l[1]);
                 }
                 let args: Vec<AstId> = l[1..]
                     .iter()
@@ -1300,6 +1404,36 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat"]);
+    }
+
+    #[test]
+    fn unsat_core_minimal() {
+        // x > 0 ∧ x < 0 ∧ x = 5: c2 is in every core; deletion keeps {c2, c3}.
+        let script = "
+            (set-option :produce-unsat-cores true)
+            (declare-const x Int)
+            (assert (! (> x 0) :named c1))
+            (assert (! (< x 0) :named c2))
+            (assert (! (= x 5) :named c3))
+            (check-sat)
+            (get-unsat-core)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        // A valid minimal core; c2 must appear, and dropping either member is sat.
+        assert!(out[1].contains("c2"), "core must contain c2: {}", out[1]);
+        assert_eq!(out[1], "(c2 c3)");
+    }
+
+    #[test]
+    fn named_assertion_transparent() {
+        // (! t :named n) behaves exactly like t.
+        let script = "
+            (declare-const p Bool)
+            (assert (! (and p (not p)) :named bad))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
