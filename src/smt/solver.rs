@@ -33,7 +33,7 @@ use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
 use crate::smt::arith::{
-    Assignment, Constraint, LinExpr, Rel, feasible_with_diseqs, model_with_diseqs,
+    Assignment, Constraint, LinExpr, Rel, SolveOutcome, model_with_diseqs_budgeted,
 };
 use crate::smt::euf::Egraph;
 
@@ -378,8 +378,9 @@ fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Arit
 }
 
 /// Decide feasibility of an [`ArithSystem`] (LRA relaxation + integer B&B, with
-/// the gcd/divisibility precheck for all-integer equalities).
-fn arith_feasible(sys: &ArithSystem) -> Feas {
+/// the gcd/divisibility precheck for all-integer equalities). `budget` bounds
+/// total work (shared with any surrounding [`theory_check`]).
+fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // Sound necessary condition: an all-integer equality with no integer
     // solution (by the gcd/divisibility test) is infeasible — this decides
     // parity-style conflicts like 2x = 2y + 1 that branch-and-bound cannot.
@@ -408,23 +409,35 @@ fn arith_feasible(sys: &ArithSystem) -> Feas {
         })
         .collect();
     let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
-    let mut budget = BB_NODE_LIMIT;
-    integer_feasible(&cons, &sys.diseqs, &int_vars, &mut budget, 0)
+    integer_feasible(&cons, &sys.diseqs, &int_vars, budget, 0)
 }
 
-/// Does the arithmetic system *entail* `u = v`? True iff neither `u < v` nor
-/// `u > v` is consistent with it — i.e. every solution has `u = v`. Used to
-/// share implied equalities with the EUF theory (Nelson–Oppen).
-fn arith_entails_eq(m: &AstManager, sys: &ArithSystem, u: AstId, v: AstId) -> bool {
+/// Does the arithmetic system *entail* `u = v`? `Some(true)` iff neither `u < v`
+/// nor `u > v` is consistent with it — i.e. every solution has `u = v`. `None` if
+/// the shared work `budget` was exhausted. Used to share implied equalities with
+/// the EUF theory (Nelson–Oppen).
+fn arith_entails_eq(
+    m: &AstManager,
+    sys: &ArithSystem,
+    u: AstId,
+    v: AstId,
+    budget: &mut u64,
+) -> Option<bool> {
     let diff = ast_to_lin(m, u).sub(&ast_to_lin(m, v)); // u - v
     let mut lt = sys.cons.clone();
     lt.push(Constraint::lt(diff.clone())); // u - v < 0
-    if feasible_with_diseqs(&lt, &sys.diseqs) {
-        return false;
+    match model_with_diseqs_budgeted(&lt, &sys.diseqs, budget) {
+        SolveOutcome::Sat(_) => return Some(false), // u < v possible ⇒ not entailed
+        SolveOutcome::Exhausted => return None,
+        SolveOutcome::Unsat => {}
     }
     let mut gt = sys.cons.clone();
     gt.push(Constraint::lt(diff.neg())); // v - u < 0  ⟺  u - v > 0
-    !feasible_with_diseqs(&gt, &sys.diseqs)
+    match model_with_diseqs_budgeted(&gt, &sys.diseqs, budget) {
+        SolveOutcome::Sat(_) => Some(false),
+        SolveOutcome::Exhausted => None,
+        SolveOutcome::Unsat => Some(true), // neither side possible ⇒ entailed
+    }
 }
 
 /// The result of the combined theory check for one Boolean assignment.
@@ -473,6 +486,9 @@ fn theory_check(
     // Each round adds at least one new equality (bounded by the interface pairs),
     // so this cap is only a backstop against surprises.
     let max_rounds = interface.len() * interface.len() + 4;
+    // A single work budget shared by the arithmetic feasibility check and every
+    // Nelson–Oppen entailment query, so the whole combined check terminates.
+    let mut budget = BB_WORK_BUDGET;
 
     for _ in 0..max_rounds {
         // Arithmetic system augmented with the EUF-implied equalities so far.
@@ -482,7 +498,7 @@ fn theory_check(
             int_set: base.int_set.clone(),
         };
         sys.cons.extend(arith_extra.iter().cloned());
-        let arith = arith_feasible(&sys);
+        let arith = arith_feasible(&sys, &mut budget);
         if matches!(arith, Feas::Unsat) {
             return TheoryOutcome::Unsat;
         }
@@ -512,7 +528,10 @@ fn theory_check(
             for j in (i + 1)..interface.len() {
                 let (u, v) = (interface[i], interface[j]);
                 let same_class = g.class_of(m, u) == g.class_of(m, v);
-                let entailed = arith_entails_eq(m, &sys, u, v);
+                let entailed = match arith_entails_eq(m, &sys, u, v, &mut budget) {
+                    Some(e) => e,
+                    None => return TheoryOutcome::Unknown, // work budget exhausted
+                };
                 if entailed && !same_class {
                     euf_extra.push((u, v)); // arith → EUF
                     changed = true;
@@ -544,36 +563,36 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
     }
 }
 
-/// A *total* node budget for branch-and-bound. Naive B&B is not guaranteed to
-/// terminate on unbounded integer problems, and its search tree can be
-/// exponential, so we bound the total number of nodes explored (not just the
-/// depth — a depth cap alone still admits a 2^depth tree). On exhaustion the
-/// search returns [`Feas::Unknown`] rather than guessing, so the overall verdict
-/// stays sound; a complete integer procedure (Omega/Cooper, or B&B with derived
-/// bounds) is future work.
-const BB_NODE_LIMIT: u32 = 20_000;
+/// A total work budget for the integer feasibility search: the number of base
+/// `model` solves permitted across all branch-and-bound nodes *and* the
+/// disequality case split (both worst-case exponential). Bounding their shared
+/// total guarantees termination; on exhaustion the search returns
+/// [`Feas::Unknown`] rather than guessing, so the verdict stays sound. A complete
+/// integer procedure (Omega/Cooper, or B&B with derived bounds) is future work.
+const BB_WORK_BUDGET: u64 = 1_000;
 
 /// A depth cap for branch-and-bound recursion, keeping the stack bounded
-/// independently of the total-node budget (a single deep chain must not overflow).
+/// independently of the work budget (a single deep chain must not overflow).
 const BB_DEPTH_CAP: u32 = 800;
 
 /// Decide integer feasibility of `cons` ∧ `diseqs` with `int_vars` integral, by
-/// branch-and-bound over the LRA relaxation. `budget` is decremented per node and
-/// bounds total work; `depth` bounds recursion for stack safety. On exhaustion of
-/// either the result is [`Feas::Unknown`].
+/// branch-and-bound over the LRA relaxation. `budget` (shared with the
+/// disequality split) bounds total work; `depth` bounds recursion for stack
+/// safety. On exhaustion of either the result is [`Feas::Unknown`].
 fn integer_feasible(
     cons: &[Constraint],
     diseqs: &[LinExpr],
     int_vars: &[AstId],
-    budget: &mut u32,
+    budget: &mut u64,
     depth: u32,
 ) -> Feas {
-    if *budget == 0 || depth >= BB_DEPTH_CAP {
-        return Feas::Unknown; // budget/stack exhausted: don't guess
+    if depth >= BB_DEPTH_CAP {
+        return Feas::Unknown; // stack budget exhausted: don't guess
     }
-    *budget -= 1;
-    let Some(model) = model_with_diseqs(cons, diseqs) else {
-        return Feas::Unsat; // relaxation infeasible
+    let model = match model_with_diseqs_budgeted(cons, diseqs, budget) {
+        SolveOutcome::Sat(m) => m,
+        SolveOutcome::Unsat => return Feas::Unsat,
+        SolveOutcome::Exhausted => return Feas::Unknown,
     };
     // Find an integer variable whose relaxed value is fractional.
     let fractional = int_vars.iter().find_map(|&v| {

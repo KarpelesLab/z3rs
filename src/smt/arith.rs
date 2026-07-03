@@ -183,6 +183,51 @@ pub fn feasible_with_diseqs(constraints: &[Constraint], diseqs: &[LinExpr]) -> b
 /// as zero).
 pub type Assignment = BTreeMap<AstId, Rational>;
 
+/// The outcome of a budgeted feasibility search.
+pub enum SolveOutcome {
+    /// A satisfying rational assignment.
+    Sat(Assignment),
+    /// Definitely infeasible.
+    Unsat,
+    /// The work budget was exhausted before deciding.
+    Exhausted,
+}
+
+/// Like [`model_with_diseqs`], but bounds total work: `budget` counts the
+/// remaining `model` solves and is decremented per leaf; on exhaustion the search
+/// returns [`SolveOutcome::Exhausted`] instead of continuing the (worst-case
+/// exponential) disequality case split. This keeps callers terminating.
+pub fn model_with_diseqs_budgeted(
+    constraints: &[Constraint],
+    diseqs: &[LinExpr],
+    budget: &mut u64,
+) -> SolveOutcome {
+    match diseqs.split_first() {
+        None => {
+            if *budget == 0 {
+                return SolveOutcome::Exhausted;
+            }
+            *budget -= 1;
+            match model(constraints) {
+                Some(a) => SolveOutcome::Sat(a),
+                None => SolveOutcome::Unsat,
+            }
+        }
+        Some((d, rest)) => {
+            let mut lt = constraints.to_vec();
+            lt.push(Constraint::lt(d.clone()));
+            match model_with_diseqs_budgeted(&lt, rest, budget) {
+                SolveOutcome::Unsat => {
+                    let mut gt = constraints.to_vec();
+                    gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
+                    model_with_diseqs_budgeted(&gt, rest, budget)
+                }
+                other => other, // Sat or Exhausted short-circuits
+            }
+        }
+    }
+}
+
 /// Like [`feasible_with_diseqs`], but returns a concrete satisfying assignment
 /// (over the rationals) when one exists.
 pub fn model_with_diseqs(constraints: &[Constraint], diseqs: &[LinExpr]) -> Option<Assignment> {

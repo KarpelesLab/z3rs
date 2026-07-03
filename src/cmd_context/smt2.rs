@@ -113,6 +113,8 @@ struct LiftCtx {
     defs: Vec<AstId>,
     cache: BTreeMap<AstId, AstId>,
     dm: BTreeMap<(AstId, AstId), (AstId, AstId)>,
+    /// Memo of `(to_int a)` arguments → their integer result constant.
+    toint: BTreeMap<AstId, AstId>,
 }
 
 /// An s-expression.
@@ -514,6 +516,8 @@ impl Context {
                     Some(ArithOp::Idiv) => q,
                     _ => r,
                 }
+            } else if let Some(k) = self.lift_to_int(rebuilt, ctx) {
+                k
             } else {
                 rebuilt
             }
@@ -575,6 +579,29 @@ impl Context {
         Some((q, r))
     }
 
+    /// If `t` is `(to_int a)`, return a fresh integer `k` with `k ≤ a < k + 1`
+    /// (i.e. `k = ⌊a⌋`), memoized per argument. Constant arguments are folded
+    /// earlier, so this handles the symbolic case.
+    fn lift_to_int(&mut self, t: AstId, ctx: &mut LiftCtx) -> Option<AstId> {
+        if self.m.arith_op(t)? != ArithOp::ToInt {
+            return None;
+        }
+        let a = self.m.app_args(t)[0];
+        if let Some(&k) = ctx.toint.get(&a) {
+            return Some(k);
+        }
+        let int = self.m.mk_int_sort();
+        let k = self.fresh_const(int);
+        let le = self.m.mk_le(k, a); // k ≤ a
+        let one = self.m.mk_int(1);
+        let kp1 = self.m.mk_add(&[k, one]);
+        let lt = self.m.mk_lt(a, kp1); // a < k + 1
+        ctx.defs.push(le);
+        ctx.defs.push(lt);
+        ctx.toint.insert(a, k);
+        Some(k)
+    }
+
     /// A fresh 0-ary constant of the given sort (for term lifting).
     fn fresh_const(&mut self, sort: AstId) -> AstId {
         let name = alloc::format!("!k!{}", self.fresh_counter);
@@ -591,6 +618,7 @@ impl Context {
             defs: Vec::new(),
             cache: BTreeMap::new(),
             dm: BTreeMap::new(),
+            toint: BTreeMap::new(),
         };
         let lifted = self.lift_terms(base, &mut ctx);
         if ctx.defs.is_empty() {
@@ -1299,6 +1327,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script2).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn to_int_symbolic() {
+        // (to_int x) = ⌊x⌋: x = 3.7 ⇒ (to_int x) = 3, so ≥ 4 is unsat.
+        assert_eq!(
+            run("(declare-const x Real)(assert (= x 3.7))(assert (>= (to_int x) 4))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // 2 ≤ x < 3 ⇒ (to_int x) = 2.
+        assert_eq!(
+            run("(declare-const x Real)(assert (<= 2.0 x))(assert (< x 3.0))(assert (not (= (to_int x) 2)))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]

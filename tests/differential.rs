@@ -225,6 +225,14 @@ const CORPUS: &[Case] = &[
         script: "(declare-sort U 0)(declare-fun p (U) Bool)(declare-const a U)(declare-const b U)
                  (assert (p a))(assert (not (p b)))(check-sat)",
     },
+    Case {
+        name: "to_int_symbolic_unsat",
+        script: "(declare-const x Real)(assert (= x 3.7))(assert (>= (to_int x) 4))(check-sat)",
+    },
+    Case {
+        name: "to_int_floor_unsat",
+        script: "(declare-const x Real)(assert (<= 2.0 x))(assert (< x 3.0))(assert (not (= (to_int x) 2)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
