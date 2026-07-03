@@ -9,8 +9,9 @@
 //! (`+ - * / <= < >= >`, `div`/`mod`/`abs`/`to_real`/`to_int`, with constant
 //! folding), and uninterpreted functions. Runs QF_UF / QF_LRA / QF_LIA scripts
 //! through [`crate::smt::check_model`], and reports models via
-//! `get-value`/`get-model`. (Nonlinear terms and arithmetic-sorted `ite` are
-//! treated opaquely — a known incompleteness pending theory support.)
+//! `get-value`/`get-model`. Term-level (non-Boolean) `ite`s are lifted to fresh
+//! constants before solving, so the theory reasons about them exactly.
+//! (Nonlinear terms remain opaque — a known incompleteness pending `nlsat`.)
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -214,6 +215,8 @@ struct Context {
     decl_order: Vec<String>,
     /// The model from the most recent satisfiable `check-sat`, if still current.
     last_model: Option<Model>,
+    /// Counter for the fresh constants introduced by term-ITE elimination.
+    fresh_counter: u32,
 }
 
 impl Context {
@@ -236,6 +239,7 @@ impl Context {
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
             last_model: None,
+            fresh_counter: 0,
         }
     }
 
@@ -357,7 +361,7 @@ impl Context {
                 Ok(None)
             }
             "check-sat" => {
-                let goal = self.conjunction();
+                let goal = self.goal();
                 let (res, model) = check_model(&self.m, goal);
                 self.last_model = model;
                 let resp = match res {
@@ -369,6 +373,72 @@ impl Context {
             "get-value" => self.get_value(list).map(Some),
             "get-model" => self.get_model().map(Some),
             other => Err(alloc::format!("unsupported command {other:?}")),
+        }
+    }
+
+    /// Eliminate non-Boolean (term-level) `ite`s from `t` by the standard
+    /// lifting: each `(ite c a b)` of a non-Boolean sort becomes a fresh
+    /// constant `k` with the defining constraints `(=> c (= k a))` and
+    /// `(=> (not c) (= k b))` pushed onto `defs`. Equisatisfiable, and lets the
+    /// linear theory reason about `k` (which it cannot for an opaque `ite`).
+    fn elim_term_ites(
+        &mut self,
+        t: AstId,
+        defs: &mut Vec<AstId>,
+        cache: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if let Some(&r) = cache.get(&t) {
+            return r;
+        }
+        let result = if self.m.is_app(t) {
+            let decl = self.m.app_decl(t);
+            let args = self.m.app_args(t).to_vec();
+            let new_args: Vec<AstId> = args
+                .iter()
+                .map(|&a| self.elim_term_ites(a, defs, cache))
+                .collect();
+            let rebuilt = if new_args == args {
+                t
+            } else {
+                self.m.mk_app(decl, &new_args)
+            };
+            if self.m.is_ite(rebuilt) && !self.m.is_bool_sort(self.m.get_sort(rebuilt)) {
+                let a = self.m.app_args(rebuilt).to_vec(); // [cond, then, else]
+                let sort = self.m.get_sort(rebuilt);
+                let name = alloc::format!("!ite!{}", self.fresh_counter);
+                self.fresh_counter += 1;
+                let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
+                let k = self.m.mk_const(d);
+                let eq_t = self.m.mk_eq(k, a[1]);
+                let eq_e = self.m.mk_eq(k, a[2]);
+                let imp_t = self.m.mk_implies(a[0], eq_t);
+                let nc = self.m.mk_not(a[0]);
+                let imp_e = self.m.mk_implies(nc, eq_e);
+                defs.push(imp_t);
+                defs.push(imp_e);
+                k
+            } else {
+                rebuilt
+            }
+        } else {
+            t
+        };
+        cache.insert(t, result);
+        result
+    }
+
+    /// The conjunction of all assertions (`true` if none), with term-level
+    /// `ite`s lifted out so the theory solvers can reason about them.
+    fn goal(&mut self) -> AstId {
+        let base = self.conjunction();
+        let mut defs = Vec::new();
+        let mut cache = BTreeMap::new();
+        let lifted = self.elim_term_ites(base, &mut defs, &mut cache);
+        if defs.is_empty() {
+            lifted
+        } else {
+            defs.push(lifted);
+            self.m.mk_and(&defs)
         }
     }
 
@@ -1004,6 +1074,36 @@ mod tests {
         let script = "
             (declare-const x Int)
             (assert (< (to_real x) (to_real x)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn term_ite_arithmetic() {
+        // x = (ite b 1 2), b, x ≠ 1 is unsat (b ⇒ x = 1).
+        let unsat = "
+            (declare-const b Bool) (declare-const x Int)
+            (assert (= x (ite b 1 2))) (assert b) (assert (not (= x 1)))
+            (check-sat)
+        ";
+        assert_eq!(run(unsat).unwrap(), alloc::vec!["unsat"]);
+        // Self-referential guard: x = (ite (< x 0) 1 2) forces x = 2 → sat.
+        let sat = "
+            (declare-const x Int)
+            (assert (= x (ite (< x 0) 1 2)))
+            (check-sat)
+        ";
+        assert_eq!(run(sat).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nested_term_ite_in_arith() {
+        // (ite (> x 0) x 0) + 1 > 100 with x < 50 is unsat in both branches.
+        let script = "
+            (declare-const x Int)
+            (assert (> (+ (ite (> x 0) x 0) 1) 100))
+            (assert (< x 50))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);

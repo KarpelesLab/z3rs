@@ -143,6 +143,19 @@ const CORPUS: &[Case] = &[
         name: "minus_nary_fold",
         script: "(declare-const x Int)(assert (= (- 10 1 2 3) x))(assert (not (= x 4)))(check-sat)",
     },
+    Case {
+        name: "term_ite_unsat",
+        script: "(declare-const b Bool)(declare-const x Int)
+                 (assert (= x (ite b 1 2)))(assert b)(assert (not (= x 1)))(check-sat)",
+    },
+    Case {
+        name: "term_ite_selfref_sat",
+        script: "(declare-const x Int)(assert (= x (ite (< x 0) 1 2)))(check-sat)",
+    },
+    Case {
+        name: "nested_term_ite_unsat",
+        script: "(declare-const x Int)(assert (> (+ (ite (> x 0) x 0) 1) 100))(assert (< x 50))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
