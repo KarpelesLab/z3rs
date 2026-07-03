@@ -17,7 +17,7 @@ categories = ["mathematics", "algorithms"]
 # `no_std + alloc` by default (see [features]), so `cargo tree` stays free of any
 # external crate. Enforced by tests/no_external_deps.rs. Add nothing else here.
 [dependencies]
-puremp = { version = "0.1.3", default-features = false, features = ["rational", "dyadic", "float"] }
+puremp = { version = "0.1.4", default-features = false, features = ["rational", "dyadic", "float"] }
 
 [dev-dependencies]
 
