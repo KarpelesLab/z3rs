@@ -257,6 +257,25 @@ impl AstManager {
         }
     }
 
+    /// The value of a bit-vector numeral `id` (in `[0, 2^width)`), if it is one.
+    pub fn bv_numeral_value(&self, id: AstId) -> Option<Int> {
+        let bvfid = self.get_family_id(Symbol::new("bv"))?;
+        let a = self.app(id)?;
+        if !a.args.is_empty() {
+            return None;
+        }
+        let d = self.func_decl(a.decl)?;
+        if d.info.family_id == bvfid && d.info.decl_kind == BvOp::Num as DeclKind {
+            d.info
+                .parameters
+                .first()?
+                .get_rational()
+                .map(|r| r.numerator().clone())
+        } else {
+            None
+        }
+    }
+
     /// If `id` applies a bit-vector-family declaration, its op kind.
     pub fn bv_op(&self, id: AstId) -> Option<BvOp> {
         let bvfid = self.get_family_id(Symbol::new("bv"))?;
