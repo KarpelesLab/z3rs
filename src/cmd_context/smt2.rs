@@ -454,6 +454,31 @@ impl Context {
                 };
                 Ok(Some(resp.to_string()))
             }
+            "check-sat-assuming" => {
+                // (check-sat-assuming (a1 a2 …)) — decide the assertions together
+                // with the assumption literals, without adding them permanently.
+                let assumptions = match list.get(1) {
+                    Some(SExpr::List(a)) => a.clone(),
+                    _ => return Err("check-sat-assuming: expected a literal list".to_string()),
+                };
+                let mut conj = alloc::vec![self.conjunction()];
+                for a in &assumptions {
+                    conj.push(self.term(a)?);
+                }
+                let base = self.m.mk_and(&conj);
+                let goal = self.lift(base);
+                let (res, model) = check_model(&self.m, goal);
+                self.last_model = model;
+                self.last_verdict = Some(res);
+                Ok(Some(
+                    match res {
+                        SmtResult::Sat => "sat",
+                        SmtResult::Unsat => "unsat",
+                        SmtResult::Unknown => "unknown",
+                    }
+                    .to_string(),
+                ))
+            }
             "get-value" => self.get_value(list).map(Some),
             "get-model" => self.get_model().map(Some),
             "get-unsat-core" => self.get_unsat_core().map(Some),
@@ -558,11 +583,10 @@ impl Context {
         self.m.mk_const(d)
     }
 
-    /// The conjunction of all assertions (`true` if none), with term-level `ite`s
-    /// and constant-divisor `div`/`mod` lifted so the theory solvers can reason
+    /// Lift term-level `ite`s and constant-divisor `div`/`mod` out of `base`,
+    /// conjoining their defining constraints, so the theory solvers can reason
     /// about them.
-    fn goal(&mut self) -> AstId {
-        let base = self.conjunction();
+    fn lift(&mut self, base: AstId) -> AstId {
         let mut ctx = LiftCtx {
             defs: Vec::new(),
             cache: BTreeMap::new(),
@@ -575,6 +599,12 @@ impl Context {
             ctx.defs.push(lifted);
             self.m.mk_and(&ctx.defs)
         }
+    }
+
+    /// The conjunction of all assertions (`true` if none), lifted.
+    fn goal(&mut self) -> AstId {
+        let base = self.conjunction();
+        self.lift(base)
     }
 
     /// The conjunction of all assertions (`true` if none).
@@ -602,18 +632,7 @@ impl Context {
             1 => subset[0],
             _ => self.m.mk_and(&subset),
         };
-        let mut ctx = LiftCtx {
-            defs: Vec::new(),
-            cache: BTreeMap::new(),
-            dm: BTreeMap::new(),
-        };
-        let lifted = self.lift_terms(base, &mut ctx);
-        let goal = if ctx.defs.is_empty() {
-            lifted
-        } else {
-            ctx.defs.push(lifted);
-            self.m.mk_and(&ctx.defs)
-        };
+        let goal = self.lift(base);
         check_model(&self.m, goal).0
     }
 
@@ -1423,6 +1442,18 @@ mod tests {
         // A valid minimal core; c2 must appear, and dropping either member is sat.
         assert!(out[1].contains("c2"), "core must contain c2: {}", out[1]);
         assert_eq!(out[1], "(c2 c3)");
+    }
+
+    #[test]
+    fn check_sat_assuming_does_not_persist() {
+        // The assumption makes this check unsat, but a later plain check is sat.
+        let script = "
+            (declare-const p Bool) (declare-const q Bool)
+            (assert (=> p q))
+            (check-sat-assuming (p (not q)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat"]);
     }
 
     #[test]
