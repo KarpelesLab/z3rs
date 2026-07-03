@@ -6,7 +6,7 @@ rust-version = "1.96"
 description = "A pure-Rust, zero-dependency port of the Z3 theorem prover"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/echelle/z3rs"
+repository = "https://github.com/KarpelesLab/z3rs"
 keywords = ["smt", "solver", "z3", "theorem-prover", "satisfiability"]
 categories = ["mathematics", "algorithms"]
 
