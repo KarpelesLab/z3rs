@@ -2,10 +2,11 @@
 //! `z3/src/parsers/smt2` (Z3 4.17.0, MIT).
 //!
 //! Supports: `set-logic`/`set-info`/`set-option` (ignored), `declare-sort`
-//! (arity 0), `declare-fun`, `declare-const`, `assert`, `check-sat`, and `exit`;
-//! terms over the core Boolean operators, equality/`distinct`, `ite`, and
-//! uninterpreted functions. Arithmetic/bit-vector terms and `push`/`pop` are not
-//! yet handled. Enough to run QF_UF scripts through [`crate::smt::check`].
+//! (arity 0), `declare-fun`, `declare-const`, `assert`, `check-sat`,
+//! `push`/`pop`/`reset`, and `exit`; terms over the core Boolean operators,
+//! equality/`distinct`, `ite`, `let`, and uninterpreted functions. Arithmetic
+//! and bit-vector terms are not yet handled. Enough to run QF_UF scripts through
+//! [`crate::smt::check`].
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -127,6 +128,8 @@ struct Context {
     sorts: BTreeMap<String, AstId>,
     funcs: BTreeMap<String, AstId>,
     assertions: Vec<AstId>,
+    /// Assertion counts saved at each `push` (for `pop` to restore).
+    assert_stack: Vec<usize>,
     /// Active `let` binding scopes (innermost last).
     scopes: Vec<Vec<(String, AstId)>>,
 }
@@ -142,7 +145,19 @@ impl Context {
             sorts,
             funcs: BTreeMap::new(),
             assertions: Vec::new(),
+            assert_stack: Vec::new(),
             scopes: Vec::new(),
+        }
+    }
+
+    /// The optional level count for `push`/`pop` (defaults to 1).
+    fn level_arg(list: &[SExpr]) -> Result<u32, String> {
+        match list.get(1) {
+            None => Ok(1),
+            Some(SExpr::Atom(a)) => a
+                .parse::<u32>()
+                .map_err(|_| alloc::format!("expected a level count, found {a:?}")),
+            Some(_) => Err("expected a numeric level count".to_string()),
         }
     }
 
@@ -168,8 +183,30 @@ impl Context {
             _ => return Err("expected a command list".to_string()),
         };
         match Self::sym(&list[0])? {
-            "set-logic" | "set-info" | "set-option" | "get-info" | "echo" | "exit" | "push"
-            | "pop" | "reset" => Ok(None),
+            "set-logic" | "set-info" | "set-option" | "get-info" | "echo" | "exit" => Ok(None),
+            "push" => {
+                let n = Self::level_arg(list)?;
+                for _ in 0..n {
+                    self.assert_stack.push(self.assertions.len());
+                }
+                Ok(None)
+            }
+            "pop" => {
+                let n = Self::level_arg(list)?;
+                for _ in 0..n {
+                    let mark = self
+                        .assert_stack
+                        .pop()
+                        .ok_or_else(|| "pop with no matching push".to_string())?;
+                    self.assertions.truncate(mark); // discard scoped assertions
+                }
+                Ok(None)
+            }
+            "reset" => {
+                self.assertions.clear();
+                self.assert_stack.clear();
+                Ok(None)
+            }
             "declare-sort" => {
                 let name = Self::sym(&list[1])?.to_string();
                 let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
@@ -427,6 +464,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn push_pop_scopes_assertions() {
+        // The contradictory assertion is scoped inside push/pop; after pop the
+        // remaining assertions are satisfiable.
+        let script = "
+            (declare-const p Bool)
+            (assert (or p (not p)))
+            (push 1)
+              (assert (and p (not p)))
+              (check-sat)
+            (pop 1)
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat"]);
     }
 
     #[test]
