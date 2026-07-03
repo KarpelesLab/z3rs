@@ -284,7 +284,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 |------:|------------------------------|:------:|-------|
 | 0     | `util` foundation            | 🟨     | done: numerals (`puremp`), hash, lbool, symbol, spinlock, bit_vector, zstring · to do: containers/params/rlimit |
 | 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/SortSize, node types, hash-consing manager, basic + arith families, traversal/recognizers, s-expr pp · to do: bv/array/datatype/… theories, quantifiers, `math`, `params` |
-| 2     | `rewriter`                   | ⬜     |       |
+| 2     | `rewriter`                   | 🟨     | bottom-up boolean constant folding (`bool_rewriter` subset) |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | ⬜     |       |
 | 5     | `smt` / `nlsat`              | ⬜     |       |

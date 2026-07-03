@@ -1,21 +1,14 @@
-//! # `rewriter` — Term rewriting, simplification, E-graph, NNF, bit-blasting, FPA
+//! # `rewriter` — term rewriting and simplification
 //!
-//! **Port phase 2.** Ported from the Z3 C++ component(s) below.
-//! See [`ROADMAP.md`](../../ROADMAP.md) for the porting plan and status.
+//! **Port phase 2.** Ported from `z3/src/ast/rewriter` and friends (Z3 4.17.0,
+//! MIT). See [`ROADMAP.md`](../../ROADMAP.md) for the plan and status.
 //!
-//! ## Upstream C++ components to port
-//! - [ ] `z3/src/rewriter`
-//! - [ ] `z3/src/euf`
-//! - [ ] `z3/src/substitution`
-//! - [ ] `z3/src/macros`
-//! - [ ] `z3/src/normal_forms`
-//! - [ ] `z3/src/proofs`
-//! - [ ] `z3/src/bit_blaster`
-//! - [ ] `z3/src/pattern`
-//! - [ ] `z3/src/parser_util`
-//! - [ ] `z3/src/fpa`
+//! ## Ported so far
+//! - [x] boolean constant folding (`bool_rewriter` subset) → [`bool_rewriter`]
+//! - [ ] full `th_rewriter`, per-theory rewriters, `euf`, `nnf`, `bit_blaster`, …
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod bool_rewriter;
+
+pub use bool_rewriter::simplify;
