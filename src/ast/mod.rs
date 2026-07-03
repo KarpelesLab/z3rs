@@ -12,13 +12,19 @@
 //!
 //! ## Status: IN PROGRESS
 
+pub mod basic;
 pub mod manager;
 pub mod node;
 pub mod parameter;
 
+pub use basic::{BasicOp, BasicSortKind};
 pub use manager::AstManager;
 pub use node::{AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData};
 pub use parameter::Parameter;
+
+/// The family id of the built-in "basic" theory (booleans, equality, ite).
+/// Registered first, so it is always `0` (`basic_family_id` in Z3).
+pub const BASIC_FAMILY_ID: FamilyId = 0;
 
 /// Identifies the theory ("family") a declaration belongs to. `-1`
 /// ([`NULL_FAMILY_ID`]) means uninterpreted.

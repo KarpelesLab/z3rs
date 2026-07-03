@@ -15,7 +15,10 @@ use crate::util::symbol::Symbol;
 
 /// Family id, decl kind, and parameters shared by sorts and function decls
 /// (`decl_info` in Z3).
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+///
+/// No `Default` impl on purpose: the zero `family_id` is the *basic* family, not
+/// the null one — use [`DeclInfo::null`] for an uninterpreted declaration.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct DeclInfo {
     /// The theory this declaration belongs to (`null` = uninterpreted).
     pub family_id: FamilyId,

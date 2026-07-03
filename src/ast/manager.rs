@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use crate::ast::node::{
     AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData,
 };
-use crate::ast::{AstId, AstKind, SortSize};
+use crate::ast::{AstId, AstKind, FamilyId, SortSize};
 use crate::util::hash::fnv_hash;
 use crate::util::symbol::Symbol;
 
@@ -31,6 +31,8 @@ pub struct AstManager {
     /// Hash-cons buckets: `buckets[hash & mask]` lists candidate node ids.
     buckets: Vec<Vec<u32>>,
     mask: usize,
+    /// Registered theory families; the index is the [`FamilyId`].
+    families: Vec<Symbol>,
 }
 
 impl Default for AstManager {
@@ -40,14 +42,40 @@ impl Default for AstManager {
 }
 
 impl AstManager {
-    /// A new, empty manager.
+    /// A new, empty manager. The "basic" family is pre-registered as id `0`.
     pub fn new() -> AstManager {
         const INIT_BUCKETS: usize = 16; // power of two
         AstManager {
             nodes: Vec::new(),
             buckets: vec![Vec::new(); INIT_BUCKETS],
             mask: INIT_BUCKETS - 1,
+            families: vec![Symbol::new("basic")],
         }
+    }
+
+    // --- theory families --------------------------------------------------
+
+    /// Register (or look up) a theory family by name, returning its id.
+    pub fn mk_family_id(&mut self, name: Symbol) -> FamilyId {
+        if let Some(fid) = self.get_family_id(name) {
+            return fid;
+        }
+        let fid = self.families.len() as FamilyId;
+        self.families.push(name);
+        fid
+    }
+
+    /// The id of an already-registered family, if any.
+    pub fn get_family_id(&self, name: Symbol) -> Option<FamilyId> {
+        self.families
+            .iter()
+            .position(|&s| s == name)
+            .map(|i| i as FamilyId)
+    }
+
+    /// The name of a registered family.
+    pub fn family_name(&self, fid: FamilyId) -> Option<Symbol> {
+        self.families.get(fid as usize).copied()
     }
 
     /// Number of distinct nodes created.

@@ -283,7 +283,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 | Phase | Area                         | Status | Notes |
 |------:|------------------------------|:------:|-------|
 | 0     | `util` foundation            | 🟨     | numerals via `puremp` (wired); containers/symbols/params to port |
-| 1     | `ast` / `math` / `params`    | ⬜     |       |
+| 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/nodes/hash-consing manager + basic bool family |
 | 2     | `rewriter`                   | ⬜     |       |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | ⬜     |       |
