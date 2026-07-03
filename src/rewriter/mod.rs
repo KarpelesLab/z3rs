@@ -7,12 +7,15 @@
 //! - [x] bottom-up driver ([`th_rewriter`]) dispatching to per-theory folders
 //! - [x] boolean constant folding ([`bool_rewriter`])
 //! - [x] arithmetic constant folding ([`arith_rewriter`])
+//! - [x] subterm / De Bruijn variable substitution ([`subst`])
 //! - [ ] richer boolean/arith rules, more theories, `euf`, `nnf`, `bit_blaster`, …
 //!
 //! ## Status: IN PROGRESS
 
 pub mod arith_rewriter;
 pub mod bool_rewriter;
+pub mod subst;
 pub mod th_rewriter;
 
+pub use subst::{substitute, substitute_vars};
 pub use th_rewriter::simplify;
