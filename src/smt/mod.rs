@@ -15,6 +15,6 @@ pub mod arith;
 pub mod euf;
 pub mod solver;
 
-pub use arith::{Constraint, LinExpr, Rel, feasible};
+pub use arith::{Constraint, LinExpr, Rel, feasible, feasible_with_diseqs};
 pub use euf::Egraph;
 pub use solver::{SmtResult, check};

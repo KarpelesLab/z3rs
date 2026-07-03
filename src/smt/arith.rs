@@ -95,6 +95,35 @@ impl LinExpr {
     fn coeff(&self, v: AstId) -> Rational {
         self.coeffs.get(&v).cloned().unwrap_or_else(zero)
     }
+
+    /// Is this a constant (no variables)?
+    pub fn is_constant(&self) -> bool {
+        self.coeffs.is_empty()
+    }
+
+    /// The constant value if this expression has no variables.
+    pub fn as_constant(&self) -> Option<Rational> {
+        self.is_constant().then(|| self.constant.clone())
+    }
+}
+
+/// Is the conjunction of `constraints` and `disequalities` (each `expr ≠ 0`)
+/// satisfiable? Disequalities are handled by case-splitting `expr < 0` vs
+/// `expr > 0` (exponential in the number of disequalities, but exact).
+pub fn feasible_with_diseqs(constraints: &[Constraint], diseqs: &[LinExpr]) -> bool {
+    match diseqs.split_first() {
+        None => feasible(constraints),
+        Some((d, rest)) => {
+            let mut lt = constraints.to_vec();
+            lt.push(Constraint::lt(d.clone()));
+            if feasible_with_diseqs(&lt, rest) {
+                return true;
+            }
+            let mut gt = constraints.to_vec();
+            gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
+            feasible_with_diseqs(&gt, rest)
+        }
+    }
 }
 
 /// A normalized constraint `expr ⋈ 0`, where `⋈` is `<` if `strict`, else `≤`.

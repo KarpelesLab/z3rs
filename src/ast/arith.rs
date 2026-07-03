@@ -333,6 +333,35 @@ impl AstManager {
             _ => false,
         }
     }
+
+    /// Is `sort_id` an arithmetic sort (`Int` or `Real`)?
+    pub fn is_arith_sort(&self, sort_id: AstId) -> bool {
+        matches!((self.arith_fid_opt(), self.sort(sort_id)), (Some(afid), Some(s)) if s.info.family_id == afid)
+    }
+
+    /// If `id` is an application of an arithmetic-family declaration, its op.
+    pub fn arith_op(&self, id: AstId) -> Option<ArithOp> {
+        let afid = self.arith_fid_opt()?;
+        let a = self.app(id)?;
+        let d = self.func_decl(a.decl)?;
+        if d.info.family_id != afid {
+            return None;
+        }
+        ArithOp::from_kind(d.info.decl_kind)
+    }
+}
+
+impl ArithOp {
+    /// The op for a declaration kind, if it is one this port models.
+    pub fn from_kind(k: DeclKind) -> Option<ArithOp> {
+        use ArithOp::*;
+        [
+            Num, Le, Ge, Lt, Gt, Add, Sub, Uminus, Mul, Div, Idiv, Rem, Mod, ToReal, ToInt, IsInt,
+            Abs, Power,
+        ]
+        .into_iter()
+        .find(|&op| op as DeclKind == k)
+    }
 }
 
 /// `+`/`*` flags: associative, flat, commutative.

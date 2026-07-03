@@ -287,7 +287,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 | 2     | `rewriter`                   | 🟨     | `th_rewriter` driver + boolean & arithmetic constant folding, substitution, NNF · to do: theory rewriters, `euf`, `bit_blaster` |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | 🟨     | CDCL solver (2-watched literals, 1-UIP learning, backjumping, VSIDS, Luby restarts), Tseitin AST→CNF, DIMACS frontend · to do: assumptions/cores, clause-DB reduction, `sat_smt` |
-| 5     | `smt` / `nlsat`              | 🟨     | lazy DPLL(T) loop + congruence-closure e-graph deciding QF_UF · to do: online theory propagation, arith/bv/array theories, quantifiers |
+| 5     | `smt` / `nlsat`              | 🟨     | lazy DPLL(T): congruence-closure e-graph (QF_UF) + Fourier–Motzkin linear arithmetic (QF_LRA) · to do: Nelson–Oppen combination, simplex, online propagation, bv/array theories, quantifiers |
 | 6     | `solver` / `cmd_context`     | 🟨     | minimal SMT-LIB2 front end (tokenizer/parser/interpreter) for the QF_UF subset; `z3rs file.smt2` works · to do: full command set, push/pop, get-model |
 | 7     | `qe` / `muz` / `opt`         | ⬜     |       |
 | 8     | `parsers`                    | ⬜     |       |
