@@ -328,6 +328,14 @@ impl Context {
                 self.last_model = None;
                 Ok(None)
             }
+            "reset-assertions" => {
+                // Drop assertions and the assertion stack, but keep declarations
+                // and options (unlike `reset`).
+                self.assertions.clear();
+                self.scope_stack.clear();
+                self.last_model = None;
+                Ok(None)
+            }
             "declare-sort" => {
                 let name = Self::sym(&list[1])?.to_string();
                 let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
@@ -781,6 +789,16 @@ impl Context {
                 Some(v) => Ok(m.mk_numeral(Rational::from_integer(v.floor()), true)),
                 None => Ok(m.mk_to_int(args[0])),
             },
+            "is_int" => match m.as_numeral(args[0]) {
+                // (is_int r): true iff r is integral. Only constants are decided;
+                // a non-constant argument is unsupported.
+                Some(v) => Ok(if v.is_integer() {
+                    m.mk_true()
+                } else {
+                    m.mk_false()
+                }),
+                None => Err("is_int: only constant arguments are supported".to_string()),
+            },
             "<=" | "<" | ">=" | ">" => {
                 let mk = |m: &mut AstManager, a, b| match head {
                     "<=" => m.mk_le(a, b),
@@ -1158,6 +1176,33 @@ mod tests {
             (declare-const y Int) (assert (> y 0)) (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
+    }
+
+    #[test]
+    fn is_int_constant_fold() {
+        // (is_int 4.0) is true, (is_int 2.5) is false.
+        assert_eq!(
+            run("(assert (not (is_int 4.0)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (is_int 2.5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn reset_assertions_keeps_declarations() {
+        // reset-assertions drops assertions but keeps the declaration of x.
+        let script = "
+            (declare-const x Int)
+            (assert (= x 1)) (assert (= x 2))
+            (check-sat)
+            (reset-assertions)
+            (assert (= x 5))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat"]);
     }
 
     #[test]
