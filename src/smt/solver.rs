@@ -344,10 +344,14 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
     }
 }
 
-/// A node budget for branch-and-bound: bounded QF_LIA problems close well within
-/// this, and it caps the search on unbounded ones (where the relaxation answer
-/// is returned as a best effort).
-const BB_NODE_LIMIT: u32 = 20_000;
+/// A recursion-depth budget for branch-and-bound. Naive B&B is not guaranteed to
+/// terminate on unbounded integer problems (it can chase a fractional value along
+/// an unbounded direction), so we cap the depth — small enough to stay well
+/// within the stack, large enough that every bounded QF_LIA problem in scope
+/// closes first. On exhaustion we fall back to the real relaxation as a best
+/// effort; a complete integer procedure (Omega/Cooper, or B&B with derived
+/// bounds) is future work.
+const BB_NODE_LIMIT: u32 = 1_000;
 
 /// A satisfying assignment for `cons` and `diseqs` in which every variable of
 /// `int_vars` is integral, if one exists. Branch-and-bound over the LRA
