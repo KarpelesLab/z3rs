@@ -301,6 +301,38 @@ impl AstManager {
             &[a],
         )
     }
+
+    // --- recognizers (read-only; do not register the family) --------------
+
+    /// The registered arithmetic family id, if arithmetic has been used yet.
+    fn arith_fid_opt(&self) -> Option<FamilyId> {
+        self.get_family_id(Symbol::new("arith"))
+    }
+
+    /// If `id` is an arithmetic numeral (`OP_NUM`), its value.
+    pub fn as_numeral(&self, id: AstId) -> Option<Rational> {
+        let afid = self.arith_fid_opt()?;
+        let a = self.app(id)?;
+        if !a.args.is_empty() {
+            return None;
+        }
+        let d = self.func_decl(a.decl)?;
+        if d.info.family_id == afid && d.info.decl_kind == ArithOp::Num as DeclKind {
+            d.info.parameters.first()?.get_rational().cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Is `sort_id` the arithmetic `Int` sort?
+    pub fn is_int_sort(&self, sort_id: AstId) -> bool {
+        match (self.arith_fid_opt(), self.sort(sort_id)) {
+            (Some(afid), Some(s)) => {
+                s.info.family_id == afid && s.info.decl_kind == ArithSortKind::Int as DeclKind
+            }
+            _ => false,
+        }
+    }
 }
 
 /// `+`/`*` flags: associative, flat, commutative.

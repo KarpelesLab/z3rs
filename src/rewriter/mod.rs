@@ -4,11 +4,15 @@
 //! MIT). See [`ROADMAP.md`](../../ROADMAP.md) for the plan and status.
 //!
 //! ## Ported so far
-//! - [x] boolean constant folding (`bool_rewriter` subset) → [`bool_rewriter`]
-//! - [ ] full `th_rewriter`, per-theory rewriters, `euf`, `nnf`, `bit_blaster`, …
+//! - [x] bottom-up driver ([`th_rewriter`]) dispatching to per-theory folders
+//! - [x] boolean constant folding ([`bool_rewriter`])
+//! - [x] arithmetic constant folding ([`arith_rewriter`])
+//! - [ ] richer boolean/arith rules, more theories, `euf`, `nnf`, `bit_blaster`, …
 //!
 //! ## Status: IN PROGRESS
 
+pub mod arith_rewriter;
 pub mod bool_rewriter;
+pub mod th_rewriter;
 
-pub use bool_rewriter::simplify;
+pub use th_rewriter::simplify;

@@ -1,70 +1,39 @@
 //! Boolean constant folding — a subset of `bool_rewriter`
 //! (`z3/src/ast/rewriter/bool_rewriter.{h,cpp}`, Z3 4.17.0, MIT).
 //!
-//! [`simplify`] rewrites a formula bottom-up, applying the identity/annihilator
-//! rules for the propositional connectives, double-negation, reflexive equality,
-//! and `ite` folding. It rebuilds through the [`AstManager`], so results stay
-//! hash-consed and structural sharing is preserved. This is the seed of the full
-//! `th_rewriter`; theory rewriting and richer boolean rules come later.
+//! [`try_fold`] applies the identity/annihilator rules for the propositional
+//! connectives, double-negation, reflexive equality, and `ite` folding to one
+//! basic-family application. The bottom-up driver that calls it lives in
+//! [`th_rewriter`](crate::rewriter::th_rewriter); use
+//! [`crate::rewriter::simplify`] to simplify a whole formula.
 
 use alloc::vec::Vec;
 
 use crate::ast::basic::BasicOp;
 use crate::ast::manager::AstManager;
-use crate::ast::node::AstNode;
-use crate::ast::{AstId, BASIC_FAMILY_ID, DeclKind, FamilyId};
+use crate::ast::{AstId, BASIC_FAMILY_ID, DeclKind};
 
-/// Simplify `root` by bottom-up boolean constant folding.
-pub fn simplify(m: &mut AstManager, root: AstId) -> AstId {
-    let order = m.postorder(root);
-    // Map every original node id to its simplified replacement. Original ids are
-    // all `< m.len()` at entry; simplified results may be newly created ids,
-    // which we never need to look up here.
-    let mut cache: Vec<Option<AstId>> = alloc::vec![None; m.len()];
-    for &id in &order {
-        let simplified = match m.node(id).clone() {
-            AstNode::App(a) => {
-                let new_args: Vec<AstId> = a
-                    .args
-                    .iter()
-                    .map(|&c| cache[c.0 as usize].unwrap())
-                    .collect();
-                simplify_app(m, a.decl, &new_args)
-            }
-            // Variables and (leaf) constants rewrite to themselves.
-            _ => id,
-        };
-        cache[id.0 as usize] = Some(simplified);
+/// Try to fold a basic-family application `decl(args)`. Returns `None` if `decl`
+/// is not a basic-family op this rewriter handles (the driver then rebuilds).
+pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Option<AstId> {
+    let d = m.func_decl(decl).expect("app decl");
+    if d.info.family_id != BASIC_FAMILY_ID {
+        return None;
     }
-    cache[root.0 as usize].unwrap()
-}
-
-/// The `(family_id, decl_kind)` of a declaration.
-fn decl_head(m: &AstManager, decl: AstId) -> (FamilyId, DeclKind) {
-    let d = m.func_decl(decl).expect("simplify: app decl");
-    (d.info.family_id, d.info.decl_kind)
-}
-
-fn simplify_app(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
-    let (fid, kind) = decl_head(m, decl);
-    if fid == BASIC_FAMILY_ID {
-        if kind == BasicOp::Not as DeclKind {
-            return simplify_not(m, decl, args);
-        } else if kind == BasicOp::And as DeclKind {
-            return simplify_and(m, args);
-        } else if kind == BasicOp::Or as DeclKind {
-            return simplify_or(m, args);
-        } else if kind == BasicOp::Eq as DeclKind {
-            if args[0] == args[1] {
-                return m.mk_true();
-            }
-        } else if kind == BasicOp::Ite as DeclKind {
-            return simplify_ite(m, decl, args);
-        }
+    let kind = d.info.decl_kind;
+    if kind == BasicOp::Not as DeclKind {
+        Some(simplify_not(m, decl, args))
+    } else if kind == BasicOp::And as DeclKind {
+        Some(simplify_and(m, args))
+    } else if kind == BasicOp::Or as DeclKind {
+        Some(simplify_or(m, args))
+    } else if kind == BasicOp::Eq as DeclKind && args[0] == args[1] {
+        Some(m.mk_true())
+    } else if kind == BasicOp::Ite as DeclKind {
+        Some(simplify_ite(m, decl, args))
+    } else {
+        None
     }
-    // No rule fired: rebuild with the (possibly) simplified arguments. If nothing
-    // changed, hash-consing returns the original node.
-    m.mk_app(decl, args)
 }
 
 fn simplify_not(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
@@ -138,7 +107,8 @@ fn simplify_ite(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ast::manager::AstManager;
+    use crate::rewriter::simplify;
 
     #[test]
     fn constant_folds_connectives() {
