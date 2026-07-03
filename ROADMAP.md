@@ -283,8 +283,8 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 | Phase | Area                         | Status | Notes |
 |------:|------------------------------|:------:|-------|
 | 0     | `util` foundation            | 🟨     | done: numerals (`puremp`), hash, lbool, symbol, spinlock, bit_vector, zstring · to do: containers/params/rlimit |
-| 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/SortSize, node types, hash-consing manager, basic + arith families, traversal/recognizers, s-expr pp · to do: bv/array/datatype/… theories, quantifiers, `math`, `params` |
-| 2     | `rewriter`                   | 🟨     | bottom-up boolean constant folding (`bool_rewriter` subset) |
+| 1     | `ast` / `math` / `params`    | 🟨     | ast: kinds/parameter/SortSize, node types, hash-consing manager, `basic`+`arith`+`bv` families, traversal/recognizers, s-expr pp · to do: array/datatype/seq/fpa theories, quantifiers, `math`, `params` |
+| 2     | `rewriter`                   | 🟨     | `th_rewriter` driver + boolean & arithmetic constant folding, substitution, NNF · to do: theory rewriters, `euf`, `bit_blaster` |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | ⬜     |       |
 | 5     | `smt` / `nlsat`              | ⬜     |       |
