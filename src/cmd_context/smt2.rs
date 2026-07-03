@@ -671,6 +671,7 @@ impl Context {
     fn array_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         let subterms = self.m.postorder(goal);
         let mut stores: Vec<AstId> = Vec::new();
+        let mut const_arrays: Vec<AstId> = Vec::new();
         let mut indices: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
         let mut array_eqs: Vec<(AstId, AstId)> = Vec::new();
@@ -686,6 +687,8 @@ impl Context {
                 if seen.insert(idx) {
                     indices.push(idx);
                 }
+            } else if self.m.is_const_array(t) {
+                const_arrays.push(t);
             } else if self.m.is_eq(t) {
                 let args = self.m.app_args(t);
                 if self.m.is_array_sort(self.m.get_sort(args[0])) {
@@ -708,6 +711,16 @@ impl Context {
             let neq_reads = self.m.mk_not(eq_reads);
             axioms.push(self.m.mk_or(&[eq_ab, neq_reads])); // a=b ∨ a[k]≠b[k]
             indices.push(k);
+        }
+        // Constant array: select(const(v), j) = v for every index j (including
+        // the extensionality Skolems).
+        for &ca in &const_arrays {
+            let v = self.m.app_args(ca)[0];
+            for &j in &indices {
+                let sel = self.m.mk_select(ca, j);
+                let ax = self.m.mk_eq(sel, v);
+                axioms.push(ax);
+            }
         }
         for &st in &stores {
             let args = self.m.app_args(st).to_vec(); // [a, i, v]
@@ -891,6 +904,18 @@ impl Context {
                 }
             },
             SExpr::List(l) if !l.is_empty() => {
+                // Qualified-identifier head, e.g. ((as const (Array I E)) v).
+                if let SExpr::List(qid) = &l[0] {
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "as")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "const")
+                    {
+                        let array_sort = self.resolve_sort(&qid[2])?;
+                        let value = self.term(&l[1])?;
+                        return Ok(self.m.mk_const_array(array_sort, value));
+                    }
+                    return Err("unsupported qualified application".to_string());
+                }
                 let head = Self::sym(&l[0])?.to_string();
                 if head == "let" {
                     return self.term_let(&l[1], &l[2]);
@@ -1664,6 +1689,24 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn constant_array() {
+        // select((as const (Array Int Int)) 7, i) = 7 for any i.
+        let script = "
+            (declare-const i Int)
+            (assert (not (= (select ((as const (Array Int Int)) 7) i) 7)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        // A store over a constant array leaves other indices at the constant.
+        let script2 = "
+            (declare-const i Int)
+            (assert (not (= (select (store ((as const (Array Int Int)) 0) i 5) (+ i 1)) 0)))
+            (check-sat)
+        ";
+        assert_eq!(run(script2).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]

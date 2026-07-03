@@ -21,7 +21,7 @@ pub enum ArraySortKind {
     Array = 0,
 }
 
-/// Array operators (`array_op_kind` in Z3; only the core two so far).
+/// Array operators (`array_op_kind` in Z3; the core three so far).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[repr(i32)]
 pub enum ArrayOp {
@@ -29,6 +29,8 @@ pub enum ArrayOp {
     Store = 0,
     /// `select` (read): `(Array I E) × I → E`.
     Select = 1,
+    /// `const` (constant array): `E → (Array I E)` — every index maps to the value.
+    Const = 2,
 }
 
 /// Array-family constructors and recognizers.
@@ -121,6 +123,21 @@ impl AstManager {
         )
     }
 
+    /// `((as const (Array I E)) value)` — the array mapping every index to
+    /// `value`. `array_sort` is the target `(Array I E)`.
+    pub fn mk_const_array(&mut self, array_sort: AstId, value: AstId) -> AstId {
+        let (_, elem_sort) = self
+            .array_sort_params(array_sort)
+            .expect("mk_const_array: not an array sort");
+        self.mk_array_app(
+            "const",
+            ArrayOp::Const,
+            &[elem_sort],
+            array_sort,
+            &[value],
+        )
+    }
+
     /// If `id` is an application of an array-family declaration, its op.
     pub fn array_op(&self, id: AstId) -> Option<ArrayOp> {
         let afid = self.array_fid_opt()?;
@@ -132,8 +149,14 @@ impl AstManager {
         match d.info.decl_kind {
             k if k == ArrayOp::Store as DeclKind => Some(ArrayOp::Store),
             k if k == ArrayOp::Select as DeclKind => Some(ArrayOp::Select),
+            k if k == ArrayOp::Const as DeclKind => Some(ArrayOp::Const),
             _ => None,
         }
+    }
+
+    /// Is `id` a constant-array application?
+    pub fn is_const_array(&self, id: AstId) -> bool {
+        self.array_op(id) == Some(ArrayOp::Const)
     }
 
     /// Is `id` a `select` application?

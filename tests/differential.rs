@@ -264,6 +264,15 @@ const CORPUS: &[Case] = &[
         script: "(declare-const a (Array Int Int))(declare-const b (Array Int Int))
                  (assert (not (= a b)))(assert (= (select a 0) (select b 0)))(check-sat)",
     },
+    Case {
+        name: "const_array_read_unsat",
+        script: "(declare-const i Int)(assert (not (= (select ((as const (Array Int Int)) 7) i) 7)))(check-sat)",
+    },
+    Case {
+        name: "const_array_store_unsat",
+        script: "(declare-const i Int)
+                 (assert (not (= (select (store ((as const (Array Int Int)) 0) i 5) (+ i 1)) 0)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
