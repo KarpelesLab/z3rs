@@ -1,12 +1,18 @@
-//! # `smt` — Core SMT engine (smt_context, theory solvers, quantifier instantiation)
+//! # `smt` — core SMT engine
 //!
-//! **Port phase 5.** Ported from the Z3 C++ component(s) below.
+//! **Port phase 5.** Ported from `z3/src/smt` (Z3 4.17.0, MIT).
 //! See [`ROADMAP.md`](../../ROADMAP.md) for the porting plan and status.
 //!
-//! ## Upstream C++ components to port
-//! - [ ] `z3/src/smt`
+//! ## Ported so far
+//! - [x] congruence closure for equality + uninterpreted functions → [`euf`]
+//! - [x] a lazy DPLL(T) loop deciding QF_UF → [`solver`]
+//! - [ ] online theory propagation, minimized explanations, more theories
+//!   (arith/bv/arrays), quantifier instantiation
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod euf;
+pub mod solver;
+
+pub use euf::Egraph;
+pub use solver::{SmtResult, check};

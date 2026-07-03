@@ -19,13 +19,23 @@ use crate::sat::solver::{SatResult, Solver};
 /// Encode `root` into `s` and return the literal representing it. Assert that
 /// literal to check satisfiability of `root`.
 pub fn encode(m: &AstManager, root: AstId, s: &mut Solver) -> Lit {
+    encode_tracking(m, root, s).0
+}
+
+/// Like [`encode`], but also return the map from each opaque atom (a
+/// propositional variable or an abstracted theory atom such as `(= a b)` or
+/// `(<= x y)`) to the SAT literal representing it. The SMT layer uses this to
+/// connect the Boolean skeleton back to theory reasoning.
+pub fn encode_tracking(m: &AstManager, root: AstId, s: &mut Solver) -> (Lit, BTreeMap<AstId, Lit>) {
     let mut enc = Tseitin {
         m,
         s,
         cache: BTreeMap::new(),
         true_lit: None,
+        atoms: BTreeMap::new(),
     };
-    enc.encode(root)
+    let top = enc.encode(root);
+    (top, enc.atoms)
 }
 
 /// Decide the propositional abstraction of the Boolean formula `root`.
@@ -41,6 +51,8 @@ struct Tseitin<'a> {
     s: &'a mut Solver,
     cache: BTreeMap<AstId, Lit>,
     true_lit: Option<Lit>,
+    /// Opaque atoms → their literal (propositional vars and theory atoms).
+    atoms: BTreeMap<AstId, Lit>,
 }
 
 impl Tseitin<'_> {
@@ -110,7 +122,9 @@ impl Tseitin<'_> {
             self.define_ite(lc, lt, le)
         } else {
             // Opaque Boolean atom (a propositional variable / theory atom).
-            self.fresh()
+            let l = self.fresh();
+            self.atoms.insert(e, l);
+            l
         }
     }
 

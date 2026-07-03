@@ -347,6 +347,10 @@ impl Solver {
             return SatResult::Unsat;
         }
         self.cancel_until(0);
+        // Re-propagate level 0 against the full clause DB. Clauses added since the
+        // last solve (e.g. theory blocking clauses) may be unit or falsified under
+        // the existing level-0 assignment; resetting qhead forces them to be seen.
+        self.qhead = 0;
         for &l in assumptions {
             self.ensure_var(l.var());
         }

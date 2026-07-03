@@ -287,7 +287,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 | 2     | `rewriter`                   | 🟨     | `th_rewriter` driver + boolean & arithmetic constant folding, substitution, NNF · to do: theory rewriters, `euf`, `bit_blaster` |
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | 🟨     | CDCL solver (2-watched literals, 1-UIP learning, backjumping, VSIDS, Luby restarts), Tseitin AST→CNF, DIMACS frontend · to do: assumptions/cores, clause-DB reduction, `sat_smt` |
-| 5     | `smt` / `nlsat`              | ⬜     |       |
+| 5     | `smt` / `nlsat`              | 🟨     | lazy DPLL(T) loop + congruence-closure e-graph deciding QF_UF · to do: online theory propagation, arith/bv/array theories, quantifiers |
 | 6     | `solver` / `cmd_context`     | ⬜     |       |
 | 7     | `qe` / `muz` / `opt`         | ⬜     |       |
 | 8     | `parsers`                    | ⬜     |       |

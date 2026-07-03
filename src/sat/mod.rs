@@ -21,4 +21,4 @@ pub mod tseitin;
 pub use dimacs::{DimacsError, parse as parse_dimacs};
 pub use literal::{Lit, Var};
 pub use solver::{SatResult, Solver};
-pub use tseitin::{check_skeleton, encode};
+pub use tseitin::{check_skeleton, encode, encode_tracking};
