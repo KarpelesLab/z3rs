@@ -12,11 +12,14 @@
 //! Integer-sorted variables are handled by branch-and-bound on top of the LRA
 //! relaxation, so integrality constraints (`QF_LIA`) are decided too.
 //!
-//! The two theories are checked independently; this is complete when they do not
-//! share terms (pure QF_UF, pure QF_LRA, or a disjoint union). Full theory
-//! combination (Nelson–Oppen equality sharing), online propagation, and
-//! minimized explanations are the refinements that come next. Non-arithmetic,
-//! non-equality atoms remain free Booleans.
+//! Every equality (of any sort) feeds the congruence closure, so uninterpreted
+//! functions get congruence even at arithmetic range sorts. The two theories are
+//! otherwise checked independently: this is complete when the only equalities
+//! they must exchange are the *explicit* ones (pure QF_UF, pure QF_LRA/LIA, or a
+//! union where shared equalities appear syntactically). Full Nelson–Oppen
+//! sharing of theory-*implied* equalities (e.g. `x = y` derived from `x ≤ y ∧
+//! y ≤ x`), online propagation, and minimized explanations are the refinements
+//! that come next. Non-arithmetic, non-equality atoms remain free Booleans.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -58,8 +61,11 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
     let (top, atoms) = encode_tracking(m, formula, &mut sat);
     sat.add_clause(&[top]);
 
-    // Classify theory atoms: equalities over uninterpreted sorts go to EUF;
-    // arithmetic comparisons and equalities go to the LRA/LIA theory.
+    // Classify theory atoms. *Every* equality feeds the EUF congruence closure,
+    // so uninterpreted functions get congruence regardless of their range sort
+    // (an equality `(f x) = (f y)` between Int-sorted applications still yields a
+    // congruence conflict when `x = y`). Arithmetic-sorted equalities and the
+    // comparisons additionally feed the LRA/LIA theory.
     let mut euf_eq: Vec<(Lit, AstId, AstId)> = Vec::new();
     let mut euf_roots: Vec<AstId> = Vec::new();
     let mut arith_atoms: Vec<ArithAtom> = Vec::new();
@@ -67,12 +73,11 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
         if m.is_eq(atom) {
             let args = m.app_args(atom);
             let (a, b) = (args[0], args[1]);
+            euf_eq.push((lit, a, b));
+            euf_roots.push(a);
+            euf_roots.push(b);
             if m.is_arith_sort(m.get_sort(a)) {
                 arith_atoms.push(ArithAtom::eq(lit, a, b));
-            } else {
-                euf_eq.push((lit, a, b));
-                euf_roots.push(a);
-                euf_roots.push(b);
             }
         } else if let Some(op) = m.arith_op(atom)
             && matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
@@ -733,6 +738,40 @@ mod tests {
 
     fn rat(_m: &AstManager, n: i64) -> puremp::Rational {
         puremp::Rational::from_integer(puremp::Int::from(n))
+    }
+
+    #[test]
+    fn congruence_on_int_range_function_unsat() {
+        // f : Int -> Int, (and (= x y) (not (= (f x) (f y)))). Even though the
+        // equality of applications is arithmetic-sorted, EUF congruence must
+        // still fire from x = y. (Regression: previously reported sat.)
+        let mut m = AstManager::new();
+        let int = m.mk_int_sort();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let f = m.mk_func_decl(Symbol::new("f"), &[int], int);
+        let fx = m.mk_app(f, &[x]);
+        let fy = m.mk_app(f, &[y]);
+        let eq = m.mk_eq(x, y);
+        let feq = m.mk_eq(fx, fy);
+        let nfeq = m.mk_not(feq);
+        let f = m.mk_and(&[eq, nfeq]);
+        assert_eq!(check(&m, f), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn congruence_on_int_range_function_sat() {
+        // Without x = y, distinct f(x), f(y) is fine.
+        let mut m = AstManager::new();
+        let int = m.mk_int_sort();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let f = m.mk_func_decl(Symbol::new("f"), &[int], int);
+        let fx = m.mk_app(f, &[x]);
+        let fy = m.mk_app(f, &[y]);
+        let feq = m.mk_eq(fx, fy);
+        let nfeq = m.mk_not(feq);
+        assert_eq!(check(&m, nfeq), SmtResult::Sat);
     }
 
     #[test]
