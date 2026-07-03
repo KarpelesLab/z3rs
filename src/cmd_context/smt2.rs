@@ -1208,14 +1208,18 @@ impl Context {
                 None => Ok(m.mk_to_int(args[0])),
             },
             "is_int" => match m.as_numeral(args[0]) {
-                // (is_int r): true iff r is integral. Only constants are decided;
-                // a non-constant argument is unsupported.
+                // (is_int r): true iff r is integral.
                 Some(v) => Ok(if v.is_integer() {
                     m.mk_true()
                 } else {
                     m.mk_false()
                 }),
-                None => Err("is_int: only constant arguments are supported".to_string()),
+                // Symbolic: is_int(x) ⟺ to_real(to_int(x)) = x (i.e. ⌊x⌋ = x).
+                None => {
+                    let ti = m.mk_to_int(args[0]);
+                    let tr = m.mk_to_real(ti);
+                    Ok(m.mk_eq(tr, args[0]))
+                }
             },
             "<=" | "<" | ">=" | ">" => {
                 let mk = |m: &mut AstManager, a, b| match head {
@@ -1797,6 +1801,20 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn is_int_symbolic() {
+        // is_int(x) ⟺ ⌊x⌋ = x.
+        assert_eq!(
+            run("(declare-const x Real)(assert (is_int x))(assert (= x 2.5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Real)(assert (not (is_int x)))(assert (= (* 2 x) 3))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
