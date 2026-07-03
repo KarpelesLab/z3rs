@@ -111,17 +111,29 @@ impl LinExpr {
 /// satisfiable? Disequalities are handled by case-splitting `expr < 0` vs
 /// `expr > 0` (exponential in the number of disequalities, but exact).
 pub fn feasible_with_diseqs(constraints: &[Constraint], diseqs: &[LinExpr]) -> bool {
+    model_with_diseqs(constraints, diseqs).is_some()
+}
+
+/// A satisfying assignment of variables to rational values, as produced by
+/// [`model`] / [`model_with_diseqs`]. Variables absent from the map are
+/// unconstrained and may take any value (the caller conventionally reads them
+/// as zero).
+pub type Assignment = BTreeMap<AstId, Rational>;
+
+/// Like [`feasible_with_diseqs`], but returns a concrete satisfying assignment
+/// (over the rationals) when one exists.
+pub fn model_with_diseqs(constraints: &[Constraint], diseqs: &[LinExpr]) -> Option<Assignment> {
     match diseqs.split_first() {
-        None => feasible(constraints),
+        None => model(constraints),
         Some((d, rest)) => {
             let mut lt = constraints.to_vec();
             lt.push(Constraint::lt(d.clone()));
-            if feasible_with_diseqs(&lt, rest) {
-                return true;
+            if let Some(a) = model_with_diseqs(&lt, rest) {
+                return Some(a);
             }
             let mut gt = constraints.to_vec();
             gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
-            feasible_with_diseqs(&gt, rest)
+            model_with_diseqs(&gt, rest)
         }
     }
 }
@@ -194,7 +206,23 @@ impl Constraint {
 
 /// Is the conjunction of `constraints` satisfiable over the rationals?
 pub fn feasible(constraints: &[Constraint]) -> bool {
+    model(constraints).is_some()
+}
+
+/// Decide feasibility of `constraints` over the rationals and, if satisfiable,
+/// return a concrete satisfying assignment.
+///
+/// This runs Fourier–Motzkin elimination while recording, for each eliminated
+/// variable, the inequalities that mentioned it. Because FM projection is exact,
+/// a feasible system always admits a witness, reconstructed by back-substitution
+/// in reverse elimination order: with every later variable already fixed, each
+/// remaining bound on the current variable evaluates to a rational, and any point
+/// in the resulting interval works.
+pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
     let mut ineqs: Vec<Ineq> = constraints.iter().flat_map(|c| c.to_ineqs()).collect();
+
+    // The inequalities that constrained each eliminated variable, newest last.
+    let mut history: Vec<(AstId, Vec<Ineq>)> = Vec::new();
 
     // Eliminate variables one at a time (Fourier–Motzkin).
     while let Some(v) = ineqs
@@ -228,6 +256,10 @@ pub fn feasible(constraints: &[Constraint]) -> bool {
                 });
             }
         }
+        // Record v's bounds for reconstruction, then continue on the rest.
+        let mut mentioning = upper;
+        mentioning.extend(lower);
+        history.push((v, mentioning));
         ineqs = next;
     }
 
@@ -237,10 +269,65 @@ pub fn feasible(constraints: &[Constraint]) -> bool {
         let k = &i.expr.constant;
         let violated = if i.strict { *k >= zero() } else { *k > zero() };
         if violated {
-            return false;
+            return None;
         }
     }
-    true
+
+    // Feasible: back-substitute in reverse elimination order.
+    let mut assign: Assignment = BTreeMap::new();
+    for (v, bounds) in history.into_iter().rev() {
+        let mut lo: Option<(Rational, bool)> = None; // (value, strict)
+        let mut hi: Option<(Rational, bool)> = None;
+        for i in &bounds {
+            let cv = i.expr.coeff(v); // nonzero
+            // Evaluate the rest of the row (everything but v) at the fixed vars.
+            let mut r = i.expr.constant.clone();
+            for (u, c) in &i.expr.coeffs {
+                if *u != v {
+                    let uv = assign.get(u).cloned().unwrap_or_else(zero);
+                    r = &r + &(c * &uv);
+                }
+            }
+            // cv·v + r ⋈ 0  ⟺  v ⋈' -r/cv, flipping ⋈ when cv < 0.
+            let bound = &r.neg() / &cv;
+            if cv > zero() {
+                // v ≤ bound (or <)
+                hi = Some(match hi {
+                    Some((h, hs)) if h < bound || (h == bound && !hs) => (h, hs),
+                    _ => (bound, i.strict),
+                });
+            } else {
+                // v ≥ bound (or >)
+                lo = Some(match lo {
+                    Some((l, ls)) if l > bound || (l == bound && !ls) => (l, ls),
+                    _ => (bound, i.strict),
+                });
+            }
+        }
+        assign.insert(v, pick_between(lo, hi));
+    }
+    Some(assign)
+}
+
+/// Choose a rational strictly (or non-strictly) inside `(lo, hi)`. Feasibility
+/// guarantees such a point exists; when both bounds are present the midpoint is
+/// always valid, and one-sided bounds step off by one.
+fn pick_between(lo: Option<(Rational, bool)>, hi: Option<(Rational, bool)>) -> Rational {
+    let one = Rational::from_integer(Int::from(1));
+    let two = Rational::from_integer(Int::from(2));
+    match (lo, hi) {
+        (None, None) => zero(),
+        (Some((l, _)), None) => &l + &one,
+        (None, Some((h, _))) => &h - &one,
+        (Some((l, ls)), Some((h, hs))) => {
+            if l == h {
+                debug_assert!(!ls && !hs, "empty interval in a feasible system");
+                l
+            } else {
+                &(&l + &h) / &two // midpoint: strictly between l and h
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,6 +384,70 @@ mod tests {
         // x = 2 and x ≥ 1  → feasible
         let x_ge1 = Constraint::le(LinExpr::constant(rat(1)).sub(&LinExpr::var(x())));
         assert!(feasible(&[x_eq2, x_ge1]));
+    }
+
+    /// Evaluate `expr` at `assign` (unassigned variables read as zero).
+    fn eval(expr: &LinExpr, assign: &Assignment) -> Rational {
+        let mut acc = expr.constant.clone();
+        for (v, c) in &expr.coeffs {
+            let val = assign.get(v).cloned().unwrap_or_else(zero);
+            acc = &acc + &(c * &val);
+        }
+        acc
+    }
+
+    /// Assert `assign` satisfies every constraint.
+    fn check_sat(cs: &[Constraint], assign: &Assignment) {
+        for c in cs {
+            let v = eval(&c.expr, assign);
+            let ok = match c.rel {
+                Rel::Le => v <= zero(),
+                Rel::Lt => v < zero(),
+                Rel::Eq => v == zero(),
+            };
+            assert!(ok, "constraint {:?} violated: lhs = {v:?}", c.rel);
+        }
+    }
+
+    #[test]
+    fn model_satisfies_bounded_system() {
+        // 0 ≤ x, 0 ≤ y, x + y ≤ 1, and x - y = 0 (encoded via constraints).
+        let x_ge0 = Constraint::le(LinExpr::var(x()).neg());
+        let y_ge0 = Constraint::le(LinExpr::var(y()).neg());
+        let sum = LinExpr::var(x())
+            .add(&LinExpr::var(y()))
+            .sub(&LinExpr::constant(rat(1)));
+        let sum_le1 = Constraint::le(sum);
+        let eq = Constraint::eq(LinExpr::var(x()).sub(&LinExpr::var(y())));
+        let cs = [x_ge0, y_ge0, sum_le1, eq];
+        let m = model(&cs).expect("feasible");
+        check_sat(&cs, &m);
+    }
+
+    #[test]
+    fn model_respects_strict_bounds() {
+        // 0 < x < 1 — witness must be strictly inside, e.g. 1/2.
+        let gt0 = Constraint::lt(LinExpr::var(x()).neg()); // -x < 0
+        let lt1 = Constraint::lt(LinExpr::var(x()).sub(&LinExpr::constant(rat(1))));
+        let cs = [gt0, lt1];
+        let m = model(&cs).expect("feasible");
+        check_sat(&cs, &m);
+        let xv = m.get(&x()).cloned().unwrap_or_else(zero);
+        assert!(xv > zero() && xv < rat(1));
+    }
+
+    #[test]
+    fn model_with_disequality() {
+        // x ≤ 5, x ≥ 5, x ≠ 5 → infeasible; x ≤ 6, x ≥ 5, x ≠ 5 → x in (5,6].
+        let le5 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(5))));
+        let ge5 = Constraint::le(LinExpr::constant(rat(5)).sub(&LinExpr::var(x())));
+        let ne5 = LinExpr::var(x()).sub(&LinExpr::constant(rat(5)));
+        assert!(model_with_diseqs(&[le5, ge5.clone()], &[ne5.clone()]).is_none());
+        let le6 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(6))));
+        let cs = [le6, ge5];
+        let m = model_with_diseqs(&cs, &[ne5]).expect("feasible");
+        check_sat(&cs, &m);
+        assert_ne!(m.get(&x()).cloned().unwrap_or_else(zero), rat(5));
     }
 
     #[test]
