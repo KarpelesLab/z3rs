@@ -335,9 +335,23 @@ impl Solver {
 
     /// Solve. On [`SatResult::Sat`], the assignment is a model.
     pub fn solve(&mut self) -> SatResult {
+        self.solve_assumptions(&[])
+    }
+
+    /// Solve under a set of `assumptions` (literals forced true for this call
+    /// only). Learnt clauses are retained, so repeated calls are incremental.
+    /// Each assumption occupies a decision level; a conflict that would have to
+    /// undo an assumption yields [`SatResult::Unsat`].
+    pub fn solve_assumptions(&mut self, assumptions: &[Lit]) -> SatResult {
         if !self.ok {
             return SatResult::Unsat;
         }
+        self.cancel_until(0);
+        for &l in assumptions {
+            self.ensure_var(l.var());
+        }
+        let n_assump = assumptions.len() as u32;
+
         let mut restart_conflicts = 0u64;
         let mut luby_index = 1u32; // Luby is 1-indexed
         let mut restart_limit = luby(luby_index) * 100;
@@ -349,6 +363,11 @@ impl Solver {
                     return SatResult::Unsat;
                 }
                 let (learnt, btlevel) = self.analyze(confl);
+                if btlevel < n_assump {
+                    // Backjumping would undo an assumption: unsat under assumptions.
+                    self.cancel_until(0);
+                    return SatResult::Unsat;
+                }
                 self.cancel_until(btlevel);
                 let asserting = learnt[0];
                 if learnt.len() == 1 {
@@ -364,7 +383,21 @@ impl Solver {
                     restart_conflicts = 0;
                     luby_index += 1;
                     restart_limit = luby(luby_index) * 100;
-                    self.cancel_until(0);
+                    self.cancel_until(n_assump); // keep the assumption prefix
+                }
+            } else if self.decision_level() < n_assump {
+                // Place the next assumption as its own decision level.
+                let a = assumptions[self.decision_level() as usize];
+                match self.lit_value(a) {
+                    LBool::False => {
+                        self.cancel_until(0);
+                        return SatResult::Unsat;
+                    }
+                    LBool::True => self.trail_lim.push(self.trail.len()), // empty level
+                    LBool::Undef => {
+                        self.trail_lim.push(self.trail.len());
+                        self.enqueue(a, REASON_NONE);
+                    }
                 }
             } else {
                 match self.pick_branch_var() {
@@ -524,6 +557,31 @@ mod tests {
                 "clause {c:?} unsatisfied"
             );
         }
+    }
+
+    #[test]
+    fn solving_under_assumptions() {
+        // (x1 ∨ x2)
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1, 2]));
+        // No assumptions: satisfiable.
+        assert_eq!(s.solve(), SatResult::Sat);
+        // Assume ¬x1: still satisfiable (x2 must hold).
+        assert_eq!(s.solve_assumptions(&lits(&[-1])), SatResult::Sat);
+        assert!(s.model_holds(Lit::pos(1)));
+        // Assume ¬x1 ∧ ¬x2: contradicts the clause → unsat under assumptions,
+        // but the clause set itself is still satisfiable afterwards.
+        assert_eq!(s.solve_assumptions(&lits(&[-1, -2])), SatResult::Unsat);
+        assert_eq!(s.solve(), SatResult::Sat);
+    }
+
+    #[test]
+    fn assumption_directly_contradicting_a_unit() {
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1])); // x1 forced true
+        assert_eq!(s.solve(), SatResult::Sat);
+        // Assuming ¬x1 contradicts the unit.
+        assert_eq!(s.solve_assumptions(&lits(&[-1])), SatResult::Unsat);
     }
 
     #[test]
