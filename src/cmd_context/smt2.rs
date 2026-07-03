@@ -531,7 +531,25 @@ impl Context {
                 Ok(acc)
             }
             "ite" => Ok(m.mk_ite(args[0], args[1], args[2])),
-            "distinct" => Ok(m.mk_distinct(&args)),
+            "distinct" => {
+                // Expand to pairwise disequality so the theory solvers see it
+                // (a bare `distinct` node would be an opaque Boolean atom).
+                if args.len() < 2 {
+                    return Ok(m.mk_true());
+                }
+                let mut neqs = Vec::new();
+                for i in 0..args.len() {
+                    for j in (i + 1)..args.len() {
+                        let eq = m.mk_eq(args[i], args[j]);
+                        neqs.push(m.mk_not(eq));
+                    }
+                }
+                Ok(if neqs.len() == 1 {
+                    neqs[0]
+                } else {
+                    m.mk_and(&neqs)
+                })
+            }
             "=" => {
                 // chainable: (= a b c) => (and (= a b) (= b c))
                 if args.len() == 2 {
@@ -560,7 +578,14 @@ impl Context {
                 1 => args[0],
                 _ => m.mk_mul(&args),
             }),
-            "/" => Ok(m.mk_div(args[0], args[1])),
+            "/" => {
+                // Fold constant real division to an exact rational; otherwise
+                // build an opaque `/` term.
+                match (m.as_numeral(args[0]), m.as_numeral(args[1])) {
+                    (Some(p), Some(q)) if !q.is_zero() => Ok(m.mk_numeral(p.div(&q), false)),
+                    _ => Ok(m.mk_div(args[0], args[1])),
+                }
+            }
             "div" => Ok(m.mk_idiv(args[0], args[1])),
             "mod" => Ok(m.mk_mod(args[0], args[1])),
             "<=" | "<" | ">=" | ">" => {
@@ -805,6 +830,46 @@ mod tests {
             (get-value (x))
         ";
         assert!(run(script).is_err());
+    }
+
+    #[test]
+    fn distinct_expands_to_pairwise_disequality() {
+        // distinct a b c with a = b is unsat.
+        let script = "
+            (declare-sort S 0)
+            (declare-const a S) (declare-const b S) (declare-const c S)
+            (assert (distinct a b c))
+            (assert (= a b))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn distinct_bool_pigeonhole_unsat() {
+        // Three pairwise-distinct Booleans cannot exist.
+        let script = "
+            (declare-const a Bool) (declare-const b Bool) (declare-const c Bool)
+            (assert (distinct a b c))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn real_division_is_exact() {
+        // (/ 1 3) is real division; x = 1/3 ∧ 3x = 1 is satisfiable.
+        let script = "
+            (declare-const x Real)
+            (assert (= x (/ 1 3)))
+            (assert (= (* 3 x) 1))
+            (check-sat)
+            (get-value (x))
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "((x (/ 1.0 3.0)))"]
+        );
     }
 
     #[test]

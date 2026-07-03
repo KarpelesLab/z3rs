@@ -90,6 +90,38 @@ const CORPUS: &[Case] = &[
         script: "(declare-const x Int)(define-fun bound () Int 10)(define-fun below ((a Int)(b Int)) Bool (< a b))
                  (assert (below x bound))(assert (>= x 10))(check-sat)",
     },
+    Case {
+        name: "distinct_uf_unsat",
+        script: "(declare-sort U 0)(declare-const a U)(declare-const b U)(declare-const c U)
+                 (assert (distinct a b c))(assert (= a b))(check-sat)",
+    },
+    Case {
+        name: "distinct_bool_pigeonhole",
+        script: "(declare-const a Bool)(declare-const b Bool)(declare-const c Bool)(assert (distinct a b c))(check-sat)",
+    },
+    Case {
+        name: "distinct_int_sat",
+        script: "(declare-const a Int)(declare-const b Int)(declare-const c Int)
+                 (assert (distinct a b c))(assert (<= 0 a))(assert (<= a 2))(assert (<= 0 b))(assert (<= b 2))
+                 (assert (<= 0 c))(assert (<= c 2))(check-sat)",
+    },
+    Case {
+        name: "real_division_sat",
+        script: "(declare-const x Real)(assert (= x (/ 1 3)))(assert (= (* 3 x) 1))(check-sat)",
+    },
+    Case {
+        name: "implies_modus_ponens",
+        script: "(declare-const p Bool)(declare-const q Bool)(assert (=> p q))(assert p)(assert (not q))(check-sat)",
+    },
+    Case {
+        name: "xor_unsat",
+        script: "(declare-const p Bool)(declare-const q Bool)(assert (xor p q))(assert (= p q))(check-sat)",
+    },
+    Case {
+        name: "chained_lt_unsat",
+        script: "(declare-const x Int)(declare-const y Int)(declare-const z Int)
+                 (assert (< x y z))(assert (< z x))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

@@ -235,14 +235,16 @@ impl AstManager {
         self.mk_cmp(">", ArithOp::Gt, a, b)
     }
 
-    /// `(/ a b)` — real division.
+    /// `(/ a b)` — real division. Always Real-sorted (SMT-LIB `/` has signature
+    /// `Real Real -> Real`), independent of how its integer-literal operands were
+    /// parsed.
     pub fn mk_div(&mut self, a: AstId, b: AstId) -> AstId {
-        let sort = self.get_sort(a);
+        let real = self.mk_real_sort();
         self.mk_arith_app(
             "/",
             ArithOp::Div,
-            &[sort, sort],
-            sort,
+            &[real, real],
+            real,
             FuncDeclFlags::default(),
             &[a, b],
         )
