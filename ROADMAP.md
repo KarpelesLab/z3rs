@@ -288,7 +288,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ done (phase exit crite
 | 3     | `model` / `tactic`           | ⬜     |       |
 | 4     | `sat`                        | 🟨     | CDCL solver (2-watched literals, 1-UIP learning, backjumping, VSIDS, Luby restarts), Tseitin AST→CNF, DIMACS frontend · to do: assumptions/cores, clause-DB reduction, `sat_smt` |
 | 5     | `smt` / `nlsat`              | 🟨     | lazy DPLL(T): congruence-closure e-graph (QF_UF) + Fourier–Motzkin linear arithmetic (QF_LRA) · to do: Nelson–Oppen combination, simplex, online propagation, bv/array theories, quantifiers |
-| 6     | `solver` / `cmd_context`     | 🟨     | minimal SMT-LIB2 front end (tokenizer/parser/interpreter) for the QF_UF subset; `z3rs file.smt2` works · to do: full command set, push/pop, get-model |
+| 6     | `solver` / `cmd_context`     | 🟨     | SMT-LIB2 front end: declares, assert, check-sat, let, push/pop/reset, define-fun, Bool/Int/Real, linear arith + UF; `z3rs file.smt2` decides QF_UF/QF_LRA · to do: get-model/get-value, full command set |
 | 7     | `qe` / `muz` / `opt`         | ⬜     |       |
 | 8     | `parsers`                    | ⬜     |       |
 | 9     | `api`                        | ⬜     |       |
