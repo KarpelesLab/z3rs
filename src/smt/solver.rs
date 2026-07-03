@@ -115,6 +115,10 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
     // clauses; that is worst-case exponential, so cap the number of rounds and
     // return a sound `unknown` on exhaustion (rather than looping indefinitely).
     let mut rounds: u32 = 0;
+    // A single work budget shared across *all* theory checks in this decision, so
+    // the whole call terminates in bounded time even when many blocking-clause
+    // rounds each face an expensive (blow-up-prone) theory check.
+    let mut budget = BB_WORK_BUDGET;
     loop {
         rounds += 1;
         if rounds > DPLL_ROUND_LIMIT {
@@ -134,7 +138,15 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     };
                     return (SmtResult::Sat, Some(model));
                 }
-                match theory_check(m, &euf_eq, &euf_roots, &arith_atoms, &pred_atoms, &sat) {
+                match theory_check(
+                    m,
+                    &euf_eq,
+                    &euf_roots,
+                    &arith_atoms,
+                    &pred_atoms,
+                    &sat,
+                    &mut budget,
+                ) {
                     // Both theories consistent under this assignment → SAT.
                     TheoryOutcome::Sat(arith, euf) => {
                         let model = Model { bools, arith, euf };
@@ -477,6 +489,7 @@ fn theory_check(
     arith_atoms: &[ArithAtom],
     pred_atoms: &[(Lit, AstId)],
     sat: &Solver,
+    budget: &mut u64,
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
     let mut eqs = Vec::new();
@@ -497,9 +510,8 @@ fn theory_check(
     // Each round adds at least one new equality (bounded by the interface pairs),
     // so this cap is only a backstop against surprises.
     let max_rounds = interface.len() * interface.len() + 4;
-    // A single work budget shared by the arithmetic feasibility check and every
-    // Nelson–Oppen entailment query, so the whole combined check terminates.
-    let mut budget = BB_WORK_BUDGET;
+    // `budget` (shared across the whole decision) bounds the arithmetic
+    // feasibility check and every Nelson–Oppen entailment query.
 
     for _ in 0..max_rounds {
         // Arithmetic system augmented with the EUF-implied equalities so far.
@@ -509,7 +521,7 @@ fn theory_check(
             int_set: base.int_set.clone(),
         };
         sys.cons.extend(arith_extra.iter().cloned());
-        let arith = arith_feasible(&sys, &mut budget);
+        let arith = arith_feasible(&sys, &mut *budget);
         if matches!(arith, Feas::Unsat) {
             return TheoryOutcome::Unsat;
         }
@@ -539,7 +551,7 @@ fn theory_check(
             for j in (i + 1)..interface.len() {
                 let (u, v) = (interface[i], interface[j]);
                 let same_class = g.class_of(m, u) == g.class_of(m, v);
-                let entailed = match arith_entails_eq(m, &sys, u, v, &mut budget) {
+                let entailed = match arith_entails_eq(m, &sys, u, v, &mut *budget) {
                     Some(e) => e,
                     None => return TheoryOutcome::Unknown, // work budget exhausted
                 };
