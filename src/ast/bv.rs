@@ -43,6 +43,14 @@ pub enum BvOp {
     Uleq = 22,
     /// `bvult`
     Ult = 26,
+    /// `bvand` (bitwise AND)
+    BAnd = 30,
+    /// `bvor` (bitwise OR)
+    BOr = 31,
+    /// `bvnot` (bitwise NOT)
+    BNot = 32,
+    /// `bvxor` (bitwise XOR)
+    BXor = 33,
 }
 
 impl BvOp {
@@ -173,6 +181,46 @@ impl AstManager {
         self.mk_bv_binop("bvmul", BvOp::Mul, flags, a, b)
     }
 
+    /// `(bvand a b)` — bitwise AND.
+    pub fn mk_bvand(&mut self, a: AstId, b: AstId) -> AstId {
+        let flags = FuncDeclFlags {
+            commutative: true,
+            ..FuncDeclFlags::default()
+        };
+        self.mk_bv_binop("bvand", BvOp::BAnd, flags, a, b)
+    }
+
+    /// `(bvor a b)` — bitwise OR.
+    pub fn mk_bvor(&mut self, a: AstId, b: AstId) -> AstId {
+        let flags = FuncDeclFlags {
+            commutative: true,
+            ..FuncDeclFlags::default()
+        };
+        self.mk_bv_binop("bvor", BvOp::BOr, flags, a, b)
+    }
+
+    /// `(bvxor a b)` — bitwise XOR.
+    pub fn mk_bvxor(&mut self, a: AstId, b: AstId) -> AstId {
+        let flags = FuncDeclFlags {
+            commutative: true,
+            ..FuncDeclFlags::default()
+        };
+        self.mk_bv_binop("bvxor", BvOp::BXor, flags, a, b)
+    }
+
+    /// `(bvnot a)` — bitwise NOT.
+    pub fn mk_bvnot(&mut self, a: AstId) -> AstId {
+        let sort = self.get_sort(a);
+        self.mk_bv_app(
+            "bvnot",
+            BvOp::BNot,
+            &[sort],
+            sort,
+            FuncDeclFlags::default(),
+            &[a],
+        )
+    }
+
     fn mk_bv_cmp(&mut self, name: &str, op: BvOp, a: AstId, b: AstId) -> AstId {
         let sort = self.get_sort(a);
         let bool_sort = self.mk_bool_sort();
@@ -208,6 +256,32 @@ impl AstManager {
             None
         }
     }
+
+    /// If `id` applies a bit-vector-family declaration, its op kind.
+    pub fn bv_op(&self, id: AstId) -> Option<BvOp> {
+        let bvfid = self.get_family_id(Symbol::new("bv"))?;
+        let a = self.app(id)?;
+        let d = self.func_decl(a.decl)?;
+        if d.info.family_id != bvfid {
+            return None;
+        }
+        let k = d.info.decl_kind;
+        [
+            BvOp::Num,
+            BvOp::Neg,
+            BvOp::Add,
+            BvOp::Sub,
+            BvOp::Mul,
+            BvOp::Uleq,
+            BvOp::Ult,
+            BvOp::BAnd,
+            BvOp::BOr,
+            BvOp::BNot,
+            BvOp::BXor,
+        ]
+        .into_iter()
+        .find(|op| *op as DeclKind == k)
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +311,26 @@ mod tests {
         let b = m.mk_bv(257, 8);
         let one = m.mk_bv(1, 8);
         assert_eq!(b, one);
+    }
+
+    #[test]
+    fn bitwise_ops_shapes() {
+        let mut m = AstManager::new();
+        let x = m.mk_bv_const("x", 8);
+        let y = m.mk_bv_const("y", 8);
+        let s8 = m.mk_bv_sort(8);
+        let and = m.mk_bvand(x, y);
+        let or = m.mk_bvor(x, y);
+        let xor = m.mk_bvxor(x, y);
+        let not = m.mk_bvnot(x);
+        for t in [and, or, xor, not] {
+            assert_eq!(m.get_sort(t), s8);
+        }
+        assert_eq!(m.bv_op(and), Some(BvOp::BAnd));
+        assert_eq!(m.bv_op(or), Some(BvOp::BOr));
+        assert_eq!(m.bv_op(xor), Some(BvOp::BXor));
+        assert_eq!(m.bv_op(not), Some(BvOp::BNot));
+        assert_eq!(m.bv_op(x), None);
     }
 
     #[test]
