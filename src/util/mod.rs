@@ -35,7 +35,9 @@ pub mod hash;
 pub mod lbool;
 pub mod symbol;
 pub mod sync;
+pub mod zstring;
 
 pub use bit_vector::BitVector;
 pub use lbool::LBool;
 pub use symbol::Symbol;
+pub use zstring::Zstring;
