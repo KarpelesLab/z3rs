@@ -7,13 +7,15 @@
 //! `Bool`/`Int`/`Real` sorts, integer and decimal numerals, the core Boolean
 //! operators, equality/`distinct`, `ite`, `let`, linear arithmetic
 //! (`+ - * / <= < >= >`, `div`/`mod`/`abs`/`to_real`/`to_int`, with constant
-//! folding), and uninterpreted functions. Runs QF_UF / QF_LRA / QF_LIA scripts
-//! through [`crate::smt::check_model`], and reports models via
-//! `get-value`/`get-model`. Term-level (non-Boolean) `ite`s are lifted to fresh
-//! constants before solving, so the theory reasons about them exactly.
-//! (Nonlinear terms remain opaque — a known incompleteness pending `nlsat`.)
+//! folding), uninterpreted functions, and arrays (`(Array I E)`, `select`,
+//! `store`). Runs QF_UF / QF_LRA / QF_LIA / QF_A scripts through
+//! [`crate::smt::check_model`], and reports models via `get-value`/`get-model`.
+//! Term-level (non-Boolean) `ite`s are lifted to fresh constants and the array
+//! read-over-write axioms are instantiated before solving, so the theory reasons
+//! about them exactly. (Nonlinear terms remain opaque — a known incompleteness
+//! pending `nlsat`.)
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -317,12 +319,26 @@ impl Context {
         }
     }
 
-    fn resolve_sort(&self, s: &SExpr) -> Result<AstId, String> {
-        let name = Self::sym(s)?;
-        self.sorts
-            .get(name)
-            .copied()
-            .ok_or_else(|| alloc::format!("unknown sort {name:?}"))
+    fn resolve_sort(&mut self, s: &SExpr) -> Result<AstId, String> {
+        match s {
+            SExpr::Atom(name) => self
+                .sorts
+                .get(name)
+                .copied()
+                .ok_or_else(|| alloc::format!("unknown sort {name:?}")),
+            SExpr::List(l) if !l.is_empty() => {
+                // Parametric sort application, e.g. (Array I E).
+                match Self::sym(&l[0])? {
+                    "Array" if l.len() == 3 => {
+                        let index = self.resolve_sort(&l[1])?;
+                        let elem = self.resolve_sort(&l[2])?;
+                        Ok(self.m.mk_array_sort(index, elem))
+                    }
+                    other => Err(alloc::format!("unsupported sort constructor {other:?}")),
+                }
+            }
+            _ => Err("expected a sort".to_string()),
+        }
     }
 
     /// Interpret a top-level command, returning any textual response.
@@ -629,10 +645,65 @@ impl Context {
         }
     }
 
-    /// The conjunction of all assertions (`true` if none), lifted.
+    /// The conjunction of all assertions (`true` if none), lifted, with the
+    /// array read-over-write axioms instantiated.
     fn goal(&mut self) -> AstId {
         let base = self.conjunction();
-        self.lift(base)
+        let lifted = self.lift(base);
+        let mut axioms = self.array_axioms(lifted);
+        if axioms.is_empty() {
+            lifted
+        } else {
+            axioms.push(lifted);
+            self.m.mk_and(&axioms)
+        }
+    }
+
+    /// Instantiate the array read-over-write axioms over the `store` terms and
+    /// index terms occurring in `goal`. For each `store(a, i, v)`:
+    /// `select(store(a,i,v), i) = v`, and for each other index `j`:
+    /// `i = j ∨ select(store(a,i,v), j) = select(a, j)`. This eager instantiation
+    /// decides ground (non-extensional) QF_A; the congruence closure supplies the
+    /// rest. It is finite (stores × indices) and terminating.
+    fn array_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let subterms = self.m.postorder(goal);
+        let mut stores: Vec<AstId> = Vec::new();
+        let mut indices: Vec<AstId> = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for &t in &subterms {
+            if self.m.is_store(t) {
+                stores.push(t);
+                let idx = self.m.app_args(t)[1];
+                if seen.insert(idx) {
+                    indices.push(idx);
+                }
+            } else if self.m.is_select(t) {
+                let idx = self.m.app_args(t)[1];
+                if seen.insert(idx) {
+                    indices.push(idx);
+                }
+            }
+        }
+        let mut axioms = Vec::new();
+        for &st in &stores {
+            let args = self.m.app_args(st).to_vec(); // [a, i, v]
+            let (a, i, v) = (args[0], args[1], args[2]);
+            let sel_i = self.m.mk_select(st, i);
+            let row1 = self.m.mk_eq(sel_i, v);
+            axioms.push(row1);
+            for &j in &indices {
+                if j == i {
+                    continue;
+                }
+                let eq_ij = self.m.mk_eq(i, j);
+                let sel_st_j = self.m.mk_select(st, j);
+                let sel_a_j = self.m.mk_select(a, j);
+                let eq_reads = self.m.mk_eq(sel_st_j, sel_a_j);
+                let row2 = self.m.mk_or(&[eq_ij, eq_reads]);
+                axioms.push(row2);
+            }
+        }
+        axioms
     }
 
     /// The conjunction of all assertions (`true` if none).
@@ -891,6 +962,8 @@ impl Context {
                 Ok(acc)
             }
             "ite" => Ok(m.mk_ite(args[0], args[1], args[2])),
+            "select" => Ok(m.mk_select(args[0], args[1])),
+            "store" => Ok(m.mk_store(args[0], args[1], args[2])),
             "distinct" => {
                 // Expand to pairwise disequality so the theory solvers see it
                 // (a bare `distinct` node would be an opaque Boolean atom).
@@ -1509,6 +1582,50 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_read_over_write_same() {
+        // select(store(a,i,v), i) = v always.
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const i Int) (declare-const v Int)
+            (assert (not (= (select (store a i v) i) v)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_read_over_write_other() {
+        // i ≠ j ⇒ select(store(a,i,v), j) = select(a, j).
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const i Int) (declare-const j Int) (declare-const v Int)
+            (assert (not (= i j)))
+            (assert (not (= (select (store a i v) j) (select a j))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_congruence_via_equality() {
+        // a = b ⇒ select(a,i) = select(b,i), so 1 = 2 is contradictory.
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const b (Array Int Int)) (declare-const i Int)
+            (assert (= (select a i) 1)) (assert (= (select b i) 2)) (assert (= a b))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_satisfiable() {
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const i Int) (declare-const v Int)
+            (assert (= (select (store a i v) i) v))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]

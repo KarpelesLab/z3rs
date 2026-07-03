@@ -233,6 +233,26 @@ const CORPUS: &[Case] = &[
         name: "to_int_floor_unsat",
         script: "(declare-const x Real)(assert (<= 2.0 x))(assert (< x 3.0))(assert (not (= (to_int x) 2)))(check-sat)",
     },
+    Case {
+        name: "array_row_same_unsat",
+        script: "(declare-const a (Array Int Int))(declare-const i Int)(declare-const v Int)
+                 (assert (not (= (select (store a i v) i) v)))(check-sat)",
+    },
+    Case {
+        name: "array_row_other_unsat",
+        script: "(declare-const a (Array Int Int))(declare-const i Int)(declare-const j Int)(declare-const v Int)
+                 (assert (not (= i j)))(assert (not (= (select (store a i v) j) (select a j))))(check-sat)",
+    },
+    Case {
+        name: "array_congruence_unsat",
+        script: "(declare-const a (Array Int Int))(declare-const b (Array Int Int))(declare-const i Int)
+                 (assert (= (select a i) 1))(assert (= (select b i) 2))(assert (= a b))(check-sat)",
+    },
+    Case {
+        name: "array_store_sat",
+        script: "(declare-const a (Array Int Int))(declare-const i Int)(declare-const v Int)
+                 (assert (= (select (store a i v) i) v))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
