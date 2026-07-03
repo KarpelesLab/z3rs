@@ -1,15 +1,16 @@
 //! `z3rs` command-line frontend — the pure-Rust counterpart of Z3's `shell`
 //! (`z3/src/shell/main.cpp`). Aims for CLI compatibility with the `z3` binary.
 //!
-//! Frontends to port, mirroring `z3/src/shell/`:
+//! Frontends, mirroring `z3/src/shell/`:
+//! - [x] DIMACS (`dimacs_frontend.cpp`)   — `-dimacs` / `*.cnf`
 //! - [ ] SMT-LIB2 (`smtlib_frontend.cpp`) — the default `-smt2` mode
-//! - [ ] DIMACS (`dimacs_frontend.cpp`)   — `-dimacs`
 //! - [ ] Datalog (`datalog_frontend.cpp`) — `-dl`
 //! - [ ] DRAT (`drat_frontend.cpp`)       — `-drat`
-//! - [ ] Z3 log replay (`z3_log_frontend.cpp`)
-//! - [ ] Optimization (`opt_frontend.cpp`)
 
 use std::process::ExitCode;
+
+use z3rs::sat::{SatResult, parse_dimacs};
+use z3rs::util::lbool::LBool;
 
 fn print_version() {
     println!(
@@ -20,18 +21,56 @@ fn print_version() {
 }
 
 fn print_usage() {
-    println!("z3rs [options] [-file:]file");
+    println!("z3rs [options] <file>");
     println!();
-    println!("A pure-Rust, zero-dependency port of the Z3 theorem prover.");
-    println!("This is an early scaffold — solving is not yet implemented.");
+    println!("A pure-Rust port of the Z3 theorem prover (early, in progress).");
     println!();
     println!("Options:");
     println!("  -h, --help       print this message");
     println!("  --version        print version information");
-    println!("  -smt2            read input as SMT-LIB2 (default for .smt2)  [TODO]");
-    println!("  -in              read from stdin                              [TODO]");
-    println!("  -dimacs          read input in DIMACS format                 [TODO]");
-    println!("  -dl              read input as Datalog                        [TODO]");
+    println!("  -dimacs          read input in DIMACS CNF format (default for *.cnf)");
+    println!("  -smt2            read input as SMT-LIB2                         [TODO]");
+    println!("  -dl              read input as Datalog                         [TODO]");
+}
+
+/// Solve a DIMACS CNF file and print SAT-competition-style output.
+/// Exit codes follow the convention: 10 = SAT, 20 = UNSAT.
+fn run_dimacs(path: &str) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("z3rs: cannot read {path:?}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut solver = match parse_dimacs(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("z3rs: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match solver.solve() {
+        SatResult::Sat => {
+            println!("s SATISFIABLE");
+            // Emit the model as a DIMACS `v` line (1-based signed literals).
+            let mut line = String::from("v");
+            for v in 0..solver.num_vars() as u32 {
+                let signed = match solver.value(v) {
+                    LBool::False => -((v + 1) as i64),
+                    _ => (v + 1) as i64, // True, or Undef (don't-care) reported positive
+                };
+                line.push_str(&format!(" {signed}"));
+            }
+            line.push_str(" 0");
+            println!("{line}");
+            ExitCode::from(10)
+        }
+        SatResult::Unsat => {
+            println!("s UNSATISFIABLE");
+            ExitCode::from(20)
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -42,6 +81,8 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    let mut force_dimacs = false;
+    let mut file: Option<String> = None;
     for arg in &args {
         match arg.as_str() {
             "--version" | "-version" | "/version" => {
@@ -52,12 +93,27 @@ fn main() -> ExitCode {
                 print_usage();
                 return ExitCode::SUCCESS;
             }
-            _ => {}
+            "-dimacs" => force_dimacs = true,
+            other if other.starts_with('-') => {
+                eprintln!("z3rs: unknown option {other:?}");
+                return ExitCode::from(1);
+            }
+            other => file = Some(other.to_string()),
         }
     }
 
-    // Until frontends are ported, fail loudly rather than pretending to solve.
-    eprintln!("z3rs: solver frontends are not implemented yet (scaffold stage).");
-    eprintln!("z3rs: see ROADMAP.md for the porting plan.");
-    ExitCode::from(1)
+    match file {
+        Some(path) if force_dimacs || path.ends_with(".cnf") || path.ends_with(".dimacs") => {
+            run_dimacs(&path)
+        }
+        Some(path) => {
+            eprintln!("z3rs: don't know how to handle {path:?} yet (only DIMACS is wired up).");
+            eprintln!("z3rs: use -dimacs for CNF; SMT-LIB2 support is coming. See ROADMAP.md.");
+            ExitCode::from(1)
+        }
+        None => {
+            print_usage();
+            ExitCode::SUCCESS
+        }
+    }
 }

@@ -10,10 +10,18 @@ so the resolved dependency tree is just `z3rs → puremp`. The library is
 `no_std` (needs only `alloc`); the optional `std` feature adds std-backed
 conveniences. It aims to be behaviourally faithful to upstream Z3.
 
-> ⚠️ **Status: early scaffold.** The crate compiles (including for bare-metal
-> `no_std` targets) and the module tree mirrors Z3's architecture, but no solving
-> functionality is implemented yet. See [`ROADMAP.md`](ROADMAP.md) for the phased
-> plan and live progress.
+> ⚠️ **Status: early, in progress.** The foundation, a hash-consing AST (boolean,
+> arithmetic, bit-vector theories), a simplifying rewriter, and a **working SAT
+> core** are in place — `z3rs` already solves DIMACS CNF and decides propositional
+> formulas. The large engines (CDCL(T) SMT, theory solvers, SMT-LIB parser, C API)
+> are still ahead. See [`ROADMAP.md`](ROADMAP.md) for the phased plan and live
+> progress.
+>
+> ```sh
+> $ z3rs problem.cnf
+> s SATISFIABLE
+> v 1 2 3 0
+> ```
 
 ## Why
 
