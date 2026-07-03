@@ -198,6 +198,19 @@ impl AstManager {
         let decl = self.mk_func_decl(Symbol::new(name), &[], b);
         self.mk_const(decl)
     }
+
+    /// Is `sort_id` the Boolean sort? (Read-only; does not register anything.)
+    pub fn is_bool_sort(&self, sort_id: AstId) -> bool {
+        self.sort(sort_id).is_some_and(|s| {
+            s.info.family_id == BASIC_FAMILY_ID
+                && s.info.decl_kind == BasicSortKind::Bool as DeclKind
+        })
+    }
+
+    /// Is `expr` Boolean-sorted?
+    pub fn is_bool(&self, expr: AstId) -> bool {
+        self.is_bool_sort(self.get_sort(expr))
+    }
 }
 
 /// Flags shared by `and`/`or`: associative, flat, commutative, idempotent.
