@@ -25,14 +25,17 @@
 //! - [x] `z3/src/util/hash.{h,cpp}` → [`hash`]
 //! - [x] `z3/src/util/lbool.{h,cpp}` → [`lbool`]
 //! - [x] `z3/src/util/symbol.{h,cpp}` → [`symbol`] (+ `no_std` [`sync`])
+//! - [x] `z3/src/util/bit_vector.{h,cpp}` → [`bit_vector`]
 //! - [ ] `z3/src/util` containers/hashtables/vector/params/rlimit/…
 //!
 //! ## Status: IN PROGRESS (numerals via `puremp`; foundation being ported)
 
+pub mod bit_vector;
 pub mod hash;
 pub mod lbool;
 pub mod symbol;
 pub mod sync;
 
+pub use bit_vector::BitVector;
 pub use lbool::LBool;
 pub use symbol::Symbol;
