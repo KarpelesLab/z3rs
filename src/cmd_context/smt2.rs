@@ -393,6 +393,7 @@ impl Context {
                 let resp = match res {
                     SmtResult::Sat => "sat",
                     SmtResult::Unsat => "unsat",
+                    SmtResult::Unknown => "unknown",
                 };
                 Ok(Some(resp.to_string()))
             }

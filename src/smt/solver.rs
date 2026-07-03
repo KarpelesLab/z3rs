@@ -30,7 +30,7 @@ use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
-use crate::smt::arith::{Assignment, Constraint, LinExpr, model_with_diseqs};
+use crate::smt::arith::{Assignment, Constraint, LinExpr, Rel, model_with_diseqs};
 use crate::smt::euf::Egraph;
 
 use alloc::collections::BTreeSet;
@@ -44,6 +44,10 @@ pub enum SmtResult {
     Sat,
     /// Unsatisfiable.
     Unsat,
+    /// Could not be decided (an incomplete procedure gave up — e.g.
+    /// branch-and-bound exhausted its budget on an unbounded integer problem).
+    /// Returned instead of guessing, so a definite `Sat`/`Unsat` is always sound.
+    Unknown,
 }
 
 /// Decide satisfiability of a quantifier-free formula over equality +
@@ -105,15 +109,23 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                 }
                 let euf = euf_model(m, &euf_eq, &euf_roots, &sat);
                 let arith = arith_model(m, &arith_atoms, &sat);
-                if let (Some(euf), Some(arith)) = (euf, arith) {
-                    let model = Model { bools, arith, euf };
-                    return (SmtResult::Sat, Some(model));
+                match (euf, arith) {
+                    // Both theories consistent under this assignment → SAT.
+                    (Some(euf), Feas::Sat(arith)) => {
+                        let model = Model { bools, arith, euf };
+                        return (SmtResult::Sat, Some(model));
+                    }
+                    // EUF consistent but arithmetic undecidable here: we can
+                    // neither confirm SAT nor soundly rule this assignment out.
+                    (Some(_), Feas::Unknown) => return (SmtResult::Unknown, None),
+                    // Some theory is definitively inconsistent → block and retry.
+                    _ => {
+                        let mut block: Vec<Lit> =
+                            euf_eq.iter().map(|&(lit, _, _)| flip(lit, &sat)).collect();
+                        block.extend(arith_atoms.iter().map(|a| flip(a.lit, &sat)));
+                        sat.add_clause(&block);
+                    }
                 }
-                // Theory conflict: block this exact assignment of theory atoms.
-                let mut block: Vec<Lit> =
-                    euf_eq.iter().map(|&(lit, _, _)| flip(lit, &sat)).collect();
-                block.extend(arith_atoms.iter().map(|a| flip(a.lit, &sat)));
-                sat.add_clause(&block);
             }
         }
     }
@@ -306,11 +318,20 @@ impl ArithAtom {
     }
 }
 
+/// The outcome of an integer-arithmetic consistency check: a satisfying
+/// assignment, definitive infeasibility, or "gave up" (an incomplete search
+/// exhausted its budget without deciding).
+enum Feas {
+    Sat(Assignment),
+    Unsat,
+    Unknown,
+}
+
 /// Check the current arithmetic atom assignment, returning a satisfying rational
 /// assignment (integrality-respecting) when consistent.
-fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Option<Assignment> {
+fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Feas {
     if atoms.is_empty() {
-        return Some(BTreeMap::new());
+        return Feas::Sat(BTreeMap::new());
     }
     let mut cons: Vec<Constraint> = Vec::new();
     let mut diseqs: Vec<LinExpr> = Vec::new();
@@ -329,14 +350,25 @@ fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Option<Assi
     }
     // Integer-sorted leaf variables must take integral values; enforce that with
     // branch-and-bound on top of the rational (LRA) relaxation.
-    let mut int_vars: BTreeSet<AstId> = BTreeSet::new();
+    let mut int_set: BTreeSet<AstId> = BTreeSet::new();
     for c in &cons {
-        collect_int_vars(m, &c.expr, &mut int_vars);
+        collect_int_vars(m, &c.expr, &mut int_set);
     }
     for d in &diseqs {
-        collect_int_vars(m, d, &mut int_vars);
+        collect_int_vars(m, d, &mut int_set);
     }
-    let int_vars: Vec<AstId> = int_vars.into_iter().collect();
+    // Sound necessary condition: an all-integer equality with no integer
+    // solution (by the gcd/divisibility test) is infeasible — this decides
+    // parity-style conflicts like 2x = 2y + 1 that branch-and-bound cannot.
+    for c in &cons {
+        if c.rel == Rel::Eq
+            && c.expr.vars().all(|v| int_set.contains(&v))
+            && c.expr.integer_equality_infeasible()
+        {
+            return Feas::Unsat;
+        }
+    }
+    let int_vars: Vec<AstId> = int_set.into_iter().collect();
     integer_feasible(&cons, &diseqs, &int_vars, 0)
 }
 
@@ -353,43 +385,53 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
 /// terminate on unbounded integer problems (it can chase a fractional value along
 /// an unbounded direction), so we cap the depth — small enough to stay well
 /// within the stack, large enough that every bounded QF_LIA problem in scope
-/// closes first. On exhaustion we fall back to the real relaxation as a best
-/// effort; a complete integer procedure (Omega/Cooper, or B&B with derived
-/// bounds) is future work.
+/// closes first. On exhaustion the search returns [`Feas::Unknown`] rather than
+/// guessing, so the overall verdict stays sound; a complete integer procedure
+/// (Omega/Cooper, or B&B with derived bounds) is future work.
 const BB_NODE_LIMIT: u32 = 1_000;
 
-/// A satisfying assignment for `cons` and `diseqs` in which every variable of
-/// `int_vars` is integral, if one exists. Branch-and-bound over the LRA
-/// relaxation.
+/// Decide integer feasibility of `cons` ∧ `diseqs` with `int_vars` integral, by
+/// branch-and-bound over the LRA relaxation. Returns [`Feas::Unknown`] if the
+/// node budget is exhausted (rather than guessing), keeping the caller sound.
 fn integer_feasible(
     cons: &[Constraint],
     diseqs: &[LinExpr],
     int_vars: &[AstId],
     depth: u32,
-) -> Option<Assignment> {
-    let model = model_with_diseqs(cons, diseqs)?; // relaxation infeasible → None
+) -> Feas {
+    let Some(model) = model_with_diseqs(cons, diseqs) else {
+        return Feas::Unsat; // relaxation infeasible
+    };
     // Find an integer variable whose relaxed value is fractional.
     let fractional = int_vars.iter().find_map(|&v| {
         let val = model.get(&v).cloned().unwrap_or_else(rat_zero);
         (!val.is_integer()).then_some((v, val))
     });
     let Some((v, val)) = fractional else {
-        return Some(model); // all integer variables are already integral
+        return Feas::Sat(model); // all integer variables are already integral
     };
     if depth >= BB_NODE_LIMIT {
-        return Some(model); // budget exhausted: fall back to the relaxation (best effort)
+        return Feas::Unknown; // budget exhausted: don't guess
     }
     // Branch: v ≤ ⌊val⌋  OR  v ≥ ⌈val⌉.
     let floor = Rational::from_integer(val.floor());
     let ceil = Rational::from_integer(val.ceil());
     let mut low = cons.to_vec();
     low.push(Constraint::le(LinExpr::var(v).sub(&LinExpr::constant(floor)))); // v - ⌊val⌋ ≤ 0
-    if let Some(a) = integer_feasible(&low, diseqs, int_vars, depth + 1) {
-        return Some(a);
+    let lo = integer_feasible(&low, diseqs, int_vars, depth + 1);
+    if let Feas::Sat(a) = lo {
+        return Feas::Sat(a);
     }
     let mut high = cons.to_vec();
     high.push(Constraint::le(LinExpr::constant(ceil).sub(&LinExpr::var(v)))); // ⌈val⌉ - v ≤ 0
-    integer_feasible(&high, diseqs, int_vars, depth + 1)
+    let hi = integer_feasible(&high, diseqs, int_vars, depth + 1);
+    match hi {
+        Feas::Sat(a) => Feas::Sat(a),
+        // Both branches exhausted with no witness: unsat only if *both* were
+        // definitively infeasible; otherwise the result is inconclusive.
+        Feas::Unsat => lo, // lo is Unsat or Unknown here
+        Feas::Unknown => Feas::Unknown,
+    }
 }
 
 fn rat_zero() -> Rational {
@@ -775,6 +817,46 @@ mod tests {
         let feq = m.mk_eq(fx, fy);
         let nfeq = m.mk_not(feq);
         assert_eq!(check(&m, nfeq), SmtResult::Sat);
+    }
+
+    #[test]
+    fn parity_equation_unsat() {
+        // 2x = 2y + 1 has no integer solution (even = odd); the gcd test decides
+        // it where branch-and-bound would diverge. Previously wrongly sat.
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let two = m.mk_int(2);
+        let one = m.mk_int(1);
+        let twox = m.mk_mul(&[two, x]);
+        let twoy = m.mk_mul(&[two, y]);
+        let rhs = m.mk_add(&[twoy, one]);
+        let eq = m.mk_eq(twox, rhs);
+        assert_eq!(check(&m, eq), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn divisibility_equation_unsat() {
+        // 3x = 7 has no integer solution (3 ∤ 7).
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let three = m.mk_int(3);
+        let seven = m.mk_int(7);
+        let tx = m.mk_mul(&[three, x]);
+        let e = m.mk_eq(tx, seven);
+        assert_eq!(check(&m, e), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn divisibility_equation_sat() {
+        // 3x = 9 has the solution x = 3.
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let three = m.mk_int(3);
+        let nine = m.mk_int(9);
+        let tx = m.mk_mul(&[three, x]);
+        let e = m.mk_eq(tx, nine);
+        assert_eq!(check(&m, e), SmtResult::Sat);
     }
 
     #[test]

@@ -156,6 +156,14 @@ const CORPUS: &[Case] = &[
         name: "nested_term_ite_unsat",
         script: "(declare-const x Int)(assert (> (+ (ite (> x 0) x 0) 1) 100))(assert (< x 50))(check-sat)",
     },
+    Case {
+        name: "parity_equation_unsat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* 2 x) (+ (* 2 y) 1)))(check-sat)",
+    },
+    Case {
+        name: "divisibility_unsat",
+        script: "(declare-const x Int)(assert (= (* 3 x) 7))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
@@ -208,7 +216,12 @@ fn matches_z3_on_corpus() {
             mismatches.push(format!("{}: z3 failed to produce a verdict", case.name));
             continue;
         };
-        if ours != theirs {
+        // "unknown" from z3rs is always sound (an incomplete procedure declined
+        // to guess), so it never counts as a mismatch against a definite z3
+        // verdict — only sat-vs-unsat disagreements do.
+        let disagree = ours.len() != theirs.len()
+            || ours.iter().zip(&theirs).any(|(o, t)| o != "unknown" && o != t);
+        if disagree {
             mismatches.push(format!(
                 "{}: z3rs={ours:?} vs z3={theirs:?}",
                 case.name

@@ -111,6 +111,37 @@ impl LinExpr {
         self.coeffs.keys().copied()
     }
 
+    /// Assuming every variable ranges over the integers, is the equation
+    /// `self = 0` unsatisfiable? A linear Diophantine equation `Σ aᵢ·xᵢ = -b`
+    /// (integer coefficients) has a solution iff `gcd(aᵢ)` divides `b`. Clearing
+    /// denominators first makes the coefficients integral. This is a sound
+    /// necessary condition — it catches, e.g., `2x − 2y − 1 = 0` (parity) — but
+    /// is not by itself complete for systems of equations.
+    pub fn integer_equality_infeasible(&self) -> bool {
+        if self.coeffs.is_empty() {
+            return !self.constant.is_zero();
+        }
+        // Multiply through by the lcm of all denominators to get integers.
+        let mut l = Int::from(1);
+        for c in self.coeffs.values() {
+            l = l.lcm(c.denominator());
+        }
+        l = l.lcm(self.constant.denominator());
+        let scaled = |r: &Rational| -> Int {
+            let factor = l.div_trunc(r.denominator()); // exact: denominator | l
+            r.numerator() * &factor
+        };
+        let mut g = Int::from(0);
+        for c in self.coeffs.values() {
+            g = g.gcd(&scaled(c));
+        }
+        let b = scaled(&self.constant);
+        if g.is_zero() {
+            return !b.is_zero();
+        }
+        !b.rem_euclid(&g).is_zero()
+    }
+
     /// Evaluate the expression at `assign` (variables absent from the map read
     /// as zero).
     pub fn eval(&self, assign: &Assignment) -> Rational {
