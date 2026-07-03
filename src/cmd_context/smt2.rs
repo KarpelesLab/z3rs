@@ -3,10 +3,12 @@
 //!
 //! Supports: `set-logic`/`set-info`/`set-option` (ignored), `declare-sort`
 //! (arity 0), `declare-fun`, `declare-const`, `assert`, `check-sat`,
-//! `push`/`pop`/`reset`, and `exit`; the `Bool`/`Int`/`Real` sorts, integer and
-//! decimal numerals, the core Boolean operators, equality/`distinct`, `ite`,
-//! `let`, linear arithmetic (`+ - * <= < >= >`, `div`/`mod`), and uninterpreted
-//! functions. Runs QF_UF / QF_LRA scripts through [`crate::smt::check`].
+//! `get-value`, `get-model`, `push`/`pop`/`reset`, and `exit`; the
+//! `Bool`/`Int`/`Real` sorts, integer and decimal numerals, the core Boolean
+//! operators, equality/`distinct`, `ite`, `let`, linear arithmetic
+//! (`+ - * <= < >= >`, `div`/`mod`), and uninterpreted functions. Runs
+//! QF_UF / QF_LRA / QF_LIA scripts through [`crate::smt::check_model`], and
+//! reports models via `get-value`/`get-model`.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -16,7 +18,7 @@ use puremp::{Int, Rational};
 
 use crate::ast::AstId;
 use crate::ast::manager::AstManager;
-use crate::smt::{SmtResult, check};
+use crate::smt::{Model, SmtResult, check_model};
 use crate::util::symbol::Symbol;
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -121,6 +123,18 @@ fn parse(input: &str) -> Result<Vec<SExpr>, String> {
     Ok(forms)
 }
 
+/// Render an s-expression back to its textual form (used to echo `get-value`
+/// query terms).
+fn render_sexpr(s: &SExpr) -> String {
+    match s {
+        SExpr::Atom(a) => a.clone(),
+        SExpr::List(l) => {
+            let inner: Vec<String> = l.iter().map(render_sexpr).collect();
+            alloc::format!("({})", inner.join(" "))
+        }
+    }
+}
+
 fn parse_one(toks: &[String], pos: &mut usize) -> Result<SExpr, String> {
     let tok = &toks[*pos];
     *pos += 1;
@@ -157,6 +171,10 @@ struct Context {
     scopes: Vec<Vec<(String, AstId)>>,
     /// `define-fun` macros: name → (parameter names, body).
     macros: BTreeMap<String, (Vec<String>, SExpr)>,
+    /// Declared constants/functions in declaration order (for `get-model`).
+    decl_order: Vec<String>,
+    /// The model from the most recent satisfiable `check-sat`, if still current.
+    last_model: Option<Model>,
 }
 
 impl Context {
@@ -177,6 +195,8 @@ impl Context {
             assert_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
+            decl_order: Vec::new(),
+            last_model: None,
         }
     }
 
@@ -219,6 +239,7 @@ impl Context {
                 for _ in 0..n {
                     self.assert_stack.push(self.assertions.len());
                 }
+                self.last_model = None;
                 Ok(None)
             }
             "pop" => {
@@ -230,11 +251,13 @@ impl Context {
                         .ok_or_else(|| "pop with no matching push".to_string())?;
                     self.assertions.truncate(mark); // discard scoped assertions
                 }
+                self.last_model = None;
                 Ok(None)
             }
             "reset" => {
                 self.assertions.clear();
                 self.assert_stack.clear();
+                self.last_model = None;
                 Ok(None)
             }
             "declare-sort" => {
@@ -248,7 +271,9 @@ impl Context {
                 let name = Self::sym(&list[1])?.to_string();
                 let range = self.resolve_sort(&list[2])?;
                 let d = self.m.mk_func_decl(Symbol::new(&name), &[], range);
-                self.funcs.insert(name, d);
+                self.funcs.insert(name.clone(), d);
+                self.decl_order.push(name);
+                self.last_model = None;
                 Ok(None)
             }
             "declare-fun" => {
@@ -263,7 +288,9 @@ impl Context {
                 };
                 let range = self.resolve_sort(&list[3])?;
                 let d = self.m.mk_func_decl(Symbol::new(&name), &domain, range);
-                self.funcs.insert(name, d);
+                self.funcs.insert(name.clone(), d);
+                self.decl_order.push(name);
+                self.last_model = None;
                 Ok(None)
             }
             "define-fun" => {
@@ -287,16 +314,21 @@ impl Context {
             "assert" => {
                 let t = self.term(&list[1])?;
                 self.assertions.push(t);
+                self.last_model = None;
                 Ok(None)
             }
             "check-sat" => {
                 let goal = self.conjunction();
-                let resp = match check(&self.m, goal) {
+                let (res, model) = check_model(&self.m, goal);
+                self.last_model = model;
+                let resp = match res {
                     SmtResult::Sat => "sat",
                     SmtResult::Unsat => "unsat",
                 };
                 Ok(Some(resp.to_string()))
             }
+            "get-value" => self.get_value(list).map(Some),
+            "get-model" => self.get_model().map(Some),
             other => Err(alloc::format!("unsupported command {other:?}")),
         }
     }
@@ -311,6 +343,72 @@ impl Context {
                 self.m.mk_and(&a)
             }
         }
+    }
+
+    /// `(get-value (t1 t2 …))` — evaluate each term under the current model and
+    /// return `((t1 v1) (t2 v2) …)`.
+    fn get_value(&mut self, list: &[SExpr]) -> Result<String, String> {
+        let queries = match list.get(1) {
+            Some(SExpr::List(q)) => q,
+            _ => return Err("get-value: expected a term list".to_string()),
+        };
+        if self.last_model.is_none() {
+            return Err("get-value requires a preceding satisfiable check-sat".to_string());
+        }
+        // Build every queried term first (this borrows `self.m` mutably).
+        let mut terms: Vec<(String, AstId)> = Vec::new();
+        for q in queries {
+            let id = self.term(q)?;
+            terms.push((render_sexpr(q), id));
+        }
+        // Then evaluate against the model (disjoint immutable borrow of `m`).
+        let mut model = self.last_model.take().unwrap();
+        let mut out = String::from("(");
+        for (i, (text, id)) in terms.iter().enumerate() {
+            if i > 0 {
+                out.push(' ');
+            }
+            let v = model.value_string(&self.m, *id);
+            out.push_str(&alloc::format!("({text} {v})"));
+        }
+        out.push(')');
+        self.last_model = Some(model);
+        Ok(out)
+    }
+
+    /// `(get-model)` — a `define-fun` per 0-ary declared constant, in
+    /// declaration order.
+    fn get_model(&mut self) -> Result<String, String> {
+        if self.last_model.is_none() {
+            return Err("get-model requires a preceding satisfiable check-sat".to_string());
+        }
+        // Collect the 0-ary constants and their range-sort names.
+        let mut consts: Vec<(String, AstId, String)> = Vec::new();
+        for name in &self.decl_order {
+            let d = self.funcs[name];
+            let fd = self.m.func_decl(d).unwrap();
+            if !fd.domain.is_empty() {
+                continue; // n-ary function interpretations not yet emitted
+            }
+            let range = fd.range;
+            let sort_name = self
+                .m
+                .sort(range)
+                .and_then(|s| s.name.as_str())
+                .unwrap_or("?")
+                .to_string();
+            let c = self.m.mk_const(d);
+            consts.push((name.clone(), c, sort_name));
+        }
+        let mut model = self.last_model.take().unwrap();
+        let mut out = String::from("(");
+        for (name, c, sort_name) in &consts {
+            let v = model.value_string(&self.m, *c);
+            out.push_str(&alloc::format!("\n  (define-fun {name} () {sort_name} {v})"));
+        }
+        out.push_str("\n)");
+        self.last_model = Some(model);
+        Ok(out)
     }
 
     /// Look up a name in the active `let` scopes (innermost first).
@@ -658,6 +756,55 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn get_value_returns_assignments() {
+        let script = "
+            (declare-const x Int) (declare-const p Bool)
+            (assert (= x 7)) (assert p)
+            (check-sat)
+            (get-value (x p (+ x 1)))
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "((x 7) (p true) ((+ x 1) 8))"]
+        );
+    }
+
+    #[test]
+    fn get_value_real_fraction() {
+        let script = "
+            (declare-const r Real)
+            (assert (= (* 2 r) 1))
+            (check-sat)
+            (get-value (r))
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "((r (/ 1.0 2.0)))"]);
+    }
+
+    #[test]
+    fn get_model_lists_constants() {
+        let script = "
+            (declare-const x Int) (declare-const b Bool)
+            (assert (= x 3)) (assert (not b))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(out[1].contains("(define-fun x () Int 3)"), "{}", out[1]);
+        assert!(out[1].contains("(define-fun b () Bool false)"), "{}", out[1]);
+    }
+
+    #[test]
+    fn get_value_without_sat_is_error() {
+        // No check-sat before get-value.
+        let script = "
+            (declare-const x Int)
+            (get-value (x))
+        ";
+        assert!(run(script).is_err());
     }
 
     #[test]

@@ -18,6 +18,7 @@
 //! minimized explanations are the refinements that come next. Non-arithmetic,
 //! non-equality atoms remain free Booleans.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::ast::AstId;
@@ -26,7 +27,7 @@ use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
-use crate::smt::arith::{Constraint, LinExpr, model_with_diseqs};
+use crate::smt::arith::{Assignment, Constraint, LinExpr, model_with_diseqs};
 use crate::smt::euf::Egraph;
 
 use alloc::collections::BTreeSet;
@@ -43,15 +44,22 @@ pub enum SmtResult {
 }
 
 /// Decide satisfiability of a quantifier-free formula over equality +
-/// uninterpreted functions and/or linear arithmetic (QF_UF / QF_LRA, and their
-/// union when the theories do not share terms).
+/// uninterpreted functions and/or linear arithmetic (QF_UF / QF_LRA / QF_LIA,
+/// and their union when the theories do not share terms).
 pub fn check(m: &AstManager, formula: AstId) -> SmtResult {
+    check_model(m, formula).0
+}
+
+/// Like [`check`], but also returns a satisfying [`Model`] when the formula is
+/// satisfiable (`None` when unsat). The model can evaluate terms via
+/// [`Model::eval`], backing `(get-value …)` / `(get-model)`.
+pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>) {
     let mut sat = Solver::new();
     let (top, atoms) = encode_tracking(m, formula, &mut sat);
     sat.add_clause(&[top]);
 
     // Classify theory atoms: equalities over uninterpreted sorts go to EUF;
-    // arithmetic comparisons and equalities go to the LRA theory.
+    // arithmetic comparisons and equalities go to the LRA/LIA theory.
     let mut euf_eq: Vec<(Lit, AstId, AstId)> = Vec::new();
     let mut euf_roots: Vec<AstId> = Vec::new();
     let mut arith_atoms: Vec<ArithAtom> = Vec::new();
@@ -77,15 +85,24 @@ pub fn check(m: &AstManager, formula: AstId) -> SmtResult {
     let has_theory = !euf_eq.is_empty() || !arith_atoms.is_empty();
     loop {
         match sat.solve() {
-            SatResult::Unsat => return SmtResult::Unsat,
+            SatResult::Unsat => return (SmtResult::Unsat, None),
             SatResult::Sat => {
+                // The Boolean assignment of every tracked atom.
+                let bools: BTreeMap<AstId, bool> =
+                    atoms.iter().map(|(&a, &l)| (a, sat.model_holds(l))).collect();
                 if !has_theory {
-                    return SmtResult::Sat;
+                    let model = Model {
+                        bools,
+                        arith: BTreeMap::new(),
+                        euf: Egraph::new(m, &[]),
+                    };
+                    return (SmtResult::Sat, Some(model));
                 }
-                if euf_consistent(m, &euf_eq, &euf_roots, &sat)
-                    && arith_consistent(m, &arith_atoms, &sat)
-                {
-                    return SmtResult::Sat;
+                let euf = euf_model(m, &euf_eq, &euf_roots, &sat);
+                let arith = arith_model(m, &arith_atoms, &sat);
+                if let (Some(euf), Some(arith)) = (euf, arith) {
+                    let model = Model { bools, arith, euf };
+                    return (SmtResult::Sat, Some(model));
                 }
                 // Theory conflict: block this exact assignment of theory atoms.
                 let mut block: Vec<Lit> =
@@ -97,19 +114,150 @@ pub fn check(m: &AstManager, formula: AstId) -> SmtResult {
     }
 }
 
+/// A satisfying assignment, able to evaluate terms to concrete [`Value`]s.
+pub struct Model {
+    /// Truth value of each tracked atom (Boolean constants + theory atoms).
+    bools: BTreeMap<AstId, bool>,
+    /// Rational value of each arithmetic leaf variable.
+    arith: Assignment,
+    /// Congruence classes over the uninterpreted terms (equal terms share an id).
+    euf: Egraph,
+}
+
+/// A concrete value in a [`Model`].
+#[derive(Clone, Debug)]
+pub enum Value {
+    /// A Boolean.
+    Bool(bool),
+    /// A numeral and whether it belongs to the `Int` sort (vs `Real`).
+    Num(Rational, bool),
+    /// An element of an uninterpreted sort, identified by its congruence class.
+    Uninterp(AstId, usize),
+}
+
+impl Model {
+    /// Evaluate `t` under this model.
+    pub fn eval(&mut self, m: &AstManager, t: AstId) -> Value {
+        let s = m.get_sort(t);
+        if m.is_bool_sort(s) {
+            Value::Bool(self.eval_bool(m, t))
+        } else if m.is_arith_sort(s) {
+            Value::Num(ast_to_lin(m, t).eval(&self.arith), m.is_int_sort(s))
+        } else {
+            let class = self.euf.class_of(m, t);
+            Value::Uninterp(s, class)
+        }
+    }
+
+    /// Render `t`'s value as an SMT-LIB2 term (`true`, `5`, `(/ 1.0 2.0)`, …).
+    pub fn value_string(&mut self, m: &AstManager, t: AstId) -> alloc::string::String {
+        self.eval(m, t).render(m)
+    }
+
+    fn eval_bool(&mut self, m: &AstManager, t: AstId) -> bool {
+        if let Some(&b) = self.bools.get(&t) {
+            return b;
+        }
+        if m.is_true(t) {
+            return true;
+        }
+        if m.is_false(t) {
+            return false;
+        }
+        if m.is_not(t) {
+            return !self.eval_bool(m, m.app_args(t)[0]);
+        }
+        if m.is_and(t) {
+            return m.app_args(t).to_vec().iter().all(|&a| self.eval_bool(m, a));
+        }
+        if m.is_or(t) {
+            return m.app_args(t).to_vec().iter().any(|&a| self.eval_bool(m, a));
+        }
+        if m.is_ite(t) {
+            let a = m.app_args(t).to_vec();
+            return if self.eval_bool(m, a[0]) {
+                self.eval_bool(m, a[1])
+            } else {
+                self.eval_bool(m, a[2])
+            };
+        }
+        if m.is_eq(t) {
+            let a = m.app_args(t).to_vec();
+            return self.values_eq(m, a[0], a[1]);
+        }
+        false // an untracked atom we cannot resolve; default to false
+    }
+
+    /// Do `a` and `b` evaluate to the same value?
+    fn values_eq(&mut self, m: &AstManager, a: AstId, b: AstId) -> bool {
+        match (self.eval(m, a), self.eval(m, b)) {
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Num(x, _), Value::Num(y, _)) => x == y,
+            (Value::Uninterp(_, x), Value::Uninterp(_, y)) => x == y,
+            _ => false,
+        }
+    }
+}
+
+impl Value {
+    /// Render as an SMT-LIB2 value term.
+    pub fn render(&self, m: &AstManager) -> alloc::string::String {
+        use alloc::string::ToString;
+        match self {
+            Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Value::Num(r, is_int) => render_numeral(r, *is_int),
+            Value::Uninterp(sort, class) => {
+                let name = m.sort(*sort).and_then(|s| s.name.as_str()).unwrap_or("U");
+                alloc::format!("{name}!val!{class}")
+            }
+        }
+    }
+}
+
+/// Render a rational as an SMT-LIB2 numeral: integers as `n` / `(- n)`, reals as
+/// `n.0` or `(/ p.0 q.0)` (each factor sign-wrapped like Z3).
+fn render_numeral(r: &Rational, is_int: bool) -> alloc::string::String {
+    if is_int {
+        return render_signed_int(r.numerator());
+    }
+    if r.is_integer() {
+        return decorate_sign(r.numerator(), |n| alloc::format!("{n}.0"));
+    }
+    let num = r.numerator();
+    let den = r.denominator(); // always positive in normalized form
+    decorate_sign(num, |n| alloc::format!("(/ {n}.0 {den}.0)"))
+}
+
+/// `n` or `(- |n|)`.
+fn render_signed_int(n: &Int) -> alloc::string::String {
+    decorate_sign(n, |a| alloc::format!("{a}"))
+}
+
+/// Apply `body` to `|n|` and wrap the whole thing in `(- …)` when `n < 0`.
+fn decorate_sign(
+    n: &Int,
+    body: impl FnOnce(&Int) -> alloc::string::String,
+) -> alloc::string::String {
+    if *n < Int::from(0) {
+        let abs = -n;
+        alloc::format!("(- {})", body(&abs))
+    } else {
+        body(n)
+    }
+}
+
 fn flip(lit: Lit, sat: &Solver) -> Lit {
     if sat.model_holds(lit) { !lit } else { lit }
 }
 
-fn euf_consistent(
+/// Build the congruence closure for the current EUF atom assignment, returning
+/// it when consistent (so callers can read equivalence classes for the model).
+fn euf_model(
     m: &AstManager,
     euf_eq: &[(Lit, AstId, AstId)],
     roots: &[AstId],
     sat: &Solver,
-) -> bool {
-    if euf_eq.is_empty() {
-        return true;
-    }
+) -> Option<Egraph> {
     let mut eqs = Vec::new();
     let mut diseqs = Vec::new();
     for &(lit, a, b) in euf_eq {
@@ -119,7 +267,8 @@ fn euf_consistent(
             diseqs.push((a, b));
         }
     }
-    Egraph::new(m, roots).is_consistent(m, &eqs, &diseqs)
+    let mut g = Egraph::new(m, roots);
+    g.is_consistent(m, &eqs, &diseqs).then_some(g)
 }
 
 /// An arithmetic theory atom: either a comparison or an equality.
@@ -152,9 +301,11 @@ impl ArithAtom {
     }
 }
 
-fn arith_consistent(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> bool {
+/// Check the current arithmetic atom assignment, returning a satisfying rational
+/// assignment (integrality-respecting) when consistent.
+fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Option<Assignment> {
     if atoms.is_empty() {
-        return true;
+        return Some(BTreeMap::new());
     }
     let mut cons: Vec<Constraint> = Vec::new();
     let mut diseqs: Vec<LinExpr> = Vec::new();
@@ -198,35 +349,34 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
 /// is returned as a best effort).
 const BB_NODE_LIMIT: u32 = 20_000;
 
-/// Is there an assignment satisfying `cons` and `diseqs` in which every variable
-/// of `int_vars` is integral? Branch-and-bound over the LRA relaxation.
+/// A satisfying assignment for `cons` and `diseqs` in which every variable of
+/// `int_vars` is integral, if one exists. Branch-and-bound over the LRA
+/// relaxation.
 fn integer_feasible(
     cons: &[Constraint],
     diseqs: &[LinExpr],
     int_vars: &[AstId],
     depth: u32,
-) -> bool {
-    let Some(model) = model_with_diseqs(cons, diseqs) else {
-        return false; // the relaxation itself is infeasible
-    };
+) -> Option<Assignment> {
+    let model = model_with_diseqs(cons, diseqs)?; // relaxation infeasible → None
     // Find an integer variable whose relaxed value is fractional.
     let fractional = int_vars.iter().find_map(|&v| {
         let val = model.get(&v).cloned().unwrap_or_else(rat_zero);
         (!val.is_integer()).then_some((v, val))
     });
     let Some((v, val)) = fractional else {
-        return true; // all integer variables are already integral
+        return Some(model); // all integer variables are already integral
     };
     if depth >= BB_NODE_LIMIT {
-        return true; // budget exhausted: fall back to the relaxation (best effort)
+        return Some(model); // budget exhausted: fall back to the relaxation (best effort)
     }
     // Branch: v ≤ ⌊val⌋  OR  v ≥ ⌈val⌉.
     let floor = Rational::from_integer(val.floor());
     let ceil = Rational::from_integer(val.ceil());
     let mut low = cons.to_vec();
     low.push(Constraint::le(LinExpr::var(v).sub(&LinExpr::constant(floor)))); // v - ⌊val⌋ ≤ 0
-    if integer_feasible(&low, diseqs, int_vars, depth + 1) {
-        return true;
+    if let Some(a) = integer_feasible(&low, diseqs, int_vars, depth + 1) {
+        return Some(a);
     }
     let mut high = cons.to_vec();
     high.push(Constraint::le(LinExpr::constant(ceil).sub(&LinExpr::var(v)))); // ⌈val⌉ - v ≤ 0
@@ -517,6 +667,68 @@ mod tests {
         let hi = m.mk_lt(x, one);
         let f = m.mk_and(&[lo, hi]);
         assert_eq!(check(&m, f), SmtResult::Sat);
+    }
+
+    #[test]
+    fn model_assigns_consistent_arith_value() {
+        // (and (>= x 3) (<= x 5)) with x : Int — the model must satisfy both.
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let three = m.mk_int(3);
+        let five = m.mk_int(5);
+        let ge = m.mk_ge(x, three);
+        let le = m.mk_le(x, five);
+        let f = m.mk_and(&[ge, le]);
+        let (res, model) = check_model(&m, f);
+        assert_eq!(res, SmtResult::Sat);
+        let mut model = model.unwrap();
+        match model.eval(&m, x) {
+            Value::Num(v, true) => {
+                assert!(v >= rat(&m, 3) && v <= rat(&m, 5) && v.is_integer());
+            }
+            other => panic!("expected an Int value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn model_renders_bool_and_real() {
+        let mut m = AstManager::new();
+        let p = m.mk_bool_const("p");
+        let r = m.mk_real_const("r");
+        let half = m.mk_numeral(
+            puremp::Rational::new(puremp::Int::from(1), puremp::Int::from(2)),
+            false,
+        );
+        let eq = m.mk_eq(r, half);
+        let f = m.mk_and(&[p, eq]);
+        let (res, model) = check_model(&m, f);
+        assert_eq!(res, SmtResult::Sat);
+        let mut model = model.unwrap();
+        assert_eq!(model.value_string(&m, p), "true");
+        assert_eq!(model.value_string(&m, r), "(/ 1.0 2.0)");
+    }
+
+    #[test]
+    fn model_shares_class_for_equal_uninterp() {
+        // a = b, a ≠ c → a and b share a class; c differs.
+        let mut m = AstManager::new();
+        let s = m.mk_uninterpreted_sort(Symbol::new("S"));
+        let a = constant(&mut m, "a", s);
+        let b = constant(&mut m, "b", s);
+        let c = constant(&mut m, "c", s);
+        let ab = m.mk_eq(a, b);
+        let ac = m.mk_eq(a, c);
+        let nac = m.mk_not(ac);
+        let f = m.mk_and(&[ab, nac]);
+        let (res, model) = check_model(&m, f);
+        assert_eq!(res, SmtResult::Sat);
+        let mut model = model.unwrap();
+        assert_eq!(model.value_string(&m, a), model.value_string(&m, b));
+        assert_ne!(model.value_string(&m, a), model.value_string(&m, c));
+    }
+
+    fn rat(_m: &AstManager, n: i64) -> puremp::Rational {
+        puremp::Rational::from_integer(puremp::Int::from(n))
     }
 
     #[test]

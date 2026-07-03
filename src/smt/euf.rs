@@ -112,6 +112,14 @@ impl Egraph {
         }
     }
 
+    /// The canonical class index of `t` in the current union-find (terms that
+    /// are equal share it). Interns `t` if unseen. Meaningful after a call to
+    /// [`is_consistent`] has applied the equalities.
+    pub fn class_of(&mut self, m: &AstManager, t: AstId) -> usize {
+        let i = self.intern(m, t);
+        self.find(i)
+    }
+
     /// Are the `equalities` (with congruence) consistent with the
     /// `disequalities`? Returns `true` if satisfiable.
     pub fn is_consistent(

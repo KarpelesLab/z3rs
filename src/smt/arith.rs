@@ -110,6 +110,17 @@ impl LinExpr {
     pub fn vars(&self) -> impl Iterator<Item = AstId> + '_ {
         self.coeffs.keys().copied()
     }
+
+    /// Evaluate the expression at `assign` (variables absent from the map read
+    /// as zero).
+    pub fn eval(&self, assign: &Assignment) -> Rational {
+        let mut acc = self.constant.clone();
+        for (v, c) in &self.coeffs {
+            let val = assign.get(v).cloned().unwrap_or_else(zero);
+            acc = &acc + &(c * &val);
+        }
+        acc
+    }
 }
 
 /// Is the conjunction of `constraints` and `disequalities` (each `expr ≠ 0`)
