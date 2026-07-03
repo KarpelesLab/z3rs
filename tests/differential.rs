@@ -293,6 +293,23 @@ const CORPUS: &[Case] = &[
         script: "(declare-const a (Array Int Int))(declare-const i Int)(declare-const j Int)
                  (assert (= i (+ j 1)))(assert (= (select a i) 1))(assert (not (= (select a (+ j 1)) 1)))(check-sat)",
     },
+    Case {
+        name: "bv_add_wrap_unsat",
+        script: "(declare-const x (_ BitVec 8))(assert (= x #xff))(assert (not (= (bvadd x #x01) #x00)))(check-sat)",
+    },
+    Case {
+        name: "bv_ult_strict_unsat",
+        script: "(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)",
+    },
+    Case {
+        name: "bv_solve_sat",
+        script: "(declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))
+                 (assert (= (bvadd x y) #x0a))(assert (bvult x #x05))(check-sat)",
+    },
+    Case {
+        name: "bv_bitwise_unsat",
+        script: "(declare-const x (_ BitVec 4))(assert (not (= (bvand x #b0000) #b0000)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

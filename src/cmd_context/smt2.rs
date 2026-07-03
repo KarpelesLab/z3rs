@@ -7,9 +7,12 @@
 //! `Bool`/`Int`/`Real` sorts, integer and decimal numerals, the core Boolean
 //! operators, equality/`distinct`, `ite`, `let`, linear arithmetic
 //! (`+ - * / <= < >= >`, `div`/`mod`/`abs`/`to_real`/`to_int`, with constant
-//! folding), uninterpreted functions, and arrays (`(Array I E)`, `select`,
-//! `store`). Runs QF_UF / QF_LRA / QF_LIA / QF_A scripts through
-//! [`crate::smt::check_model`], and reports models via `get-value`/`get-model`.
+//! folding), uninterpreted functions, arrays (`(Array I E)`, `select`, `store`,
+//! `(as const …)`), and bit-vectors (`(_ BitVec n)`, `#x`/`#b`/`(_ bvN w)`
+//! literals, `bvand/bvor/bvxor/bvnot`, `bvadd/bvsub/bvneg`,
+//! `bvult/bvule/bvugt/bvuge`). Runs QF_UF / QF_LRA / QF_LIA / QF_A through
+//! [`crate::smt::check_model`] and QF_BV through [`crate::smt::check_bv`]
+//! (bit-blasting), and reports models via `get-value`/`get-model`.
 //! Term-level (non-Boolean) `ite`s are lifted to fresh constants and the array
 //! read-over-write axioms are instantiated before solving, so the theory reasons
 //! about them exactly. (Nonlinear terms remain opaque — a known incompleteness
@@ -24,7 +27,7 @@ use puremp::{Int, Rational};
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
-use crate::smt::{Model, SmtResult, check_model};
+use crate::smt::{Model, SmtResult, check_bv, check_model};
 use crate::util::symbol::Symbol;
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -51,6 +54,24 @@ fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
 /// A rational from a small integer.
 fn rat(n: i64) -> Rational {
     Rational::from_integer(Int::from(n))
+}
+
+/// Parse a bit-vector literal `#x1a` (hex, 4 bits/digit) or `#b101` (binary,
+/// 1 bit/digit) into `(value, width)`.
+fn parse_bv_literal(s: &str) -> Option<(Int, u32)> {
+    if let Some(hex) = s.strip_prefix("#x") {
+        if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some((Int::from_str_radix(hex, 16).ok()?, hex.len() as u32 * 4))
+    } else if let Some(bin) = s.strip_prefix("#b") {
+        if bin.is_empty() || !bin.bytes().all(|b| b == b'0' || b == b'1') {
+            return None;
+        }
+        Some((Int::from_str_radix(bin, 2).ok()?, bin.len() as u32))
+    } else {
+        None
+    }
 }
 
 /// The rational values of `args` if *every* one is a numeral, else `None`.
@@ -369,12 +390,18 @@ impl Context {
                 .copied()
                 .ok_or_else(|| alloc::format!("unknown sort {name:?}")),
             SExpr::List(l) if !l.is_empty() => {
-                // Parametric sort application, e.g. (Array I E).
+                // Parametric sort application, e.g. (Array I E) or (_ BitVec n).
                 match Self::sym(&l[0])? {
                     "Array" if l.len() == 3 => {
                         let index = self.resolve_sort(&l[1])?;
                         let elem = self.resolve_sort(&l[2])?;
                         Ok(self.m.mk_array_sort(index, elem))
+                    }
+                    "_" if l.len() == 3 && Self::sym(&l[1])? == "BitVec" => {
+                        let w: u32 = Self::sym(&l[2])?
+                            .parse()
+                            .map_err(|_| "BitVec: bad width".to_string())?;
+                        Ok(self.m.mk_bv_sort(w))
                     }
                     other => Err(alloc::format!("unsupported sort constructor {other:?}")),
                 }
@@ -800,12 +827,24 @@ impl Context {
     /// contains genuine nonlinear arithmetic the linear core over-approximates
     /// (so a definite `sat`/`unsat` is always sound).
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        // Bit-vector formulas are decided by bit-blasting (no model produced yet).
+        if self.is_bv_goal(goal) {
+            return (check_bv(&self.m, goal), None);
+        }
         let (res, model) = check_model(&self.m, goal);
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
             (SmtResult::Unknown, None)
         } else {
             (res, model)
         }
+    }
+
+    /// Does `goal` mention any bit-vector-sorted term?
+    fn is_bv_goal(&self, goal: AstId) -> bool {
+        self.m
+            .postorder(goal)
+            .iter()
+            .any(|&t| self.m.bv_sort_width(self.m.get_sort(t)).is_some())
     }
 
     /// Does `goal` contain nonlinear arithmetic the linear solver treats as an
@@ -973,6 +1012,9 @@ impl Context {
                     if let Some((r, is_int)) = parse_numeral(name) {
                         return Ok(self.m.mk_numeral(r, is_int));
                     }
+                    if let Some((v, w)) = parse_bv_literal(name) {
+                        return Ok(self.m.mk_bv_numeral(v, w));
+                    }
                     if self.macros.contains_key(name) {
                         return self.expand_macro(name, Vec::new());
                     }
@@ -1004,6 +1046,19 @@ impl Context {
                     // (! t :annotation value …) — annotations are transparent to
                     // the term's meaning; evaluate the annotated term.
                     return self.term(&l[1]);
+                }
+                if head == "_" {
+                    // Indexed identifier, e.g. (_ bv5 8) — a bit-vector numeral.
+                    let name = Self::sym(&l[1])?;
+                    if let Some(digits) = name.strip_prefix("bv") {
+                        let v = Int::from_str_radix(digits, 10)
+                            .map_err(|_| "bad bv numeral".to_string())?;
+                        let w: u32 = Self::sym(&l[2])?
+                            .parse()
+                            .map_err(|_| "bad bv width".to_string())?;
+                        return Ok(self.m.mk_bv_numeral(v, w));
+                    }
+                    return Err(alloc::format!("unsupported indexed identifier {name:?}"));
                 }
                 let args: Vec<AstId> = l[1..]
                     .iter()
@@ -1238,6 +1293,18 @@ impl Context {
                     Ok(m.mk_and(&cs))
                 }
             }
+            // --- bit-vectors ---
+            "bvnot" => Ok(m.mk_bvnot(args[0])),
+            "bvneg" => Ok(m.mk_bvneg(args[0])),
+            "bvand" => Ok(m.mk_bvand(args[0], args[1])),
+            "bvor" => Ok(m.mk_bvor(args[0], args[1])),
+            "bvxor" => Ok(m.mk_bvxor(args[0], args[1])),
+            "bvadd" => Ok(m.mk_bvadd(args[0], args[1])),
+            "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
+            "bvult" => Ok(m.mk_bvult(args[0], args[1])),
+            "bvule" => Ok(m.mk_bvule(args[0], args[1])),
+            "bvugt" => Ok(m.mk_bvult(args[1], args[0])), // a >u b  ⟺  b <u a
+            "bvuge" => Ok(m.mk_bvule(args[1], args[0])), // a ≥u b  ⟺  b ≤u a
             name => {
                 let d = *self
                     .funcs
@@ -1866,6 +1933,43 @@ mod tests {
         assert_eq!(
             run(script).unwrap(),
             alloc::vec!["hello world", "(:name \"z3rs\")", "sat"]
+        );
+    }
+
+    #[test]
+    fn bitvector_arithmetic_and_literals() {
+        // 8-bit wrap: 0xff + 1 = 0.
+        let wrap = "
+            (declare-const x (_ BitVec 8))
+            (assert (= x #xff)) (assert (not (= (bvadd x #x01) #x00)))
+            (check-sat)
+        ";
+        assert_eq!(run(wrap).unwrap(), alloc::vec!["unsat"]);
+        // Satisfiable: x + y = 10 with x < 5.
+        let sat = "
+            (declare-const x (_ BitVec 8)) (declare-const y (_ BitVec 8))
+            (assert (= (bvadd x y) #x0a)) (assert (bvult x #x05))
+            (check-sat)
+        ";
+        assert_eq!(run(sat).unwrap(), alloc::vec!["sat"]);
+        // (_ bvN w) literal form.
+        assert_eq!(
+            run("(assert (= (_ bv5 8) #x05))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn bitvector_bitwise_and_compare() {
+        // x & 0 = 0 always; x <u x never.
+        assert_eq!(
+            run("(declare-const x (_ BitVec 4))(assert (not (= (bvand x #b0000) #b0000)))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
