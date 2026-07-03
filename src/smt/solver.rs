@@ -13,13 +13,15 @@
 //! relaxation, so integrality constraints (`QF_LIA`) are decided too.
 //!
 //! Every equality (of any sort) feeds the congruence closure, so uninterpreted
-//! functions get congruence even at arithmetic range sorts. The two theories are
-//! otherwise checked independently: this is complete when the only equalities
-//! they must exchange are the *explicit* ones (pure QF_UF, pure QF_LRA/LIA, or a
-//! union where shared equalities appear syntactically). Full Nelson–Oppen
-//! sharing of theory-*implied* equalities (e.g. `x = y` derived from `x ≤ y ∧
-//! y ≤ x`), online propagation, and minimized explanations are the refinements
-//! that come next. Non-arithmetic, non-equality atoms remain free Booleans.
+//! functions get congruence even at arithmetic range sorts. The theories are
+//! combined à la Nelson–Oppen: after each individually consistent assignment,
+//! every equality the arithmetic theory *entails* between shared (interface)
+//! terms — e.g. `x = y` derived from `x ≤ y ∧ y ≤ x` — is added to the
+//! congruence closure, so implied equalities drive congruence too. Entailment is
+//! decided convexly (a single equality per pair), which is complete for QF_UFLRA
+//! and a sound approximation for QF_UFLIA. Online propagation, minimized
+//! explanations, and equality sharing in the EUF→arith direction come next.
+//! Non-arithmetic, non-equality atoms remain free Booleans.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -30,7 +32,9 @@ use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
-use crate::smt::arith::{Assignment, Constraint, LinExpr, Rel, model_with_diseqs};
+use crate::smt::arith::{
+    Assignment, Constraint, LinExpr, Rel, feasible_with_diseqs, model_with_diseqs,
+};
 use crate::smt::euf::Egraph;
 
 use alloc::collections::BTreeSet;
@@ -107,19 +111,16 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     };
                     return (SmtResult::Sat, Some(model));
                 }
-                let euf = euf_model(m, &euf_eq, &euf_roots, &sat);
-                let arith = arith_model(m, &arith_atoms, &sat);
-                match (euf, arith) {
+                match theory_check(m, &euf_eq, &euf_roots, &arith_atoms, &sat) {
                     // Both theories consistent under this assignment → SAT.
-                    (Some(euf), Feas::Sat(arith)) => {
+                    TheoryOutcome::Sat(arith, euf) => {
                         let model = Model { bools, arith, euf };
                         return (SmtResult::Sat, Some(model));
                     }
-                    // EUF consistent but arithmetic undecidable here: we can
-                    // neither confirm SAT nor soundly rule this assignment out.
-                    (Some(_), Feas::Unknown) => return (SmtResult::Unknown, None),
-                    // Some theory is definitively inconsistent → block and retry.
-                    _ => {
+                    // Undecidable here: neither confirm SAT nor soundly block.
+                    TheoryOutcome::Unknown => return (SmtResult::Unknown, None),
+                    // Definitively inconsistent → block this assignment and retry.
+                    TheoryOutcome::Unsat => {
                         let mut block: Vec<Lit> =
                             euf_eq.iter().map(|&(lit, _, _)| flip(lit, &sat)).collect();
                         block.extend(arith_atoms.iter().map(|a| flip(a.lit, &sat)));
@@ -267,25 +268,27 @@ fn flip(lit: Lit, sat: &Solver) -> Lit {
     if sat.model_holds(lit) { !lit } else { lit }
 }
 
-/// Build the congruence closure for the current EUF atom assignment, returning
-/// it when consistent (so callers can read equivalence classes for the model).
-fn euf_model(
-    m: &AstManager,
-    euf_eq: &[(Lit, AstId, AstId)],
-    roots: &[AstId],
-    sat: &Solver,
-) -> Option<Egraph> {
-    let mut eqs = Vec::new();
-    let mut diseqs = Vec::new();
-    for &(lit, a, b) in euf_eq {
-        if sat.model_holds(lit) {
-            eqs.push((a, b));
-        } else {
-            diseqs.push((a, b));
+/// The shared (interface) terms of a combined problem: arithmetic leaf variables
+/// that also occur inside some EUF equality. These are the terms whose equality
+/// the two theories exchange in the Nelson–Oppen combination.
+fn interface_terms(m: &AstManager, euf_roots: &[AstId], arith_atoms: &[ArithAtom]) -> Vec<AstId> {
+    let mut euf_universe: BTreeSet<AstId> = BTreeSet::new();
+    for &r in euf_roots {
+        for t in m.postorder(r) {
+            euf_universe.insert(t);
         }
     }
-    let mut g = Egraph::new(m, roots);
-    g.is_consistent(m, &eqs, &diseqs).then_some(g)
+    let mut shared: BTreeSet<AstId> = BTreeSet::new();
+    for atom in arith_atoms {
+        for side in [atom.a, atom.b] {
+            for v in ast_to_lin(m, side).vars() {
+                if euf_universe.contains(&v) {
+                    shared.insert(v);
+                }
+            }
+        }
+    }
+    shared.into_iter().collect()
 }
 
 /// An arithmetic theory atom: either a comparison or an equality.
@@ -327,12 +330,16 @@ enum Feas {
     Unknown,
 }
 
-/// Check the current arithmetic atom assignment, returning a satisfying rational
-/// assignment (integrality-respecting) when consistent.
-fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Feas {
-    if atoms.is_empty() {
-        return Feas::Sat(BTreeMap::new());
-    }
+/// The arithmetic constraint system for the current atom assignment: equality /
+/// comparison constraints, disequalities (`expr ≠ 0`), and the integer-sorted
+/// leaf variables.
+struct ArithSystem {
+    cons: Vec<Constraint>,
+    diseqs: Vec<LinExpr>,
+    int_set: BTreeSet<AstId>,
+}
+
+fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> ArithSystem {
     let mut cons: Vec<Constraint> = Vec::new();
     let mut diseqs: Vec<LinExpr> = Vec::new();
     for atom in atoms {
@@ -348,8 +355,6 @@ fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Feas {
             cons.push(comparison_constraint(atom.op, holds, diff));
         }
     }
-    // Integer-sorted leaf variables must take integral values; enforce that with
-    // branch-and-bound on top of the rational (LRA) relaxation.
     let mut int_set: BTreeSet<AstId> = BTreeSet::new();
     for c in &cons {
         collect_int_vars(m, &c.expr, &mut int_set);
@@ -357,19 +362,103 @@ fn arith_model(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Feas {
     for d in &diseqs {
         collect_int_vars(m, d, &mut int_set);
     }
+    ArithSystem {
+        cons,
+        diseqs,
+        int_set,
+    }
+}
+
+/// Decide feasibility of an [`ArithSystem`] (LRA relaxation + integer B&B, with
+/// the gcd/divisibility precheck for all-integer equalities).
+fn arith_feasible(sys: &ArithSystem) -> Feas {
     // Sound necessary condition: an all-integer equality with no integer
     // solution (by the gcd/divisibility test) is infeasible — this decides
     // parity-style conflicts like 2x = 2y + 1 that branch-and-bound cannot.
-    for c in &cons {
+    for c in &sys.cons {
         if c.rel == Rel::Eq
-            && c.expr.vars().all(|v| int_set.contains(&v))
+            && c.expr.vars().all(|v| sys.int_set.contains(&v))
             && c.expr.integer_equality_infeasible()
         {
             return Feas::Unsat;
         }
     }
-    let int_vars: Vec<AstId> = int_set.into_iter().collect();
-    integer_feasible(&cons, &diseqs, &int_vars, 0)
+    let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
+    integer_feasible(&sys.cons, &sys.diseqs, &int_vars, 0)
+}
+
+/// Does the arithmetic system *entail* `u = v`? True iff neither `u < v` nor
+/// `u > v` is consistent with it — i.e. every solution has `u = v`. Used to
+/// share implied equalities with the EUF theory (Nelson–Oppen).
+fn arith_entails_eq(m: &AstManager, sys: &ArithSystem, u: AstId, v: AstId) -> bool {
+    let diff = ast_to_lin(m, u).sub(&ast_to_lin(m, v)); // u - v
+    let mut lt = sys.cons.clone();
+    lt.push(Constraint::lt(diff.clone())); // u - v < 0
+    if feasible_with_diseqs(&lt, &sys.diseqs) {
+        return false;
+    }
+    let mut gt = sys.cons.clone();
+    gt.push(Constraint::lt(diff.neg())); // v - u < 0  ⟺  u - v > 0
+    !feasible_with_diseqs(&gt, &sys.diseqs)
+}
+
+/// The result of the combined theory check for one Boolean assignment.
+enum TheoryOutcome {
+    /// Consistent: a rational assignment plus the congruence closure (for models).
+    Sat(Assignment, Egraph),
+    /// Definitively inconsistent — the assignment must be blocked.
+    Unsat,
+    /// Inconclusive (the arithmetic search gave up).
+    Unknown,
+}
+
+/// The combined EUF + arithmetic theory check for one Boolean assignment, with
+/// Nelson–Oppen sharing of arithmetic-implied equalities into the congruence
+/// closure.
+fn theory_check(
+    m: &AstManager,
+    euf_eq: &[(Lit, AstId, AstId)],
+    euf_roots: &[AstId],
+    arith_atoms: &[ArithAtom],
+    sat: &Solver,
+) -> TheoryOutcome {
+    // EUF equalities / disequalities implied by the assignment.
+    let mut eqs = Vec::new();
+    let mut diseqs = Vec::new();
+    for &(lit, a, b) in euf_eq {
+        if sat.model_holds(lit) {
+            eqs.push((a, b));
+        } else {
+            diseqs.push((a, b));
+        }
+    }
+    // Arithmetic feasibility (definitive Unsat ends this assignment early).
+    let sys = build_arith_system(m, arith_atoms, sat);
+    let arith = arith_feasible(&sys);
+    if matches!(arith, Feas::Unsat) {
+        return TheoryOutcome::Unsat;
+    }
+    // Nelson–Oppen: add every arithmetic-implied equality between shared
+    // (interface) terms to the EUF equalities, so congruence sees them.
+    let interface = interface_terms(m, euf_roots, arith_atoms);
+    let mut all_eqs = eqs;
+    for i in 0..interface.len() {
+        for j in (i + 1)..interface.len() {
+            let (u, v) = (interface[i], interface[j]);
+            if arith_entails_eq(m, &sys, u, v) {
+                all_eqs.push((u, v));
+            }
+        }
+    }
+    let mut g = Egraph::new(m, euf_roots);
+    if !g.is_consistent(m, &all_eqs, &diseqs) {
+        return TheoryOutcome::Unsat;
+    }
+    match arith {
+        Feas::Sat(assign) => TheoryOutcome::Sat(assign, g),
+        Feas::Unknown => TheoryOutcome::Unknown,
+        Feas::Unsat => unreachable!(),
+    }
 }
 
 /// Record the integer-sorted variables of `e` into `set`.
@@ -817,6 +906,49 @@ mod tests {
         let feq = m.mk_eq(fx, fy);
         let nfeq = m.mk_not(feq);
         assert_eq!(check(&m, nfeq), SmtResult::Sat);
+    }
+
+    #[test]
+    fn nelson_oppen_implied_equality_unsat() {
+        // (<= x y) ∧ (<= y x) forces x = y in the arithmetic theory; that shared
+        // equality must propagate to EUF so congruence gives f(x) = f(y) = a,
+        // contradicting f(y) ≠ a. Requires Nelson–Oppen equality sharing.
+        let mut m = AstManager::new();
+        let s = m.mk_uninterpreted_sort(Symbol::new("S"));
+        let int = m.mk_int_sort();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let a = constant(&mut m, "a", s);
+        let f = m.mk_func_decl(Symbol::new("f"), &[int], s);
+        let fx = m.mk_app(f, &[x]);
+        let fy = m.mk_app(f, &[y]);
+        let le1 = m.mk_le(x, y);
+        let le2 = m.mk_le(y, x);
+        let e1 = m.mk_eq(fx, a);
+        let e2 = m.mk_eq(fy, a);
+        let ne2 = m.mk_not(e2);
+        let formula = m.mk_and(&[le1, le2, e1, ne2]);
+        assert_eq!(check(&m, formula), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn nelson_oppen_no_forced_equality_sat() {
+        // With only (<= x y), x = y is not entailed, so f(x) and f(y) may differ.
+        let mut m = AstManager::new();
+        let s = m.mk_uninterpreted_sort(Symbol::new("S"));
+        let int = m.mk_int_sort();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let a = constant(&mut m, "a", s);
+        let f = m.mk_func_decl(Symbol::new("f"), &[int], s);
+        let fx = m.mk_app(f, &[x]);
+        let fy = m.mk_app(f, &[y]);
+        let le1 = m.mk_le(x, y);
+        let e1 = m.mk_eq(fx, a);
+        let e2 = m.mk_eq(fy, a);
+        let ne2 = m.mk_not(e2);
+        let formula = m.mk_and(&[le1, e1, ne2]);
+        assert_eq!(check(&m, formula), SmtResult::Sat);
     }
 
     #[test]

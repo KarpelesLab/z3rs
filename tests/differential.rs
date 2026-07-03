@@ -164,6 +164,23 @@ const CORPUS: &[Case] = &[
         name: "divisibility_unsat",
         script: "(declare-const x Int)(assert (= (* 3 x) 7))(check-sat)",
     },
+    Case {
+        name: "nelson_oppen_lia_unsat",
+        script: "(declare-sort S 0)(declare-fun f (Int) S)(declare-const a S)
+                 (declare-const x Int)(declare-const y Int)
+                 (assert (<= x y))(assert (<= y x))(assert (= (f x) a))(assert (not (= (f y) a)))(check-sat)",
+    },
+    Case {
+        name: "nelson_oppen_lra_unsat",
+        script: "(declare-fun f (Real) Real)(declare-const x Real)(declare-const y Real)
+                 (assert (<= x y))(assert (<= y x))(assert (not (= (f x) (f y))))(check-sat)",
+    },
+    Case {
+        name: "nelson_oppen_sat",
+        script: "(declare-sort S 0)(declare-fun f (Int) S)(declare-const a S)
+                 (declare-const x Int)(declare-const y Int)
+                 (assert (<= x y))(assert (= (f x) a))(assert (not (= (f y) a)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
