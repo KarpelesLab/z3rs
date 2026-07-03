@@ -124,14 +124,16 @@ z3rs depends on `puremp` with `default-features = false, features =
 (`cargo tree` for z3rs is just `z3rs → puremp`). The dependency-free arithmetic
 core keeps the whole "no GMP / no native code" guarantee intact.
 
-z3rs uses `puremp`'s types (`puremp::Int`, `puremp::Rational`, `puremp::Float`)
-**directly** throughout — `puremp` is ours, so there is no wrapper/facade layer;
-the crate is re-exported as [`z3rs::puremp`](src/lib.rs) for API consumers. Z3's
-specialized numerals that `puremp` does not provide are ported in-tree **on top
-of** `puremp::Int`:
-- `util::mpbq` — dyadic rationals `n·2^-k` (nlsat / realclosure / intervals)
-- `util::mpff`, `util::mpfx` — Z3's fixed-precision perf specializations
-- `util::inf_rational`, … — the ε-augmented numerals
+z3rs uses `puremp`'s types **directly** throughout — `puremp` is ours, so there
+is no wrapper/facade layer; the crate is re-exported as
+[`z3rs::puremp`](src/lib.rs) for API consumers. As of `puremp` 0.1.2 it covers
+Z3's **entire** numeral stack, so nothing in this layer is ported in-tree:
+
+| Z3 `util`                    | `puremp`      |   | Z3 `util`                  | `puremp`      |
+|------------------------------|---------------|---|----------------------------|---------------|
+| `mpn` / `mpz`                | `Nat` / `Int` |   | `mpbq` (dyadic `n·2^-k`)   | `Dyadic`      |
+| `mpq` / `rational`           | `Rational`    |   | `mpf` (software IEEE-754)  | `Float`       |
+| `inf_rational` (ε-augmented) | `InfRational` |   | `mpff` / `mpfx` (fixed)    | `FixedFloat`  |
 
 Everything above this layer (`ast`, `smt`, …) manipulates numerals through these
 types, so the port never touches GMP concerns.
@@ -157,12 +159,12 @@ strictly dependency-ordered; later phases may begin their scaffolding early but
 cannot pass their exit criterion until predecessors do.
 
 ### Phase 0 — Foundation (`util`)
-Numerals are provided by `puremp` (§4) — so Phase 0 is the rest of `util`: core
-containers, `symbol` interning, `vector`/`buffer`, `hashtable`, `params`/`gparams`,
-`rlimit`, `sexpr`, `region`, `memory`, `lbool`, `statistics`, plus the specialized
-numerals layered on `puremp::Int` (`mpbq`, `mpff`/`mpfx`, `inf_rational`).
-- **Exit:** container/symbol/params semantics tested; the specialized numerals
-  pass a fuzz suite; the whole `util` layer builds `no_std + alloc`.
+The **entire** numeral stack is provided by `puremp` (§4) — so Phase 0 is the
+rest of `util`: core containers, `symbol` interning, `vector`/`buffer`,
+`hashtable`, `params`/`gparams`, `rlimit`, `sexpr`, `region`, `memory`, `lbool`,
+`statistics`.
+- **Exit:** container/symbol/params semantics tested; the whole `util` layer
+  builds `no_std + alloc`.
 
 ### Phase 1 — Terms & exact math (`ast`, `math`, `params`)
 `ast` core (`ast`, `sort`, `func_decl`, `app`, `quantifier`, `ast_manager`,

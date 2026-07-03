@@ -107,9 +107,10 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(test)]
 mod tests {
-    use puremp::{Int, Rational};
+    use puremp::{Dyadic, Int, Rational};
 
-    /// Smoke-test that the `puremp` numeric backend is wired and usable.
+    /// Smoke-test that the `puremp` numeric backend — including the numeral
+    /// types z3rs needs beyond integers/rationals — is wired and usable.
     #[test]
     fn numeric_backend_is_wired() {
         let a: Int = "123456789012345678901234567890".parse().unwrap();
@@ -119,5 +120,9 @@ mod tests {
         let half = Rational::new(Int::from(1), Int::from(2));
         let third = Rational::new(Int::from(1), Int::from(3));
         assert_eq!(&half + &third, Rational::new(Int::from(5), Int::from(6)));
+
+        // Dyadic (Z3's `mpbq`): mantissa·2^exponent, so 3·2^-1 == 3/2.
+        let three_halves = Dyadic::new(Int::from(3), -1);
+        assert_eq!(three_halves.to_rational(), Rational::new(Int::from(3), Int::from(2)));
     }
 }
