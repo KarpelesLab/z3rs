@@ -85,6 +85,17 @@ fn euclid_div_mod(a: &Int, b: &Int) -> (Int, Int) {
     }
 }
 
+/// The content of an SMT-LIB string literal token (`"…"`), with the surrounding
+/// quotes removed and doubled `""` collapsed to a single quote. Non-string tokens
+/// are returned unchanged.
+fn unquote_string(tok: &str) -> String {
+    if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
+        tok[1..tok.len() - 1].replace("\"\"", "\"")
+    } else {
+        tok.to_string()
+    }
+}
+
 /// The `:named` label of an assertion written `(! term :named name …)`, if any.
 fn named_label(s: &SExpr) -> Option<String> {
     let SExpr::List(l) = s else { return None };
@@ -161,6 +172,28 @@ fn tokenize(input: &str) -> Vec<String> {
             '(' | ')' => {
                 toks.push(c.to_string());
                 chars.next();
+            }
+            '"' => {
+                // String literal "…"; a doubled "" is an embedded quote. Kept
+                // with its surrounding quotes so it stays a single, recognizable
+                // token.
+                chars.next(); // opening quote
+                let mut s = String::from("\"");
+                while let Some(&c) = chars.peek() {
+                    chars.next();
+                    if c == '"' {
+                        if chars.peek() == Some(&'"') {
+                            s.push('"');
+                            s.push('"');
+                            chars.next();
+                            continue;
+                        }
+                        break;
+                    }
+                    s.push(c);
+                }
+                s.push('"'); // closing quote
+                toks.push(s);
             }
             '|' => {
                 // quoted symbol |...|
@@ -348,7 +381,18 @@ impl Context {
             _ => return Err("expected a command list".to_string()),
         };
         match Self::sym(&list[0])? {
-            "set-logic" | "set-info" | "set-option" | "get-info" | "echo" | "exit" => Ok(None),
+            "set-logic" | "set-info" | "set-option" | "exit" => Ok(None),
+            "echo" => Ok(Some(match list.get(1) {
+                Some(SExpr::Atom(a)) => unquote_string(a),
+                _ => String::new(),
+            })),
+            "get-info" => match list.get(1) {
+                Some(SExpr::Atom(k)) if k == ":version" => {
+                    Ok(Some("(:version \"0.0.1\")".to_string()))
+                }
+                Some(SExpr::Atom(k)) if k == ":name" => Ok(Some("(:name \"z3rs\")".to_string())),
+                _ => Ok(None),
+            },
             "push" => {
                 let n = Self::level_arg(list)?;
                 for _ in 0..n {
@@ -1720,6 +1764,21 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn echo_and_get_info() {
+        // echo prints the string content; string literals with spaces tokenize
+        // as one token.
+        let script = "
+            (echo \"hello world\")
+            (get-info :name)
+            (declare-const x Int) (assert (> x 0)) (check-sat)
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["hello world", "(:name \"z3rs\")", "sat"]
+        );
     }
 
     #[test]
