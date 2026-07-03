@@ -9,6 +9,7 @@
 
 use std::process::ExitCode;
 
+use z3rs::cmd_context::run_smt2;
 use z3rs::sat::{SatResult, parse_dimacs};
 use z3rs::util::lbool::LBool;
 
@@ -28,8 +29,8 @@ fn print_usage() {
     println!("Options:");
     println!("  -h, --help       print this message");
     println!("  --version        print version information");
+    println!("  -smt2            read input as SMT-LIB2 (default; QF_UF subset)");
     println!("  -dimacs          read input in DIMACS CNF format (default for *.cnf)");
-    println!("  -smt2            read input as SMT-LIB2                         [TODO]");
     println!("  -dl              read input as Datalog                         [TODO]");
 }
 
@@ -73,6 +74,29 @@ fn run_dimacs(path: &str) -> ExitCode {
     }
 }
 
+/// Run an SMT-LIB2 script file, printing one response line per `(check-sat)`.
+fn run_smt2_file(path: &str) -> ExitCode {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("z3rs: cannot read {path:?}: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    match run_smt2(&text) {
+        Ok(responses) => {
+            for r in responses {
+                println!("{r}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("z3rs: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -94,6 +118,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "-dimacs" => force_dimacs = true,
+            "-smt2" | "-in" => {} // format hints; inferred from extension otherwise
             other if other.starts_with('-') => {
                 eprintln!("z3rs: unknown option {other:?}");
                 return ExitCode::from(1);
@@ -106,11 +131,7 @@ fn main() -> ExitCode {
         Some(path) if force_dimacs || path.ends_with(".cnf") || path.ends_with(".dimacs") => {
             run_dimacs(&path)
         }
-        Some(path) => {
-            eprintln!("z3rs: don't know how to handle {path:?} yet (only DIMACS is wired up).");
-            eprintln!("z3rs: use -dimacs for CNF; SMT-LIB2 support is coming. See ROADMAP.md.");
-            ExitCode::from(1)
-        }
+        Some(path) => run_smt2_file(&path), // default: SMT-LIB2 (e.g. *.smt2)
         None => {
             print_usage();
             ExitCode::SUCCESS

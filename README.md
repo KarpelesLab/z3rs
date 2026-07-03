@@ -18,9 +18,12 @@ conveniences. It aims to be behaviourally faithful to upstream Z3.
 > progress.
 >
 > ```sh
-> $ z3rs problem.cnf
+> $ z3rs problem.cnf          # DIMACS CNF
 > s SATISFIABLE
 > v 1 2 3 0
+>
+> $ z3rs problem.smt2         # SMT-LIB2 (QF_UF)
+> unsat
 > ```
 
 ## Why
