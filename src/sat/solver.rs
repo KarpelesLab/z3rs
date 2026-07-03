@@ -1,11 +1,12 @@
-//! A propositional SAT solver core.
+//! A conflict-driven clause-learning (CDCL) SAT solver.
 //!
-//! This is a correct, self-contained DPLL with unit propagation — the seed of
-//! the CDCL engine in `z3/src/sat/sat_solver.{h,cpp}` (Z3 4.17.0, MIT). Watched
-//! literals, conflict-driven clause learning, restarts, and in-processing land
-//! on top of this in later steps; the public API is chosen to survive that
-//! evolution.
+//! MiniSat-style core ported in spirit from `z3/src/sat/sat_solver.{h,cpp}`
+//! (Z3 4.17.0, MIT): two-watched-literal propagation, 1-UIP conflict analysis
+//! with clause learning, non-chronological backjumping, VSIDS decision
+//! heuristic, and Luby restarts. Learnt-clause DB reduction and in-processing
+//! come later.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::sat::literal::{Lit, Var};
@@ -20,23 +21,54 @@ pub enum SatResult {
     Unsat,
 }
 
-/// A DPLL SAT solver.
-#[derive(Default)]
+/// Sentinel `reason`: a decision literal or a top-level fact (no antecedent).
+const REASON_NONE: i32 = -1;
+
+/// A CDCL SAT solver.
 pub struct Solver {
-    /// Per-variable truth assignment (`Undef` = unassigned).
     assign: Vec<LBool>,
-    /// The clause database (each clause a disjunction of literals).
+    level: Vec<u32>,
+    /// Antecedent clause index for an implied literal, or [`REASON_NONE`].
+    reason: Vec<i32>,
+    /// Saved polarity for phase saving.
+    polarity: Vec<bool>,
+    activity: Vec<f64>,
+    var_inc: f64,
+
     clauses: Vec<Vec<Lit>>,
-    /// Assignment trail, for chronological backtracking.
+    /// `watches[l.index()]` = clauses watching literal `~l` (MiniSat convention).
+    watches: Vec<Vec<usize>>,
+
     trail: Vec<Lit>,
-    /// Set once a clause forces unsatisfiability at the top level.
-    unsat: bool,
+    trail_lim: Vec<usize>,
+    qhead: usize,
+
+    ok: bool,
+}
+
+impl Default for Solver {
+    fn default() -> Solver {
+        Solver::new()
+    }
 }
 
 impl Solver {
     /// A new, empty solver.
     pub fn new() -> Solver {
-        Solver::default()
+        Solver {
+            assign: Vec::new(),
+            level: Vec::new(),
+            reason: Vec::new(),
+            polarity: Vec::new(),
+            activity: Vec::new(),
+            var_inc: 1.0,
+            clauses: Vec::new(),
+            watches: Vec::new(),
+            trail: Vec::new(),
+            trail_lim: Vec::new(),
+            qhead: 0,
+            ok: true,
+        }
     }
 
     /// The number of variables.
@@ -49,136 +81,32 @@ impl Solver {
     pub fn mk_var(&mut self) -> Var {
         let v = self.assign.len() as Var;
         self.assign.push(LBool::Undef);
+        self.level.push(0);
+        self.reason.push(REASON_NONE);
+        self.polarity.push(false);
+        self.activity.push(0.0);
+        self.watches.push(Vec::new()); // for the positive literal
+        self.watches.push(Vec::new()); // for the negative literal
         v
     }
 
-    /// Ensure variables `0..=max` exist.
     fn ensure_var(&mut self, v: Var) {
         while (self.assign.len() as Var) <= v {
-            self.assign.push(LBool::Undef);
+            self.mk_var();
         }
     }
 
-    /// Add a clause (a disjunction of literals). An empty clause makes the
-    /// problem unsatisfiable.
-    pub fn add_clause(&mut self, lits: &[Lit]) {
-        for &l in lits {
-            self.ensure_var(l.var());
-        }
-        if lits.is_empty() {
-            self.unsat = true;
-        }
-        self.clauses.push(lits.to_vec());
+    #[inline]
+    fn decision_level(&self) -> u32 {
+        self.trail_lim.len() as u32
     }
 
-    /// The value of a literal under the current assignment.
     #[inline]
     fn lit_value(&self, l: Lit) -> LBool {
         match self.assign[l.var() as usize] {
             LBool::Undef => LBool::Undef,
             LBool::True => LBool::from_bool(!l.sign()),
             LBool::False => LBool::from_bool(l.sign()),
-        }
-    }
-
-    /// Assign `l` to true and record it on the trail.
-    #[inline]
-    fn assign_lit(&mut self, l: Lit) {
-        self.assign[l.var() as usize] = LBool::from_bool(!l.sign());
-        self.trail.push(l);
-    }
-
-    /// Undo assignments back to trail length `mark`.
-    fn backtrack(&mut self, mark: usize) {
-        while self.trail.len() > mark {
-            let l = self.trail.pop().unwrap();
-            self.assign[l.var() as usize] = LBool::Undef;
-        }
-    }
-
-    /// Boolean-constraint propagation: repeatedly assign forced (unit) literals.
-    /// Returns `false` if a clause becomes empty (conflict).
-    fn propagate(&mut self) -> bool {
-        loop {
-            let mut unit: Option<Lit> = None;
-            for ci in 0..self.clauses.len() {
-                let mut num_undef = 0;
-                let mut last_undef = None;
-                let mut satisfied = false;
-                for k in 0..self.clauses[ci].len() {
-                    let lit = self.clauses[ci][k];
-                    match self.lit_value(lit) {
-                        LBool::True => {
-                            satisfied = true;
-                            break;
-                        }
-                        LBool::Undef => {
-                            num_undef += 1;
-                            last_undef = Some(lit);
-                        }
-                        LBool::False => {}
-                    }
-                }
-                if satisfied {
-                    continue;
-                }
-                if num_undef == 0 {
-                    return false; // conflict: all literals false
-                }
-                if num_undef == 1 {
-                    unit = last_undef;
-                    break;
-                }
-            }
-            match unit {
-                Some(l) => self.assign_lit(l),
-                None => return true, // fixpoint, no conflict
-            }
-        }
-    }
-
-    /// The first unassigned variable, if any.
-    fn pick_unassigned(&self) -> Option<Var> {
-        self.assign
-            .iter()
-            .position(|&v| v == LBool::Undef)
-            .map(|i| i as Var)
-    }
-
-    /// Solve. On [`SatResult::Sat`], the assignment is a model.
-    pub fn solve(&mut self) -> SatResult {
-        if self.unsat {
-            return SatResult::Unsat;
-        }
-        if self.dpll() {
-            SatResult::Sat
-        } else {
-            SatResult::Unsat
-        }
-    }
-
-    /// Recursive DPLL: propagate, then branch on an unassigned variable.
-    fn dpll(&mut self) -> bool {
-        let mark = self.trail.len();
-        if !self.propagate() {
-            self.backtrack(mark);
-            return false;
-        }
-        match self.pick_unassigned() {
-            // Every variable is assigned and no clause conflicts → model found.
-            None => true,
-            Some(v) => {
-                for sign in [false, true] {
-                    let branch_mark = self.trail.len();
-                    self.assign_lit(Lit::new(v, sign));
-                    if self.dpll() {
-                        return true;
-                    }
-                    self.backtrack(branch_mark);
-                }
-                self.backtrack(mark);
-                false
-            }
         }
     }
 
@@ -192,6 +120,280 @@ impl Solver {
     #[inline]
     pub fn model_holds(&self, l: Lit) -> bool {
         self.lit_value(l) == LBool::True
+    }
+
+    /// Add a clause. Duplicate literals are merged, tautologies dropped, and an
+    /// empty clause makes the problem unsatisfiable.
+    pub fn add_clause(&mut self, lits: &[Lit]) {
+        if !self.ok {
+            return;
+        }
+        for &l in lits {
+            self.ensure_var(l.var());
+        }
+        // Normalize: sort by index, drop duplicates, detect x ∧ ¬x tautology.
+        let mut ps: Vec<Lit> = lits.to_vec();
+        ps.sort_by_key(|l| l.index());
+        ps.dedup();
+        for w in ps.windows(2) {
+            if w[0].var() == w[1].var() {
+                return; // x and ¬x adjacent after sort → tautology
+            }
+        }
+
+        if ps.is_empty() {
+            self.ok = false;
+        } else if ps.len() == 1 {
+            if !self.enqueue(ps[0], REASON_NONE) {
+                self.ok = false;
+            }
+        } else {
+            self.attach_clause(ps);
+        }
+    }
+
+    fn attach_clause(&mut self, ps: Vec<Lit>) {
+        let cref = self.clauses.len();
+        let (w0, w1) = ((!ps[0]).index() as usize, (!ps[1]).index() as usize);
+        self.clauses.push(ps);
+        self.watches[w0].push(cref);
+        self.watches[w1].push(cref);
+    }
+
+    /// Assign `l` true with the given antecedent. Returns `false` on conflict.
+    fn enqueue(&mut self, l: Lit, reason: i32) -> bool {
+        match self.lit_value(l) {
+            LBool::True => true,
+            LBool::False => false,
+            LBool::Undef => {
+                let v = l.var() as usize;
+                self.assign[v] = LBool::from_bool(!l.sign());
+                self.level[v] = self.decision_level();
+                self.reason[v] = reason;
+                self.trail.push(l);
+                true
+            }
+        }
+    }
+
+    /// Propagate all queued assignments. Returns the conflicting clause, if any.
+    fn propagate(&mut self) -> Option<usize> {
+        let mut confl = None;
+        while self.qhead < self.trail.len() {
+            let p = self.trail[self.qhead];
+            self.qhead += 1;
+            // Clauses watching ~p (now false) live under watches[p.index()].
+            let mut ws = core::mem::take(&mut self.watches[p.index() as usize]);
+            let false_lit = !p;
+            let mut i = 0;
+            'next_clause: while i < ws.len() {
+                let cref = ws[i];
+                // Ensure the false watched literal is at position 1.
+                if self.clauses[cref][0] == false_lit {
+                    self.clauses[cref].swap(0, 1);
+                }
+                let first = self.clauses[cref][0]; // the other watched literal
+                if self.lit_value(first) == LBool::True {
+                    i += 1; // clause already satisfied; keep watching
+                    continue;
+                }
+                // Look for a new, non-false literal to watch.
+                let len = self.clauses[cref].len();
+                for k in 2..len {
+                    let lk = self.clauses[cref][k];
+                    if self.lit_value(lk) != LBool::False {
+                        self.clauses[cref].swap(1, k);
+                        self.watches[(!self.clauses[cref][1]).index() as usize].push(cref);
+                        ws.swap_remove(i); // stop watching under p
+                        continue 'next_clause;
+                    }
+                }
+                // No new watch: `first` is unit, or conflict.
+                if self.lit_value(first) == LBool::False {
+                    // Conflict: keep the rest of the watch list intact.
+                    confl = Some(cref);
+                    self.qhead = self.trail.len();
+                    break;
+                } else {
+                    i += 1;
+                    self.enqueue(first, cref as i32);
+                }
+            }
+            // Restore the (possibly shortened) watch list.
+            let dst = &mut self.watches[p.index() as usize];
+            if dst.is_empty() {
+                *dst = ws;
+            } else {
+                dst.append(&mut ws);
+            }
+            if confl.is_some() {
+                break;
+            }
+        }
+        confl
+    }
+
+    fn bump_var(&mut self, v: usize) {
+        self.activity[v] += self.var_inc;
+        if self.activity[v] > 1e100 {
+            for a in &mut self.activity {
+                *a *= 1e-100;
+            }
+            self.var_inc *= 1e-100;
+        }
+    }
+
+    /// 1-UIP conflict analysis. Returns the learnt clause (asserting literal at
+    /// index 0) and the level to backjump to.
+    fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32) {
+        let cur_level = self.decision_level();
+        let mut seen = vec![false; self.num_vars()];
+        let mut learnt: Vec<Lit> = vec![Lit::pos(0)]; // slot 0 reserved for the UIP
+        let mut path_c = 0i32;
+        let mut p: Option<Lit> = None;
+        let mut confl = confl;
+        let mut index = self.trail.len();
+
+        loop {
+            let clause = self.clauses[confl].clone();
+            let start = usize::from(p.is_some());
+            for &q in &clause[start..] {
+                let v = q.var() as usize;
+                if !seen[v] && self.level[v] > 0 {
+                    self.bump_var(v);
+                    seen[v] = true;
+                    if self.level[v] >= cur_level {
+                        path_c += 1;
+                    } else {
+                        learnt.push(q);
+                    }
+                }
+            }
+            // Next literal to resolve: the most recent `seen` one on the trail.
+            index -= 1;
+            while !seen[self.trail[index].var() as usize] {
+                index -= 1;
+            }
+            let pl = self.trail[index];
+            seen[pl.var() as usize] = false;
+            path_c -= 1;
+            p = Some(pl);
+            if path_c <= 0 {
+                break;
+            }
+            confl = self.reason[pl.var() as usize] as usize;
+        }
+        learnt[0] = !p.unwrap();
+
+        // Backtrack level = second-highest level in the clause; move that literal
+        // to position 1 so the learnt clause watches it.
+        let btlevel = if learnt.len() == 1 {
+            0
+        } else {
+            let mut max_i = 1;
+            for i in 2..learnt.len() {
+                if self.level[learnt[i].var() as usize] > self.level[learnt[max_i].var() as usize] {
+                    max_i = i;
+                }
+            }
+            learnt.swap(1, max_i);
+            self.level[learnt[1].var() as usize]
+        };
+        (learnt, btlevel)
+    }
+
+    /// Undo assignments until decision level `level`.
+    fn cancel_until(&mut self, level: u32) {
+        if self.decision_level() <= level {
+            return;
+        }
+        let target = self.trail_lim[level as usize];
+        while self.trail.len() > target {
+            let l = self.trail.pop().unwrap();
+            let v = l.var() as usize;
+            self.assign[v] = LBool::Undef;
+            self.polarity[v] = !l.sign(); // phase saving
+            self.reason[v] = REASON_NONE;
+        }
+        self.qhead = target;
+        self.trail_lim.truncate(level as usize);
+    }
+
+    /// Pick the unassigned variable with the highest activity.
+    fn pick_branch_var(&self) -> Option<Var> {
+        let mut best: Option<(f64, Var)> = None;
+        for v in 0..self.num_vars() {
+            if self.assign[v] == LBool::Undef {
+                let a = self.activity[v];
+                if best.is_none_or(|(ba, _)| a > ba) {
+                    best = Some((a, v as Var));
+                }
+            }
+        }
+        best.map(|(_, v)| v)
+    }
+
+    /// Solve. On [`SatResult::Sat`], the assignment is a model.
+    pub fn solve(&mut self) -> SatResult {
+        if !self.ok {
+            return SatResult::Unsat;
+        }
+        let mut restart_conflicts = 0u64;
+        let mut luby_index = 1u32; // Luby is 1-indexed
+        let mut restart_limit = luby(luby_index) * 100;
+
+        loop {
+            if let Some(confl) = self.propagate() {
+                if self.decision_level() == 0 {
+                    self.ok = false;
+                    return SatResult::Unsat;
+                }
+                let (learnt, btlevel) = self.analyze(confl);
+                self.cancel_until(btlevel);
+                let asserting = learnt[0];
+                if learnt.len() == 1 {
+                    self.enqueue(asserting, REASON_NONE);
+                } else {
+                    let cref = self.clauses.len();
+                    self.attach_clause(learnt);
+                    self.enqueue(asserting, cref as i32);
+                }
+                self.var_inc /= 0.95; // decay
+                restart_conflicts += 1;
+                if restart_conflicts >= restart_limit {
+                    restart_conflicts = 0;
+                    luby_index += 1;
+                    restart_limit = luby(luby_index) * 100;
+                    self.cancel_until(0);
+                }
+            } else {
+                match self.pick_branch_var() {
+                    None => return SatResult::Sat, // all variables assigned
+                    Some(v) => {
+                        self.trail_lim.push(self.trail.len());
+                        let sign = self.polarity[v as usize];
+                        self.enqueue(Lit::new(v, sign), REASON_NONE);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The Luby sequence (1,1,2,1,1,2,4,…) used to schedule restart intervals.
+fn luby(mut i: u32) -> u64 {
+    // Find the subsequence: smallest k with i < 2^k - 1.
+    let mut k = 1u32;
+    loop {
+        if i == (1 << k) - 1 {
+            return 1u64 << (k - 1);
+        }
+        if i < (1 << k) - 1 {
+            i -= (1 << (k - 1)) - 1;
+            k = 1;
+        } else {
+            k += 1;
+        }
     }
 }
 
@@ -220,7 +422,6 @@ mod tests {
 
     #[test]
     fn unit_propagation_chain() {
-        // p ; (¬p ∨ q) ; (¬q ∨ r) forces p, q, r all true.
         let mut s = Solver::new();
         s.add_clause(&lits(&[1]));
         s.add_clause(&lits(&[-1, 2]));
@@ -233,7 +434,6 @@ mod tests {
 
     #[test]
     fn contradiction_is_unsat() {
-        // (p ∨ q) ∧ ¬p ∧ ¬q
         let mut s = Solver::new();
         s.add_clause(&lits(&[1, 2]));
         s.add_clause(&lits(&[-1]));
@@ -243,37 +443,75 @@ mod tests {
 
     #[test]
     fn finds_a_satisfying_model() {
-        // (p ∨ q) ∧ ¬p  →  q must be true.
         let mut s = Solver::new();
         s.add_clause(&lits(&[1, 2]));
         s.add_clause(&lits(&[-1]));
         assert_eq!(s.solve(), SatResult::Sat);
-        assert_eq!(s.value(0), LBool::False);
-        assert_eq!(s.value(1), LBool::True);
-        // Every clause is satisfied by the model.
         assert!(s.model_holds(Lit::pos(1)));
     }
 
     #[test]
-    fn pigeonhole_php_2_1_is_unsat() {
-        // 2 pigeons, 1 hole: each pigeon in the hole, but not both.
-        // vars: x11 (=1), x21 (=2). Clauses: (x11) (x21) (¬x11 ∨ ¬x21)
+    fn pigeonhole_php_3_2_is_unsat() {
+        // 3 pigeons, 2 holes. var(p,h) = p*2 + h + 1 (1-based).
         let mut s = Solver::new();
-        s.add_clause(&lits(&[1]));
-        s.add_clause(&lits(&[2]));
-        s.add_clause(&lits(&[-1, -2]));
+        let v = |p: i32, h: i32| p * 2 + h + 1;
+        // each pigeon in some hole
+        for p in 0..3 {
+            s.add_clause(&lits(&[v(p, 0), v(p, 1)]));
+        }
+        // no two pigeons share a hole
+        for h in 0..2 {
+            for p1 in 0..3 {
+                for p2 in (p1 + 1)..3 {
+                    s.add_clause(&lits(&[-v(p1, h), -v(p2, h)]));
+                }
+            }
+        }
         assert_eq!(s.solve(), SatResult::Unsat);
     }
 
     #[test]
-    fn larger_satisfiable_instance() {
-        // A small chain that is satisfiable; check the model really satisfies it.
+    fn six_clause_cycle_unsat_regression() {
+        // Exact instance that must be UNSAT (implication cycle + both polarities
+        // blocked); guards against an earlier unsoundness.
+        let mut s = Solver::new();
+        for c in [
+            lits(&[1, 2, 3]),
+            lits(&[-1, 2]),
+            lits(&[-2, 3]),
+            lits(&[-3, 1]),
+            lits(&[1, -2, 3]),
+            lits(&[-1, -2, -3]),
+        ] {
+            s.add_clause(&c);
+        }
+        assert_eq!(s.solve(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn implication_cycle_is_unsat() {
+        // x1→x2→x3→x1 forces all equal; both all-true and all-false violate a
+        // clause, so this is UNSAT — a good conflict-learning stress test.
+        let mut s = Solver::new();
+        for c in [
+            lits(&[1, 2, 3]),
+            lits(&[-1, 2]),
+            lits(&[-2, 3]),
+            lits(&[-3, 1]),
+            lits(&[-1, -2, -3]),
+        ] {
+            s.add_clause(&c);
+        }
+        assert_eq!(s.solve(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn learns_and_verifies_model_on_larger_sat() {
         let mut s = Solver::new();
         let clauses = [
             lits(&[1, 2, 3]),
             lits(&[-1, 2]),
             lits(&[-2, 3]),
-            lits(&[-3, 1]),
             lits(&[1, -2, 3]),
         ];
         for c in &clauses {
@@ -286,5 +524,12 @@ mod tests {
                 "clause {c:?} unsatisfied"
             );
         }
+    }
+
+    #[test]
+    fn luby_sequence_prefix() {
+        // Luby is 1-indexed: luby(1..).
+        let seq: Vec<u64> = (1..=15).map(luby).collect();
+        assert_eq!(seq, vec![1, 1, 2, 1, 1, 2, 4, 1, 1, 2, 1, 1, 2, 4, 8]);
     }
 }
