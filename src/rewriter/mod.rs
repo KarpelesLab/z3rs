@@ -8,14 +8,17 @@
 //! - [x] boolean constant folding ([`bool_rewriter`])
 //! - [x] arithmetic constant folding ([`arith_rewriter`])
 //! - [x] subterm / De Bruijn variable substitution ([`subst`])
-//! - [ ] richer boolean/arith rules, more theories, `euf`, `nnf`, `bit_blaster`, …
+//! - [x] negation normal form ([`nnf`])
+//! - [ ] richer boolean/arith rules, more theories, `euf`, `bit_blaster`, …
 //!
 //! ## Status: IN PROGRESS
 
 pub mod arith_rewriter;
 pub mod bool_rewriter;
+pub mod nnf;
 pub mod subst;
 pub mod th_rewriter;
 
+pub use nnf::to_nnf;
 pub use subst::{substitute, substitute_vars};
 pub use th_rewriter::simplify;
