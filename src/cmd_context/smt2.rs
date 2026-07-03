@@ -659,17 +659,21 @@ impl Context {
         }
     }
 
-    /// Instantiate the array read-over-write axioms over the `store` terms and
-    /// index terms occurring in `goal`. For each `store(a, i, v)`:
-    /// `select(store(a,i,v), i) = v`, and for each other index `j`:
-    /// `i = j ∨ select(store(a,i,v), j) = select(a, j)`. This eager instantiation
-    /// decides ground (non-extensional) QF_A; the congruence closure supplies the
-    /// rest. It is finite (stores × indices) and terminating.
+    /// Instantiate the array axioms over the `store`, `select`, and
+    /// array-equality terms occurring in `goal`. Read-over-write, for each
+    /// `store(a, i, v)`: `select(store(a,i,v), i) = v`, and for other indices `j`
+    /// `i = j ∨ select(store(a,i,v), j) = select(a, j)`. Extensionality, for each
+    /// array equality `(= a b)`: a fresh Skolem index `k` with
+    /// `a = b ∨ select(a, k) ≠ select(b, k)`, with `k` joining the index set so
+    /// read-over-write covers it too. This eager instantiation decides ground
+    /// (extensional) QF_AX; the congruence closure supplies the rest. It is finite
+    /// and terminating.
     fn array_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         let subterms = self.m.postorder(goal);
         let mut stores: Vec<AstId> = Vec::new();
         let mut indices: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        let mut array_eqs: Vec<(AstId, AstId)> = Vec::new();
         for &t in &subterms {
             if self.m.is_store(t) {
                 stores.push(t);
@@ -682,9 +686,29 @@ impl Context {
                 if seen.insert(idx) {
                     indices.push(idx);
                 }
+            } else if self.m.is_eq(t) {
+                let args = self.m.app_args(t);
+                if self.m.is_array_sort(self.m.get_sort(args[0])) {
+                    array_eqs.push((args[0], args[1]));
+                }
             }
         }
         let mut axioms = Vec::new();
+        // Extensionality: introduce a distinguishing index for each array equality.
+        for &(a, b) in &array_eqs {
+            let (idx_sort, _) = self
+                .m
+                .array_sort_params(self.m.get_sort(a))
+                .expect("array equality over a non-array sort");
+            let k = self.fresh_const(idx_sort);
+            let eq_ab = self.m.mk_eq(a, b);
+            let sel_a = self.m.mk_select(a, k);
+            let sel_b = self.m.mk_select(b, k);
+            let eq_reads = self.m.mk_eq(sel_a, sel_b);
+            let neq_reads = self.m.mk_not(eq_reads);
+            axioms.push(self.m.mk_or(&[eq_ab, neq_reads])); // a=b ∨ a[k]≠b[k]
+            indices.push(k);
+        }
         for &st in &stores {
             let args = self.m.app_args(st).to_vec(); // [a, i, v]
             let (a, i, v) = (args[0], args[1], args[2]);
@@ -1616,6 +1640,30 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_extensionality_store_commute() {
+        // Writing i then j (i ≠ j) equals writing j then i: the two arrays are
+        // equal, so their disequality is unsat (requires extensionality).
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const i Int) (declare-const j Int)
+            (assert (not (= i j)))
+            (assert (not (= (store (store a i 1) j 2) (store (store a j 2) i 1))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_extensionality_sat() {
+        // Agreeing at one index does not force equality.
+        let script = "
+            (declare-const a (Array Int Int)) (declare-const b (Array Int Int))
+            (assert (not (= a b))) (assert (= (select a 0) (select b 0)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
