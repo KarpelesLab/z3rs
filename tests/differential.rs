@@ -122,6 +122,27 @@ const CORPUS: &[Case] = &[
         script: "(declare-const x Int)(declare-const y Int)(declare-const z Int)
                  (assert (< x y z))(assert (< z x))(check-sat)",
     },
+    Case {
+        name: "int_div_mod_fold",
+        script: "(assert (not (= (div 7 3) 2)))(check-sat)",
+    },
+    Case {
+        name: "mod_negative",
+        script: "(assert (not (= (mod (- 7) 3) 2)))(check-sat)",
+    },
+    Case {
+        name: "abs_constant",
+        script: "(declare-const x Int)(assert (= x (abs (- 5))))(assert (not (= x 5)))(check-sat)",
+    },
+    Case {
+        name: "to_real_value",
+        script: "(declare-const x Int)(declare-const y Real)
+                 (assert (= y (to_real x)))(assert (= x 3))(assert (not (= y 3.0)))(check-sat)",
+    },
+    Case {
+        name: "minus_nary_fold",
+        script: "(declare-const x Int)(assert (= (- 10 1 2 3) x))(assert (not (= x 4)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

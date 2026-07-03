@@ -6,9 +6,11 @@
 //! `get-value`, `get-model`, `push`/`pop`/`reset`, and `exit`; the
 //! `Bool`/`Int`/`Real` sorts, integer and decimal numerals, the core Boolean
 //! operators, equality/`distinct`, `ite`, `let`, linear arithmetic
-//! (`+ - * <= < >= >`, `div`/`mod`), and uninterpreted functions. Runs
-//! QF_UF / QF_LRA / QF_LIA scripts through [`crate::smt::check_model`], and
-//! reports models via `get-value`/`get-model`.
+//! (`+ - * / <= < >= >`, `div`/`mod`/`abs`/`to_real`/`to_int`, with constant
+//! folding), and uninterpreted functions. Runs QF_UF / QF_LRA / QF_LIA scripts
+//! through [`crate::smt::check_model`], and reports models via
+//! `get-value`/`get-model`. (Nonlinear terms and arithmetic-sorted `ite` are
+//! treated opaquely — a known incompleteness pending theory support.)
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -40,6 +42,43 @@ fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
     let frac_i = Int::from_str_radix(frac_part, 10).ok()?;
     let num = &(&ip_i * &denom) + &frac_i;
     Some((Rational::new(num, denom), false))
+}
+
+/// A rational from a small integer.
+fn rat(n: i64) -> Rational {
+    Rational::from_integer(Int::from(n))
+}
+
+/// The rational values of `args` if *every* one is a numeral, else `None`.
+fn all_numerals(m: &AstManager, args: &[AstId]) -> Option<Vec<Rational>> {
+    args.iter().map(|&a| m.as_numeral(a)).collect()
+}
+
+/// Are all of `args` integer-sorted (so a folded result stays `Int`)?
+fn all_int(m: &AstManager, args: &[AstId]) -> bool {
+    args.iter().all(|&a| m.is_int_sort(m.get_sort(a)))
+}
+
+/// If both terms are integer numerals, return them as [`Int`]s.
+fn int_pair(m: &AstManager, a: AstId, b: AstId) -> Option<(Int, Int)> {
+    let ai = m.as_numeral(a)?.to_integer()?;
+    let bi = m.as_numeral(b)?.to_integer()?;
+    Some((ai, bi))
+}
+
+/// Euclidean division and remainder (SMT-LIB `div`/`mod`): `a = b·q + r` with
+/// `0 ≤ r < |b|`. `b` must be non-zero.
+fn euclid_div_mod(a: &Int, b: &Int) -> (Int, Int) {
+    let (q, r) = a.div_rem_trunc(b); // truncated: r has the sign of a
+    if r < Int::from(0) {
+        if *b > Int::from(0) {
+            (&q - &Int::from(1), &r + b)
+        } else {
+            (&q + &Int::from(1), &r - b)
+        }
+    } else {
+        (q, r)
+    }
 }
 
 /// An s-expression.
@@ -562,22 +601,48 @@ impl Context {
                     Ok(m.mk_and(&eqs))
                 }
             }
-            // --- linear arithmetic ---
-            "+" => Ok(match args.len() {
-                0 => m.mk_int(0),
-                1 => args[0],
-                _ => m.mk_add(&args),
-            }),
-            "-" => Ok(if args.len() == 1 {
-                m.mk_uminus(args[0])
-            } else {
-                m.mk_sub(&args)
-            }),
-            "*" => Ok(match args.len() {
-                0 => m.mk_int(1),
-                1 => args[0],
-                _ => m.mk_mul(&args),
-            }),
+            // --- linear arithmetic (with constant folding, so downstream `mod`,
+            // `abs`, … see literal operands) ---
+            "+" => {
+                if let Some(ns) = all_numerals(m, &args) {
+                    let sum = ns.iter().fold(rat(0), |a, b| &a + b);
+                    return Ok(m.mk_numeral(sum, all_int(m, &args)));
+                }
+                Ok(match args.len() {
+                    0 => m.mk_int(0),
+                    1 => args[0],
+                    _ => m.mk_add(&args),
+                })
+            }
+            "-" => {
+                if let Some(ns) = all_numerals(m, &args) {
+                    let is_int = all_int(m, &args);
+                    let val = match ns.split_first() {
+                        Some((head, rest)) if !rest.is_empty() => {
+                            rest.iter().fold(head.clone(), |a, b| &a - b)
+                        }
+                        Some((head, _)) => head.neg(), // unary minus
+                        None => rat(0),
+                    };
+                    return Ok(m.mk_numeral(val, is_int));
+                }
+                Ok(if args.len() == 1 {
+                    m.mk_uminus(args[0])
+                } else {
+                    m.mk_sub(&args)
+                })
+            }
+            "*" => {
+                if let Some(ns) = all_numerals(m, &args) {
+                    let prod = ns.iter().fold(rat(1), |a, b| &a * b);
+                    return Ok(m.mk_numeral(prod, all_int(m, &args)));
+                }
+                Ok(match args.len() {
+                    0 => m.mk_int(1),
+                    1 => args[0],
+                    _ => m.mk_mul(&args),
+                })
+            }
             "/" => {
                 // Fold constant real division to an exact rational; otherwise
                 // build an opaque `/` term.
@@ -586,8 +651,39 @@ impl Context {
                     _ => Ok(m.mk_div(args[0], args[1])),
                 }
             }
-            "div" => Ok(m.mk_idiv(args[0], args[1])),
-            "mod" => Ok(m.mk_mod(args[0], args[1])),
+            "div" => match int_pair(m, args[0], args[1]) {
+                Some((a, b)) if !b.is_zero() => {
+                    let (q, _) = euclid_div_mod(&a, &b);
+                    Ok(m.mk_numeral(Rational::from_integer(q), true))
+                }
+                _ => Ok(m.mk_idiv(args[0], args[1])),
+            },
+            "mod" => match int_pair(m, args[0], args[1]) {
+                Some((a, b)) if !b.is_zero() => {
+                    let (_, r) = euclid_div_mod(&a, &b);
+                    Ok(m.mk_numeral(Rational::from_integer(r), true))
+                }
+                _ => Ok(m.mk_mod(args[0], args[1])),
+            },
+            "abs" => match m.as_numeral(args[0]).and_then(|v| v.to_integer()) {
+                Some(a) => Ok(m.mk_numeral(Rational::from_integer(a.abs()), true)),
+                None => {
+                    // (abs a) = (ite (>= a 0) a (- a)); opaque to the linear core
+                    // for non-constant a, but structurally faithful.
+                    let zero = m.mk_int(0);
+                    let ge = m.mk_ge(args[0], zero);
+                    let neg = m.mk_uminus(args[0]);
+                    Ok(m.mk_ite(ge, args[0], neg))
+                }
+            },
+            "to_real" => match m.as_numeral(args[0]) {
+                Some(v) => Ok(m.mk_numeral(v, false)),
+                None => Ok(m.mk_to_real(args[0])),
+            },
+            "to_int" => match m.as_numeral(args[0]) {
+                Some(v) => Ok(m.mk_numeral(Rational::from_integer(v.floor()), true)),
+                None => Ok(m.mk_to_int(args[0])),
+            },
             "<=" | "<" | ">=" | ">" => {
                 let mk = |m: &mut AstManager, a, b| match head {
                     "<=" => m.mk_le(a, b),
@@ -870,6 +966,47 @@ mod tests {
             run(script).unwrap(),
             alloc::vec!["sat", "((x (/ 1.0 3.0)))"]
         );
+    }
+
+    #[test]
+    fn integer_div_mod_fold() {
+        // Euclidean semantics: (div 7 3)=2, (mod 7 3)=1, (mod (- 7) 3)=2.
+        let script = "
+            (assert (not (= (div 7 3) 2)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        let script2 = "(assert (not (= (mod (- 7) 3) 2)))(check-sat)";
+        assert_eq!(run(script2).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn abs_and_to_real() {
+        let script = "
+            (declare-const x Int)
+            (assert (= x (abs (- 5))))
+            (assert (not (= x 5)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        // to_real preserves value: y = to_real x, x = 3, y ≠ 3.0 is unsat.
+        let script2 = "
+            (declare-const x Int) (declare-const y Real)
+            (assert (= y (to_real x))) (assert (= x 3)) (assert (not (= y 3.0)))
+            (check-sat)
+        ";
+        assert_eq!(run(script2).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn to_real_linear_nonconstant() {
+        // to_real of a variable is the identity on value: to_real(x) < x is unsat.
+        let script = "
+            (declare-const x Int)
+            (assert (< (to_real x) (to_real x)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]

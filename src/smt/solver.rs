@@ -441,6 +441,9 @@ fn ast_to_lin(m: &AstManager, t: AstId) -> LinExpr {
             e
         }
         ArithOp::Uminus => ast_to_lin(m, args[0]).neg(),
+        // to_real preserves the numeric value, so it is the identity map on the
+        // linear representation.
+        ArithOp::ToReal => ast_to_lin(m, args[0]),
         ArithOp::Mul => {
             let mut scalar = one();
             let mut nonconst: Option<LinExpr> = None;
