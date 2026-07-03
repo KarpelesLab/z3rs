@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use puremp::{Int, Rational};
 
 use crate::ast::AstId;
+use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::smt::{Model, SmtResult, check_model};
 use crate::util::symbol::Symbol;
@@ -80,6 +81,15 @@ fn euclid_div_mod(a: &Int, b: &Int) -> (Int, Int) {
     } else {
         (q, r)
     }
+}
+
+/// Working state for [`Context::lift_terms`]: the defining constraints collected
+/// so far, a memo of already-lifted subterms, and a memo of `(a, divisor)` pairs
+/// sharing a `(quotient, remainder)`.
+struct LiftCtx {
+    defs: Vec<AstId>,
+    cache: BTreeMap<AstId, AstId>,
+    dm: BTreeMap<(AstId, AstId), (AstId, AstId)>,
 }
 
 /// An s-expression.
@@ -411,69 +421,119 @@ impl Context {
         }
     }
 
-    /// Eliminate non-Boolean (term-level) `ite`s from `t` by the standard
-    /// lifting: each `(ite c a b)` of a non-Boolean sort becomes a fresh
-    /// constant `k` with the defining constraints `(=> c (= k a))` and
-    /// `(=> (not c) (= k b))` pushed onto `defs`. Equisatisfiable, and lets the
-    /// linear theory reason about `k` (which it cannot for an opaque `ite`).
-    fn elim_term_ites(
-        &mut self,
-        t: AstId,
-        defs: &mut Vec<AstId>,
-        cache: &mut BTreeMap<AstId, AstId>,
-    ) -> AstId {
-        if let Some(&r) = cache.get(&t) {
+    /// Lift theory terms the linear core cannot reason about opaquely into fresh
+    /// constants with defining constraints (pushed onto `ctx.defs`), keeping the
+    /// result equisatisfiable. A non-Boolean `(ite c a b)` becomes `k` with
+    /// `(=> c (= k a))` and `(=> ¬c (= k b))`. A `(div a n)` or `(mod a n)` with a
+    /// constant divisor `n ≠ 0` becomes `q` / `r` with `a = n·q + r` and
+    /// `0 ≤ r < |n|` (Euclidean). `ctx.dm` memoizes each `(a, n)` so `div` and
+    /// `mod` of the same operands share one `(q, r)` pair.
+    fn lift_terms(&mut self, t: AstId, ctx: &mut LiftCtx) -> AstId {
+        if let Some(&r) = ctx.cache.get(&t) {
             return r;
         }
         let result = if self.m.is_app(t) {
             let decl = self.m.app_decl(t);
             let args = self.m.app_args(t).to_vec();
-            let new_args: Vec<AstId> = args
-                .iter()
-                .map(|&a| self.elim_term_ites(a, defs, cache))
-                .collect();
+            let new_args: Vec<AstId> = args.iter().map(|&a| self.lift_terms(a, ctx)).collect();
             let rebuilt = if new_args == args {
                 t
             } else {
                 self.m.mk_app(decl, &new_args)
             };
             if self.m.is_ite(rebuilt) && !self.m.is_bool_sort(self.m.get_sort(rebuilt)) {
-                let a = self.m.app_args(rebuilt).to_vec(); // [cond, then, else]
-                let sort = self.m.get_sort(rebuilt);
-                let name = alloc::format!("!ite!{}", self.fresh_counter);
-                self.fresh_counter += 1;
-                let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
-                let k = self.m.mk_const(d);
-                let eq_t = self.m.mk_eq(k, a[1]);
-                let eq_e = self.m.mk_eq(k, a[2]);
-                let imp_t = self.m.mk_implies(a[0], eq_t);
-                let nc = self.m.mk_not(a[0]);
-                let imp_e = self.m.mk_implies(nc, eq_e);
-                defs.push(imp_t);
-                defs.push(imp_e);
-                k
+                self.lift_ite(rebuilt, &mut ctx.defs)
+            } else if let Some((q, r)) = self.divmod_pieces(rebuilt, ctx) {
+                // Return q for div, r for mod.
+                match self.m.arith_op(rebuilt) {
+                    Some(ArithOp::Idiv) => q,
+                    _ => r,
+                }
             } else {
                 rebuilt
             }
         } else {
             t
         };
-        cache.insert(t, result);
+        ctx.cache.insert(t, result);
         result
     }
 
-    /// The conjunction of all assertions (`true` if none), with term-level
-    /// `ite`s lifted out so the theory solvers can reason about them.
+    /// Lift a non-Boolean `ite` to a fresh constant, returning it.
+    fn lift_ite(&mut self, ite: AstId, defs: &mut Vec<AstId>) -> AstId {
+        let a = self.m.app_args(ite).to_vec(); // [cond, then, else]
+        let sort = self.m.get_sort(ite);
+        let k = self.fresh_const(sort);
+        let eq_t = self.m.mk_eq(k, a[1]);
+        let eq_e = self.m.mk_eq(k, a[2]);
+        let imp_t = self.m.mk_implies(a[0], eq_t);
+        let nc = self.m.mk_not(a[0]);
+        let imp_e = self.m.mk_implies(nc, eq_e);
+        defs.push(imp_t);
+        defs.push(imp_e);
+        k
+    }
+
+    /// If `t` is `(div a n)` or `(mod a n)` with a constant integer divisor
+    /// `n ≠ 0`, return the shared `(q, r)` for `a`,`n`, creating and constraining
+    /// them (`a = n·q + r`, `0 ≤ r < |n|`) on first use.
+    fn divmod_pieces(&mut self, t: AstId, ctx: &mut LiftCtx) -> Option<(AstId, AstId)> {
+        let op = self.m.arith_op(t)?;
+        if !matches!(op, ArithOp::Idiv | ArithOp::Mod) {
+            return None;
+        }
+        let args = self.m.app_args(t).to_vec();
+        let (a, b) = (args[0], args[1]);
+        let n = self.m.as_numeral(b)?.to_integer()?; // constant divisor only
+        if n.is_zero() {
+            return None;
+        }
+        if let Some(&pair) = ctx.dm.get(&(a, b)) {
+            return Some(pair);
+        }
+        let int = self.m.mk_int_sort();
+        let q = self.fresh_const(int);
+        let r = self.fresh_const(int);
+        // a = n·q + r
+        let nq = self.m.mk_mul(&[b, q]);
+        let sum = self.m.mk_add(&[nq, r]);
+        let eq = self.m.mk_eq(a, sum);
+        // 0 ≤ r < |n|
+        let zero = self.m.mk_int(0);
+        let ge = self.m.mk_ge(r, zero);
+        let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
+        let lt = self.m.mk_lt(r, abs_n);
+        ctx.defs.push(eq);
+        ctx.defs.push(ge);
+        ctx.defs.push(lt);
+        ctx.dm.insert((a, b), (q, r));
+        Some((q, r))
+    }
+
+    /// A fresh 0-ary constant of the given sort (for term lifting).
+    fn fresh_const(&mut self, sort: AstId) -> AstId {
+        let name = alloc::format!("!k!{}", self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
+        self.m.mk_const(d)
+    }
+
+    /// The conjunction of all assertions (`true` if none), with term-level `ite`s
+    /// and constant-divisor `div`/`mod` lifted so the theory solvers can reason
+    /// about them.
     fn goal(&mut self) -> AstId {
         let base = self.conjunction();
-        let mut defs = Vec::new();
-        let mut cache = BTreeMap::new();
-        let lifted = self.elim_term_ites(base, &mut defs, &mut cache);
-        if defs.is_empty() {
+        let mut ctx = LiftCtx {
+            defs: Vec::new(),
+            cache: BTreeMap::new(),
+            dm: BTreeMap::new(),
+        };
+        let lifted = self.lift_terms(base, &mut ctx);
+        if ctx.defs.is_empty() {
             lifted
         } else {
-            defs.push(lifted);
-            self.m.mk_and(&defs)
+            ctx.defs.push(lifted);
+            self.m.mk_and(&ctx.defs)
         }
     }
 
@@ -1176,6 +1236,38 @@ mod tests {
             (declare-const y Int) (assert (> y 0)) (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
+    }
+
+    #[test]
+    fn mod_div_variable_axioms() {
+        // (mod x 3) is always in [0,3): these are unsat.
+        assert_eq!(
+            run("(declare-const x Int)(assert (< (mod x 3) 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(assert (>= (mod x 3) 3))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // The defining relation x = n·(div x n) + (mod x n) always holds.
+        assert_eq!(
+            run("(declare-const x Int)(assert (not (= x (+ (* 3 (div x 3)) (mod x 3)))))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn mod_div_satisfiable() {
+        // x = 12 ⇒ (mod x 5) = 2, (div x 5) = 2.
+        let script = "
+            (declare-const x Int)
+            (assert (= x 12))
+            (assert (= (mod x 5) 2))
+            (assert (= (div x 5) 2))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
