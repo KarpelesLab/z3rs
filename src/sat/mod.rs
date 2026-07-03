@@ -1,14 +1,18 @@
-//! # `sat` — CDCL SAT core, SAT/SMT bridge, DRAT proofs
+//! # `sat` — propositional SAT core
 //!
-//! **Port phase 4.** Ported from the Z3 C++ component(s) below.
+//! **Port phase 4.** Ported from `z3/src/sat` (Z3 4.17.0, MIT).
 //! See [`ROADMAP.md`](../../ROADMAP.md) for the porting plan and status.
 //!
-//! ## Upstream C++ components to port
-//! - [ ] `z3/src/sat`
-//! - [ ] `z3/src/sat_smt`
-//! - [ ] `z3/src/dd`
+//! ## Ported so far
+//! - [x] literal/variable encoding (`sat_types`) → [`literal`]
+//! - [x] a correct DPLL solver with unit propagation → [`solver`]
+//! - [ ] CDCL: watched literals, clause learning, restarts, in-processing
+//! - [ ] `sat_smt` bridge, DRAT proofs, DIMACS
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod literal;
+pub mod solver;
+
+pub use literal::{Lit, Var};
+pub use solver::{SatResult, Solver};
