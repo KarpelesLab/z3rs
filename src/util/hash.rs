@@ -69,6 +69,53 @@ pub fn hash_u_u(a: u32, b: u32) -> u32 {
     combine_hash(hash_u(a), hash_u(b))
 }
 
+/// A tiny FNV-1a hasher implementing [`core::hash::Hasher`]. `core`/`alloc`
+/// ship no concrete hasher, so this provides one for hashing arbitrary `Hash`
+/// values in `no_std` (e.g. the AST hash-cons table).
+pub struct FnvHasher(u64);
+
+impl FnvHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    /// A fresh hasher seeded with the FNV offset basis.
+    #[inline]
+    pub const fn new() -> FnvHasher {
+        FnvHasher(Self::OFFSET)
+    }
+}
+
+impl Default for FnvHasher {
+    #[inline]
+    fn default() -> FnvHasher {
+        FnvHasher::new()
+    }
+}
+
+impl core::hash::Hasher for FnvHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(Self::PRIME);
+        }
+        self.0 = h;
+    }
+}
+
+/// Hash any [`Hash`](core::hash::Hash) value to a 32-bit code via FNV-1a.
+pub fn fnv_hash<T: core::hash::Hash>(value: &T) -> u32 {
+    use core::hash::Hasher;
+    let mut h = FnvHasher::new();
+    value.hash(&mut h);
+    h.finish() as u32
+}
+
 #[inline]
 fn read_u32(data: &[u8]) -> u32 {
     // Mirrors Z3's `memcpy(&n, s, 4)`: a native-endian load of 4 bytes.

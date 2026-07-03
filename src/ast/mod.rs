@@ -6,13 +6,18 @@
 //! ## Upstream components ported so far
 //! - [x] `ast.h` metadata: [`AstKind`], [`FamilyId`], [`DeclKind`], [`SortSize`]
 //! - [x] `ast.h` `parameter` → [`parameter`]
-//! - [ ] AST nodes (`sort`/`func_decl`/`app`/`var`/`quantifier`) + `ast_manager`
-//! - [ ] theory `*_decl_plugin`s, translation, pretty-printing
+//! - [x] AST node content (`sort`/`func_decl`/`app`/`var`) → [`node`]
+//! - [x] hash-consing `ast_manager` (sorts/decls/apps/vars) → [`manager`]
+//! - [ ] quantifiers, theory `*_decl_plugin`s, translation, pretty-printing
 //!
 //! ## Status: IN PROGRESS
 
+pub mod manager;
+pub mod node;
 pub mod parameter;
 
+pub use manager::AstManager;
+pub use node::{AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData};
 pub use parameter::Parameter;
 
 /// Identifies the theory ("family") a declaration belongs to. `-1`
