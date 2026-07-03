@@ -14,6 +14,7 @@
 
 pub mod arith;
 pub mod basic;
+pub mod bv;
 pub mod manager;
 pub mod node;
 pub mod parameter;
@@ -22,6 +23,7 @@ pub mod query;
 
 pub use arith::{ArithOp, ArithSortKind};
 pub use basic::{BasicOp, BasicSortKind};
+pub use bv::{BvOp, BvSortKind};
 pub use manager::AstManager;
 pub use node::{AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData};
 pub use parameter::Parameter;
