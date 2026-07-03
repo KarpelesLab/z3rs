@@ -3,19 +3,42 @@
 //!
 //! Supports: `set-logic`/`set-info`/`set-option` (ignored), `declare-sort`
 //! (arity 0), `declare-fun`, `declare-const`, `assert`, `check-sat`,
-//! `push`/`pop`/`reset`, and `exit`; terms over the core Boolean operators,
-//! equality/`distinct`, `ite`, `let`, and uninterpreted functions. Arithmetic
-//! and bit-vector terms are not yet handled. Enough to run QF_UF scripts through
-//! [`crate::smt::check`].
+//! `push`/`pop`/`reset`, and `exit`; the `Bool`/`Int`/`Real` sorts, integer and
+//! decimal numerals, the core Boolean operators, equality/`distinct`, `ite`,
+//! `let`, linear arithmetic (`+ - * <= < >= >`, `div`/`mod`), and uninterpreted
+//! functions. Runs QF_UF / QF_LRA scripts through [`crate::smt::check`].
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use puremp::{Int, Rational};
+
 use crate::ast::AstId;
 use crate::ast::manager::AstManager;
 use crate::smt::{SmtResult, check};
 use crate::util::symbol::Symbol;
+
+/// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
+fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
+    let is_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    if is_digits(s) {
+        let i = Int::from_str_radix(s, 10).ok()?;
+        return Some((Rational::from_integer(i), true));
+    }
+    let (int_part, frac_part) = s.split_once('.')?;
+    let ip = if int_part.is_empty() { "0" } else { int_part };
+    if !is_digits(ip) || !is_digits(frac_part) {
+        return None;
+    }
+    // value = intpart.frac = (ip·10^k + frac) / 10^k
+    let denom_str = alloc::format!("1{}", "0".repeat(frac_part.len()));
+    let denom = Int::from_str_radix(&denom_str, 10).ok()?;
+    let ip_i = Int::from_str_radix(ip, 10).ok()?;
+    let frac_i = Int::from_str_radix(frac_part, 10).ok()?;
+    let num = &(&ip_i * &denom) + &frac_i;
+    Some((Rational::new(num, denom), false))
+}
 
 /// An s-expression.
 #[derive(Clone, Debug)]
@@ -138,8 +161,12 @@ impl Context {
     fn new() -> Context {
         let mut m = AstManager::new();
         let bool_sort = m.mk_bool_sort();
+        let int_sort = m.mk_int_sort();
+        let real_sort = m.mk_real_sort();
         let mut sorts = BTreeMap::new();
         sorts.insert("Bool".to_string(), bool_sort);
+        sorts.insert("Int".to_string(), int_sort);
+        sorts.insert("Real".to_string(), real_sort);
         Context {
             m,
             sorts,
@@ -286,6 +313,9 @@ impl Context {
                     if let Some(id) = self.lookup_bound(name) {
                         return Ok(id);
                     }
+                    if let Some((r, is_int)) = parse_numeral(name) {
+                        return Ok(self.m.mk_numeral(r, is_int));
+                    }
                     let d = *self
                         .funcs
                         .get(name)
@@ -367,6 +397,42 @@ impl Context {
                         eqs.push(m.mk_eq(w[0], w[1]));
                     }
                     Ok(m.mk_and(&eqs))
+                }
+            }
+            // --- linear arithmetic ---
+            "+" => Ok(match args.len() {
+                0 => m.mk_int(0),
+                1 => args[0],
+                _ => m.mk_add(&args),
+            }),
+            "-" => Ok(if args.len() == 1 {
+                m.mk_uminus(args[0])
+            } else {
+                m.mk_sub(&args)
+            }),
+            "*" => Ok(match args.len() {
+                0 => m.mk_int(1),
+                1 => args[0],
+                _ => m.mk_mul(&args),
+            }),
+            "/" => Ok(m.mk_div(args[0], args[1])),
+            "div" => Ok(m.mk_idiv(args[0], args[1])),
+            "mod" => Ok(m.mk_mod(args[0], args[1])),
+            "<=" | "<" | ">=" | ">" => {
+                let mk = |m: &mut AstManager, a, b| match head {
+                    "<=" => m.mk_le(a, b),
+                    "<" => m.mk_lt(a, b),
+                    ">=" => m.mk_ge(a, b),
+                    _ => m.mk_gt(a, b),
+                };
+                if args.len() == 2 {
+                    Ok(mk(m, args[0], args[1]))
+                } else {
+                    let mut cs = Vec::new();
+                    for w in args.windows(2) {
+                        cs.push(mk(m, w[0], w[1]));
+                    }
+                    Ok(m.mk_and(&cs))
                 }
             }
             name => {
@@ -480,6 +546,32 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat"]);
+    }
+
+    #[test]
+    fn qf_lra_bounds_unsat() {
+        let script = "
+            (set-logic QF_LRA)
+            (declare-const x Real) (declare-const y Real)
+            (assert (>= x 1)) (assert (>= y 1))
+            (assert (<= (+ x y) 1))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn qf_lia_satisfiable_and_decimals() {
+        let script = "
+            (declare-const x Int)
+            (assert (<= 3 x)) (assert (<= x 5))
+            (check-sat)
+            (declare-const r Real)
+            (assert (= r 1.5))
+            (assert (< r 1.0))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
