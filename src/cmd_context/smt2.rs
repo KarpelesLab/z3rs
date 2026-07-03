@@ -849,6 +849,9 @@ impl Context {
                 continue; // n-ary function interpretations not yet emitted
             }
             let range = fd.range;
+            if self.m.is_array_sort(range) {
+                continue; // array interpretations not yet emitted (would be invalid)
+            }
             let sort_name = self
                 .m
                 .sort(range)
