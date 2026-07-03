@@ -13,15 +13,18 @@
 //! relaxation, so integrality constraints (`QF_LIA`) are decided too.
 //!
 //! Every equality (of any sort) feeds the congruence closure, so uninterpreted
-//! functions get congruence even at arithmetic range sorts. The theories are
-//! combined à la Nelson–Oppen: after each individually consistent assignment,
-//! every equality the arithmetic theory *entails* between shared (interface)
-//! terms — e.g. `x = y` derived from `x ≤ y ∧ y ≤ x` — is added to the
-//! congruence closure, so implied equalities drive congruence too. Entailment is
-//! decided convexly (a single equality per pair), which is complete for QF_UFLRA
-//! and a sound approximation for QF_UFLIA. Online propagation, minimized
-//! explanations, and equality sharing in the EUF→arith direction come next.
-//! Non-arithmetic, non-equality atoms remain free Booleans.
+//! functions get congruence even at arithmetic range sorts, and Boolean-valued
+//! predicate applications get it too. The theories are combined à la
+//! Nelson–Oppen with **bidirectional** equality sharing, iterated to a fixpoint:
+//! equalities the arithmetic theory *entails* between shared (interface) terms
+//! (e.g. `x = y` from `x ≤ y ∧ y ≤ x`) are added to the congruence closure, and
+//! equalities congruence induces between interface terms are added back to the
+//! arithmetic constraints. Entailment is decided convexly (a single equality per
+//! pair), complete for QF_UFLRA and sound for QF_UFLIA. A shared work budget
+//! bounds the (worst-case exponential) disequality split and branch-and-bound,
+//! yielding a sound `unknown` on exhaustion. Minimized explanations and online
+//! propagation come next. Non-arithmetic, non-equality atoms remain free
+//! Booleans.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
