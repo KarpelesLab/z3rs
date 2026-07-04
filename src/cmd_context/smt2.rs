@@ -2345,7 +2345,7 @@ impl Context {
     /// incomplete, so a `sat` result in the presence of universals is reported
     /// as a sound `unknown`.
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
-        let instances = self.universal_instances();
+        let (instances, saturated) = self.universal_instances();
         let base = self.conjunction();
         let combined = if instances.is_empty() {
             base
@@ -2357,7 +2357,10 @@ impl Context {
         let lifted = self.lift(combined);
         let goal = self.with_axioms(lifted);
         let (res, model) = self.decide(goal);
-        if res == SmtResult::Sat && !self.universals.is_empty() {
+        // A `sat` result is complete only if instantiation reached a fixpoint
+        // (every ground instance is present — e.g. a finite Datalog domain);
+        // otherwise the un-instantiated cases keep it a sound `unknown`.
+        if res == SmtResult::Sat && !self.universals.is_empty() && !saturated {
             (SmtResult::Unknown, None)
         } else {
             (res, model)
@@ -2658,9 +2661,9 @@ impl Context {
     /// assertions **and from previously generated instances** — iterating to a
     /// fixpoint so chained/inductive universals (`∀x. p(x) ⇒ p(x+1)` with
     /// `p(0)`, `¬p(3)`) fully unfold. Bounded by rounds and a total-instance cap.
-    fn universal_instances(&mut self) -> Vec<AstId> {
+    fn universal_instances(&mut self) -> (Vec<AstId>, bool) {
         if self.universals.is_empty() {
-            return Vec::new();
+            return (Vec::new(), true);
         }
         const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
         const MAX_ROUNDS: usize = 8;
@@ -2727,15 +2730,16 @@ impl Context {
                         }
                     }
                     if instances.len() >= MAX_TOTAL {
-                        return instances;
+                        return (instances, false); // capped: not saturated
                     }
                 }
             }
             if !fresh_term {
-                break; // fixpoint: no new ground terms to instantiate over
+                // Fixpoint: every ground instance is present → saturated.
+                return (instances, true);
             }
         }
-        instances
+        (instances, false) // ran out of rounds: not saturated
     }
 
     /// Instantiate the array + enum axioms for `lifted` and conjoin them.
@@ -4898,6 +4902,38 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((x #x0f))");
+    }
+
+    #[test]
+    fn quantifier_saturation_decides_sat() {
+        // Datalog-style reachability (CHC): path(1,3) is derivable -> unsat.
+        let rules = "(declare-fun edge (Int Int) Bool)(declare-fun path (Int Int) Bool)\
+             (assert (forall ((a Int)(b Int)) (=> (edge a b) (path a b))))\
+             (assert (forall ((a Int)(b Int)(c Int)) (=> (and (path a b)(edge b c)) (path a c))))\
+             (assert (edge 1 2))(assert (edge 2 3))";
+        assert_eq!(
+            run(&alloc::format!(
+                "{rules}(assert (not (path 1 3)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // path(3,1) is NOT derivable; the finite instantiation saturates, so the
+        // sat is complete (not unknown).
+        assert_eq!(
+            run(&alloc::format!(
+                "{rules}(assert (not (path 3 1)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // A universal over a finite (enum) domain: sat once saturated.
+        assert_eq!(
+            run("(declare-datatypes () ((C a b)))(declare-fun q (C) Bool)\
+                 (assert (forall ((x C)) (q x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
