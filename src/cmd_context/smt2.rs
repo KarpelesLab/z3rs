@@ -102,6 +102,19 @@ fn replace_first(s: &[u32], from: &[u32], to: &[u32]) -> String {
     code_points_to_string(s)
 }
 
+/// Interpret an unsigned `w`-bit value as a two's-complement signed integer.
+fn to_signed(v: &Int, w: u32) -> Int {
+    if w == 0 {
+        return v.clone();
+    }
+    let half = Int::from(2).pow(w - 1);
+    if *v >= half {
+        v.sub(&Int::from(2).pow(w))
+    } else {
+        v.clone()
+    }
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -2662,6 +2675,25 @@ impl Context {
                             _ => Ok(self.bv_rotate(k, x, false)),
                         };
                     }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "int2bv")
+                    {
+                        // ((_ int2bv n) t): fold a constant Int to its n-bit value;
+                        // a symbolic Int argument leaves a mixed term the `decide`
+                        // gate answers `unknown`.
+                        let n: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "int2bv: bad width".to_string())?;
+                        let t = self.term(&l[1])?;
+                        if let Some(v) = self.m.as_numeral(t).and_then(|r| r.to_integer()) {
+                            return Ok(self.m.mk_bv_numeral(v, n));
+                        }
+                        let bvs = self.m.mk_bv_sort(n);
+                        let its = self.m.get_sort(t);
+                        let d = self.m.mk_func_decl(Symbol::new("int2bv"), &[its], bvs);
+                        return Ok(self.m.mk_app(d, &[t]));
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();
@@ -3093,6 +3125,45 @@ impl Context {
             "bvxnor" => {
                 let t = m.mk_bvxor(args[0], args[1]);
                 Ok(m.mk_bvnot(t))
+            }
+            // bvcomp a b → #b1 if a = b else #b0.
+            "bvcomp" => {
+                let eq = m.mk_eq(args[0], args[1]);
+                let (one, zero) = (m.mk_bv(1, 1), m.mk_bv(0, 1));
+                Ok(m.mk_ite(eq, one, zero))
+            }
+            // bvredand a → #b1 iff every bit is set; bvredor → #b1 iff any is.
+            "bvredand" => {
+                let w = m.bv_sort_width(m.get_sort(args[0])).unwrap_or(1);
+                let zero = m.mk_bv(0, w);
+                let ones = m.mk_bvnot(zero);
+                let eq = m.mk_eq(args[0], ones);
+                let (b1, b0) = (m.mk_bv(1, 1), m.mk_bv(0, 1));
+                Ok(m.mk_ite(eq, b1, b0))
+            }
+            "bvredor" => {
+                let w = m.bv_sort_width(m.get_sort(args[0])).unwrap_or(1);
+                let zero = m.mk_bv(0, w);
+                let eq = m.mk_eq(args[0], zero);
+                let (b1, b0) = (m.mk_bv(1, 1), m.mk_bv(0, 1));
+                Ok(m.mk_ite(eq, b0, b1))
+            }
+            // bv2int / (u)bv_to_int / bv2nat: fold a constant. A symbolic use is
+            // an Int term over a bit-vector, so the mixed-theory gate in `decide`
+            // routes the goal to a sound `unknown`.
+            "bv2int" | "ubv_to_int" | "bv2nat" | "sbv_to_int" => {
+                if let Some(v) = m.bv_numeral_value(args[0]) {
+                    let val = if head == "sbv_to_int" {
+                        to_signed(&v, m.bv_sort_width(m.get_sort(args[0])).unwrap_or(0))
+                    } else {
+                        v
+                    };
+                    return Ok(m.mk_numeral(Rational::from_integer(val), true));
+                }
+                let int = m.mk_int_sort();
+                let bvs = m.get_sort(args[0]);
+                let d = m.mk_func_decl(Symbol::new(head), &[bvs], int);
+                Ok(m.mk_app(d, &args))
             }
             name => {
                 let d = *self
@@ -3783,6 +3854,35 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn bv_comp_reductions_conversions() {
+        // bvcomp equality, reductions, and constant int/bv conversions.
+        assert_eq!(
+            run(
+                "(declare-const x (_ BitVec 4))(declare-const y (_ BitVec 4))\
+                 (assert (= (bvcomp x y) #b1))(assert (not (= x y)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (not (= (bvredand #xff) #b1)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (not (= (bv2int #x0f) 15)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (not (= ((_ int2bv 4) 17) #x1)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (not (= (sbv_to_int #xff) (- 1))))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
