@@ -99,6 +99,10 @@ pub mod parsers;
 // --- Phase 9: public API ---
 pub mod api;
 
+// The C ABI (opt-in via the `ffi` feature); the only module that uses `unsafe`.
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 /// The upstream Z3 version this port tracks.
 pub const Z3_UPSTREAM_VERSION: &str = "4.17.0";
 
