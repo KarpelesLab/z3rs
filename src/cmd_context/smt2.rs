@@ -40,6 +40,45 @@ enum OptResult {
     Unknown,
 }
 
+/// A Rust string from a slice of Unicode code points.
+fn code_points_to_string(cps: &[u32]) -> String {
+    cps.iter().filter_map(|&c| char::from_u32(c)).collect()
+}
+
+/// Fold a Boolean string predicate over literal operands' code points.
+fn fold_string_pred(op: &str, parts: &[Vec<u32>]) -> bool {
+    let (a, b) = (&parts[0], &parts[1]);
+    match op {
+        // (str.contains s sub): does `s` (=a) contain `sub` (=b)?
+        "str.contains" => a.windows(b.len().max(1)).any(|w| w == b.as_slice()) || b.is_empty(),
+        // (str.prefixof s t): is `s` (=a) a prefix of `t` (=b)?
+        "str.prefixof" => a.len() <= b.len() && b[..a.len()] == a[..],
+        // (str.suffixof s t): is `s` (=a) a suffix of `t` (=b)?
+        "str.suffixof" => a.len() <= b.len() && b[b.len() - a.len()..] == a[..],
+        _ => false,
+    }
+}
+
+/// `(str.replace s from to)` — replace the first occurrence of `from` in `s`.
+fn replace_first(s: &[u32], from: &[u32], to: &[u32]) -> String {
+    if from.is_empty() {
+        let mut out = to.to_vec();
+        out.extend_from_slice(s);
+        return code_points_to_string(&out);
+    }
+    if from.len() <= s.len() {
+        for i in 0..=s.len() - from.len() {
+            if s[i..i + from.len()] == from[..] {
+                let mut out = s[..i].to_vec();
+                out.extend_from_slice(to);
+                out.extend_from_slice(&s[i + from.len()..]);
+                return code_points_to_string(&out);
+            }
+        }
+    }
+    code_points_to_string(s)
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -615,6 +654,16 @@ struct Context {
     /// Soft constraints (`assert-soft`) as `(penalty indicator bool, weight)`;
     /// `check-sat` minimizes the total weight of the violated ones (MaxSAT).
     soft: Vec<(AstId, i64)>,
+    /// The interned `String` sort, once used.
+    string_sort: Option<AstId>,
+    /// String literal text → its distinct constant of the `String` sort.
+    str_lits: BTreeMap<String, AstId>,
+    /// The `str.len : String → Int` function declaration, once used.
+    str_len_decl: Option<AstId>,
+    /// Symbolic (non-constant-folded) string-producing operations. A goal that
+    /// mentions any is answered `unknown` (their word semantics aren't solved),
+    /// keeping every definite verdict sound.
+    str_symbolic: BTreeSet<AstId>,
 }
 
 impl Context {
@@ -651,6 +700,10 @@ impl Context {
             objectives: Vec::new(),
             objective_values: Vec::new(),
             soft: Vec::new(),
+            string_sort: None,
+            str_lits: BTreeMap::new(),
+            str_len_decl: None,
+            str_symbolic: BTreeSet::new(),
         }
     }
 
@@ -674,6 +727,7 @@ impl Context {
 
     fn resolve_sort(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
+            SExpr::Atom(name) if name == "String" => Ok(self.string_sort()),
             SExpr::Atom(name) => self
                 .sorts
                 .get(name)
@@ -1318,6 +1372,243 @@ impl Context {
         ax
     }
 
+    /// Axioms for the string literals mentioned in `goal`: each literal's length
+    /// equals its code-point count, and distinct literals are unequal.
+    fn string_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.str_lits.is_empty() {
+            return Vec::new();
+        }
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        // Literals occurring in the goal, with their lengths.
+        let lits: Vec<(AstId, i64)> = self
+            .str_lits
+            .iter()
+            .filter(|(_, c)| present.contains(*c))
+            .map(|(text, &c)| (c, text.chars().count() as i64))
+            .collect();
+        let mut ax = Vec::new();
+        if !lits.is_empty() {
+            let lenf = self.str_len_fn();
+            for &(c, n) in &lits {
+                let lc = self.m.mk_app(lenf, &[c]);
+                let nv = self.m.mk_int(n);
+                let eq = self.m.mk_eq(lc, nv);
+                ax.push(eq);
+            }
+            for i in 0..lits.len() {
+                for j in i + 1..lits.len() {
+                    let eq = self.m.mk_eq(lits[i].0, lits[j].0);
+                    ax.push(self.m.mk_not(eq));
+                }
+            }
+        }
+        ax
+    }
+
+    /// The interned `String` sort (registered on first use).
+    fn string_sort(&mut self) -> AstId {
+        if let Some(s) = self.string_sort {
+            return s;
+        }
+        let s = self.m.mk_uninterpreted_sort(Symbol::new("String"));
+        self.string_sort = Some(s);
+        self.sorts.insert("String".to_string(), s);
+        s
+    }
+
+    /// The distinct constant for the string literal `text` (interned).
+    fn mk_str_lit(&mut self, text: &str) -> AstId {
+        if let Some(&c) = self.str_lits.get(text) {
+            return c;
+        }
+        let sort = self.string_sort();
+        let name = alloc::format!("!str!{}", self.str_lits.len());
+        let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
+        let c = self.m.mk_const(d);
+        self.str_lits.insert(text.to_string(), c);
+        c
+    }
+
+    /// The `str.len : String → Int` declaration (created on first use).
+    fn str_len_fn(&mut self) -> AstId {
+        if let Some(d) = self.str_len_decl {
+            return d;
+        }
+        let s = self.string_sort();
+        let int = self.m.mk_int_sort();
+        let d = self.m.mk_func_decl(Symbol::new("str.len"), &[s], int);
+        self.str_len_decl = Some(d);
+        d
+    }
+
+    /// The code points of `t` if it is a string literal constant.
+    fn str_value(&self, t: AstId) -> Option<Vec<u32>> {
+        self.str_lits
+            .iter()
+            .find(|(_, c)| **c == t)
+            .map(|(text, _)| text.chars().map(|ch| ch as u32).collect::<Vec<u32>>())
+    }
+
+    /// Build a string-theory application `(op args…)`, folding when every string
+    /// argument is a literal and otherwise producing an uninterpreted term
+    /// (marked symbolic so a goal mentioning it is answered `unknown`).
+    fn string_op(&mut self, op: &str, raw: &[AstId]) -> Result<AstId, String> {
+        // Concrete code points of each argument, if all are string literals.
+        let strs: Option<Vec<Vec<u32>>> = raw.iter().map(|&a| self.str_value(a)).collect();
+        match op {
+            "str.len" => {
+                if let Some(v) = self.str_value(raw[0]) {
+                    return Ok(self.m.mk_int(v.len() as i64));
+                }
+                // Symbolic length is a genuine function — sound, not gated.
+                let d = self.str_len_fn();
+                Ok(self.m.mk_app(d, &[raw[0]]))
+            }
+            "str.++" => {
+                if let Some(parts) = strs {
+                    let joined: Vec<u32> = parts.into_iter().flatten().collect();
+                    return Ok(self.mk_str_lit(&code_points_to_string(&joined)));
+                }
+                self.symbolic_string(op, raw)
+            }
+            "str.at" | "str.substr" | "str.replace" | "str.from_int" | "str.from-int" => {
+                if let Some(v) = self.fold_string_producer(op, raw) {
+                    return Ok(self.mk_str_lit(&v));
+                }
+                self.symbolic_string(op, raw)
+            }
+            "str.contains" | "str.prefixof" | "str.suffixof" => {
+                if let Some(parts) = &strs {
+                    let b = fold_string_pred(op, parts);
+                    return Ok(if b {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    });
+                }
+                // A symbolic string predicate can also be unsound if its string
+                // argument is pinned to a literal, so gate via a symbolic marker.
+                let atom = self.symbolic_string(op, raw)?;
+                Ok(atom)
+            }
+            "str.indexof" | "str.to_int" | "str.to-int" => {
+                if let Some(v) = self.fold_string_to_int(op, raw) {
+                    return Ok(self.m.mk_int(v));
+                }
+                self.symbolic_string(op, raw)
+            }
+            _ => Err(alloc::format!("unsupported string op {op:?}")),
+        }
+    }
+
+    /// A fresh uninterpreted term standing for a symbolic string operation,
+    /// recorded so the goal is answered `unknown`.
+    fn symbolic_string(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // Result sort: Bool for predicates, Int for indexof/to_int, else String.
+        let sort = match op {
+            "str.contains" | "str.prefixof" | "str.suffixof" => self.m.mk_bool_sort(),
+            "str.indexof" | "str.to_int" | "str.to-int" => self.m.mk_int_sort(),
+            _ => self.string_sort(),
+        };
+        let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
+        let name = alloc::format!("!strop!{}!{}", op, self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
+        let app = self.m.mk_app(d, args);
+        self.str_symbolic.insert(app);
+        Ok(app)
+    }
+
+    /// Fold a string-producing op over literal arguments (`str_vals` the code
+    /// points of each argument if all literals), returning the result string.
+    fn fold_string_producer(&self, op: &str, raw: &[AstId]) -> Option<String> {
+        match op {
+            "str.at" => {
+                let s = self.str_value(raw[0])?;
+                let i = self.int_arg(raw[1])?;
+                Some(if i >= 0 && (i as usize) < s.len() {
+                    code_points_to_string(&[s[i as usize]])
+                } else {
+                    String::new()
+                })
+            }
+            "str.substr" => {
+                let s = self.str_value(raw[0])?;
+                let (i, n) = (self.int_arg(raw[1])?, self.int_arg(raw[2])?);
+                if i < 0 || n < 0 || (i as usize) > s.len() {
+                    return Some(String::new());
+                }
+                let start = i as usize;
+                let end = (start + n as usize).min(s.len());
+                Some(code_points_to_string(&s[start..end]))
+            }
+            "str.replace" => {
+                let (s, from, to) = (
+                    self.str_value(raw[0])?,
+                    self.str_value(raw[1])?,
+                    self.str_value(raw[2])?,
+                );
+                Some(replace_first(&s, &from, &to))
+            }
+            "str.from_int" | "str.from-int" => {
+                let n = self.int_arg(raw[0])?;
+                Some(if n < 0 {
+                    String::new()
+                } else {
+                    alloc::format!("{n}")
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The integer value of `t` if it is an integer numeral.
+    fn int_arg(&self, t: AstId) -> Option<i64> {
+        self.m.as_numeral(t)?.to_integer()?.to_i64()
+    }
+
+    /// Fold a string→int op (`str.to_int`, `str.indexof`) over literal arguments.
+    fn fold_string_to_int(&self, op: &str, raw: &[AstId]) -> Option<i64> {
+        match op {
+            "str.to_int" | "str.to-int" => {
+                let s = self.str_value(raw[0])?;
+                // A non-empty run of ASCII digits is its value; otherwise -1.
+                if !s.is_empty() && s.iter().all(|&c| (0x30..=0x39).contains(&c)) {
+                    let mut n: i64 = 0;
+                    for &c in &s {
+                        n = n.checked_mul(10)?.checked_add((c - 0x30) as i64)?;
+                    }
+                    Some(n)
+                } else {
+                    Some(-1)
+                }
+            }
+            "str.indexof" => {
+                let s = self.str_value(raw[0])?;
+                let sub = self.str_value(raw[1])?;
+                let off = if raw.len() > 2 {
+                    self.int_arg(raw[2])?
+                } else {
+                    0
+                };
+                if off < 0 || off as usize > s.len() {
+                    return Some(-1);
+                }
+                let start = off as usize;
+                if sub.is_empty() {
+                    return Some(start as i64);
+                }
+                for i in start..=s.len().saturating_sub(sub.len()) {
+                    if s[i..i + sub.len()] == sub[..] {
+                        return Some(i as i64);
+                    }
+                }
+                Some(-1)
+            }
+            _ => None,
+        }
+    }
+
     /// A fresh 0-ary constant of the given sort (for term lifting).
     fn fresh_const(&mut self, sort: AstId) -> AstId {
         let name = alloc::format!("!k!{}", self.fresh_counter);
@@ -1636,6 +1927,7 @@ impl Context {
         axioms.extend(self.enum_axioms(lifted));
         axioms.extend(self.record_axioms(lifted));
         axioms.extend(self.datatype_axioms(lifted));
+        axioms.extend(self.string_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -1750,14 +2042,15 @@ impl Context {
     /// contains genuine nonlinear arithmetic the linear core over-approximates
     /// (so a definite `sat`/`unsat` is always sound).
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
-        // Quantified formulas are not decided yet: if the goal mentions a
-        // quantifier sentinel, answer a sound `unknown`.
-        if !self.quant_atoms.is_empty()
+        // Quantified formulas and symbolic string operations are not fully
+        // decided: if the goal mentions either kind of sentinel, answer a sound
+        // `unknown`.
+        if (!self.quant_atoms.is_empty() || !self.str_symbolic.is_empty())
             && self
                 .m
                 .postorder(goal)
                 .iter()
-                .any(|t| self.quant_atoms.contains(t))
+                .any(|t| self.quant_atoms.contains(t) || self.str_symbolic.contains(t))
         {
             return (SmtResult::Unknown, None);
         }
@@ -2014,6 +2307,11 @@ impl Context {
             SExpr::Atom(a) => match a.as_str() {
                 "true" => Ok(self.m.mk_true()),
                 "false" => Ok(self.m.mk_false()),
+                name if name.starts_with('"') => {
+                    // A string literal "…" → its interned distinct constant.
+                    let text = unquote_string(name);
+                    Ok(self.mk_str_lit(&text))
+                }
                 name => {
                     if let Some(id) = self.lookup_bound(name) {
                         return Ok(id);
@@ -2149,6 +2447,9 @@ impl Context {
                     .collect::<Result<_, _>>()?;
                 if self.macros.contains_key(&head) {
                     return self.expand_macro(&head, args);
+                }
+                if head.starts_with("str.") {
+                    return self.string_op(&head, &args);
                 }
                 self.apply(&head, args)
             }
@@ -3111,6 +3412,34 @@ mod tests {
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn string_fragment_decides() {
+        // Constant folding of string operations.
+        assert_eq!(
+            run("(assert (not (= (str.++ \"ab\" (str.substr \"xcdy\" 1 2)) \"abcd\")))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Length reasoning through equality/congruence.
+        assert_eq!(
+            run("(declare-const x String)(assert (= x \"abc\"))\
+                 (assert (= (str.len x) 4))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Distinct string literals.
+        assert_eq!(
+            run("(declare-const x String)(assert (= x \"a\"))(assert (= x \"b\"))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A satisfiable length constraint on a free string.
+        assert_eq!(
+            run("(declare-const x String)(assert (= (str.len x) 5))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
