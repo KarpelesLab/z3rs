@@ -6360,6 +6360,25 @@ mod tests {
     }
 
     #[test]
+    fn integer_dark_shadow_sat() {
+        // Unbounded feasible integer systems that branch-and-bound cannot
+        // converge on: the dark shadow constructs and verifies a witness.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (>= (- a b) 1))(assert (<= (- a b) 5))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (<= (+ (* 3 x) (* 2 y)) 10))(assert (>= (+ (* 3 x) (* 2 y)) 5))\
+                 (assert (>= x 0))(assert (>= y 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
     fn integer_fourier_motzkin_unsat() {
         // 2a+4b ∈ [3,5] ∧ a = b: real-feasible (a ∈ [1/2, 5/6]) but no integer
         // solution — eliminating b and tightening (6a ∈ [3,5] → a≥1 ∧ a≤0)

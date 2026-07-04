@@ -578,9 +578,136 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
             if integer_fm_unsat(&cons, &int_vars, &mut fm_budget) {
                 return Feas::Unsat;
             }
+            // Dark-shadow SAT: a verified witness upgrades unknown → sat for
+            // unbounded feasible systems B&B cannot converge on.
+            let mut dark_budget: u64 = 60_000;
+            if let Some(a) = omega_dark_witness(&cons, &sys.diseqs, &int_vars, &mut dark_budget) {
+                return Feas::Sat(a);
+            }
         }
     }
     feas
+}
+
+/// Omega-test **dark shadow** witness for a pure-integer system: try to prove
+/// satisfiability by eliminating every variable with the dark-shadow projection
+/// (Fourier–Motzkin plus the `(α−1)(β−1)` tightening term that guarantees an
+/// integer between the bounds), then back-substituting to build a concrete
+/// assignment. The returned assignment is **verified against every original
+/// constraint and disequality**, so — exactly like [`dioph_witness`] — a bug in
+/// the shadow logic can only cost completeness (a missed `sat`), never
+/// soundness. `None` when the dark shadow is infeasible (the tight cases that
+/// need the gray shadow), the budget is exhausted, or the witness fails to
+/// verify.
+fn omega_dark_witness(
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+    budget: &mut u64,
+) -> Option<Assignment> {
+    let zero = Rational::from_integer(Int::from(0));
+    let one = Rational::from_integer(Int::from(1));
+    let coeff = |e: &LinExpr, x: AstId| -> Rational {
+        e.terms()
+            .find(|(v, _)| *v == x)
+            .map(|(_, c)| c.clone())
+            .unwrap_or_else(|| zero.clone())
+    };
+    // Normalize to a list of `e ≤ 0` expressions.
+    let mut work: Vec<LinExpr> = Vec::new();
+    for c in cons {
+        match c.rel {
+            Rel::Le => work.push(c.expr.clone()),
+            Rel::Lt => work.push(c.expr.integer_strict_tighten()),
+            Rel::Eq => {
+                work.push(c.expr.clone());
+                work.push(c.expr.neg());
+            }
+        }
+    }
+    // Eliminate each variable, recording its lower/upper bounds for back-substitution.
+    let mut steps: Vec<(AstId, Vec<LinExpr>, Vec<LinExpr>)> = Vec::new();
+    for &x in int_vars {
+        let (mut lower, mut upper, mut rest) = (Vec::new(), Vec::new(), Vec::new());
+        for e in &work {
+            let c = coeff(e, x);
+            if c.is_zero() {
+                rest.push(e.clone());
+            } else if c < zero {
+                lower.push(e.clone());
+            } else {
+                upper.push(e.clone());
+            }
+        }
+        for l in &lower {
+            let alpha = coeff(l, x).neg(); // α > 0 (−coeff)
+            for u in &upper {
+                if *budget == 0 {
+                    return None;
+                }
+                *budget -= 1;
+                let beta = coeff(u, x); // β > 0
+                // Real resolvent β·l + α·u cancels x; the dark-shadow term
+                // (α−1)(β−1) makes an integer between the bounds sufficient.
+                let mut r = l.scale(&beta).add(&u.scale(&alpha));
+                let extra = &(&alpha - &one) * &(&beta - &one);
+                r = r.add(&LinExpr::constant(extra.clone()));
+                rest.push(r);
+            }
+        }
+        steps.push((x, lower, upper));
+        work = rest;
+    }
+    // Dark shadow infeasible if a constant residual is positive, or (defensively)
+    // if a non-constant residual remains (some variable was not integer).
+    if work
+        .iter()
+        .any(|e| e.as_constant().is_none_or(|k| k > zero))
+    {
+        return None;
+    }
+    // Back-substitute in reverse elimination order: each variable's bounds now
+    // involve only already-assigned variables.
+    let mut a: Assignment = int_vars.iter().map(|&v| (v, zero.clone())).collect();
+    for (x, lower, upper) in steps.iter().rev() {
+        let at_zero = |e: &LinExpr| -> Rational {
+            let mut t = a.clone();
+            t.insert(*x, zero.clone());
+            e.eval(&t)
+        };
+        // Lower bounds: −αx + l₀ ≤ 0 ⟹ x ≥ ⌈l₀/α⌉.
+        let mut lo: Option<Rational> = None;
+        for l in lower {
+            let alpha = coeff(l, *x).neg();
+            let b = Rational::from_integer((&at_zero(l) / &alpha).ceil());
+            lo = Some(lo.map_or_else(
+                || b.clone(),
+                |m: Rational| if b > m { b.clone() } else { m },
+            ));
+        }
+        // Upper bounds: βx + u₀ ≤ 0 ⟹ x ≤ ⌊−u₀/β⌋.
+        let mut hi: Option<Rational> = None;
+        for u in upper {
+            let beta = coeff(u, *x);
+            let b = Rational::from_integer((&at_zero(u).neg() / &beta).floor());
+            hi = Some(hi.map_or_else(
+                || b.clone(),
+                |m: Rational| if b < m { b.clone() } else { m },
+            ));
+        }
+        let x_val = lo.or(hi).unwrap_or_else(|| zero.clone());
+        a.insert(*x, x_val);
+    }
+    // Safety net: accept only a genuinely satisfying assignment.
+    let ok = cons.iter().all(|c| {
+        let v = c.expr.eval(&a);
+        match c.rel {
+            Rel::Le => v <= zero,
+            Rel::Lt => v < zero,
+            Rel::Eq => v == zero,
+        }
+    }) && diseqs.iter().all(|d| d.eval(&a) != zero);
+    ok.then_some(a)
 }
 
 /// A sound (incomplete) integer-infeasibility test for an all-integer system:
