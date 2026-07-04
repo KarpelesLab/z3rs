@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "puremp"
-version = "0.1.4"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c6c83249ae5a1775beba3ae97eca917aea838d357cf6e7f167167294a2fcbacb"
+checksum = "7bd1f38102e114b648aaaa62c2314f7b4fe4993eae80917ef0077fa7d0730fe7"
 
 [[package]]
 name = "z3rs"
