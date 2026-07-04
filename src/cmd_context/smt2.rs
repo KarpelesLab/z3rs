@@ -3636,14 +3636,19 @@ mod tests {
     #[test]
     fn regex_membership_folds() {
         // "a5z" matches letter·digit·letter.
-        let re = "(re.++ (re.range \"a\" \"z\") (re.++ (re.range \"0\" \"9\") (re.range \"a\" \"z\")))";
+        let re =
+            "(re.++ (re.range \"a\" \"z\") (re.++ (re.range \"0\" \"9\") (re.range \"a\" \"z\")))";
         assert_eq!(
-            run(&alloc::format!("(assert (not (str.in_re \"a5z\" {re})))(check-sat)")).unwrap(),
+            run(&alloc::format!(
+                "(assert (not (str.in_re \"a5z\" {re})))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         // (ab)* matches "abab" but not "aba".
         assert_eq!(
-            run("(assert (not (str.in_re \"abab\" (re.* (str.to_re \"ab\")))))(check-sat)").unwrap(),
+            run("(assert (not (str.in_re \"abab\" (re.* (str.to_re \"ab\")))))(check-sat)")
+                .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
