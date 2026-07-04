@@ -541,6 +541,9 @@ struct Context {
     /// Boolean sentinels standing in for (not-yet-decided) quantified formulas;
     /// a goal that mentions any of these is answered `unknown` (see `decide`).
     quant_atoms: BTreeSet<AstId>,
+    /// Enumeration datatypes: sort → its constructor constants. Reasoned about
+    /// as a finite uninterpreted sort with distinct elements and a domain axiom.
+    enums: BTreeMap<AstId, Vec<AstId>>,
 }
 
 impl Context {
@@ -568,6 +571,7 @@ impl Context {
             last_model: None,
             fresh_counter: 0,
             quant_atoms: BTreeSet::new(),
+            enums: BTreeMap::new(),
         }
     }
 
@@ -691,6 +695,11 @@ impl Context {
                 let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
                 self.sorts.insert(name.clone(), s);
                 self.sort_order.push(name);
+                Ok(None)
+            }
+            "declare-datatypes" => {
+                self.declare_datatypes(&list[1], &list[2])?;
+                self.last_model = None;
                 Ok(None)
             }
             "declare-const" => {
@@ -893,6 +902,76 @@ impl Context {
         Some(k)
     }
 
+    /// `(declare-datatypes sort_decls bodies)` — currently the enumeration case
+    /// (all constructors nullary). Supports both the SMT-LIB 2.6 form
+    /// `((T 0)…) ((( c1 )( c2 ))…)` and the legacy `() ((T c1 c2 …)…)`.
+    fn declare_datatypes(&mut self, sort_decls: &SExpr, bodies: &SExpr) -> Result<(), String> {
+        let sort_decls = as_list(sort_decls)?;
+        let bodies = as_list(bodies)?;
+        for (i, body) in bodies.iter().enumerate() {
+            let bodyl = as_list(body)?;
+            // The datatype name and the constructor s-expressions.
+            let (name, ctors): (String, &[SExpr]) = if sort_decls.is_empty() {
+                (Self::sym(&bodyl[0])?.to_string(), &bodyl[1..]) // legacy (T c1 c2 …)
+            } else {
+                let sd = as_list(&sort_decls[i])?;
+                (Self::sym(&sd[0])?.to_string(), bodyl) // 2.6: name from (T k)
+            };
+            let sort = self.m.mk_uninterpreted_sort(Symbol::new(&name));
+            self.sorts.insert(name.clone(), sort);
+            self.sort_order.push(name);
+            let mut ctor_ids = Vec::new();
+            for c in ctors {
+                let cname = match c {
+                    SExpr::Atom(a) => a.clone(),
+                    SExpr::List(cl) if cl.len() == 1 => Self::sym(&cl[0])?.to_string(),
+                    _ => {
+                        return Err("declare-datatypes: only enumeration datatypes \
+                                    (nullary constructors) are supported"
+                            .to_string());
+                    }
+                };
+                let d = self.m.mk_func_decl(Symbol::new(&cname), &[], sort);
+                let cid = self.m.mk_const(d);
+                self.funcs.insert(cname.clone(), d);
+                self.decl_order.push(cname);
+                ctor_ids.push(cid);
+            }
+            self.enums.insert(sort, ctor_ids);
+        }
+        Ok(())
+    }
+
+    /// Axioms for the declared enumeration datatypes: the constructors of each
+    /// enum are pairwise distinct, and every term of an enum sort in `goal`
+    /// equals one of that enum's constructors (the domain axiom).
+    fn enum_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.enums.is_empty() {
+            return Vec::new();
+        }
+        let mut ax = Vec::new();
+        // Constructor distinctness — always sound, independent of the goal.
+        // Expanded to pairwise disequality (a bare `distinct` node is opaque to
+        // the theory solvers).
+        for ctors in self.enums.values().cloned().collect::<Vec<_>>() {
+            for i in 0..ctors.len() {
+                for j in i + 1..ctors.len() {
+                    let eq = self.m.mk_eq(ctors[i], ctors[j]);
+                    ax.push(self.m.mk_not(eq));
+                }
+            }
+        }
+        // Domain axiom for each enum-sorted term the goal mentions.
+        for t in self.m.postorder(goal) {
+            let s = self.m.get_sort(t);
+            if let Some(ctors) = self.enums.get(&s).cloned() {
+                let eqs: Vec<AstId> = ctors.iter().map(|&c| self.m.mk_eq(t, c)).collect();
+                ax.push(self.m.mk_or(&eqs));
+            }
+        }
+        ax
+    }
+
     /// A fresh 0-ary constant of the given sort (for term lifting).
     fn fresh_const(&mut self, sort: AstId) -> AstId {
         let name = alloc::format!("!k!{}", self.fresh_counter);
@@ -926,6 +1005,7 @@ impl Context {
         let base = self.conjunction();
         let lifted = self.lift(base);
         let mut axioms = self.array_axioms(lifted);
+        axioms.extend(self.enum_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -1319,6 +1399,16 @@ impl Context {
             SExpr::List(l) if !l.is_empty() => {
                 // Qualified-identifier head, e.g. ((as const (Array I E)) v).
                 if let SExpr::List(qid) = &l[0] {
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "is")
+                    {
+                        // ((_ is C) x) — the enum tester: x = C.
+                        let cname = Self::sym(&qid[2])?.to_string();
+                        let c = self.term(&SExpr::Atom(cname))?;
+                        let x = self.term(&l[1])?;
+                        return Ok(self.m.mk_eq(x, c));
+                    }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "as")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "const")
@@ -2374,6 +2464,34 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn enum_datatypes_decide() {
+        let dt = "(declare-datatypes () ((Color red green blue)))";
+        // A constructor equality is unsat (constructors are distinct).
+        assert_eq!(
+            run(&alloc::format!("{dt}(assert (= red green))(check-sat)")).unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Excluding every constructor is unsat (the domain axiom).
+        assert_eq!(
+            run(&alloc::format!(
+                "{dt}(declare-const c Color)(assert (not (= c red)))\
+                 (assert (not (= c green)))(assert (not (= c blue)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // The tester and transitivity: c is red, so it can't also be green.
+        assert_eq!(
+            run(&alloc::format!(
+                "{dt}(declare-const c Color)(assert ((_ is red) c))\
+                 (assert ((_ is green) c))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
