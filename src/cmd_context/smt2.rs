@@ -162,6 +162,16 @@ fn fold_string_pred(op: &str, parts: &[Vec<u32>]) -> bool {
     }
 }
 
+/// `2^w` as an arbitrary-precision integer.
+fn pow2(w: u32) -> Int {
+    let mut r = Int::from(1);
+    let two = Int::from(2);
+    for _ in 0..w {
+        r = r.mul(&two);
+    }
+    r
+}
+
 /// `(str.replace_all s from to)` — replace every non-overlapping occurrence.
 fn replace_all(s: &[u32], from: &[u32], to: &[u32]) -> String {
     if from.is_empty() || from.len() > s.len() {
@@ -1947,6 +1957,48 @@ impl Context {
     /// the disjunction over every way the literal splits among the concatenation
     /// parts — sound and complete for this word-equation fragment. `None` if the
     /// pattern doesn't match.
+    /// Bridge an Int↔BV equality involving `bv2int`/`int2bv` and a constant on
+    /// the other side, linking the two theories: `(= (bv2int a) c)` becomes
+    /// `a = bv(c)` (or `false` if `c` is out of range), and `(= (int2bv x) c)`
+    /// becomes `(mod x 2ⁿ) = value(c)`. `None` if the pattern doesn't match.
+    fn bv_int_bridge_eq(&mut self, a: AstId, b: AstId) -> Option<AstId> {
+        self.bridge_dir(a, b).or_else(|| self.bridge_dir(b, a))
+    }
+
+    fn bridge_dir(&mut self, x: AstId, y: AstId) -> Option<AstId> {
+        let app = self.m.app(x)?.clone();
+        if app.args.len() != 1 {
+            return None;
+        }
+        let nm = self.m.func_decl(app.decl)?.name.as_str()?;
+        let arg = app.args[0];
+        if matches!(nm, "bv2int" | "bv2nat" | "ubv_to_int" | "sbv_to_int") {
+            let c = self.m.as_numeral(y).and_then(|r| r.to_integer())?;
+            let w = self.m.bv_sort_width(self.m.get_sort(arg))?;
+            let (lo, hi) = if nm == "sbv_to_int" {
+                let h = pow2(w - 1);
+                (-&h, h)
+            } else {
+                (Int::from(0), pow2(w))
+            };
+            if c < lo || c >= hi {
+                return Some(self.m.mk_false()); // no bit-vector maps to this integer
+            }
+            let bv = self.m.mk_bv_numeral(c, w);
+            return Some(self.m.mk_eq(arg, bv));
+        }
+        if nm == "int2bv" {
+            let v = self.m.bv_numeral_value(y)?;
+            let w = self.m.bv_sort_width(self.m.get_sort(x))?;
+            // int2bv(x) = c  ⟺  x ≡ value(c) (mod 2ⁿ).
+            let modulus = self.m.mk_numeral(Rational::from_integer(pow2(w)), true);
+            let m2 = self.m.mk_mod(arg, modulus);
+            let vv = self.m.mk_numeral(Rational::from_integer(v), true);
+            return Some(self.m.mk_eq(m2, vv));
+        }
+        None
+    }
+
     fn try_split_concat_eq(&mut self, a: &SExpr, b: &SExpr) -> Result<Option<AstId>, String> {
         // Flatten a (possibly nested) `str.++` into its sequence of parts.
         fn flatten(s: &SExpr, out: &mut Vec<SExpr>) {
@@ -4457,6 +4509,13 @@ impl Context {
                 {
                     return Ok(self.m.mk_eq(a, b));
                 }
+                // Int↔BV bridge: (= (bv2int a) c) / (= (int2bv x) c).
+                if head == "="
+                    && args.len() == 2
+                    && let Some(t) = self.bv_int_bridge_eq(args[0], args[1])
+                {
+                    return Ok(t);
+                }
                 // Fold equality of two structural sequences (element-wise, or
                 // false on a length mismatch).
                 if head == "="
@@ -6230,6 +6289,29 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn int_bv_bridge() {
+        // (bv2int a) = 5 forces a = #x05.
+        assert_eq!(
+            run("(declare-const a (_ BitVec 8))(assert (= (bv2int a) 5))\
+                 (assert (not (= a #x05)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Out of range for the width → no bit-vector maps to it.
+        assert_eq!(
+            run("(declare-const a (_ BitVec 4))(assert (= (bv2int a) 20))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // int2bv is modular: int2bv(x)=#x05 ⟺ x ≡ 5 (mod 256), so x=261 works.
+        assert_eq!(
+            run("(declare-const x Int)(assert (= ((_ int2bv 8) x) #x05))\
+                 (assert (= x 261))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
