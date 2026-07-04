@@ -542,7 +542,105 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
         })
         .collect();
     let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
+    // Branch-and-bound cannot converge on an unbounded Diophantine system
+    // (e.g. `6a+4b=2`). Try to construct an integer witness first — it uses no
+    // budget and is *verified* against every constraint, so it only ever yields a
+    // genuine `Sat` and cannot introduce unsoundness. Running it before B&B also
+    // preserves the shared budget for the Nelson–Oppen interface phase.
+    if let Some(a) = dioph_witness(&cons, &sys.diseqs, &int_vars) {
+        return Feas::Sat(a);
+    }
     integer_feasible(&cons, &sys.diseqs, &int_vars, budget, 0)
+}
+
+/// Extended Euclid: returns `(g, x, y)` with `a·x + b·y = g = gcd(a,b)`.
+fn egcd(a: i128, b: i128) -> (i128, i128, i128) {
+    if b == 0 {
+        (a, 1, 0)
+    } else {
+        let (g, x, y) = egcd(b, a % b);
+        (g, y, x - (a / b) * y)
+    }
+}
+
+/// Try to build a verified integer witness for a system whose only equality is a
+/// two-variable linear Diophantine `c₁·v₁ + c₂·v₂ + k = 0`. Searches the general
+/// solution `(v₁,v₂) = (x₀,y₀) + t·(c₂/g, −c₁/g)` over a bounded `t`, sets the
+/// other integer variables to 0, and returns the first assignment that satisfies
+/// every constraint and disequality. `None` if the pattern doesn't match or no
+/// witness verifies.
+fn dioph_witness(
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+) -> Option<Assignment> {
+    let eqs: Vec<&Constraint> = cons.iter().filter(|c| c.rel == Rel::Eq).collect();
+    if eqs.len() != 1 {
+        return None;
+    }
+    let e = &eqs[0].expr;
+    let as_i128 = |r: &Rational| -> Option<i128> {
+        r.is_integer()
+            .then(|| r.to_integer())
+            .flatten()
+            .and_then(|i| i.to_i64())
+            .map(|n| n as i128)
+    };
+    let terms: Vec<(AstId, i128)> = e
+        .terms()
+        .map(|(v, c)| as_i128(c).map(|n| (v, n)))
+        .collect::<Option<_>>()?;
+    if terms.len() != 2 {
+        return None;
+    }
+    let k = as_i128(e.const_term())?;
+    let (v1, c1) = terms[0];
+    let (v2, c2) = terms[1];
+    if c1 == 0 || c2 == 0 {
+        return None;
+    }
+    let (mut g, s, t_e) = egcd(c1, c2); // c1·s + c2·t_e = g
+    if g == 0 {
+        return None;
+    }
+    if g < 0 {
+        g = -g;
+    }
+    let rhs = -k; // c1·v1 + c2·v2 = rhs
+    if rhs % g != 0 {
+        return None; // no integer solution (unsat, handled elsewhere)
+    }
+    // Particular solution scaled from the raw egcd cofactors (c1·s + c2·t_e is
+    // the signed gcd, which also divides rhs).
+    let mult = rhs / (c1 * s + c2 * t_e);
+    let (x0, y0) = (s * mult, t_e * mult);
+    let (dx, dy) = (c2 / g, -(c1 / g));
+    let fits = |x: i128| i64::try_from(x).is_ok();
+    for t in -256i128..=256 {
+        let (xv, yv) = (x0 + dx * t, y0 + dy * t);
+        if !fits(xv) || !fits(yv) {
+            continue;
+        }
+        let mut a: Assignment = int_vars
+            .iter()
+            .map(|&v| (v, Rational::from_integer(Int::from(0))))
+            .collect();
+        a.insert(v1, Rational::from_integer(Int::from(xv as i64)));
+        a.insert(v2, Rational::from_integer(Int::from(yv as i64)));
+        let zero = Rational::from_integer(Int::from(0));
+        let ok_cons = cons.iter().all(|c| {
+            let val = c.expr.eval(&a);
+            match c.rel {
+                Rel::Le => val <= zero,
+                Rel::Lt => val < zero,
+                Rel::Eq => val == zero,
+            }
+        });
+        if ok_cons && diseqs.iter().all(|d| d.eval(&a) != zero) {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// Does the arithmetic system *entail* `u = v`? `Some(true)` iff neither `u < v`

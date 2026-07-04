@@ -6015,6 +6015,33 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_diophantine() {
+        // 6a+4b=2 (gcd 2 | 2) is satisfiable but unbounded, so branch-and-bound
+        // cannot converge; a verified integer witness decides it.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (= (+ (* 6 a) (* 4 b)) 2))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // Still sat under a one-sided bound (the witness search covers the
+        // general solution).
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (= (+ (* 6 a) (* 4 b)) 2))(assert (>= a 100))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // gcd 2 does not divide 3 → unsat.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (= (+ (* 6 a) (* 4 b)) 3))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
     fn divmod_linking() {
         // mod is in range and consistent with div.
         assert_eq!(
