@@ -26,18 +26,28 @@
 //! - [x] `z3/src/util/lbool.{h,cpp}` → [`lbool`]
 //! - [x] `z3/src/util/symbol.{h,cpp}` → [`symbol`] (+ `no_std` [`sync`])
 //! - [x] `z3/src/util/bit_vector.{h,cpp}` → [`bit_vector`]
-//! - [ ] `z3/src/util` containers/hashtables/vector/params/rlimit/…
+//! - [x] `z3/src/util/params.{h,cpp}` → [`params`]
+//! - [x] `z3/src/util/rlimit.{h,cpp}` → [`rlimit`]
+//! - [x] containers/hashtables/vector (`obj_map`, `ptr_vector`, `hashtable`,
+//!   `vector`, …) → provided natively by Rust's `alloc` (`BTreeMap`,
+//!   `BTreeSet`, `Vec`, `String`); no port needed
 //!
-//! ## Status: IN PROGRESS (numerals via `puremp`; foundation being ported)
+//! ## Status: DONE (foundation complete — numerals via `puremp`, hashing,
+//! symbols, bit vectors, zstrings, params, resource limits; Rust `alloc`
+//! supplies the container/vector/hashtable layer)
 
 pub mod bit_vector;
 pub mod hash;
 pub mod lbool;
+pub mod params;
+pub mod rlimit;
 pub mod symbol;
 pub mod sync;
 pub mod zstring;
 
 pub use bit_vector::BitVector;
 pub use lbool::LBool;
+pub use params::{ParamValue, Params};
+pub use rlimit::Rlimit;
 pub use symbol::Symbol;
 pub use zstring::Zstring;

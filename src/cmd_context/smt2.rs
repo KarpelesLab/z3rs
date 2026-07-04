@@ -1041,6 +1041,8 @@ struct Context {
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
     /// `empty`), for structural folding of `seq.len`/`nth`/`at`/`extract`/`=`.
     seq_of: BTreeMap<AstId, Vec<AstId>>,
+    /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
+    params: crate::util::Params,
 }
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
@@ -1174,6 +1176,7 @@ impl Context {
             lambdas: BTreeMap::new(),
             maps: BTreeMap::new(),
             as_arrays: BTreeMap::new(),
+            params: crate::util::Params::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -1282,7 +1285,46 @@ impl Context {
             _ => return Err("expected a command list".to_string()),
         };
         match Self::sym(&list[0])? {
-            "set-logic" | "set-info" | "set-option" | "exit" => Ok(None),
+            "set-option" => {
+                // (set-option :name value) — store the option so get-option can
+                // return it. The value is one of the SMT-LIB scalar forms.
+                if list.len() >= 3
+                    && let Ok(name) = Self::sym(&list[1])
+                {
+                    let name = name.to_string();
+                    if let SExpr::Atom(v) = &list[2] {
+                        use crate::util::ParamValue;
+                        let pv = match v.as_str() {
+                            "true" => ParamValue::Bool(true),
+                            "false" => ParamValue::Bool(false),
+                            s => {
+                                if let Ok(u) = s.parse::<u64>() {
+                                    ParamValue::UInt(u)
+                                } else if let Ok(d) = s.parse::<f64>() {
+                                    ParamValue::Double(d)
+                                } else {
+                                    ParamValue::Str(s.to_string())
+                                }
+                            }
+                        };
+                        self.params.set(&name, pv);
+                    }
+                }
+                Ok(None)
+            }
+            "get-option" => {
+                // (get-option :name) — the stored value, or "unsupported".
+                use crate::util::ParamValue;
+                let name = Self::sym(&list[1])?;
+                Ok(Some(match self.params.get(name) {
+                    Some(ParamValue::Bool(b)) => b.to_string(),
+                    Some(ParamValue::UInt(u)) => u.to_string(),
+                    Some(ParamValue::Double(d)) => d.to_string(),
+                    Some(ParamValue::Str(s)) => s.clone(),
+                    None => "unsupported".to_string(),
+                }))
+            }
+            "set-logic" | "set-info" | "exit" => Ok(None),
             "echo" => Ok(Some(match list.get(1) {
                 Some(SExpr::Atom(a)) => unquote_string(a),
                 _ => String::new(),
