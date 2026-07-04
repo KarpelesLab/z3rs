@@ -565,7 +565,7 @@ mod tests {
         let le5 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(5))));
         let ge5 = Constraint::le(LinExpr::constant(rat(5)).sub(&LinExpr::var(x())));
         let ne5 = LinExpr::var(x()).sub(&LinExpr::constant(rat(5)));
-        assert!(model_with_diseqs(&[le5, ge5.clone()], &[ne5.clone()]).is_none());
+        assert!(model_with_diseqs(&[le5, ge5.clone()], core::slice::from_ref(&ne5)).is_none());
         let le6 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(6))));
         let cs = [le6, ge5];
         let m = model_with_diseqs(&cs, &[ne5]).expect("feasible");

@@ -1077,9 +1077,7 @@ impl Context {
         }
         let mut names = Vec::new();
         for (k, label) in keep.iter().zip(&self.assert_names) {
-            if *k
-                && let Some(name) = label
-            {
+            if *k && let Some(name) = label {
                 names.push(name.clone());
             }
         }
@@ -1148,7 +1146,9 @@ impl Context {
         let mut out = String::from("(");
         for (name, c, sort_name) in &consts {
             let v = model.value_string(&self.m, *c);
-            out.push_str(&alloc::format!("\n  (define-fun {name} () {sort_name} {v})"));
+            out.push_str(&alloc::format!(
+                "\n  (define-fun {name} () {sort_name} {v})"
+            ));
         }
         out.push_str("\n)");
         self.last_model = Some(model);
@@ -1708,7 +1708,10 @@ mod tests {
             (check-sat)
             (get-value (r))
         ";
-        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "((r (/ 1.0 2.0)))"]);
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "((r (/ 1.0 2.0)))"]
+        );
     }
 
     #[test]
@@ -1722,7 +1725,11 @@ mod tests {
         let out = run(script).unwrap();
         assert_eq!(out[0], "sat");
         assert!(out[1].contains("(define-fun x () Int 3)"), "{}", out[1]);
-        assert!(out[1].contains("(define-fun b () Bool false)"), "{}", out[1]);
+        assert!(
+            out[1].contains("(define-fun b () Bool false)"),
+            "{}",
+            out[1]
+        );
     }
 
     #[test]
@@ -1899,8 +1906,10 @@ mod tests {
         );
         // The defining relation x = n·(div x n) + (mod x n) always holds.
         assert_eq!(
-            run("(declare-const x Int)(assert (not (= x (+ (* 3 (div x 3)) (mod x 3)))))(check-sat)")
-                .unwrap(),
+            run(
+                "(declare-const x Int)(assert (not (= x (+ (* 3 (div x 3)) (mod x 3)))))(check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }

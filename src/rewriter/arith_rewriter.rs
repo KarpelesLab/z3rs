@@ -1,7 +1,7 @@
 //! Arithmetic constant folding — a subset of `arith_rewriter`
 //! (`z3/src/ast/rewriter/arith_rewriter.{h,cpp}`, Z3 4.17.0, MIT).
 //!
-//! [`try_fold`] evaluates an arithmetic application whose arguments are all
+//! `try_fold` evaluates an arithmetic application whose arguments are all
 //! numerals: `+`, `*`, `-` (n-ary and unary), and the `<=`/`<`/`>=`/`>`
 //! comparisons, using `puremp`'s exact rational arithmetic. Non-constant
 //! applications are left to the driver to rebuild.

@@ -413,13 +413,17 @@ fn matches_z3_on_corpus() {
         // to guess), so it never counts as a mismatch against a definite z3
         // verdict — only sat-vs-unsat disagreements do.
         let disagree = ours.len() != theirs.len()
-            || ours.iter().zip(&theirs).any(|(o, t)| o != "unknown" && o != t);
+            || ours
+                .iter()
+                .zip(&theirs)
+                .any(|(o, t)| o != "unknown" && o != t);
         if disagree {
-            mismatches.push(format!(
-                "{}: z3rs={ours:?} vs z3={theirs:?}",
-                case.name
-            ));
+            mismatches.push(format!("{}: z3rs={ours:?} vs z3={theirs:?}", case.name));
         }
     }
-    assert!(mismatches.is_empty(), "differential mismatches:\n{}", mismatches.join("\n"));
+    assert!(
+        mismatches.is_empty(),
+        "differential mismatches:\n{}",
+        mismatches.join("\n")
+    );
 }

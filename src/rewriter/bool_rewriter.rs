@@ -1,7 +1,7 @@
 //! Boolean constant folding — a subset of `bool_rewriter`
 //! (`z3/src/ast/rewriter/bool_rewriter.{h,cpp}`, Z3 4.17.0, MIT).
 //!
-//! [`try_fold`] applies the identity/annihilator rules for the propositional
+//! `try_fold` applies the identity/annihilator rules for the propositional
 //! connectives, double-negation, reflexive equality, and `ite` folding to one
 //! basic-family application. The bottom-up driver that calls it lives in
 //! [`th_rewriter`](crate::rewriter::th_rewriter); use

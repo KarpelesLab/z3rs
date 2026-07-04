@@ -109,8 +109,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
         }
     }
 
-    let has_theory =
-        !euf_eq.is_empty() || !arith_atoms.is_empty() || !pred_atoms.is_empty();
+    let has_theory = !euf_eq.is_empty() || !arith_atoms.is_empty() || !pred_atoms.is_empty();
     // The offline lazy loop enumerates theory-atom assignments via blocking
     // clauses; that is worst-case exponential, so cap the number of rounds and
     // return a sound `unknown` on exhaustion (rather than looping indefinitely).
@@ -128,8 +127,10 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
             SatResult::Unsat => return (SmtResult::Unsat, None),
             SatResult::Sat => {
                 // The Boolean assignment of every tracked atom.
-                let bools: BTreeMap<AstId, bool> =
-                    atoms.iter().map(|(&a, &l)| (a, sat.model_holds(l))).collect();
+                let bools: BTreeMap<AstId, bool> = atoms
+                    .iter()
+                    .map(|(&a, &l)| (a, sat.model_holds(l)))
+                    .collect();
                 if !has_theory {
                     let model = Model {
                         bools,
@@ -634,13 +635,17 @@ fn integer_feasible(
     let floor = Rational::from_integer(val.floor());
     let ceil = Rational::from_integer(val.ceil());
     let mut low = cons.to_vec();
-    low.push(Constraint::le(LinExpr::var(v).sub(&LinExpr::constant(floor)))); // v - ⌊val⌋ ≤ 0
+    low.push(Constraint::le(
+        LinExpr::var(v).sub(&LinExpr::constant(floor)),
+    )); // v - ⌊val⌋ ≤ 0
     let lo = integer_feasible(&low, diseqs, int_vars, budget, depth + 1);
     if let Feas::Sat(a) = lo {
         return Feas::Sat(a);
     }
     let mut high = cons.to_vec();
-    high.push(Constraint::le(LinExpr::constant(ceil).sub(&LinExpr::var(v)))); // ⌈val⌉ - v ≤ 0
+    high.push(Constraint::le(
+        LinExpr::constant(ceil).sub(&LinExpr::var(v)),
+    )); // ⌈val⌉ - v ≤ 0
     let hi = integer_feasible(&high, diseqs, int_vars, budget, depth + 1);
     match hi {
         Feas::Sat(a) => Feas::Sat(a),

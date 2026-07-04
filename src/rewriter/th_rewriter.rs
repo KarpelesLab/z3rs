@@ -3,8 +3,8 @@
 //!
 //! [`simplify`] walks a term bottom-up (children before parents), simplifying
 //! each application by dispatching to the per-theory folders
-//! ([`bool_rewriter`](crate::rewriter::bool_rewriter),
-//! [`arith_rewriter`](crate::rewriter::arith_rewriter)) and rebuilding through
+//! ([`bool_rewriter`],
+//! [`arith_rewriter`]) and rebuilding through
 //! the [`AstManager`] so results stay hash-consed.
 
 use alloc::vec::Vec;

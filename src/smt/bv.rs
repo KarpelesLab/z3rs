@@ -198,7 +198,13 @@ impl<'a> BitBlaster<'a> {
 
         let result = if let Some(val) = self.m.bv_numeral_value(t) {
             (0..width)
-                .map(|i| if val.bit(i as u32) { self.true_lit } else { !self.true_lit })
+                .map(|i| {
+                    if val.bit(i as u32) {
+                        self.true_lit
+                    } else {
+                        !self.true_lit
+                    }
+                })
                 .collect()
         } else if let Some(op) = self.m.bv_op(t) {
             let args: Vec<AstId> = self.m.app_args(t).to_vec();
@@ -296,10 +302,7 @@ impl<'a> BitBlaster<'a> {
     ) -> Vec<Lit> {
         let a = self.blast_bv(a);
         let b = self.blast_bv(b);
-        a.iter()
-            .zip(&b)
-            .map(|(&x, &y)| gate(self, x, y))
-            .collect()
+        a.iter().zip(&b).map(|(&x, &y)| gate(self, x, y)).collect()
     }
 
     /// The literal for a Boolean term.
@@ -315,10 +318,22 @@ impl<'a> BitBlaster<'a> {
             let a = self.blast_bool(self.m.app_args(t)[0]);
             !a
         } else if self.m.is_and(t) {
-            let ls: Vec<Lit> = self.m.app_args(t).to_vec().iter().map(|&a| self.blast_bool(a)).collect();
+            let ls: Vec<Lit> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.blast_bool(a))
+                .collect();
             self.and_all(&ls)
         } else if self.m.is_or(t) {
-            let ls: Vec<Lit> = self.m.app_args(t).to_vec().iter().map(|&a| self.blast_bool(a)).collect();
+            let ls: Vec<Lit> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.blast_bool(a))
+                .collect();
             self.or_all(&ls)
         } else if self.m.is_eq(t) {
             let args = self.m.app_args(t).to_vec();
@@ -429,7 +444,8 @@ mod tests {
         let zero = m.mk_bv(0, 8);
         let sum = m.mk_bvadd(x, one);
         let eq255 = m.mk_eq(x, c255);
-        let e0 = m.mk_eq(sum, zero); let ne0 = m.mk_not(e0);
+        let e0 = m.mk_eq(sum, zero);
+        let ne0 = m.mk_not(e0);
         let f = m.mk_and(&[eq255, ne0]);
         assert_eq!(check_bv(&m, f), SmtResult::Unsat);
     }
@@ -441,7 +457,8 @@ mod tests {
         let x = bvc(&mut m, "x", 4);
         let zero = m.mk_bv(0, 4);
         let and = m.mk_bvand(x, zero);
-        let e = m.mk_eq(and, zero); let ne = m.mk_not(e);
+        let e = m.mk_eq(and, zero);
+        let ne = m.mk_not(e);
         assert_eq!(check_bv(&m, ne), SmtResult::Unsat);
     }
 
@@ -489,7 +506,8 @@ mod tests {
         let x = bvc(&mut m, "x", 8);
         let zero = m.mk_bv(0, 8);
         let sub = m.mk_bvsub(x, x);
-        let e = m.mk_eq(sub, zero); let ne = m.mk_not(e);
+        let e = m.mk_eq(sub, zero);
+        let ne = m.mk_not(e);
         assert_eq!(check_bv(&m, ne), SmtResult::Unsat);
     }
 }

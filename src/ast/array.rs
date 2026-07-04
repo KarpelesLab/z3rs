@@ -129,13 +129,7 @@ impl AstManager {
         let (_, elem_sort) = self
             .array_sort_params(array_sort)
             .expect("mk_const_array: not an array sort");
-        self.mk_array_app(
-            "const",
-            ArrayOp::Const,
-            &[elem_sort],
-            array_sort,
-            &[value],
-        )
+        self.mk_array_app("const", ArrayOp::Const, &[elem_sort], array_sort, &[value])
     }
 
     /// If `id` is an application of an array-family declaration, its op.

@@ -4,7 +4,7 @@
 //!
 //! This is a minimal core: it stores the code points and round-trips through
 //! Rust `&str`. Full SMT-LIB escaping/encoding (`\u{...}`, BMP/ASCII encodings)
-//! will be filled in with the sequence/string theory (Phase 5); the [`Display`]
+//! will be filled in with the sequence/string theory (Phase 5); the `Display`
 //! here is a plain rendering, not the SMT-LIB escaped form.
 
 use alloc::string::String;

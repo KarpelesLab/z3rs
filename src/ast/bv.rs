@@ -227,8 +227,12 @@ impl AstManager {
     /// `(concat a b)` — `a` in the high bits, `b` in the low bits; the result
     /// width is the sum of the operand widths.
     pub fn mk_bv_concat(&mut self, a: AstId, b: AstId) -> AstId {
-        let wa = self.bv_sort_width(self.get_sort(a)).expect("concat: a not bv");
-        let wb = self.bv_sort_width(self.get_sort(b)).expect("concat: b not bv");
+        let wa = self
+            .bv_sort_width(self.get_sort(a))
+            .expect("concat: a not bv");
+        let wb = self
+            .bv_sort_width(self.get_sort(b))
+            .expect("concat: b not bv");
         let sa = self.get_sort(a);
         let sb = self.get_sort(b);
         let range = self.mk_bv_sort(wa + wb);
@@ -254,8 +258,13 @@ impl AstManager {
             BvOp::Extract as DeclKind,
             vec![Parameter::Int(high as i32), Parameter::Int(low as i32)],
         );
-        let decl =
-            self.mk_func_decl_full(Symbol::new("extract"), &[sx], range, info, FuncDeclFlags::default());
+        let decl = self.mk_func_decl_full(
+            Symbol::new("extract"),
+            &[sx],
+            range,
+            info,
+            FuncDeclFlags::default(),
+        );
         self.mk_app(decl, &[x])
     }
 
@@ -270,12 +279,20 @@ impl AstManager {
     }
 
     fn mk_bv_extend(&mut self, name: &str, op: BvOp, k: u32, x: AstId) -> AstId {
-        let w = self.bv_sort_width(self.get_sort(x)).expect("extend: not bv");
+        let w = self
+            .bv_sort_width(self.get_sort(x))
+            .expect("extend: not bv");
         let sx = self.get_sort(x);
         let range = self.mk_bv_sort(w + k);
         let fid = self.bv_fid();
         let info = DeclInfo::new(fid, op as DeclKind, vec![Parameter::Int(k as i32)]);
-        let decl = self.mk_func_decl_full(Symbol::new(name), &[sx], range, info, FuncDeclFlags::default());
+        let decl = self.mk_func_decl_full(
+            Symbol::new(name),
+            &[sx],
+            range,
+            info,
+            FuncDeclFlags::default(),
+        );
         self.mk_app(decl, &[x])
     }
 
