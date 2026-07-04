@@ -5183,6 +5183,36 @@ impl Context {
                         self.str_symbolic.insert(t);
                         return Ok(t);
                     }
+                    // Pseudo-boolean cardinality ((_ at-least k) / (_ at-most k)):
+                    // "at least/most k of the arguments are true", encoded as an
+                    // integer sum of 0/1 ites compared to k, decided by arithmetic.
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "at-least" || a == "at-most")
+                    {
+                        let name = Self::sym(&qid[1])?.to_string();
+                        let k: i64 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "at-least/at-most: bad count".to_string())?;
+                        let mut terms = Vec::new();
+                        for arg in &l[1..] {
+                            let b = self.term(arg)?;
+                            let one = self.m.mk_int(1);
+                            let zero = self.m.mk_int(0);
+                            terms.push(self.m.mk_ite(b, one, zero));
+                        }
+                        let sum = match terms.len() {
+                            0 => self.m.mk_int(0),
+                            1 => terms[0],
+                            _ => self.m.mk_add(&terms),
+                        };
+                        let kk = self.m.mk_int(k);
+                        return Ok(if name == "at-least" {
+                            self.m.mk_ge(sum, kk)
+                        } else {
+                            self.m.mk_le(sum, kk)
+                        });
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();
@@ -7138,6 +7168,31 @@ mod tests {
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn pseudo_boolean_cardinality() {
+        // (_ at-least k) / (_ at-most k): at least/most k of the args are true.
+        assert_eq!(
+            run("(declare-const a Bool)(declare-const b Bool)\
+                 (assert ((_ at-least 1) a b))(assert (not a))(assert (not b))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const a Bool)(declare-const b Bool)\
+                 (assert ((_ at-most 1) a b))(assert a)(assert b)(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(
+                "(declare-const a Bool)(declare-const b Bool)(declare-const c Bool)\
+                 (assert ((_ at-least 2) a b c))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
