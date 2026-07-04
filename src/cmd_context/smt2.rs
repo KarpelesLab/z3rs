@@ -849,6 +849,9 @@ struct Context {
     /// `(eb, sb) = (11, 53)` constants are folded (via `f64`); other formats and
     /// symbolic values are gated to a sound `unknown`.
     fp_of: BTreeMap<AstId, (u64, u32, u32)>,
+    /// Bit-vector representation of a symbolic FP term (`fp_to_bv`), so equality
+    /// and the classification predicates bit-blast through the QF_BV engine.
+    fp_bv: BTreeMap<AstId, AstId>,
     /// `(Seq E)` sorts, keyed by element sort.
     seq_sorts: BTreeMap<AstId, AstId>,
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
@@ -986,6 +989,7 @@ impl Context {
             fp_sorts: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
+            fp_bv: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
         }
@@ -2014,6 +2018,80 @@ impl Context {
         }
     }
 
+    /// The `(eb, sb)` format of an FP sort, if known.
+    fn fp_format_of(&self, sort: AstId) -> Option<(u32, u32)> {
+        self.fp_sorts
+            .iter()
+            .find(|(_, s)| **s == sort)
+            .map(|(&fmt, _)| fmt)
+    }
+
+    /// The bit-vector representation of an FP term: a constant → its numeral, an
+    /// FP variable → a fresh `(eb+sb)`-bit constant (cached), so symbolic FP
+    /// equality/classification bit-blast through QF_BV. `None` if the format is
+    /// unknown.
+    fn fp_to_bv(&mut self, t: AstId) -> Option<AstId> {
+        if let Some(&(bits, eb, sb)) = self.fp_of.get(&t) {
+            return Some(self.m.mk_bv_numeral(Int::from(bits as i64), eb + sb));
+        }
+        if let Some(&bv) = self.fp_bv.get(&t) {
+            return Some(bv);
+        }
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(t))?;
+        let bv = self
+            .m
+            .mk_bv_const(&alloc::format!("!fpbv!{}", self.fresh_counter), eb + sb);
+        self.fresh_counter += 1;
+        self.fp_bv.insert(t, bv);
+        Some(bv)
+    }
+
+    /// A classification predicate (`fp.isNaN` …) as a Boolean over the bits of
+    /// the FP term `t` (format `(eb, sb)`), decided by the QF_BV engine.
+    fn fp_classify_bv(&mut self, op: &str, t: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(t))?;
+        if sb < 2 {
+            return None;
+        }
+        let bv = self.fp_to_bv(t)?;
+        let w = eb + sb;
+        let exp = self.m.mk_bv_extract(w - 2, sb - 1, bv); // eb bits
+        let mant = self.m.mk_bv_extract(sb - 2, 0, bv); // sb-1 bits
+        let sign = self.m.mk_bv_extract(w - 1, w - 1, bv); // 1 bit
+        let exp_zero = self.m.mk_bv(0, eb);
+        let exp_ones = self.m.mk_bvnot(exp_zero);
+        let mant_zero = self.m.mk_bv(0, sb - 1);
+        let one1 = self.m.mk_bv(1, 1);
+        let is_exp_ones = self.m.mk_eq(exp, exp_ones);
+        let is_exp_zero = self.m.mk_eq(exp, exp_zero);
+        let is_mant_zero = self.m.mk_eq(mant, mant_zero);
+        let mant_nz = self.m.mk_not(is_mant_zero);
+        let is_nan = self.m.mk_and(&[is_exp_ones, mant_nz]);
+        Some(match op {
+            "fp.isNaN" => is_nan,
+            "fp.isInfinite" => self.m.mk_and(&[is_exp_ones, is_mant_zero]),
+            "fp.isZero" => self.m.mk_and(&[is_exp_zero, is_mant_zero]),
+            "fp.isSubnormal" => self.m.mk_and(&[is_exp_zero, mant_nz]),
+            "fp.isNormal" => {
+                let not_zero = self.m.mk_not(is_exp_zero);
+                let not_ones = self.m.mk_not(is_exp_ones);
+                self.m.mk_and(&[not_zero, not_ones])
+            }
+            "fp.isNegative" => {
+                let neg = self.m.mk_eq(sign, one1);
+                let not_nan = self.m.mk_not(is_nan);
+                self.m.mk_and(&[neg, not_nan])
+            }
+            "fp.isPositive" => {
+                let zero1 = self.m.mk_bv(0, 1);
+                let pos = self.m.mk_eq(sign, zero1);
+                let not_nan = self.m.mk_not(is_nan);
+                self.m.mk_and(&[pos, not_nan])
+            }
+            _ => return None,
+        })
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -2088,6 +2166,10 @@ impl Context {
                         _ => a.is_sign_positive() && !a.is_nan(),
                     };
                     return Ok(self.mk_bool(r));
+                }
+                // Symbolic: bit-blast the classification through QF_BV.
+                if let Some(t) = self.fp_classify_bv(op, args[0]) {
+                    return Ok(t);
                 }
                 self.symbolic_fp(op, args)
             }
@@ -3728,11 +3810,19 @@ impl Context {
                 // Structural equality of two FP constants compares their bits.
                 if head == "="
                     && args.len() == 2
-                    && let (Some(&(ba, ea, sa)), Some(&(bb, _, _))) =
+                    && let (Some(&(ba, _, _)), Some(&(bb, _, _))) =
                         (self.fp_of.get(&args[0]), self.fp_of.get(&args[1]))
                 {
-                    let _ = (ea, sa);
                     return Ok(self.mk_bool(ba == bb));
+                }
+                // Structural equality of FP terms (at least one symbolic) →
+                // bit-vector equality of their representations (QF_BV).
+                if head == "="
+                    && args.len() == 2
+                    && self.fp_format_of(self.m.get_sort(args[0])).is_some()
+                    && let (Some(a), Some(b)) = (self.fp_to_bv(args[0]), self.fp_to_bv(args[1]))
+                {
+                    return Ok(self.m.mk_eq(a, b));
                 }
                 // Fold equality of two structural sequences (element-wise, or
                 // false on a length mismatch).
@@ -4977,6 +5067,33 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn symbolic_floating_point_via_bv() {
+        let d = "(declare-const x (_ FloatingPoint 11 53))";
+        // A value can't be both NaN and zero (classification bit-blasted to BV).
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(assert (fp.isNaN x))(assert (fp.isZero x))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Equality of the bit representations interacts with classification:
+        // x = NaN forces isNaN(x).
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(assert (= x (_ NaN 11 53)))(assert (not (fp.isNaN x)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Some value is NaN — satisfiable.
+        assert_eq!(
+            run(&alloc::format!("{d}(assert (fp.isNaN x))(check-sat)")).unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
