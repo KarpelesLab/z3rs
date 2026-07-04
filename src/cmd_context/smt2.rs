@@ -3216,26 +3216,112 @@ impl Context {
     /// assertions **and from previously generated instances** — iterating to a
     /// fixpoint so chained/inductive universals (`∀x. p(x) ⇒ p(x+1)` with
     /// `p(0)`, `¬p(3)`) fully unfold. Bounded by rounds and a total-instance cap.
-    /// Trigger applications for E-matching: the smallest user-function
-    /// applications in `body` that jointly are single terms containing *every*
-    /// bound variable (a single-trigger covers all binders). Empty if none does.
-    fn triggers(
+    /// Trigger *sets* for E-matching. Each returned set is a group of
+    /// user-function applications from `body` that jointly contain every bound
+    /// variable; matching a set binds all binders. A single application covering
+    /// all binders is a one-element set (preferred); otherwise a greedy
+    /// multi-trigger set is formed (e.g. `p(x,y)` + `p(y,z)` for a ternary
+    /// transitivity binder). Empty if the binders can't be covered.
+    fn trigger_sets(
         &self,
         vars: &BTreeSet<AstId>,
         body: AstId,
         user_decls: &BTreeSet<AstId>,
-    ) -> Vec<AstId> {
-        let mut trigs = Vec::new();
+    ) -> Vec<Vec<AstId>> {
+        // Candidate trigger applications and the binders each one covers.
+        let mut apps: Vec<(AstId, BTreeSet<AstId>)> = Vec::new();
         let mut seen = BTreeSet::new();
         for t in self.m.postorder(body) {
-            if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) {
-                let po: BTreeSet<AstId> = self.m.postorder(t).into_iter().collect();
-                if vars.iter().all(|v| po.contains(v)) && seen.insert(t) {
-                    trigs.push(t);
+            if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) && seen.insert(t) {
+                let covers: BTreeSet<AstId> = self
+                    .m
+                    .postorder(t)
+                    .into_iter()
+                    .filter(|x| vars.contains(x))
+                    .collect();
+                if !covers.is_empty() {
+                    apps.push((t, covers));
                 }
             }
         }
-        trigs
+        // Single triggers that already cover every binder.
+        let singles: Vec<Vec<AstId>> = apps
+            .iter()
+            .filter(|(_, c)| vars.iter().all(|v| c.contains(v)))
+            .map(|(t, _)| alloc::vec![*t])
+            .collect();
+        if !singles.is_empty() {
+            return singles;
+        }
+        // Greedy multi-trigger: repeatedly add the app covering the most
+        // still-uncovered binders.
+        let mut covered: BTreeSet<AstId> = BTreeSet::new();
+        let mut set: Vec<AstId> = Vec::new();
+        while !vars.iter().all(|v| covered.contains(v)) {
+            let best = apps
+                .iter()
+                .filter(|(t, _)| !set.contains(t))
+                .max_by_key(|(_, c)| c.difference(&covered).count());
+            match best {
+                Some((t, c)) if c.difference(&covered).count() > 0 => {
+                    set.push(*t);
+                    covered.extend(c.iter().copied());
+                }
+                _ => return Vec::new(), // binders cannot be covered by triggers
+            }
+        }
+        alloc::vec![set]
+    }
+
+    /// All complete binder substitutions obtained by matching a trigger *set*
+    /// against the ground applications in `by_decl`, joining the per-application
+    /// partial bindings on their shared variables.
+    fn ematch_set(
+        &self,
+        set: &[AstId],
+        vars: &BTreeSet<AstId>,
+        by_decl: &BTreeMap<AstId, BTreeSet<AstId>>,
+    ) -> Vec<BTreeMap<AstId, AstId>> {
+        const CAP: usize = 256;
+        let mut acc: Vec<BTreeMap<AstId, AstId>> = alloc::vec![BTreeMap::new()];
+        for &trig in set {
+            let decl = self.m.app_decl(trig);
+            let grounds = match by_decl.get(&decl) {
+                Some(g) => g,
+                None => return Vec::new(),
+            };
+            // Partial bindings from matching this trigger alone.
+            let mut partials: Vec<BTreeMap<AstId, AstId>> = Vec::new();
+            for &g in grounds {
+                let mut b = BTreeMap::new();
+                if self.ematch(trig, g, vars, &mut b) {
+                    partials.push(b);
+                }
+            }
+            // Join with the accumulator, keeping only compatible merges.
+            let mut next: Vec<BTreeMap<AstId, AstId>> = Vec::new();
+            for a in &acc {
+                for p in &partials {
+                    if a.iter().all(|(k, v)| p.get(k).is_none_or(|w| w == v)) {
+                        let mut m = a.clone();
+                        m.extend(p.iter().map(|(&k, &v)| (k, v)));
+                        next.push(m);
+                        if next.len() >= CAP {
+                            break;
+                        }
+                    }
+                }
+                if next.len() >= CAP {
+                    break;
+                }
+            }
+            acc = next;
+            if acc.is_empty() {
+                return Vec::new();
+            }
+        }
+        acc.retain(|b| vars.iter().all(|v| b.contains_key(v)));
+        acc
     }
 
     /// Try to match trigger pattern `pat` against ground term `g`, extending
@@ -3285,11 +3371,11 @@ impl Context {
         // User-function declarations (targets for E-matching triggers) and, per
         // universal, a trigger that covers all its binders (if one exists).
         let user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
-        let trigs: Vec<Vec<AstId>> = universals
+        let trigs: Vec<Vec<Vec<AstId>>> = universals
             .iter()
             .map(|(vars, body)| {
                 let vs: BTreeSet<AstId> = vars.iter().copied().collect();
-                self.triggers(&vs, *body, &user_decls)
+                self.trigger_sets(&vs, *body, &user_decls)
             })
             .collect();
 
@@ -3328,19 +3414,8 @@ impl Context {
             let mut fresh = false;
             for (ui, (vars, body)) in universals.iter().enumerate() {
                 let vs: BTreeSet<AstId> = vars.iter().copied().collect();
-                for &trig in &trigs[ui] {
-                    let decl = self.m.app_decl(trig);
-                    let grounds: Vec<AstId> = by_decl
-                        .get(&decl)
-                        .map(|s| s.iter().copied().collect())
-                        .unwrap_or_default();
-                    for g in grounds {
-                        let mut binding: BTreeMap<AstId, AstId> = BTreeMap::new();
-                        if !self.ematch(trig, g, &vs, &mut binding)
-                            || !vars.iter().all(|v| binding.contains_key(v))
-                        {
-                            continue;
-                        }
+                for set in &trigs[ui] {
+                    for binding in self.ematch_set(set, &vs, &by_decl) {
                         let subst: Vec<(AstId, AstId)> =
                             vars.iter().map(|&v| (v, binding[&v])).collect();
                         let raw = substitute(&mut self.m, *body, &subst);
@@ -5840,6 +5915,29 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn multi_trigger_ematching() {
+        // Transitivity over an *infinite* (symbolic) domain: no single trigger
+        // covers x,y,z, so the multi-trigger {r(x,y), r(y,z)} is joined on y.
+        assert_eq!(
+            run("(declare-fun r (Int Int) Bool)\
+                 (declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (forall ((x Int)(y Int)(z Int)) (=> (and (r x y) (r y z)) (r x z))))\
+                 (assert (r a b))(assert (r b c))(assert (not (r a c)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // The same axiom is satisfiable without the negated goal.
+        assert_eq!(
+            run("(declare-fun r (Int Int) Bool)\
+                 (declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (forall ((x Int)(y Int)(z Int)) (=> (and (r x y) (r y z)) (r x z))))\
+                 (assert (r a b))(assert (r b c))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
