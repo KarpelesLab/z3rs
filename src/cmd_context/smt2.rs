@@ -4776,6 +4776,12 @@ impl Context {
     /// divisor, or a power)? Such terms make a `sat` verdict unsound.
     fn arith_nonlinear(&self, goal: AstId) -> bool {
         for t in self.m.postorder(goal) {
+            // The exponentiation fallback for a non-constant base or non-integer
+            // exponent is an opaque UF named "^" — unconstrained, so treat it as
+            // nonlinear (a `sat` over it would be unsound).
+            if self.m.is_app(t) && self.decl_name(self.m.app_decl(t)).as_deref() == Some("^") {
+                return true;
+            }
             let Some(op) = self.m.arith_op(t) else {
                 continue;
             };
@@ -7173,6 +7179,30 @@ mod tests {
             run("(declare-const x String)\
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn nonlinear_power_is_gated() {
+        // Regression: `(^ base exp)` with a non-integer exponent or symbolic base
+        // is an opaque nonlinear term; a `sat` over it would be unsound
+        // (√2 = 2 and x² = −1 are false but the unconstrained UF made them sat).
+        assert_ne!(
+            run("(assert (= (^ 2.0 0.5) 2.0))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_ne!(
+            run("(declare-const x Real)(assert (= (^ x 2.0) (- 1.0)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // Integer powers still fold exactly.
+        assert_eq!(
+            run("(assert (= (^ 2 3) 8))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(assert (= (^ 2 3) 9))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
