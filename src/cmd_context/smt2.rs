@@ -27,6 +27,7 @@ use puremp::{Int, Rational};
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
+use crate::rewriter::substitute;
 use crate::smt::{Model, SmtResult, check_bv_model, check_model};
 use crate::util::symbol::Symbol;
 
@@ -316,6 +317,21 @@ fn run_v1(l: &[SExpr]) -> Result<Vec<String>, String> {
     Ok(alloc::vec![verdict_word(res).to_string()])
 }
 
+/// If `s` is a top-level `(forall …)` or `(exists …)`, its keyword.
+fn top_level_quantifier(s: &SExpr) -> Option<&'static str> {
+    if let SExpr::List(l) = s
+        && l.len() == 3
+        && let SExpr::Atom(h) = &l[0]
+    {
+        return match h.as_str() {
+            "forall" => Some("forall"),
+            "exists" => Some("exists"),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// The elements of a list s-expression.
 fn as_list(s: &SExpr) -> Result<&[SExpr], String> {
     match s {
@@ -511,6 +527,7 @@ struct Scope {
     assertions: usize,
     decls: usize,
     sorts: usize,
+    universals: usize,
 }
 
 struct Context {
@@ -544,6 +561,9 @@ struct Context {
     /// Enumeration datatypes: sort → its constructor constants. Reasoned about
     /// as a finite uninterpreted sort with distinct elements and a domain axiom.
     enums: BTreeMap<AstId, Vec<AstId>>,
+    /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
+    /// body)`; instantiated over ground terms at each `check-sat`.
+    universals: Vec<(Vec<AstId>, AstId)>,
 }
 
 impl Context {
@@ -572,6 +592,7 @@ impl Context {
             fresh_counter: 0,
             quant_atoms: BTreeSet::new(),
             enums: BTreeMap::new(),
+            universals: Vec::new(),
         }
     }
 
@@ -647,6 +668,7 @@ impl Context {
                         assertions: self.assertions.len(),
                         decls: self.decl_order.len(),
                         sorts: self.sort_order.len(),
+                        universals: self.universals.len(),
                     });
                 }
                 self.last_model = None;
@@ -661,6 +683,7 @@ impl Context {
                         .ok_or_else(|| "pop with no matching push".to_string())?;
                     self.assertions.truncate(mark.assertions); // discard scoped assertions
                     self.assert_names.truncate(mark.assertions);
+                    self.universals.truncate(mark.universals);
                     // Undeclare constants/functions and sorts made since the push.
                     for name in self.decl_order.drain(mark.decls..) {
                         self.funcs.remove(&name);
@@ -675,6 +698,7 @@ impl Context {
             "reset" => {
                 self.assertions.clear();
                 self.assert_names.clear();
+                self.universals.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -685,6 +709,7 @@ impl Context {
                 // and options (unlike `reset`).
                 self.assertions.clear();
                 self.assert_names.clear();
+                self.universals.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -748,6 +773,24 @@ impl Context {
                 Ok(None)
             }
             "assert" => {
+                // A top-level quantifier gets real (sound) handling: `exists` is
+                // skolemized (its body asserted with fresh constants), `forall` is
+                // recorded for ground instantiation at check-sat. Quantifiers
+                // nested inside a formula fall back to the `unknown` sentinel.
+                if let Some(kind) = top_level_quantifier(&list[1]) {
+                    let ql = as_list(&list[1])?;
+                    let (vars, body) = self.parse_quantifier(&ql[1], &ql[2])?;
+                    if kind == "exists" {
+                        // ∃x. P(x) is equisatisfiable with P(k) for fresh k.
+                        self.assertions.push(body);
+                        self.assert_names.push(None);
+                    } else {
+                        self.universals.push((vars, body));
+                    }
+                    self.last_model = None;
+                    self.last_verdict = None;
+                    return Ok(None);
+                }
                 let t = self.term(&list[1])?;
                 let name = named_label(&list[1]);
                 self.assertions.push(t);
@@ -757,8 +800,7 @@ impl Context {
                 Ok(None)
             }
             "check-sat" => {
-                let goal = self.goal();
-                let (res, model) = self.decide(goal);
+                let (res, model) = self.check_sat();
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -1015,9 +1057,120 @@ impl Context {
 
     /// The conjunction of all assertions (`true` if none), lifted, with the
     /// array read-over-write axioms instantiated.
-    fn goal(&mut self) -> AstId {
+    /// Decide the current assertion set, instantiating any recorded universals
+    /// over the ground terms. A `forall` instance is a consequence of the
+    /// universal, so an `unsat` result is sound; but the instantiation is
+    /// incomplete, so a `sat` result in the presence of universals is reported
+    /// as a sound `unknown`.
+    fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        let instances = self.universal_instances();
         let base = self.conjunction();
-        let lifted = self.lift(base);
+        let combined = if instances.is_empty() {
+            base
+        } else {
+            let mut conj = alloc::vec![base];
+            conj.extend(instances);
+            self.m.mk_and(&conj)
+        };
+        let lifted = self.lift(combined);
+        let goal = self.with_axioms(lifted);
+        let (res, model) = self.decide(goal);
+        if res == SmtResult::Sat && !self.universals.is_empty() {
+            (SmtResult::Unknown, None)
+        } else {
+            (res, model)
+        }
+    }
+
+    /// Parse a quantifier's binder list `((x S) …)` and body into fresh
+    /// placeholder constants (one per bound variable) and the body term built
+    /// over them. The placeholders double as skolem constants for `exists`.
+    fn parse_quantifier(
+        &mut self,
+        binders: &SExpr,
+        body: &SExpr,
+    ) -> Result<(Vec<AstId>, AstId), String> {
+        let binders = as_list(binders)?;
+        let mut scope = Vec::new();
+        let mut vars = Vec::new();
+        for b in binders {
+            let pair = as_list(b)?;
+            let name = Self::sym(&pair[0])?.to_string();
+            let sort = self.resolve_sort(&pair[1])?;
+            let ph = self.fresh_const(sort);
+            scope.push((name, ph));
+            vars.push(ph);
+        }
+        self.scopes.push(scope);
+        let result = self.term(body);
+        self.scopes.pop();
+        Ok((vars, result?))
+    }
+
+    /// Ground instances of every recorded universal: substitute the bound-var
+    /// placeholders by ground terms of the matching sort drawn from the current
+    /// assertions (bounded to keep the instance set finite).
+    fn universal_instances(&mut self) -> Vec<AstId> {
+        if self.universals.is_empty() {
+            return Vec::new();
+        }
+        // Ground terms by sort, collected from the assertions.
+        let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for a in self.assertions.clone() {
+            for t in self.m.postorder(a) {
+                let s = self.m.get_sort(t);
+                by_sort.entry(s).or_default().push(t);
+            }
+        }
+        for v in by_sort.values_mut() {
+            v.sort_unstable();
+            v.dedup();
+        }
+        const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
+        let mut instances = Vec::new();
+        for (vars, body) in self.universals.clone() {
+            // Candidate ground terms for each bound variable.
+            let mut cands: Vec<Vec<AstId>> = Vec::new();
+            for &v in &vars {
+                let s = self.m.get_sort(v);
+                let mut c = by_sort.get(&s).cloned().unwrap_or_default();
+                if c.is_empty() {
+                    // No ground term of this sort: use a fresh representative
+                    // (uninterpreted sorts are non-empty; sound for the others).
+                    c.push(self.fresh_const(s));
+                }
+                cands.push(c);
+            }
+            // Bounded cartesian product of the candidates.
+            let mut combos: Vec<Vec<AstId>> = alloc::vec![Vec::new()];
+            for c in &cands {
+                let mut next = Vec::new();
+                for combo in &combos {
+                    for &g in c {
+                        let mut nc = combo.clone();
+                        nc.push(g);
+                        next.push(nc);
+                        if next.len() >= MAX_INSTANCES_PER_UNIVERSAL {
+                            break;
+                        }
+                    }
+                    if next.len() >= MAX_INSTANCES_PER_UNIVERSAL {
+                        break;
+                    }
+                }
+                combos = next;
+            }
+            for combo in combos {
+                let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
+                let inst = substitute(&mut self.m, body, &subst);
+                instances.push(inst);
+            }
+        }
+        instances
+    }
+
+    /// Instantiate the array + enum axioms for `lifted` and conjoin them.
+    fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
         if axioms.is_empty() {
@@ -1026,6 +1179,12 @@ impl Context {
             axioms.push(lifted);
             self.m.mk_and(&axioms)
         }
+    }
+
+    fn goal(&mut self) -> AstId {
+        let base = self.conjunction();
+        let lifted = self.lift(base);
+        self.with_axioms(lifted)
     }
 
     /// Instantiate the array axioms over the `store`, `select`, and
@@ -2520,6 +2679,33 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((x #x0f))");
+    }
+
+    #[test]
+    fn quantifier_instantiation_and_skolemization() {
+        // forall instantiated over the ground term 5 → unsat.
+        assert_eq!(
+            run(
+                "(declare-fun p (Int) Bool)(assert (forall ((x Int)) (p x)))\
+                 (assert (not (p 5)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // exists skolemized → sat.
+        assert_eq!(
+            run("(declare-fun p (Int) Bool)(assert (exists ((x Int)) (p x)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // exists a witness, but forall forbids every value → unsat.
+        assert_eq!(
+            run(
+                "(declare-fun p (Int) Bool)(assert (exists ((y Int)) (p y)))\
+                 (assert (forall ((x Int)) (not (p x))))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
