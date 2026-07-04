@@ -818,6 +818,9 @@ struct Context {
     /// Parametric (polymorphic) datatype templates: name → (type parameters,
     /// constructor s-expressions). Monomorphized on use, e.g. `(Pair Int Bool)`.
     param_datatypes: BTreeMap<String, (Vec<String>, Vec<SExpr>)>,
+    /// Array `lambda` closures: array term → (bound-variable placeholders, body).
+    /// `(select (lambda ((x S)) body) i)` beta-reduces to `body[x:=i]`.
+    lambdas: BTreeMap<AstId, (Vec<AstId>, AstId)>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -979,6 +982,7 @@ impl Context {
             dt_depth: BTreeMap::new(),
             tester_of: BTreeMap::new(),
             param_datatypes: BTreeMap::new(),
+            lambdas: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -4266,6 +4270,17 @@ impl Context {
                     self.quant_atoms.insert(atom);
                     return Ok(atom);
                 }
+                if head == "lambda" {
+                    // (lambda ((x S)…) body): an array value. Record the closure;
+                    // `select` beta-reduces it below.
+                    let (params, body) = self.parse_quantifier(&l[1], &l[2])?;
+                    let dom = self.m.get_sort(params[0]);
+                    let cod = self.m.get_sort(body);
+                    let arr = self.m.mk_array_sort(dom, cod);
+                    let t = self.fresh_const(arr);
+                    self.lambdas.insert(t, (params, body));
+                    return Ok(t);
+                }
                 if head == "_" {
                     // Indexed identifier, e.g. (_ bv5 8) — a bit-vector numeral.
                     let name = Self::sym(&l[1])?;
@@ -4303,6 +4318,16 @@ impl Context {
                     .iter()
                     .map(|a| self.term(a))
                     .collect::<Result<_, _>>()?;
+                // (select (lambda ((x S)…) body) i…) beta-reduces to body[x:=i…].
+                if head == "select"
+                    && let Some((params, body)) = self.lambdas.get(&args[0]).cloned()
+                    && params.len() == args.len() - 1
+                {
+                    let subst: Vec<(AstId, AstId)> =
+                        params.into_iter().zip(args[1..].iter().copied()).collect();
+                    let reduced = substitute(&mut self.m, body, &subst);
+                    return Ok(crate::rewriter::simplify(&mut self.m, reduced));
+                }
                 if self.macros.contains_key(&head) {
                     return self.expand_macro(&head, args);
                 }
@@ -6110,6 +6135,25 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn lambda_arrays() {
+        // select beta-reduces a lambda-defined array.
+        assert_eq!(
+            run(
+                "(define-fun a () (Array Int Int) (lambda ((x Int)) (+ x 1)))\
+                 (assert (not (= (select a 3) 4)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Multi-argument lambda.
+        assert_eq!(
+            run("(assert (not (= (select (lambda ((x Int) (y Int)) (+ x y)) 3 4) 7)))(check-sat)")
+                .unwrap(),
             alloc::vec!["unsat"]
         );
     }
