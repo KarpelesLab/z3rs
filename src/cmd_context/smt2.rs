@@ -2641,14 +2641,46 @@ impl Context {
     /// result is rebuilt as a quantifier-free formula. `None` if the body is not
     /// purely linear or a projection exceeds budget (→ fall back to instantiation).
     fn qe_forall(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
-        if !vars.iter().all(|&v| {
-            let s = self.m.get_sort(v);
-            self.m.is_arith_sort(s) && !self.m.is_int_sort(s) // FM is exact only for reals
-        }) {
+        let arith = |m: &AstManager, v: AstId| m.is_arith_sort(m.get_sort(v));
+        if !vars.iter().all(|&v| arith(&self.m, v)) {
             return None;
+        }
+        let all_int = vars.iter().all(|&v| self.m.is_int_sort(self.m.get_sort(v)));
+        let all_real = vars
+            .iter()
+            .all(|&v| !self.m.is_int_sort(self.m.get_sort(v)));
+        if !all_int && !all_real {
+            return None; // mixed Int/Real binders unsupported
         }
         // DNF of ¬body: a disjunction of cubes (conjunctions of constraints).
         let cubes = self.body_dnf(body, false)?;
+        // Fourier–Motzkin is exact for the reals; for integers it is exact only
+        // when the body is pure LIA (integer coefficients) and every binder
+        // appears with coefficient ±1 (real shadow = integer shadow). Otherwise
+        // fall back to instantiation rather than risk an unsound elimination.
+        if all_int {
+            for cube in &cubes {
+                for c in cube {
+                    if !c.expr.const_term().is_integer()
+                        || c.expr.terms().any(|(_, k)| !k.is_integer())
+                    {
+                        return None;
+                    }
+                    for &v in vars {
+                        let cv = c
+                            .expr
+                            .terms()
+                            .find(|(u, _)| *u == v)
+                            .map(|(_, k)| k.clone());
+                        if let Some(k) = cv
+                            && k.abs() != rat(1)
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
         let mut budget: u64 = 100_000;
         // Project every bound variable out of each cube, then rebuild ∃x.¬body.
         let mut disjuncts: Vec<AstId> = Vec::new();
@@ -2656,7 +2688,10 @@ impl Context {
             for &v in vars {
                 cube = project(&cube, v, &mut budget)?;
             }
-            let atoms: Vec<AstId> = cube.iter().map(|c| self.constraint_atom(c)).collect();
+            let atoms: Vec<AstId> = cube
+                .iter()
+                .map(|c| self.constraint_atom(c, all_int))
+                .collect();
             disjuncts.push(match atoms.len() {
                 0 => self.m.mk_true(),
                 1 => atoms[0],
@@ -2797,10 +2832,11 @@ impl Context {
         })
     }
 
-    /// Rebuild the AST atom `expr ⋈ 0` from a linear [`Constraint`] (over reals).
-    fn constraint_atom(&mut self, c: &Constraint) -> AstId {
-        let t = self.lin_to_term(&c.expr);
-        let zero = self.m.mk_numeral(rat(0), false);
+    /// Rebuild the AST atom `expr ⋈ 0` from a linear [`Constraint`] (`is_int`
+    /// selects Int vs Real numerals).
+    fn constraint_atom(&mut self, c: &Constraint, is_int: bool) -> AstId {
+        let t = self.lin_to_term(&c.expr, is_int);
+        let zero = self.m.mk_numeral(rat(0), is_int);
         match c.rel {
             Rel::Le => self.m.mk_le(t, zero),
             Rel::Lt => self.m.mk_lt(t, zero),
@@ -2808,20 +2844,20 @@ impl Context {
         }
     }
 
-    /// Build the real-sorted AST term of a linear expression.
-    fn lin_to_term(&mut self, e: &crate::smt::LinExpr) -> AstId {
+    /// Build the AST term of a linear expression (`is_int` → Int numerals).
+    fn lin_to_term(&mut self, e: &crate::smt::LinExpr, is_int: bool) -> AstId {
         let mut parts: Vec<AstId> = Vec::new();
         for (v, coeff) in e.terms() {
             if coeff == &rat(1) {
                 parts.push(v);
             } else {
-                let k = self.m.mk_numeral(coeff.clone(), false);
+                let k = self.m.mk_numeral(coeff.clone(), is_int);
                 parts.push(self.m.mk_mul(&[k, v]));
             }
         }
         let c = e.const_term().clone();
         if !c.is_zero() || parts.is_empty() {
-            parts.push(self.m.mk_numeral(c, false));
+            parts.push(self.m.mk_numeral(c, is_int));
         }
         match parts.len() {
             1 => parts[0],
@@ -5125,6 +5161,21 @@ mod tests {
             run("(assert (forall ((x Real)) (< x 0.0)))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+        // Integer QE (unit coefficients): ∀x∈[0,10]. x ≤ a ⟺ a ≥ 10.
+        assert_eq!(
+            run("(declare-const a Int)\
+                 (assert (forall ((x Int)) (=> (and (<= 0 x) (<= x 10)) (<= x a))))\
+                 (assert (< a 10))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Non-unit coefficient falls back (sound unknown, not a wrong verdict).
+        assert_eq!(
+            run("(declare-const a Int)\
+                 (assert (forall ((x Int)) (=> (<= (* 2 x) a) (<= x 3))))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unknown"]
+        );
     }
 
     #[test]
@@ -5209,14 +5260,15 @@ mod tests {
     }
 
     #[test]
-    fn quantifiers_accepted_as_unknown() {
-        // Quantified formulas are accepted (not a parse error) and answered
-        // with a sound `unknown`; ground goals alongside still decide.
+    fn quantifiers_accepted_soundly() {
+        // A non-linear quantified body is accepted (not a parse error) and
+        // answered with a sound `unknown` (no QE, no saturation).
         assert_eq!(
-            run("(declare-const x Int)(assert (forall ((y Int)) (>= (+ x y) y)))(check-sat)")
+            run("(declare-const x Int)(assert (forall ((y Int)) (> (* y y) x)))(check-sat)")
                 .unwrap(),
             alloc::vec!["unknown"]
         );
+        // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
