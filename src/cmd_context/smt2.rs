@@ -3470,7 +3470,7 @@ impl Context {
             return None; // mixed Int/Real binders unsupported
         }
         // DNF of ¬body: a disjunction of cubes (conjunctions of constraints).
-        let cubes = self.body_dnf(body, false)?;
+        let mut cubes = self.body_dnf(body, false)?;
         // A binder may appear ONLY as a linear variable. If one occurs inside a
         // compound term — e.g. an uninterpreted application `f(x)`, which
         // `ast_to_lin` opaquely treats as a single variable — Fourier–Motzkin
@@ -3510,6 +3510,17 @@ impl Context {
                         {
                             return None;
                         }
+                    }
+                }
+            }
+            // Over the integers a strict `expr < 0` is `expr + 1 ≤ 0`; tighten it
+            // so Fourier–Motzkin's real shadow matches the integer shadow (else
+            // `x > 0 ∧ x < 1` looks feasible over the reals though it is empty
+            // over the integers).
+            for cube in &mut cubes {
+                for c in cube.iter_mut() {
+                    if c.rel == Rel::Lt {
+                        *c = Constraint::le(c.expr.integer_strict_tighten());
                     }
                 }
             }
@@ -3652,9 +3663,10 @@ impl Context {
         let le = |e: crate::smt::LinExpr| alloc::vec![alloc::vec![Constraint::le(e)]];
         let lt = |e: crate::smt::LinExpr| alloc::vec![alloc::vec![Constraint::lt(e)]];
         Some(match (op, positive) {
-            ("<=", true) | (">=", false) => le(diff),      // a ≤ b
+            // ¬(a > b) = a ≤ b (non-strict); ¬(a ≥ b) = a < b (strict).
+            ("<=", true) | (">", false) => le(diff), // a ≤ b
             ("<=", false) | (">", true) => lt(diff.neg()), // a > b  ⟺ b < a
-            ("<", true) | (">", false) => lt(diff),        // a < b
+            ("<", true) | (">=", false) => lt(diff), // a < b
             ("<", false) | (">=", true) => le(diff.neg()), // a ≥ b
             ("=", true) => alloc::vec![alloc::vec![Constraint::eq(diff)]],
             ("=", false) => alloc::vec![
@@ -6817,6 +6829,32 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((x #x0f))");
+    }
+
+    #[test]
+    fn qe_valid_universals_are_sat() {
+        // Regression: valid universals must be sat, not refuted. A strictness bug
+        // in the ≥/> negation once made these unsat.
+        for body in [
+            "(>= x x)",               // tautology
+            "(=> (<= 0 x) (>= x 0))", // valid
+            "(=> (and (<= 0 x) (<= x 2)) (>= x 0))",
+            "(=> (> x 0) (>= x 1))", // valid over the integers
+        ] {
+            assert_eq!(
+                run(&alloc::format!(
+                    "(assert (forall ((x Int)) {body}))(check-sat)"
+                ))
+                .unwrap(),
+                alloc::vec!["sat"],
+                "body: {body}"
+            );
+        }
+        // …while a genuinely false universal is still refuted.
+        assert_eq!(
+            run("(assert (forall ((x Int)) (=> (> x 0) (>= x 2))))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
