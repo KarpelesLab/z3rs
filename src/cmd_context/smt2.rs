@@ -892,6 +892,8 @@ enum Regex {
     Concat(Box<Regex>, Box<Regex>),
     Union(Box<Regex>, Box<Regex>),
     Inter(Box<Regex>, Box<Regex>),
+    /// Complement (`re.comp`): every string the inner regex does *not* match.
+    Comp(Box<Regex>),
     Star(Box<Regex>),
 }
 
@@ -934,6 +936,15 @@ impl Regex {
                 let ea = a.ends(s, from);
                 for p in b.ends(s, from) {
                     if ea.contains(&p) {
+                        out.insert(p);
+                    }
+                }
+            }
+            Regex::Comp(r) => {
+                // s[from..p] matches the complement iff it does not match `r`.
+                let er = r.ends(s, from);
+                for p in from..=s.len() {
+                    if !er.contains(&p) {
                         out.insert(p);
                     }
                 }
@@ -2646,6 +2657,14 @@ impl Context {
                     Box::new(s.into_iter().next().unwrap()),
                     Box::new(Regex::Lit(Vec::new())),
                 )
+            }),
+            "re.comp" => subs.map(|s| Regex::Comp(Box::new(s.into_iter().next().unwrap()))),
+            "re.diff" => subs.map(|s| {
+                // a \ b = a ∩ comp(b).
+                let mut it = s.into_iter();
+                let a = it.next().unwrap();
+                let b = it.next().unwrap();
+                Regex::Inter(Box::new(a), Box::new(Regex::Comp(Box::new(b))))
             }),
             _ => None,
         };
@@ -6330,6 +6349,29 @@ mod tests {
         assert_eq!(
             run("(assert (not (= (fp.to_real ((_ to_fp 11 53) RNE 3.0)) 3.0)))(check-sat)")
                 .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn regex_complement_and_difference() {
+        // re.comp: "b" is in the complement of "a", "a" is not.
+        assert_eq!(
+            run("(assert (str.in_re \"b\" (re.comp (str.to_re \"a\"))))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // re.diff: [a-z] minus "b" excludes "b" but keeps "a".
+        assert_eq!(
+            run("(assert (not (str.in_re \"a\" (re.diff (re.range \"a\" \"z\") (str.to_re \"b\")))))\
+                 (check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Complement composes inside a concatenation.
+        assert_eq!(
+            run("(assert (not (str.in_re \"ab\" \
+                 (re.++ (re.comp (str.to_re \"x\")) (str.to_re \"b\")))))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
