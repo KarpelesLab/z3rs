@@ -2365,6 +2365,13 @@ impl Context {
         if let Some(&bv) = self.fp_bv.get(&t) {
             return Some(bv);
         }
+        // An opaque symbolic FP operation (e.g. fp.fma/fp.sqrt we cannot fold)
+        // has a *determined* value we don't know; representing it as a free
+        // bit-vector would be unsound (it would satisfy any equality). Refuse it
+        // so the surrounding goal keeps the `unknown` gate instead.
+        if self.str_symbolic.contains(&t) {
+            return None;
+        }
         let (eb, sb) = self.fp_format_of(self.m.get_sort(t))?;
         let bv = self
             .m
@@ -5948,6 +5955,28 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn opaque_fp_ops_gate_not_contradict() {
+        // fp.fma / fp.sqrt on constants have a determined value we can't fold
+        // in no_std; they must stay `unknown`, never a wrong verdict. (A bug once
+        // bit-blasted them to a free bit-vector, giving `sat` where z3 is unsat.)
+        let t = "((_ to_fp 11 53) RNE";
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (= (fp.fma RNE {t} 2.0) {t} 3.0) {t} 1.0)) {t} 7.0))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unknown"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (= (fp.sqrt RNE {t} 9.0)) {t} 3.0))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unknown"]
+        );
     }
 
     #[test]
