@@ -2070,6 +2070,18 @@ impl Context {
                 }
                 self.symbolic_string(op, raw)
             }
+            "str.is_digit" => {
+                if let Some(parts) = &strs {
+                    let s = &parts[0];
+                    let b = s.len() == 1 && (0x30..=0x39).contains(&s[0]);
+                    return Ok(self.mk_bool(b));
+                }
+                self.symbolic_string(op, raw)
+            }
+            // str.to_lower / str.to_upper are not part of z3's SMT2 surface (z3
+            // treats them as uninterpreted), so folding them would contradict
+            // the oracle; keep them a sound `unknown`.
+            "str.to_lower" | "str.to_upper" => self.symbolic_string(op, raw),
             "str.indexof" | "str.to_int" | "str.to-int" | "str.to_code" | "str.to-code" => {
                 if let Some(v) = self.fold_string_to_int(op, raw) {
                     return Ok(self.m.mk_int(v));
@@ -2303,6 +2315,21 @@ impl Context {
                         bits ^ (1u64 << 63)
                     };
                     return Ok(self.mk_fp(r, 11, 53));
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.to_real" if args.len() == 1 => {
+                // Exact real value of a finite Float64 constant. Folded when the
+                // value is an integer; other finite values would need an exact
+                // dyadic rational, so they stay a gated `unknown`.
+                if let Some(a) = self.fp64(args[0])
+                    && a.is_finite()
+                    && a.abs() < 9.007e15
+                    && (a as i64) as f64 == a
+                {
+                    return Ok(self
+                        .m
+                        .mk_numeral(Rational::from_integer(puremp::Int::from(a as i64)), false));
                 }
                 self.symbolic_fp(op, args)
             }
@@ -2586,8 +2613,11 @@ impl Context {
     fn symbolic_string(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
         // Result sort: Bool for predicates, Int for indexof/to_int, else String.
         let sort = match op {
-            "str.contains" | "str.prefixof" | "str.suffixof" => self.m.mk_bool_sort(),
-            "str.indexof" | "str.to_int" | "str.to-int" => self.m.mk_int_sort(),
+            "str.contains" | "str.prefixof" | "str.suffixof" | "str.is_digit" | "str.<"
+            | "str.<=" => self.m.mk_bool_sort(),
+            "str.indexof" | "str.to_int" | "str.to-int" | "str.to_code" | "str.to-code" => {
+                self.m.mk_int_sort()
+            }
             _ => self.string_sort(),
         };
         let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
@@ -6199,6 +6229,25 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn str_is_digit_and_fp_to_real() {
+        // str.is_digit: single decimal digit.
+        assert_eq!(
+            run("(assert (not (str.is_digit \"5\")))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (str.is_digit \"a\"))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // fp.to_real on an integral Float64 constant.
+        assert_eq!(
+            run("(assert (not (= (fp.to_real ((_ to_fp 11 53) RNE 3.0)) 3.0)))(check-sat)")
+                .unwrap(),
             alloc::vec!["unsat"]
         );
     }
