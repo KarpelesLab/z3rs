@@ -10,7 +10,7 @@ checksum = "7bd1f38102e114b648aaaa62c2314f7b4fe4993eae80917ef0077fa7d0730fe7"
 
 [[package]]
 name = "z3rs"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "puremp",
 ]
