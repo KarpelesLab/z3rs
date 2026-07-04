@@ -28,7 +28,26 @@ use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::rewriter::substitute;
-use crate::smt::{Model, SmtResult, check_bv_model, check_model};
+use crate::smt::{Model, SmtResult, Value, check_bv_model, check_model};
+
+/// The result of optimizing one objective.
+enum OptResult {
+    /// The proven optimal integer value.
+    Optimum(Int),
+    /// The objective is unbounded in the optimizing direction.
+    Unbounded,
+    /// Could not determine within budget.
+    Unknown,
+}
+
+/// Render an integer as an SMT-LIB term (`n` or `(- n)`).
+fn render_int(v: &Int) -> String {
+    if *v < Int::from(0) {
+        alloc::format!("(- {})", v.abs())
+    } else {
+        alloc::format!("{v}")
+    }
+}
 use crate::util::symbol::Symbol;
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -577,6 +596,10 @@ struct Context {
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
+    /// Optimization objectives as `(term, maximize?, display text)`.
+    objectives: Vec<(AstId, bool, String)>,
+    /// The rendered optimal value of each objective after the last `check-sat`.
+    objective_values: Vec<String>,
 }
 
 impl Context {
@@ -610,6 +633,8 @@ impl Context {
             dt_depth: BTreeMap::new(),
             tester_of: BTreeMap::new(),
             universals: Vec::new(),
+            objectives: Vec::new(),
+            objective_values: Vec::new(),
         }
     }
 
@@ -716,6 +741,8 @@ impl Context {
                 self.assertions.clear();
                 self.assert_names.clear();
                 self.universals.clear();
+                self.objectives.clear();
+                self.objective_values.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -727,6 +754,8 @@ impl Context {
                 self.assertions.clear();
                 self.assert_names.clear();
                 self.universals.clear();
+                self.objectives.clear();
+                self.objective_values.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -816,8 +845,21 @@ impl Context {
                 self.last_verdict = None;
                 Ok(None)
             }
+            "maximize" | "minimize" => {
+                let t = self.term(&list[1])?;
+                let maximize = matches!(&list[0], SExpr::Atom(a) if a == "maximize");
+                let text = render_sexpr(&list[1]);
+                self.objectives.push((t, maximize, text));
+                self.last_model = None;
+                Ok(None)
+            }
+            "get-objectives" => Ok(Some(self.get_objectives())),
             "check-sat" => {
-                let (res, model) = self.check_sat();
+                let (res, model) = if self.objectives.is_empty() {
+                    self.check_sat()
+                } else {
+                    self.optimize()
+                };
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -1292,6 +1334,139 @@ impl Context {
         } else {
             (res, model)
         }
+    }
+
+    /// Decide the assertions together with `extra` temporary constraints,
+    /// without permanently adding them.
+    fn check_with(&mut self, extra: &[AstId]) -> (SmtResult, Option<Model>) {
+        let n = self.assertions.len();
+        self.assertions.extend_from_slice(extra);
+        let r = self.check_sat();
+        self.assertions.truncate(n);
+        r
+    }
+
+    /// Optimize the recorded objectives (integer, lexicographic in declaration
+    /// order) and return the model at the optimum. Each objective is bounded by
+    /// binary search; a non-integer objective or one not bounded within budget
+    /// is reported as `unknown` (or `oo`/`(- oo)` when provably unbounded).
+    fn optimize(&mut self) -> (SmtResult, Option<Model>) {
+        let objs = self.objectives.clone();
+        self.objective_values = alloc::vec!["unknown".to_string(); objs.len()];
+        let (res, mut model) = self.check_with(&[]);
+        if res != SmtResult::Sat {
+            return (res, model);
+        }
+        let mut fixed: Vec<AstId> = Vec::new();
+        for (i, (obj, maximize, _)) in objs.iter().enumerate() {
+            let (obj, maximize) = (*obj, *maximize);
+            if !self.m.is_int_sort(self.m.get_sort(obj)) {
+                continue; // only integer objectives are optimized soundly for now
+            }
+            let v0 = match model.as_mut().map(|m| m.eval(&self.m, obj)) {
+                Some(Value::Num(r, _)) => r.numerator().clone(),
+                _ => continue,
+            };
+            match self.opt_int_search(obj, maximize, v0, &fixed) {
+                OptResult::Optimum(v) => {
+                    self.objective_values[i] = render_int(&v);
+                    let iv = self.m.mk_numeral(Rational::from_integer(v), true);
+                    let eq = self.m.mk_eq(obj, iv);
+                    fixed.push(eq);
+                    model = self.check_with(&fixed).1;
+                }
+                OptResult::Unbounded => {
+                    self.objective_values[i] = if maximize {
+                        "oo".to_string()
+                    } else {
+                        "(- oo)".to_string()
+                    };
+                }
+                OptResult::Unknown => {}
+            }
+        }
+        (SmtResult::Sat, model)
+    }
+
+    /// The bound constraint `obj ≥ k` (maximize) or `obj ≤ k` (minimize).
+    fn opt_bound(&mut self, obj: AstId, maximize: bool, k: &Int) -> AstId {
+        let kv = self.m.mk_numeral(Rational::from_integer(k.clone()), true);
+        if maximize {
+            self.m.mk_ge(obj, kv)
+        } else {
+            self.m.mk_le(obj, kv)
+        }
+    }
+
+    /// Binary-search the optimum of the integer objective `obj` (feasible value
+    /// `v0`) subject to the base assertions plus `fixed`. Probes an outer bound
+    /// by doubling, then bisects; caps total solves.
+    fn opt_int_search(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        v0: Int,
+        fixed: &[AstId],
+    ) -> OptResult {
+        let two = Int::from(2);
+        let mut budget = 200i32;
+        let sat_at = |ctx: &mut Self, k: &Int, budget: &mut i32| -> Option<bool> {
+            if *budget <= 0 {
+                return None;
+            }
+            *budget -= 1;
+            let c = ctx.opt_bound(obj, maximize, k);
+            let mut ex = fixed.to_vec();
+            ex.push(c);
+            Some(ctx.check_with(&ex).0 == SmtResult::Sat)
+        };
+        // Doubling to find a bound infeasible in the optimizing direction.
+        let dir = |v: &Int, s: &Int, maximize: bool| if maximize { v.add(s) } else { v.sub(s) };
+        let mut step = Int::from(1);
+        let mut feasible = v0;
+        let infeasible;
+        loop {
+            let cand = dir(&feasible, &step, maximize);
+            match sat_at(self, &cand, &mut budget) {
+                None => return OptResult::Unknown,
+                Some(true) => {
+                    feasible = cand;
+                    step = step.mul(&two);
+                    if step.bit_len() > 200 {
+                        return OptResult::Unbounded;
+                    }
+                }
+                Some(false) => {
+                    infeasible = cand;
+                    break;
+                }
+            }
+        }
+        // Bisect: `feasible` is sat, `infeasible` is unsat, one step apart at end.
+        let (mut lo, mut hi) = (feasible, infeasible);
+        loop {
+            let gap = hi.sub(&lo).abs();
+            if gap <= Int::from(1) {
+                break;
+            }
+            let mid = lo.add(&hi).div_rem(&two).map(|(q, _)| q).unwrap();
+            match sat_at(self, &mid, &mut budget) {
+                None => return OptResult::Unknown,
+                Some(true) => lo = mid,
+                Some(false) => hi = mid,
+            }
+        }
+        OptResult::Optimum(lo)
+    }
+
+    /// The `(objectives …)` response after an optimizing `check-sat`.
+    fn get_objectives(&self) -> String {
+        let mut out = String::from("(objectives");
+        for ((_, _, text), val) in self.objectives.iter().zip(&self.objective_values) {
+            out.push_str(&alloc::format!("\n ({text} {val})"));
+        }
+        out.push_str("\n)");
+        out
     }
 
     /// Parse a quantifier's binder list `((x S) …)` and body into fresh
@@ -2863,6 +3038,28 @@ mod tests {
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn integer_optimization() {
+        // Maximize a bounded objective.
+        let out = run("(declare-const x Int)(assert (<= x 10))(assert (>= x 0))\
+             (maximize x)(check-sat)(get-objectives)")
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(out[1].contains("(x 10)"), "got {:?}", out[1]);
+        // Minimize.
+        let out = run(
+            "(declare-const x Int)(declare-const y Int)(assert (>= x 3))\
+             (assert (>= y x))(minimize y)(check-sat)(get-objectives)",
+        )
+        .unwrap();
+        assert!(out[1].contains("(y 3)"), "got {:?}", out[1]);
+        // Unbounded.
+        let out =
+            run("(declare-const x Int)(assert (>= x 0))(maximize x)(check-sat)(get-objectives)")
+                .unwrap();
+        assert!(out[1].contains("(x oo)"), "got {:?}", out[1]);
     }
 
     #[test]
