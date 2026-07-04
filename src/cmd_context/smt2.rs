@@ -6112,6 +6112,15 @@ mod tests {
             .unwrap(),
             alloc::vec!["unsat"]
         );
+        // A system: eliminate c=3-b (unit coefficient), reducing to 6a+4b=2.
+        assert_eq!(
+            run(
+                "(declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (= (+ (* 6 a) (* 4 b)) 2))(assert (= (+ b c) 3))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]

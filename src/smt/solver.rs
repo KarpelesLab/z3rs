@@ -608,40 +608,71 @@ fn dioph_witness(
     diseqs: &[LinExpr],
     int_vars: &[AstId],
 ) -> Option<Assignment> {
-    let eqs: Vec<&Constraint> = cons.iter().filter(|c| c.rel == Rel::Eq).collect();
-    if eqs.len() != 1 {
+    let int_set: BTreeSet<AstId> = int_vars.iter().copied().collect();
+    let mut eqs: Vec<LinExpr> = cons
+        .iter()
+        .filter(|c| c.rel == Rel::Eq)
+        .map(|c| c.expr.clone())
+        .collect();
+    if eqs.is_empty() {
         return None;
     }
-    let e = &eqs[0].expr;
-    let as_i128 = |r: &Rational| -> Option<i128> {
-        r.is_integer()
-            .then(|| r.to_integer())
-            .flatten()
-            .and_then(|i| i.to_i64())
-            .map(|n| n as i128)
-    };
-    let terms: Vec<(AstId, i128)> = e
-        .terms()
-        .map(|(v, c)| as_i128(c).map(|n| (v, n)))
-        .collect::<Option<_>>()?;
-    if terms.is_empty() || terms.iter().any(|&(_, c)| c == 0) {
-        return None;
-    }
-    let k = as_i128(e.const_term())?;
-    let rhs = -k; // Σ cᵢ·vᵢ = rhs
-    let vars: Vec<AstId> = terms.iter().map(|&(v, _)| v).collect();
-    let coeffs: Vec<i128> = terms.iter().map(|&(_, c)| c).collect();
+    let one = Rational::from_integer(Int::from(1));
+    let neg_one = Rational::from_integer(Int::from(-1));
+    let zero = Rational::from_integer(Int::from(0));
 
-    // Build and verify a candidate: `sol` assigns the equation's variables, all
-    // other integer variables are 0. Accept only if every constraint holds.
-    let verify = |sol: &[i128]| -> Option<Assignment> {
-        if sol.iter().any(|&x| i64::try_from(x).is_err()) {
+    // Eliminate integer variables that occur with coefficient ±1 in some
+    // equation: solve that equation for the variable and substitute it into the
+    // remaining equations (and prior substitutions). This reduces a system to a
+    // single residual Diophantine equation the witness search below can handle.
+    let mut subs: Vec<(AstId, LinExpr)> = Vec::new();
+    loop {
+        let found = eqs.iter().enumerate().find_map(|(i, e)| {
+            e.terms()
+                .find(|(v, c)| int_set.contains(v) && (**c == one || **c == neg_one))
+                .map(|(v, c)| (i, v, c.clone()))
+        });
+        let Some((i, v, cv)) = found else { break };
+        let e = eqs.remove(i);
+        let rest = e.sub(&LinExpr::var(v).scale(&cv)); // e = cv·v + rest
+        let v_expr = rest.scale(if cv == one { &neg_one } else { &one }); // v = -rest/cv
+        for eq in &mut eqs {
+            *eq = substitute_lin(eq, v, &v_expr);
+        }
+        for (_, se) in &mut subs {
+            *se = substitute_lin(se, v, &v_expr);
+        }
+        subs.push((v, v_expr));
+    }
+    // A residual equation that is a nonzero constant is infeasible on this path.
+    if eqs
+        .iter()
+        .any(|e| e.is_constant() && e.as_constant().map(|c| !c.is_zero()) == Some(true))
+    {
+        return None;
+    }
+    eqs.retain(|e| !e.is_constant()); // drop trivial 0 = 0
+    if eqs.len() > 1 {
+        return None; // more than one residual equation: too complex here
+    }
+
+    // Assemble and verify: place values for the residual equation's variables,
+    // back-substitute the eliminated variables, set the rest to 0, and check
+    // every constraint (including integrality of the eliminated variables).
+    let verify = |free: &BTreeMap<AstId, i128>| -> Option<Assignment> {
+        if free.values().any(|&x| i64::try_from(x).is_err()) {
             return None;
         }
-        let zero = Rational::from_integer(Int::from(0));
         let mut a: Assignment = int_vars.iter().map(|&v| (v, zero.clone())).collect();
-        for (&v, &x) in vars.iter().zip(sol) {
+        for (&v, &x) in free {
             a.insert(v, Rational::from_integer(Int::from(x as i64)));
+        }
+        for (v, e) in &subs {
+            let val = e.eval(&a);
+            if int_set.contains(v) && !val.is_integer() {
+                return None;
+            }
+            a.insert(*v, val);
         }
         let ok = cons.iter().all(|c| {
             let val = c.expr.eval(&a);
@@ -654,10 +685,31 @@ fn dioph_witness(
         ok.then_some(a)
     };
 
+    let as_i128 = |r: &Rational| -> Option<i128> {
+        r.is_integer()
+            .then(|| r.to_integer())
+            .flatten()
+            .and_then(|i| i.to_i64())
+            .map(|n| n as i128)
+    };
+    if eqs.is_empty() {
+        return verify(&BTreeMap::new()); // fully determined by the substitutions
+    }
+    let e = &eqs[0];
+    let terms: Vec<(AstId, i128)> = e
+        .terms()
+        .map(|(v, c)| as_i128(c).map(|n| (v, n)))
+        .collect::<Option<_>>()?;
+    if terms.is_empty() || terms.iter().any(|&(_, c)| c == 0) {
+        return None;
+    }
+    let k = as_i128(e.const_term())?;
+    let rhs = -k;
+    let vars: Vec<AstId> = terms.iter().map(|&(v, _)| v).collect();
+    let coeffs: Vec<i128> = terms.iter().map(|&(_, c)| c).collect();
     if terms.len() == 2 {
-        // Two variables: search the general solution to also satisfy any bounds.
         let (c1, c2) = (coeffs[0], coeffs[1]);
-        let (g, s, t_e) = egcd(c1, c2); // c1·s + c2·t_e = g
+        let (g, s, t_e) = egcd(c1, c2);
         let gg = g.abs();
         if gg == 0 || rhs % gg != 0 {
             return None;
@@ -666,14 +718,23 @@ fn dioph_witness(
         let (x0, y0) = (s * mult, t_e * mult);
         let (dx, dy) = (c2 / gg, -(c1 / gg));
         for t in -256i128..=256 {
-            if let Some(a) = verify(&[x0 + dx * t, y0 + dy * t]) {
+            let free = BTreeMap::from([(vars[0], x0 + dx * t), (vars[1], y0 + dy * t)]);
+            if let Some(a) = verify(&free) {
                 return Some(a);
             }
         }
         None
     } else {
-        // n ≥ 3 (or 1): a particular solution, other variables 0.
-        verify(&solve_dioph(&coeffs, rhs)?)
+        let sol = solve_dioph(&coeffs, rhs)?;
+        verify(&vars.iter().copied().zip(sol).collect())
+    }
+}
+
+/// Replace variable `v` in `e` by the linear expression `v_expr`.
+fn substitute_lin(e: &LinExpr, v: AstId, v_expr: &LinExpr) -> LinExpr {
+    match e.terms().find(|(u, _)| *u == v).map(|(_, c)| c.clone()) {
+        Some(c) => e.sub(&LinExpr::var(v).scale(&c)).add(&v_expr.scale(&c)),
+        None => e.clone(),
     }
 }
 
