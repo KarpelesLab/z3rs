@@ -6360,6 +6360,20 @@ mod tests {
     }
 
     #[test]
+    fn integer_fourier_motzkin_unsat() {
+        // 2a+4b ∈ [3,5] ∧ a = b: real-feasible (a ∈ [1/2, 5/6]) but no integer
+        // solution — eliminating b and tightening (6a ∈ [3,5] → a≥1 ∧ a≤0)
+        // refutes it, which branch-and-bound alone cannot on the unbounded system.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (<= (+ (* 2 a) (* 4 b)) 5))(assert (>= (+ (* 2 a) (* 4 b)) 3))\
+                 (assert (= a b))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
     fn unbounded_diophantine() {
         // 6a+4b=2 (gcd 2 | 2) is satisfiable but unbounded, so branch-and-bound
         // cannot converge; a verified integer witness decides it.

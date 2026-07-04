@@ -36,7 +36,7 @@ use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
 use crate::smt::arith::{
-    Assignment, Constraint, LinExpr, Rel, SolveOutcome, model_with_diseqs_budgeted,
+    Assignment, Constraint, LinExpr, Rel, SolveOutcome, model_with_diseqs_budgeted, project,
 };
 use crate::smt::euf::Egraph;
 
@@ -562,7 +562,77 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     if let Some(a) = dioph_witness(&cons, &sys.diseqs, &int_vars) {
         return Feas::Sat(a);
     }
-    integer_feasible(&cons, &sys.diseqs, &int_vars, budget, 0)
+    let feas = integer_feasible(&cons, &sys.diseqs, &int_vars, budget, 0);
+    // Omega-style last resort when B&B gave up on a pure-integer system:
+    // eliminate every variable by Fourier–Motzkin, GCD-tightening the residual
+    // constraints after each step. Because tightening preserves the integer
+    // solutions and FM preserves real feasibility, a derived contradiction proves
+    // genuine integer infeasibility (unbounded systems B&B cannot refute). Runs
+    // only on the hard `unknown` cases, with its own bounded budget.
+    if matches!(feas, Feas::Unknown) {
+        let all_integer = cons
+            .iter()
+            .all(|c| c.expr.vars().all(|v| sys.int_set.contains(&v)));
+        if all_integer {
+            let mut fm_budget: u64 = 60_000;
+            if integer_fm_unsat(&cons, &int_vars, &mut fm_budget) {
+                return Feas::Unsat;
+            }
+        }
+    }
+    feas
+}
+
+/// A sound (incomplete) integer-infeasibility test for an all-integer system:
+/// project every variable out by Fourier–Motzkin, GCD-tightening the residual
+/// `≤` constraints after each elimination. Returns `true` only when a constant
+/// contradiction (`k ≤ 0` with `k > 0`) is derived — which, because every step
+/// is integer-solution-preserving, proves the system has no integer solution.
+/// Returns `false` (undecided) if the budget is exhausted or no contradiction
+/// appears.
+fn integer_fm_unsat(cons: &[Constraint], int_vars: &[AstId], budget: &mut u64) -> bool {
+    // Normalize to `expr ≤ 0`: equalities become two inequalities; strict
+    // inequalities are integer-tightened to `≤`.
+    let mut work: Vec<Constraint> = Vec::new();
+    for c in cons {
+        match c.rel {
+            Rel::Le => work.push(c.clone()),
+            Rel::Lt => work.push(Constraint::le(c.expr.integer_strict_tighten())),
+            Rel::Eq => {
+                work.push(Constraint::le(c.expr.clone()));
+                work.push(Constraint::le(c.expr.neg()));
+            }
+        }
+    }
+    fn tighten(work: &mut [Constraint]) {
+        for c in work.iter_mut() {
+            if let Some(t) = c.expr.integer_gcd_tighten_le() {
+                *c = Constraint::le(t);
+            }
+        }
+    }
+    // A constant `k ≤ 0` with `k > 0` is a contradiction.
+    fn contradiction(work: &[Constraint]) -> bool {
+        let zero = Rational::from_integer(Int::from(0));
+        work.iter()
+            .filter_map(|c| c.expr.as_constant())
+            .any(|k| k > zero)
+    }
+    tighten(&mut work);
+    if contradiction(&work) {
+        return true;
+    }
+    for &v in int_vars {
+        match project(&work, v, budget) {
+            Some(w) => work = w,
+            None => return false, // budget exhausted: undecided
+        }
+        tighten(&mut work);
+        if contradiction(&work) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Extended Euclid: returns `(g, x, y)` with `a·x + b·y = g = gcd(a,b)`.
