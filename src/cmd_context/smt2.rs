@@ -3216,6 +3216,63 @@ impl Context {
     /// assertions **and from previously generated instances** — iterating to a
     /// fixpoint so chained/inductive universals (`∀x. p(x) ⇒ p(x+1)` with
     /// `p(0)`, `¬p(3)`) fully unfold. Bounded by rounds and a total-instance cap.
+    /// Trigger applications for E-matching: the smallest user-function
+    /// applications in `body` that jointly are single terms containing *every*
+    /// bound variable (a single-trigger covers all binders). Empty if none does.
+    fn triggers(
+        &self,
+        vars: &BTreeSet<AstId>,
+        body: AstId,
+        user_decls: &BTreeSet<AstId>,
+    ) -> Vec<AstId> {
+        let mut trigs = Vec::new();
+        let mut seen = BTreeSet::new();
+        for t in self.m.postorder(body) {
+            if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) {
+                let po: BTreeSet<AstId> = self.m.postorder(t).into_iter().collect();
+                if vars.iter().all(|v| po.contains(v)) && seen.insert(t) {
+                    trigs.push(t);
+                }
+            }
+        }
+        trigs
+    }
+
+    /// Try to match trigger pattern `pat` against ground term `g`, extending
+    /// `binding` (bound var → ground term). A non-variable pattern with no bound
+    /// variables must equal `g` exactly (terms are hash-consed); a compound
+    /// pattern must match `g`'s decl and arguments structurally.
+    fn ematch(
+        &self,
+        pat: AstId,
+        g: AstId,
+        vars: &BTreeSet<AstId>,
+        binding: &mut BTreeMap<AstId, AstId>,
+    ) -> bool {
+        if vars.contains(&pat) {
+            return match binding.get(&pat) {
+                Some(&x) => x == g,
+                None => {
+                    binding.insert(pat, g);
+                    true
+                }
+            };
+        }
+        if !self.m.postorder(pat).iter().any(|x| vars.contains(x)) {
+            return pat == g;
+        }
+        if self.m.is_app(pat) && self.m.is_app(g) && self.m.app_decl(pat) == self.m.app_decl(g) {
+            let pa = self.m.app_args(pat).to_vec();
+            let ga = self.m.app_args(g).to_vec();
+            return pa.len() == ga.len()
+                && pa
+                    .iter()
+                    .zip(&ga)
+                    .all(|(&p, &q)| self.ematch(p, q, vars, binding));
+        }
+        false
+    }
+
     fn universal_instances(&mut self) -> (Vec<AstId>, bool) {
         if self.universals.is_empty() {
             return (Vec::new(), true);
@@ -3225,11 +3282,27 @@ impl Context {
         const MAX_TOTAL: usize = 400;
         let universals = self.universals.clone();
 
-        // Ground terms by sort, seeded from the assertions.
+        // User-function declarations (targets for E-matching triggers) and, per
+        // universal, a trigger that covers all its binders (if one exists).
+        let user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        let trigs: Vec<Vec<AstId>> = universals
+            .iter()
+            .map(|(vars, body)| {
+                let vs: BTreeSet<AstId> = vars.iter().copied().collect();
+                self.triggers(&vs, *body, &user_decls)
+            })
+            .collect();
+
+        // Ground terms by sort, and user-function applications by decl (for
+        // E-matching), seeded from the assertions.
         let mut by_sort: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
+        let mut by_decl: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
         for a in self.assertions.clone() {
             for t in self.m.postorder(a) {
                 by_sort.entry(self.m.get_sort(t)).or_default().insert(t);
+                if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) {
+                    by_decl.entry(self.m.app_decl(t)).or_default().insert(t);
+                }
             }
         }
         // Ensure every binder sort has at least one ground term (a fresh rep).
@@ -3245,9 +3318,69 @@ impl Context {
 
         let mut instances: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        let mut ematch_saturated = false;
+        // Phase 1 — E-matching to a fixpoint: instantiate each universal by
+        // matching its trigger against ground applications of the same function,
+        // so only *relevant* instances are generated (a recursive/UF universal
+        // unfolds its actual argument chain, e.g. fact(3)→fact(2)→…→fact(0),
+        // instead of flooding the budget with irrelevant ground combinations).
+        for _ in 0..MAX_ROUNDS {
+            let mut fresh = false;
+            for (ui, (vars, body)) in universals.iter().enumerate() {
+                let vs: BTreeSet<AstId> = vars.iter().copied().collect();
+                for &trig in &trigs[ui] {
+                    let decl = self.m.app_decl(trig);
+                    let grounds: Vec<AstId> = by_decl
+                        .get(&decl)
+                        .map(|s| s.iter().copied().collect())
+                        .unwrap_or_default();
+                    for g in grounds {
+                        let mut binding: BTreeMap<AstId, AstId> = BTreeMap::new();
+                        if !self.ematch(trig, g, &vs, &mut binding)
+                            || !vars.iter().all(|v| binding.contains_key(v))
+                        {
+                            continue;
+                        }
+                        let subst: Vec<(AstId, AstId)> =
+                            vars.iter().map(|&v| (v, binding[&v])).collect();
+                        let raw = substitute(&mut self.m, *body, &subst);
+                        let inst = crate::rewriter::simplify(&mut self.m, raw);
+                        if !seen.insert(inst) {
+                            continue;
+                        }
+                        instances.push(inst);
+                        for t in self.m.postorder(inst) {
+                            let s = self.m.get_sort(t);
+                            if by_sort.entry(s).or_default().insert(t) {
+                                fresh = true;
+                            }
+                            if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) {
+                                by_decl.entry(self.m.app_decl(t)).or_default().insert(t);
+                            }
+                        }
+                        if instances.len() >= MAX_TOTAL {
+                            return (instances, false);
+                        }
+                    }
+                }
+            }
+            if !fresh {
+                ematch_saturated = true;
+                break; // E-matching fixpoint reached
+            }
+        }
+        // Phase 2 — enumerative instantiation over all ground terms: provides the
+        // saturation guarantee that makes a `sat` result complete for finite
+        // domains / Datalog. Universals that HAVE a covering trigger are left to
+        // E-matching (phase 1) — enumerating them over their own function's
+        // outputs would spawn irrelevant nested applications (e.g. fact(fact(x)),
+        // which is non-linear) that only obscure the goal.
         for _round in 0..MAX_ROUNDS {
             let mut fresh_term = false;
-            for (vars, body) in &universals {
+            for (ui, (vars, body)) in universals.iter().enumerate() {
+                if !trigs[ui].is_empty() {
+                    continue; // handled completely by E-matching
+                }
                 let cands: Vec<Vec<AstId>> = vars
                     .iter()
                     .map(|&v| by_sort[&self.m.get_sort(v)].iter().copied().collect())
@@ -3295,8 +3428,9 @@ impl Context {
                 }
             }
             if !fresh_term {
-                // Fixpoint: every ground instance is present → saturated.
-                return (instances, true);
+                // Enumeration fixpoint; overall completeness also needs the
+                // E-matching phase to have reached its own fixpoint.
+                return (instances, ematch_saturated);
             }
         }
         (instances, false) // ran out of rounds: not saturated
@@ -5710,6 +5844,38 @@ mod tests {
     }
 
     #[test]
+    fn ematching_decides_recursive_and_uf() {
+        // E-matching unfolds fact's argument chain, so fact(3)=6 refutes =7...
+        assert_eq!(
+            run(
+                "(define-fun-rec fact ((n Int)) Int (ite (<= n 0) 1 (* n (fact (- n 1)))))\
+                 (assert (= (fact 3) 6))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // ...and a summation recursion decides both ways.
+        assert_eq!(
+            run(
+                "(define-fun-rec sm ((n Int)) Int (ite (<= n 0) 0 (+ n (sm (- n 1)))))\
+                 (assert (not (= (sm 4) 10)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A non-terminating instantiation (f(x)=f(x+1)) still yields a sound
+        // `unknown` (E-matching never reaches a fixpoint).
+        assert_eq!(
+            run(
+                "(declare-fun f (Int) Int)(assert (forall ((x Int)) (= (f x) (f (+ x 1)))))\
+                 (assert (= (f 0) 5))(assert (not (= (f 100) 5)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unknown"]
+        );
+    }
+
+    #[test]
     fn recursive_function_definitions() {
         // define-funs-rec (mutual recursion): even/odd over a small argument
         // fully unfold and decide.
@@ -5720,16 +5886,24 @@ mod tests {
             .unwrap(),
             alloc::vec!["sat"]
         );
-        // define-fun-rec is accepted and handled soundly (never a wrong verdict);
-        // a deep arithmetic recursion stays a sound `unknown` rather than a parse
-        // error, and must terminate (constant `ite`/arith fold on instantiation).
+        // define-fun-rec: E-matching unfolds the argument chain, so a base-case
+        // recursion decides (f(2)=f(1)=f(0)=0).
         assert_eq!(
             run(
                 "(define-fun-rec f ((n Int)) Int (ite (<= n 0) 0 (f (- n 1))))\
                  (assert (= (f 2) 0))(check-sat)"
             )
             .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["sat"]
+        );
+        // A contradictory arithmetic recursion is refuted: fact(3) = 6 ≠ 7.
+        assert_eq!(
+            run(
+                "(define-fun-rec fact ((n Int)) Int (ite (<= n 0) 1 (* n (fact (- n 1)))))\
+                 (assert (= (fact 3) 7))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
