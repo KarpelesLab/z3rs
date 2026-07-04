@@ -1417,6 +1417,33 @@ impl Context {
                 let s = crate::rewriter::simplify(&mut self.m, folded);
                 Ok(Some(self.m.pp(s)))
             }
+            "apply" => {
+                // (apply tactic) — apply a goal-transforming tactic and print the
+                // residual subgoal. The simplifying tactics (simplify /
+                // ctx-simplify / propagate-values, and combinators over them)
+                // reduce here to simplifying each assertion; trivially-true ones
+                // are dropped, and a false assertion collapses the goal.
+                let asserts = self.assertions.clone();
+                let mut lines: Vec<String> = Vec::new();
+                for a in asserts {
+                    let folded = self.dt_fold(a);
+                    let s = crate::rewriter::simplify(&mut self.m, folded);
+                    if self.m.is_false(s) {
+                        lines = alloc::vec!["false".to_string()];
+                        break;
+                    }
+                    if !self.m.is_true(s) {
+                        lines.push(self.m.pp(s));
+                    }
+                }
+                let body = lines
+                    .iter()
+                    .map(|l| alloc::format!("\n  {l}"))
+                    .collect::<String>();
+                Ok(Some(alloc::format!(
+                    "(goals\n(goal{body}\n  :precision precise :depth 1)\n)"
+                )))
+            }
             "eval" => {
                 // (eval term) — the value of `term` in the current model.
                 if self.last_model.is_none() {
@@ -7187,6 +7214,20 @@ mod tests {
             .unwrap(),
             alloc::vec!["sat"]
         );
+    }
+
+    #[test]
+    fn apply_simplify_tactic() {
+        // (apply simplify) prints the residual goal; trivially-true assertions
+        // are dropped by the rewriter.
+        let out = run(
+            "(declare-const x Int)(assert (and true (> x 5)))(assert (= 1 1))\
+                       (apply simplify)",
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("(goal"), "output: {}", out[0]);
+        assert!(out[0].contains("x 5"), "output: {}", out[0]);
     }
 
     #[test]
