@@ -162,6 +162,32 @@ fn fold_string_pred(op: &str, parts: &[Vec<u32>]) -> bool {
     }
 }
 
+/// First index ≥ `from` at which `sub` occurs contiguously in `seq` (elements
+/// compared by their hash-consed id). `None` if absent. Empty `sub` matches at
+/// `from` (clamped to the length).
+fn find_sub(seq: &[AstId], sub: &[AstId], from: usize) -> Option<usize> {
+    if sub.is_empty() {
+        return Some(from.min(seq.len()));
+    }
+    if sub.len() > seq.len() {
+        return None;
+    }
+    (from..=seq.len() - sub.len()).find(|&i| seq[i..i + sub.len()] == sub[..])
+}
+
+/// Replace the first contiguous occurrence of `from` in `seq` with `to`.
+fn replace_first_seq(seq: &[AstId], from: &[AstId], to: &[AstId]) -> Vec<AstId> {
+    match find_sub(seq, from, 0) {
+        Some(i) if !from.is_empty() => {
+            let mut out = seq[..i].to_vec();
+            out.extend_from_slice(to);
+            out.extend_from_slice(&seq[i + from.len()..]);
+            out
+        }
+        _ => seq.to_vec(),
+    }
+}
+
 /// `2^w` as an arbitrary-precision integer.
 fn pow2(w: u32) -> Int {
     let mut r = Int::from(1);
@@ -2564,6 +2590,55 @@ impl Context {
                     let start = i as usize;
                     let end = (start + n as usize).min(l.len());
                     return Ok(self.mk_seq(l[start..end].to_vec()));
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.contains" | "seq.prefixof" | "seq.suffixof" => {
+                if let Some(ps) = &lists {
+                    // seq.prefixof/suffixof: (sub, whole); seq.contains: (whole, sub).
+                    let (whole, sub) = if op == "seq.contains" {
+                        (&ps[0], &ps[1])
+                    } else {
+                        (&ps[1], &ps[0])
+                    };
+                    let b = match op {
+                        "seq.prefixof" => whole.len() >= sub.len() && whole[..sub.len()] == sub[..],
+                        "seq.suffixof" => {
+                            whole.len() >= sub.len() && whole[whole.len() - sub.len()..] == sub[..]
+                        }
+                        _ => find_sub(whole, sub, 0).is_some(),
+                    };
+                    return Ok(self.mk_bool(b));
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.indexof" => {
+                // The optional third argument is an Int offset, not a sequence,
+                // so fetch the two sequence operands directly.
+                let off = if args.len() > 2 {
+                    self.int_arg(args[2])
+                } else {
+                    Some(0)
+                };
+                if let (Some(whole), Some(sub), Some(o)) = (
+                    self.seq_of.get(&args[0]).cloned(),
+                    self.seq_of.get(&args[1]).cloned(),
+                    off,
+                ) && o >= 0
+                {
+                    let idx = find_sub(&whole, &sub, o as usize)
+                        .map(|p| p as i64)
+                        .unwrap_or(-1);
+                    return Ok(self.m.mk_int(idx));
+                }
+                self.symbolic_seq(op, args)
+            }
+            // seq.replace (first occurrence) folds; seq.replace_all is not part
+            // of z3's SMT2 surface (uninterpreted there), so it stays `unknown`
+            // to avoid contradicting the oracle.
+            "seq.replace" => {
+                if let Some(ps) = &lists {
+                    return Ok(self.mk_seq(replace_first_seq(&ps[0], &ps[1], &ps[2])));
                 }
                 self.symbolic_seq(op, args)
             }
@@ -6349,6 +6424,35 @@ mod tests {
         assert_eq!(
             run("(assert (not (= (fp.to_real ((_ to_fp 11 53) RNE 3.0)) 3.0)))(check-sat)")
                 .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn sequence_search_and_replace() {
+        let s = "(seq.++ (seq.unit 1) (seq.unit 2) (seq.unit 1))";
+        // indexof with an offset skips the first occurrence.
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (= (seq.indexof {s} (seq.unit 1) 1) 2)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // contains and first-occurrence replace.
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (seq.contains {s} (seq.unit 2))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(
+                "(assert (not (= (seq.replace (seq.++ (seq.unit 1) (seq.unit 2)) \
+                 (seq.unit 2) (seq.unit 9)) (seq.++ (seq.unit 1) (seq.unit 9)))))(check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
