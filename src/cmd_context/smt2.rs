@@ -538,6 +538,9 @@ struct Context {
     last_model: Option<Model>,
     /// Counter for the fresh constants introduced by term-ITE elimination.
     fresh_counter: u32,
+    /// Boolean sentinels standing in for (not-yet-decided) quantified formulas;
+    /// a goal that mentions any of these is answered `unknown` (see `decide`).
+    quant_atoms: BTreeSet<AstId>,
 }
 
 impl Context {
@@ -564,6 +567,7 @@ impl Context {
             sort_order: Vec::new(),
             last_model: None,
             fresh_counter: 0,
+            quant_atoms: BTreeSet::new(),
         }
     }
 
@@ -1030,6 +1034,17 @@ impl Context {
     /// contains genuine nonlinear arithmetic the linear core over-approximates
     /// (so a definite `sat`/`unsat` is always sound).
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        // Quantified formulas are not decided yet: if the goal mentions a
+        // quantifier sentinel, answer a sound `unknown`.
+        if !self.quant_atoms.is_empty()
+            && self
+                .m
+                .postorder(goal)
+                .iter()
+                .any(|t| self.quant_atoms.contains(t))
+        {
+            return (SmtResult::Unknown, None);
+        }
         // Bit-vector formulas are decided by bit-blasting (no model produced yet).
         // The bit-blaster handles only pure QF_BV; a goal mixing bit-vectors with
         // uninterpreted, array, or arithmetic terms is not combined yet, so return
@@ -1363,6 +1378,20 @@ impl Context {
                     // (! t :annotation value …) — annotations are transparent to
                     // the term's meaning; evaluate the annotated term.
                     return self.term(&l[1]);
+                }
+                if head == "forall" || head == "exists" {
+                    // Quantifiers are not decided yet. Sound over-approximation:
+                    // replace the quantified formula by a fresh, unconstrained
+                    // Boolean sentinel; any goal that mentions one forces a sound
+                    // `unknown` (see `decide`). The body is intentionally not
+                    // parsed (its bound variables are undeclared).
+                    let name = alloc::format!("!q!{}", self.fresh_counter);
+                    self.fresh_counter += 1;
+                    let b = self.m.mk_bool_sort();
+                    let d = self.m.mk_func_decl(Symbol::new(&name), &[], b);
+                    let atom = self.m.mk_const(d);
+                    self.quant_atoms.insert(atom);
+                    return Ok(atom);
                 }
                 if head == "_" {
                     // Indexed identifier, e.g. (_ bv5 8) — a bit-vector numeral.
@@ -2344,6 +2373,21 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn quantifiers_accepted_as_unknown() {
+        // Quantified formulas are accepted (not a parse error) and answered
+        // with a sound `unknown`; ground goals alongside still decide.
+        assert_eq!(
+            run("(declare-const x Int)(assert (forall ((y Int)) (>= (+ x y) y)))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unknown"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
