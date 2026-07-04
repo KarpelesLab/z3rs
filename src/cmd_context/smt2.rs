@@ -2587,6 +2587,16 @@ impl Context {
                         self.m.mk_false()
                     });
                 }
+                // Reflexivity on identical arguments holds regardless of the
+                // (possibly symbolic) value: s contains/prefixof/suffixof/≤ s, and
+                // s < s is false.
+                if raw.len() == 2 && raw[0] == raw[1] {
+                    return Ok(if op == "str.<" {
+                        self.m.mk_false()
+                    } else {
+                        self.m.mk_true()
+                    });
+                }
                 // A symbolic string predicate can also be unsound if its string
                 // argument is pinned to a literal, so gate via a symbolic marker.
                 let atom = self.symbolic_string(op, raw)?;
