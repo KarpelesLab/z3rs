@@ -168,6 +168,40 @@ impl LinExpr {
         e
     }
 
+    /// GCD-tighten the non-strict constraint `self ≤ 0`, assuming every variable
+    /// ranges over the integers. With `g = gcd` of the (denominator-cleared)
+    /// variable coefficients, `Σ aᵢ·xᵢ ≤ -c` is `Σ(aᵢ/g)·xᵢ ≤ ⌊-c/g⌋` because the
+    /// left side is an integer — a strictly tighter bound whenever `g ∤ c`. This
+    /// is the Omega-test inequality tightening: it makes Fourier–Motzkin decide
+    /// systems like `3x−3y ≥ 1 ∧ 3x−3y ≤ 2` (integer-infeasible though the real
+    /// relaxation is feasible). Returns the tightened LHS, or `None` when there
+    /// is nothing to tighten (no variables, or the coefficients are already
+    /// coprime). Preserves the exact set of integer solutions.
+    pub fn integer_gcd_tighten_le(&self) -> Option<LinExpr> {
+        if self.coeffs.is_empty() {
+            return None;
+        }
+        // Clear denominators so the coefficients and constant are integers.
+        let mut l = Int::from(1);
+        for c in self.coeffs.values() {
+            l = l.lcm(c.denominator());
+        }
+        l = l.lcm(self.constant.denominator());
+        let e = self.scale(&Rational::from_integer(l));
+        // g = gcd of the (now integer) variable coefficients.
+        let mut g = Int::from(0);
+        for c in e.coeffs.values() {
+            g = g.gcd(c.numerator());
+        }
+        if g <= Int::from(1) {
+            return None; // coprime coefficients: nothing to tighten
+        }
+        // Divide through by g and round the constant up (⌈c/g⌉ = −⌊−c/g⌋).
+        let mut out = e.scale(&Rational::from_integer(g).recip());
+        out.constant = Rational::from_integer(out.constant.ceil());
+        Some(out)
+    }
+
     /// Evaluate the expression at `assign` (variables absent from the map read
     /// as zero).
     pub fn eval(&self, assign: &Assignment) -> Rational {

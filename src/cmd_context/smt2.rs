@@ -6331,6 +6331,35 @@ mod tests {
     }
 
     #[test]
+    fn integer_gcd_inequality_tightening() {
+        // 3x−3y ∈ [1,2]: the real relaxation is feasible (x−y ∈ [1/3, 2/3]) but
+        // no integer x−y lies in it. GCD tightening (÷3, round bounds) turns this
+        // into x−y ≥ 1 ∧ x−y ≤ 0, which Fourier–Motzkin refutes.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (>= (- (* 3 x) (* 3 y)) 1))(assert (<= (- (* 3 x) (* 3 y)) 2))\
+                 (check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // 2x+2y = 1 is integer-infeasible (odd = even).
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (>= (+ (* 2 x) (* 2 y)) 1))(assert (<= (+ (* 2 x) (* 2 y)) 1))\
+                 (check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // …but 3x−3y = 3 (⇒ x−y = 1) stays satisfiable.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (= (- (* 3 x) (* 3 y)) 3))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
     fn unbounded_diophantine() {
         // 6a+4b=2 (gcd 2 | 2) is satisfiable but unbounded, so branch-and-bound
         // cannot converge; a verified integer witness decides it.

@@ -529,15 +529,27 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // `expr ≤ -1`. This lets Fourier–Motzkin decide many QF_LIA systems directly
     // (e.g. x < y ∧ y < x+1 becomes x+1 ≤ y ∧ y ≤ x, immediately infeasible)
     // instead of relying on branch-and-bound.
+    // Also GCD-tighten all-integer `≤`/`<` constraints: dividing by the gcd of
+    // the variable coefficients rounds the bound (Omega-test tightening), so
+    // Fourier–Motzkin decides integer-infeasible-but-real-feasible systems like
+    // `3x−3y ≥ 1 ∧ 3x−3y ≤ 2`. This preserves the integer solution set exactly
+    // and is local to the feasibility check (it never feeds interface reasoning).
     let cons: Vec<Constraint> = sys
         .cons
         .iter()
         .map(|c| {
             let all_int = !c.expr.is_constant() && c.expr.vars().all(|v| sys.int_set.contains(&v));
-            if c.rel == Rel::Lt && all_int {
-                Constraint::le(c.expr.integer_strict_tighten())
-            } else {
-                c.clone()
+            match c.rel {
+                Rel::Lt if all_int => {
+                    let le = c.expr.integer_strict_tighten();
+                    Constraint::le(le.integer_gcd_tighten_le().unwrap_or(le))
+                }
+                Rel::Le if all_int => Constraint::le(
+                    c.expr
+                        .integer_gcd_tighten_le()
+                        .unwrap_or_else(|| c.expr.clone()),
+                ),
+                _ => c.clone(),
             }
         })
         .collect();
