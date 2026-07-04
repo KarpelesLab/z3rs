@@ -2832,7 +2832,10 @@ mod tests {
         let o = "(declare-datatypes ((Opt 0)) (((none) (some (val Int)))))";
         // Selector-over-constructor and distinctness.
         assert_eq!(
-            run(&alloc::format!("{o}(assert (not (= (val (some 7)) 7)))(check-sat)")).unwrap(),
+            run(&alloc::format!(
+                "{o}(assert (not (= (val (some 7)) 7)))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
