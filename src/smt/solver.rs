@@ -534,7 +534,7 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // Fourier–Motzkin decides integer-infeasible-but-real-feasible systems like
     // `3x−3y ≥ 1 ∧ 3x−3y ≤ 2`. This preserves the integer solution set exactly
     // and is local to the feasibility check (it never feeds interface reasoning).
-    let cons: Vec<Constraint> = sys
+    let mut cons: Vec<Constraint> = sys
         .cons
         .iter()
         .map(|c| {
@@ -553,6 +553,32 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
             }
         })
         .collect();
+    // Implied equalities: if `e ≤ 0` and `−e ≤ 0` are both present, then `e = 0`.
+    // Gcd tightening turns a pinned pair like `6x−4y ≤ 3 ∧ 6x−4y ≥ 1` into
+    // `3x−2y ≤ 1 ∧ 3x−2y ≥ 1`, whose sum is 0; recovering the equation lets the
+    // Diophantine witness solve it (the dark shadow's interval widening would
+    // otherwise reject the exact bound). Sound: the equality is entailed.
+    {
+        let zero = Rational::from_integer(Int::from(0));
+        let les: Vec<usize> = cons
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.rel == Rel::Le)
+            .map(|(i, _)| i)
+            .collect();
+        let mut implied: Vec<LinExpr> = Vec::new();
+        for a in 0..les.len() {
+            for b in (a + 1)..les.len() {
+                let (ea, eb) = (&cons[les[a]].expr, &cons[les[b]].expr);
+                if !ea.is_constant() && ea.add(eb).as_constant() == Some(zero.clone()) {
+                    implied.push(ea.clone());
+                }
+            }
+        }
+        for e in implied {
+            cons.push(Constraint::eq(e));
+        }
+    }
     let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
     // Branch-and-bound cannot converge on an unbounded Diophantine system
     // (e.g. `6a+4b=2`). Try to construct an integer witness first — it uses no

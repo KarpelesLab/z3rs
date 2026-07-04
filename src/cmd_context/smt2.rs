@@ -6360,6 +6360,28 @@ mod tests {
     }
 
     #[test]
+    fn integer_implied_equality() {
+        // 6x−4y ∈ [1,3] gcd-tightens to the pinned 3x−2y ∈ [1,1], i.e. the
+        // equation 3x−2y = 1 (x=1,y=1) — recovered as an implied equality and
+        // solved by the Diophantine witness.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (<= (- (* 6 x) (* 4 y)) 3))(assert (>= (- (* 6 x) (* 4 y)) 1))\
+                 (check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // 2x−2y = 1 (odd = even) is unsat.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (<= (- (* 2 x) (* 2 y)) 1))(assert (>= (- (* 2 x) (* 2 y)) 1))\
+                 (check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
     fn integer_dark_shadow_with_equality() {
         // Equality + unbounded inequalities: 2b=6 ⇒ b=3, leaving a≤2 ∧ c≤a−1
         // (both unbounded below). The dark shadow eliminates equalities first,
