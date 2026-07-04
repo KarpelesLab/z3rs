@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/z3rs/compare/v0.0.2...v0.0.3) - 2026-07-04
+
+### Other
+
+- Update ROADMAP: Omega-test progress in Phase 5
+- Phase 5: Omega-test dark shadow (verified SAT witness)
+- Phase 5: Fourier–Motzkin integer-unsat fallback (Omega real shadow)
+- Phase 5: Omega-test GCD tightening of integer inequalities
+- Phase 3: honor tactics in (apply …) — nnf + combinators
+- Fix unsound SAT: datatype universal with a non-matching selector trigger
+- Phase 6: get-assertions, arity-N uninterpreted sorts, version fix
+- Phase 2 ✅: enrich the theory rewriter; mark rewriter phase done
+- Phase 4 ✅: SAT phase functional criterion met (cores + sat_smt)
+- Phase 0 ✅: complete the util foundation (params + rlimit)
+- Phase 5: word-equation boundary-character mismatch
+- Phase 3: minimal (apply simplify) tactic + get-value model surface
+- Reject bit-vector operand-width mismatches (robustness)
+
 ## [0.0.2](https://github.com/KarpelesLab/z3rs/compare/v0.0.1...v0.0.2) - 2026-07-04
 
 ### Other
