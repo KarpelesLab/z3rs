@@ -1043,6 +1043,9 @@ struct Context {
     seq_of: BTreeMap<AstId, Vec<AstId>>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
+    /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
+    /// Each application `(P s…)` monomorphizes to a distinct cached sort.
+    sort_ctors: BTreeMap<String, usize>,
 }
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
@@ -1177,6 +1180,7 @@ impl Context {
             maps: BTreeMap::new(),
             as_arrays: BTreeMap::new(),
             params: crate::util::Params::new(),
+            sort_ctors: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -1271,6 +1275,21 @@ impl Context {
                     name if self.param_datatypes.contains_key(name) => {
                         self.monomorphize_datatype(name, &l[1..])
                     }
+                    name if self.sort_ctors.get(name) == Some(&(l.len() - 1)) => {
+                        // An arity-N uninterpreted sort constructor: each distinct
+                        // argument tuple is a distinct (cached) uninterpreted sort.
+                        let args: Vec<AstId> = l[1..]
+                            .iter()
+                            .map(|a| self.resolve_sort(a))
+                            .collect::<Result<_, _>>()?;
+                        let key = alloc::format!("{name}!{args:?}");
+                        if let Some(&s) = self.sorts.get(&key) {
+                            return Ok(s);
+                        }
+                        let s = self.m.mk_uninterpreted_sort(Symbol::new(&key));
+                        self.sorts.insert(key, s);
+                        Ok(s)
+                    }
                     other => Err(alloc::format!("unsupported sort constructor {other:?}")),
                 }
             }
@@ -1324,15 +1343,25 @@ impl Context {
                     None => "unsupported".to_string(),
                 }))
             }
+            "get-assertions" => {
+                // The current assertion stack, as an s-expr list.
+                let body = self
+                    .assertions
+                    .iter()
+                    .map(|&a| alloc::format!("\n  {}", self.m.pp(a)))
+                    .collect::<String>();
+                Ok(Some(alloc::format!("({body})")))
+            }
             "set-logic" | "set-info" | "exit" => Ok(None),
             "echo" => Ok(Some(match list.get(1) {
                 Some(SExpr::Atom(a)) => unquote_string(a),
                 _ => String::new(),
             })),
             "get-info" => match list.get(1) {
-                Some(SExpr::Atom(k)) if k == ":version" => {
-                    Ok(Some("(:version \"0.0.1\")".to_string()))
-                }
+                Some(SExpr::Atom(k)) if k == ":version" => Ok(Some(alloc::format!(
+                    "(:version \"{}\")",
+                    env!("CARGO_PKG_VERSION")
+                ))),
                 Some(SExpr::Atom(k)) if k == ":name" => Ok(Some("(:name \"z3rs\")".to_string())),
                 Some(SExpr::Atom(k)) if k == ":authors" => {
                     Ok(Some("(:authors \"z3rs\")".to_string()))
@@ -1414,9 +1443,20 @@ impl Context {
             }
             "declare-sort" => {
                 let name = Self::sym(&list[1])?.to_string();
-                let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
-                self.sorts.insert(name.clone(), s);
-                self.sort_order.push(name);
+                // Optional arity (default 0). Arity ≥ 1 is a sort constructor,
+                // applied as `(Name s…)` and monomorphized in resolve_sort.
+                let arity: usize = list
+                    .get(2)
+                    .and_then(|a| Self::sym(a).ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                if arity == 0 {
+                    let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
+                    self.sorts.insert(name.clone(), s);
+                    self.sort_order.push(name);
+                } else {
+                    self.sort_ctors.insert(name, arity);
+                }
                 Ok(None)
             }
             "define-sort" => {
@@ -7305,6 +7345,24 @@ mod tests {
                 "(assert (str.in_re \"aaa\" ((_ re.loop 3 5) (str.to_re \"a\"))))\
                  (assert (not (str.in_re \"aa\" ((_ re.loop 3 5) (str.to_re \"a\")))))(check-sat)"
             )
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn arity_n_uninterpreted_sorts() {
+        // (declare-sort P 1): each argument tuple is a distinct sort; reflexivity
+        // still holds, and elements at different sorts are unrelated.
+        assert_eq!(
+            run("(declare-sort P 1)(declare-const x (P Int))\
+                 (assert (not (= x x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-sort Pair 2)(declare-const p (Pair Int Bool))\
+                 (declare-const q (Pair Int Bool))(assert (distinct p q))(check-sat)")
             .unwrap(),
             alloc::vec!["sat"]
         );
