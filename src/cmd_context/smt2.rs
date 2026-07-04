@@ -976,12 +976,30 @@ impl Context {
             }
             return (SmtResult::Unknown, None);
         }
+        // Arrays indexed by Bool need boolean-value reasoning on the indices
+        // (Bool is 2-valued, true ≠ false) that the array axioms do not yet do;
+        // return a sound `unknown` rather than a possibly-wrong verdict.
+        if self.has_bool_indexed_array(goal) {
+            return (SmtResult::Unknown, None);
+        }
         let (res, model) = check_model(&self.m, goal);
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
             (SmtResult::Unknown, None)
         } else {
             (res, model)
         }
+    }
+
+    /// Does `goal` contain a `select`/`store` over an array whose index sort is
+    /// `Bool`? (An unsupported corner needing boolean-value index reasoning.)
+    fn has_bool_indexed_array(&self, goal: AstId) -> bool {
+        self.m.postorder(goal).iter().any(|&t| {
+            (self.m.is_select(t) || self.m.is_store(t))
+                && self
+                    .m
+                    .array_sort_params(self.m.get_sort(self.m.app_args(t)[0]))
+                    .is_some_and(|(idx, _)| self.m.is_bool_sort(idx))
+        })
     }
 
     /// Does `goal` mention any bit-vector-sorted term?
@@ -1416,10 +1434,15 @@ impl Context {
                 })
             }
             "/" => {
-                // Fold constant real division to an exact rational; otherwise
-                // build an opaque `/` term.
+                // `/` is real division. A constant divisor makes it linear:
+                // both constant → an exact rational; `(/ a k)` with a constant
+                // `k ≠ 0` → `a · (1/k)`. Only a non-constant divisor stays opaque.
                 match (m.as_numeral(args[0]), m.as_numeral(args[1])) {
                     (Some(p), Some(q)) if !q.is_zero() => Ok(m.mk_numeral(p.div(&q), false)),
+                    (_, Some(q)) if !q.is_zero() => {
+                        let inv = m.mk_numeral(rat(1).div(&q), false);
+                        Ok(m.mk_mul(&[args[0], inv]))
+                    }
                     _ => Ok(m.mk_div(args[0], args[1])),
                 }
             }

@@ -357,6 +357,14 @@ const CORPUS: &[Case] = &[
         name: "bv_lshr",
         script: "(assert (not (= (bvlshr #x80 #x03) #x10)))(check-sat)",
     },
+    Case {
+        name: "real_div_by_constant",
+        script: "(declare-const x Real)(assert (= (/ x 2) 3))(assert (not (= x 6)))(check-sat)",
+    },
+    Case {
+        name: "lira_div_by_one",
+        script: "(declare-const x Int)(assert (>= (/ x 1) 5))(assert (< x 5))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
