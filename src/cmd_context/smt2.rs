@@ -996,6 +996,9 @@ struct Context {
     /// Array `(_ map f)` combinators: array term → (function name, source arrays).
     /// `(select ((_ map f) a…) i)` rewrites to `f((select a i)…)`.
     maps: BTreeMap<AstId, (String, Vec<AstId>)>,
+    /// `(_ as-array f)` values: array term → the function declaration.
+    /// `(select (_ as-array f) i)` rewrites to `f(i)`.
+    as_arrays: BTreeMap<AstId, AstId>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -1170,6 +1173,7 @@ impl Context {
             param_datatypes: BTreeMap::new(),
             lambdas: BTreeMap::new(),
             maps: BTreeMap::new(),
+            as_arrays: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -1608,7 +1612,9 @@ impl Context {
                 Ok(None)
             }
             "get-objectives" => Ok(Some(self.get_objectives())),
-            "check-sat" => {
+            // check-sat-using (tactic …) picks a solving strategy but yields the
+            // same verdict; the tactic argument is advisory, so run a plain check.
+            "check-sat" | "check-sat-using" => {
                 let (res, model) = if self.objectives.is_empty() && self.soft.is_empty() {
                     self.check_sat()
                 } else {
@@ -4910,6 +4916,20 @@ impl Context {
                 if head == "_" {
                     // Indexed identifier, e.g. (_ bv5 8) — a bit-vector numeral.
                     let name = Self::sym(&l[1])?;
+                    // (_ as-array f): the array λi. f(i). `select` applies f below.
+                    if name == "as-array" && l.len() == 3 {
+                        let fname = Self::sym(&l[2])?.to_string();
+                        let decl = *self
+                            .funcs
+                            .get(&fname)
+                            .ok_or_else(|| alloc::format!("as-array: unknown function {fname}"))?;
+                        let fd = self.m.func_decl(decl).ok_or("as-array: bad decl")?;
+                        let (dom, rng) = (fd.domain[0], fd.range);
+                        let arr = self.m.mk_array_sort(dom, rng);
+                        let t = self.fresh_const(arr);
+                        self.as_arrays.insert(t, decl);
+                        return Ok(t);
+                    }
                     // FP special values: (_ +oo eb sb), (_ NaN eb sb), …
                     if l.len() == 4 && matches!(name, "+oo" | "-oo" | "NaN" | "+zero" | "-zero") {
                         let kind = name.to_string();
@@ -4962,6 +4982,12 @@ impl Context {
                     let selects: Vec<AstId> =
                         arrays.iter().map(|&a| self.m.mk_select(a, idx)).collect();
                     return self.apply(&fname, selects);
+                }
+                // (select (_ as-array f) i) → f(i).
+                if head == "select"
+                    && let Some(&decl) = self.as_arrays.get(&args[0])
+                {
+                    return Ok(self.m.mk_app(decl, &[args[1]]));
                 }
                 if self.macros.contains_key(&head) {
                     return self.expand_macro(&head, args);
@@ -7125,6 +7151,24 @@ mod tests {
         assert_eq!(
             run("(simplify (and true (or false true)))").unwrap(),
             alloc::vec!["true"]
+        );
+    }
+
+    #[test]
+    fn as_array_and_check_sat_using() {
+        // (_ as-array f): select is f applied to the index.
+        assert_eq!(
+            run("(declare-fun f (Int) Int)\
+                 (assert (not (= (select (_ as-array f) 3) (f 3))))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // check-sat-using ignores the tactic and returns the same verdict.
+        assert_eq!(
+            run("(declare-const x Int)(assert (> x 5))(assert (< x 3))\
+                 (check-sat-using (then simplify smt))")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
