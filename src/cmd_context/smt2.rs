@@ -1762,6 +1762,74 @@ impl Context {
             .map(|(text, _)| text.chars().map(|ch| ch as u32).collect::<Vec<u32>>())
     }
 
+    /// If `(= a b)` is `(str.++ …) = "literal"` (either way round), expand it to
+    /// the disjunction over every way the literal splits among the concatenation
+    /// parts — sound and complete for this word-equation fragment. `None` if the
+    /// pattern doesn't match.
+    fn try_split_concat_eq(&mut self, a: &SExpr, b: &SExpr) -> Result<Option<AstId>, String> {
+        // Flatten a (possibly nested) `str.++` into its sequence of parts.
+        fn flatten(s: &SExpr, out: &mut Vec<SExpr>) {
+            if let SExpr::List(l) = s
+                && l.len() >= 3
+                && matches!(&l[0], SExpr::Atom(h) if h == "str.++")
+            {
+                for p in &l[1..] {
+                    flatten(p, out);
+                }
+            } else {
+                out.push(s.clone());
+            }
+        }
+        let concat_parts = |s: &SExpr| -> Option<Vec<SExpr>> {
+            match s {
+                SExpr::List(l)
+                    if l.len() >= 3 && matches!(&l[0], SExpr::Atom(h) if h == "str.++") =>
+                {
+                    let mut parts = Vec::new();
+                    flatten(s, &mut parts);
+                    Some(parts)
+                }
+                _ => None,
+            }
+        };
+        let literal = |s: &SExpr| -> Option<Vec<u32>> {
+            match s {
+                SExpr::Atom(a) if a.starts_with('"') => {
+                    Some(unquote_string(a).chars().map(|c| c as u32).collect())
+                }
+                _ => None,
+            }
+        };
+        let (parts, lit) = match (concat_parts(a), literal(b), concat_parts(b), literal(a)) {
+            (Some(p), Some(l), _, _) | (_, _, Some(p), Some(l)) => (p, l),
+            _ => return Ok(None),
+        };
+        Ok(Some(self.split_concat_eq(&parts, &lit)?))
+    }
+
+    /// The disjunction over split points of `(str.++ parts…) = lit`.
+    fn split_concat_eq(&mut self, parts: &[SExpr], lit: &[u32]) -> Result<AstId, String> {
+        if parts.len() == 1 {
+            let p = self.term(&parts[0])?;
+            let l = self.mk_str_lit(&code_points_to_string(lit));
+            return Ok(self.m.mk_eq(p, l));
+        }
+        // First part takes lit[0..k]; the rest match lit[k..].
+        let mut disjuncts = Vec::new();
+        for k in 0..=lit.len() {
+            let head = self.term(&parts[0])?;
+            let prefix = self.mk_str_lit(&code_points_to_string(&lit[..k]));
+            let eq_head = self.m.mk_eq(head, prefix);
+            let rest = self.split_concat_eq(&parts[1..], &lit[k..])?;
+            disjuncts.push(self.m.mk_and(&[eq_head, rest]));
+        }
+        Ok(match disjuncts.len() {
+            0 => self.m.mk_false(),
+            1 => disjuncts[0],
+            _ => self.m.mk_or(&disjuncts),
+        })
+    }
+
     /// Build a string-theory application `(op args…)`, folding when every string
     /// argument is a literal and otherwise producing an uninterpreted term
     /// (marked symbolic so a goal mentioning it is answered `unknown`).
@@ -3582,6 +3650,15 @@ impl Context {
                     }
                     return Err(alloc::format!("unsupported indexed identifier {name:?}"));
                 }
+                // Word equation `(= (str.++ …) "literal")`: expand to the sound,
+                // complete disjunction over split points before building the
+                // (otherwise gated) symbolic concatenation.
+                if head == "="
+                    && l.len() == 3
+                    && let Some(t) = self.try_split_concat_eq(&l[1], &l[2])?
+                {
+                    return Ok(t);
+                }
                 let args: Vec<AstId> = l[1..]
                     .iter()
                     .map(|a| self.term(a))
@@ -4908,6 +4985,31 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(declare-const y Int)\
                  (assert (= (seq.unit x) (seq.unit y)))(assert (not (= x y)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn string_concat_word_equations() {
+        // (str.++ x y) = "abcd" ∧ x = "ab" forces y = "cd".
+        assert_eq!(
+            run("(declare-const x String)(declare-const y String)\
+                 (assert (= (str.++ x y) \"abcd\"))(assert (= x \"ab\"))\
+                 (assert (not (= y \"cd\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A suffix that can't fit makes it unsat.
+        assert_eq!(
+            run("(declare-const x String)(assert (= (str.++ x \"z\") \"abcd\"))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Nested/flat concatenation with a fixed middle part.
+        assert_eq!(
+            run("(declare-const x String)\
+                 (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
