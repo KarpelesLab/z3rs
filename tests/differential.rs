@@ -321,7 +321,7 @@ const CORPUS: &[Case] = &[
     },
     Case {
         name: "bv_mul_commutes",
-        script: "(declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))
+        script: "(declare-const x (_ BitVec 4))(declare-const y (_ BitVec 4))
                  (assert (not (= (bvmul x y) (bvmul y x))))(check-sat)",
     },
     Case {

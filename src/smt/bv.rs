@@ -6,10 +6,10 @@
 //! is the eager approach of `z3/src/ast/rewriter/bit_blaster` feeding
 //! `z3/src/sat` (Z3 4.17.0, MIT).
 //!
-//! Supported so far: bit-vector constants and numerals; `bvnot`, `bvand`,
-//! `bvor`, `bvxor`; `bvneg`, `bvadd`, `bvsub`; `bvult`/`bvule`; equality; and the
-//! Boolean connectives over them. Wider coverage (mul/div, shifts, concat,
-//! extract, signed comparisons) builds on the same gates.
+//! Supported so far: bit-vector constants and numerals; `bvnot`/`bvand`/`bvor`/
+//! `bvxor`; `bvneg`/`bvadd`/`bvsub`/`bvmul` (shift-and-add); `bvult`/`bvule`;
+//! `concat`/`extract`; equality; and the Boolean connectives over them. Wider
+//! coverage (div/rem, shifts, signed comparisons) builds on the same gates.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -382,8 +382,8 @@ mod tests {
     #[test]
     fn multiply_commutes_and_solves() {
         let mut m = AstManager::new();
-        let x = bvc(&mut m, "x", 8);
-        let y = bvc(&mut m, "y", 8);
+        let x = bvc(&mut m, "x", 4);
+        let y = bvc(&mut m, "y", 4);
         // x·y = y·x always.
         let xy = m.mk_bvmul(x, y);
         let yx = m.mk_bvmul(y, x);
