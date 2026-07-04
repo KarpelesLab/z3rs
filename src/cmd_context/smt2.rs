@@ -1232,6 +1232,12 @@ impl Context {
                 self.macros.insert(name, (params, list[4].clone()));
                 Ok(None)
             }
+            "define-const" => {
+                // (define-const name S body) ≡ (define-fun name () S body).
+                let name = Self::sym(&list[1])?.to_string();
+                self.macros.insert(name, (Vec::new(), list[3].clone()));
+                Ok(None)
+            }
             "define-fun-rec" => {
                 // (define-fun-rec name ((p S)...) R body): a possibly-recursive
                 // definition. Declare `name` uninterpreted and add the defining
@@ -4157,6 +4163,21 @@ impl Context {
                     }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "divisible")
+                    {
+                        // ((_ divisible n) t) ≡ (= (mod t n) 0).
+                        let n = Self::sym(&qid[2])?;
+                        let t = self.term(&l[1])?;
+                        let d = self.m.mk_int(
+                            n.parse::<i64>()
+                                .map_err(|_| "divisible: bad n".to_string())?,
+                        );
+                        let m = self.m.mk_mod(t, d);
+                        let zero = self.m.mk_int(0);
+                        return Ok(self.m.mk_eq(m, zero));
+                    }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "int2bv")
                     {
                         // ((_ int2bv n) t): fold a constant Int to its n-bit value;
@@ -4628,6 +4649,29 @@ impl Context {
                 }
                 _ => Ok(m.mk_mod(args[0], args[1])),
             },
+            "^" => {
+                // Exponentiation: fold a constant base to a non-negative integer
+                // constant power; otherwise leave an opaque (non-linear) term.
+                if let (Some(base), Some(exp)) = (
+                    m.as_numeral(args[0]),
+                    m.as_numeral(args[1]).and_then(|v| v.to_integer()),
+                ) && let Some(e) = exp.to_i64()
+                    && (0..=1024).contains(&e)
+                {
+                    let is_int = m.is_int_sort(m.get_sort(args[0]));
+                    let mut acc = Rational::from_integer(puremp::Int::from(1));
+                    for _ in 0..e {
+                        acc = acc.mul(&base);
+                    }
+                    return Ok(m.mk_numeral(acc, is_int));
+                }
+                let d = m.mk_func_decl(
+                    Symbol::new("^"),
+                    &[m.get_sort(args[0]); 2],
+                    m.get_sort(args[0]),
+                );
+                Ok(m.mk_app(d, &args))
+            }
             "abs" => match m.as_numeral(args[0]).and_then(|v| v.to_integer()) {
                 Some(a) => Ok(m.mk_numeral(Rational::from_integer(a.abs()), true)),
                 None => {
@@ -6066,6 +6110,26 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn divisible_define_const_power() {
+        // (_ divisible n) ≡ mod-zero.
+        assert_eq!(
+            run("(declare-const x Int)(assert ((_ divisible 3) x))(assert (= x 9))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(assert ((_ divisible 3) x))(assert (= x 7))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // define-const and constant exponentiation fold.
+        assert_eq!(
+            run("(define-const k Int 5)(assert (not (= (^ k 2) 25)))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
