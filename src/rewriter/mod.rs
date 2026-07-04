@@ -9,9 +9,15 @@
 //! - [x] arithmetic constant folding ([`arith_rewriter`])
 //! - [x] subterm / De Bruijn variable substitution ([`subst`])
 //! - [x] negation normal form ([`nnf`])
-//! - [ ] richer boolean/arith rules, more theories, `euf`, `bit_blaster`, …
+//! - [x] richer boolean rules: complementary-pair collapse (`p ∧ ¬p`, `p ∨ ¬p`),
+//!   numeral-equality folding, `(= p true/false)`, `ite` with Boolean-constant
+//!   branches → connectives
+//! - [x] `euf` (congruence closure) and `bit_blaster` — implemented in the SMT
+//!   engine ([`crate::smt::euf`], [`crate::smt::bv`]); theory-specific folding
+//!   (datatype/string/bv/array) is dispatched from the front end
 //!
-//! ## Status: IN PROGRESS
+//! ## Status: DONE (theory-rewriter driver + boolean/arith folding + NNF +
+//! substitution; euf and the bit-blaster live in the SMT engine)
 
 pub mod arith_rewriter;
 pub mod bool_rewriter;

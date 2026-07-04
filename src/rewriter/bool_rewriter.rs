@@ -27,8 +27,8 @@ pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Optio
         Some(simplify_and(m, args))
     } else if kind == BasicOp::Or as DeclKind {
         Some(simplify_or(m, args))
-    } else if kind == BasicOp::Eq as DeclKind && args[0] == args[1] {
-        Some(m.mk_true())
+    } else if kind == BasicOp::Eq as DeclKind {
+        simplify_eq(m, args)
     } else if kind == BasicOp::Ite as DeclKind {
         Some(simplify_ite(m, decl, args))
     } else if kind == BasicOp::Implies as DeclKind {
@@ -88,6 +88,40 @@ fn simplify_not(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
     m.mk_app(decl, args)
 }
 
+/// `(= a b)`: reflexivity, numeral comparison, and boolean equality with a
+/// constant (`(= p true) = p`, `(= p false) = ¬p`).
+fn simplify_eq(m: &mut AstManager, args: &[AstId]) -> Option<AstId> {
+    if args.len() != 2 {
+        return None;
+    }
+    let (a, b) = (args[0], args[1]);
+    if a == b {
+        return Some(m.mk_true()); // reflexivity
+    }
+    if let (Some(x), Some(y)) = (m.as_numeral(a), m.as_numeral(b)) {
+        return Some(if x == y { m.mk_true() } else { m.mk_false() });
+    }
+    if m.is_true(a) {
+        return Some(b);
+    }
+    if m.is_true(b) {
+        return Some(a);
+    }
+    if m.is_false(a) {
+        return Some(m.mk_not(b));
+    }
+    if m.is_false(b) {
+        return Some(m.mk_not(a));
+    }
+    None
+}
+
+/// True iff `x` is the negation of some literal also present in `lits` (so the
+/// conjunction/disjunction has a complementary pair).
+fn has_complement(m: &AstManager, lits: &[AstId], x: AstId) -> bool {
+    m.is_not(x) && lits.contains(&m.app_args(x)[0])
+}
+
 fn simplify_and(m: &mut AstManager, args: &[AstId]) -> AstId {
     let mut kept: Vec<AstId> = Vec::new();
     for &a in args {
@@ -100,6 +134,10 @@ fn simplify_and(m: &mut AstManager, args: &[AstId]) -> AstId {
         if !kept.contains(&a) {
             kept.push(a); // idempotent
         }
+    }
+    // p ∧ ¬p → false.
+    if kept.iter().any(|&a| has_complement(m, &kept, a)) {
+        return m.mk_false();
     }
     match kept.len() {
         0 => m.mk_true(),
@@ -121,6 +159,10 @@ fn simplify_or(m: &mut AstManager, args: &[AstId]) -> AstId {
             kept.push(a); // idempotent
         }
     }
+    // p ∨ ¬p → true.
+    if kept.iter().any(|&a| has_complement(m, &kept, a)) {
+        return m.mk_true();
+    }
     match kept.len() {
         0 => m.mk_false(),
         1 => kept[0],
@@ -138,6 +180,23 @@ fn simplify_ite(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
     }
     if t == e {
         return t;
+    }
+    // Boolean-constant branches collapse to a connective (`is_true`/`is_false`
+    // only match the Bool constants, so these fire only for a Boolean ite). Route
+    // through the connective folders so the result is itself simplified.
+    if m.is_true(t) {
+        return simplify_or(m, &[c, e]); // (ite c true e) = c ∨ e
+    }
+    if m.is_false(e) {
+        return simplify_and(m, &[c, t]); // (ite c t false) = c ∧ t
+    }
+    if m.is_false(t) {
+        let nc = m.mk_not(c);
+        return simplify_and(m, &[nc, e]); // (ite c false e) = ¬c ∧ e
+    }
+    if m.is_true(e) {
+        let nc = m.mk_not(c);
+        return simplify_or(m, &[nc, t]); // (ite c t true) = ¬c ∨ t
     }
     m.mk_app(decl, args)
 }
@@ -206,6 +265,43 @@ mod tests {
         let and = m.mk_and(&[p, q]);
         // Nothing to fold: result is the same hash-consed node.
         assert_eq!(simplify(&mut m, and), and);
+    }
+
+    #[test]
+    fn folds_complementary_pairs_and_bool_eq() {
+        let mut m = AstManager::new();
+        let p = m.mk_bool_const("p");
+        let np = m.mk_not(p);
+        let t = m.mk_true();
+        let f = m.mk_false();
+        // p ∧ ¬p = false ; p ∨ ¬p = true
+        let and = m.mk_and(&[p, np]);
+        assert_eq!(simplify(&mut m, and), f);
+        let or = m.mk_or(&[p, np]);
+        assert_eq!(simplify(&mut m, or), t);
+        // (= p true) = p ; (= p false) = ¬p
+        let eqt = m.mk_eq(p, t);
+        assert_eq!(simplify(&mut m, eqt), p);
+        let eqf = m.mk_eq(p, f);
+        assert_eq!(simplify(&mut m, eqf), np);
+    }
+
+    #[test]
+    fn folds_numeral_equality_and_bool_ite() {
+        let mut m = AstManager::new();
+        let three = m.mk_int(3);
+        let five = m.mk_int(5);
+        let t = m.mk_true();
+        let f = m.mk_false();
+        // (= 3 5) = false ; (= 3 3) = true
+        let ne = m.mk_eq(three, five);
+        assert_eq!(simplify(&mut m, ne), f);
+        let eq = m.mk_eq(three, three);
+        assert_eq!(simplify(&mut m, eq), t);
+        // (ite c true false) = c
+        let c = m.mk_bool_const("c");
+        let ite = m.mk_ite(c, t, f);
+        assert_eq!(simplify(&mut m, ite), c);
     }
 
     #[test]
