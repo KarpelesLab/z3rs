@@ -993,6 +993,9 @@ struct Context {
     /// Array `lambda` closures: array term → (bound-variable placeholders, body).
     /// `(select (lambda ((x S)) body) i)` beta-reduces to `body[x:=i]`.
     lambdas: BTreeMap<AstId, (Vec<AstId>, AstId)>,
+    /// Array `(_ map f)` combinators: array term → (function name, source arrays).
+    /// `(select ((_ map f) a…) i)` rewrites to `f((select a i)…)`.
+    maps: BTreeMap<AstId, (String, Vec<AstId>)>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -1166,6 +1169,7 @@ impl Context {
             tester_of: BTreeMap::new(),
             param_datatypes: BTreeMap::new(),
             lambdas: BTreeMap::new(),
+            maps: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -4602,6 +4606,27 @@ impl Context {
                         return Ok(self.m.mk_eq(x, c));
                     }
                     if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "map")
+                    {
+                        // ((_ map f) a…): an array value; `select` applies f
+                        // element-wise below. The function is qid[2], either a
+                        // plain name or a qualified `(f (Dom…) Rng)` identifier.
+                        let fname = match &qid[2] {
+                            SExpr::Atom(a) => a.clone(),
+                            SExpr::List(fl) if !fl.is_empty() => Self::sym(&fl[0])?.to_string(),
+                            _ => return Err("map: bad function".to_string()),
+                        };
+                        let arrays: Vec<AstId> = l[1..]
+                            .iter()
+                            .map(|a| self.term(a))
+                            .collect::<Result<_, _>>()?;
+                        let sort = self.m.get_sort(arrays[0]);
+                        let t = self.fresh_const(sort);
+                        self.maps.insert(t, (fname, arrays));
+                        return Ok(t);
+                    }
+                    if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "as")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "const")
                     {
@@ -4845,6 +4870,15 @@ impl Context {
                         params.into_iter().zip(args[1..].iter().copied()).collect();
                     let reduced = substitute(&mut self.m, body, &subst);
                     return Ok(crate::rewriter::simplify(&mut self.m, reduced));
+                }
+                // (select ((_ map f) a…) i) → f((select a i)…).
+                if head == "select"
+                    && let Some((fname, arrays)) = self.maps.get(&args[0]).cloned()
+                {
+                    let idx = args[1];
+                    let selects: Vec<AstId> =
+                        arrays.iter().map(|&a| self.m.mk_select(a, idx)).collect();
+                    return self.apply(&fname, selects);
                 }
                 if self.macros.contains_key(&head) {
                     return self.expand_macro(&head, args);
@@ -6899,6 +6933,27 @@ mod tests {
         assert_eq!(
             run("(simplify (and true (or false true)))").unwrap(),
             alloc::vec!["true"]
+        );
+    }
+
+    #[test]
+    fn array_map_combinator() {
+        // ((_ map f) a b) applies f element-wise; select rewrites to f of selects.
+        assert_eq!(
+            run(
+                "(declare-const a (Array Int Int))(declare-const b (Array Int Int))\
+                 (assert (= (select a 2) 10))(assert (= (select b 2) 20))\
+                 (assert (not (= (select ((_ map (+ (Int Int) Int)) a b) 2) 30)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Boolean map (not) over a set-like array.
+        assert_eq!(
+            run("(declare-const a (Array Int Bool))(assert (select a 3))\
+                 (assert (not (select ((_ map not) a) 3)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
