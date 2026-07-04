@@ -4636,9 +4636,14 @@ impl Context {
                 );
             for &arg in &args {
                 if self.m.bv_sort_width(self.m.get_sort(arg)).is_some() {
-                    if is_b2i {
+                    // Only a free bit-vector *leaf* (a variable) may be replaced by
+                    // an unconstrained bounded integer. A compound argument such as
+                    // `int2bv(x)` carries a value (x mod 2ⁿ) a free integer would
+                    // not, so eliminating it would be unsound.
+                    let is_leaf = !self.m.is_app(arg) || self.m.app_args(arg).is_empty();
+                    if is_b2i && is_leaf {
                         apps.push((t, arg));
-                    } else {
+                    } else if !is_b2i {
                         impure.insert(arg);
                     }
                 }
@@ -7159,6 +7164,15 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const a (_ BitVec 4))(assert (= (bv2int a) 7))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // Regression: a compound bv2int argument (int2bv(x)) must NOT be replaced
+        // by a free integer — it carries the value x mod 2ⁿ. This is unsat
+        // (round-trip identity for x in range), and must never answer sat.
+        assert_ne!(
+            run("(declare-const x Int)(assert (>= x 0))(assert (< x 16))\
+                 (assert (not (= (bv2int ((_ int2bv 4) x)) x)))(check-sat)")
+            .unwrap(),
             alloc::vec!["sat"]
         );
     }
