@@ -565,9 +565,13 @@ struct Context {
     /// `(constructor decl, selector decls)`. Reasoned about with the
     /// selector-over-constructor and constructor-surjectivity (eta) axioms.
     records: BTreeMap<AstId, (AstId, Vec<AstId>)>,
-    /// General non-recursive datatypes with ≥2 constructors that have fields:
+    /// General datatypes with ≥2 constructors that have fields:
     /// sort → per-constructor `(constructor decl, selector decls, tester decl)`.
     datatypes: BTreeMap<AstId, Vec<(AstId, Vec<AstId>, AstId)>>,
+    /// For each recursive datatype, an uninterpreted `depth : DT → Int` used to
+    /// enforce acyclicity (a constructor is strictly deeper than its recursive
+    /// children, so no term can be its own descendant).
+    dt_depth: BTreeMap<AstId, AstId>,
     /// Constructor name → its tester declaration (for `((_ is C) t)`).
     tester_of: BTreeMap<String, AstId>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
@@ -603,6 +607,7 @@ impl Context {
             enums: BTreeMap::new(),
             records: BTreeMap::new(),
             datatypes: BTreeMap::new(),
+            dt_depth: BTreeMap::new(),
             tester_of: BTreeMap::new(),
             universals: Vec::new(),
         }
@@ -1047,6 +1052,18 @@ impl Context {
                     self.tester_of.insert(cname.clone(), tdecl);
                     ctor_infos.push((cdecl, sel_decls, tdecl));
                 }
+                // Recursive if any selector's field sort is the datatype itself.
+                let recursive = ctor_infos
+                    .iter()
+                    .flat_map(|(_, sels, _)| sels)
+                    .any(|&sd| self.m.func_decl(sd).map(|d| d.range) == Some(sort));
+                if recursive {
+                    let int_sort = self.m.mk_int_sort();
+                    let name = alloc::format!("depth!{}", self.fresh_counter);
+                    self.fresh_counter += 1;
+                    let depth = self.m.mk_func_decl(Symbol::new(&name), &[sort], int_sort);
+                    self.dt_depth.insert(sort, depth);
+                }
                 self.datatypes.insert(sort, ctor_infos);
             }
         }
@@ -1101,6 +1118,27 @@ impl Context {
                     let eq = self.m.mk_eq(t, ct);
                     let imp = self.m.mk_implies(testers[idx], eq);
                     ax.push(imp);
+                }
+                // Acyclicity: for a recursive datatype, a constructor is strictly
+                // deeper than each recursive child, so no term is its own
+                // descendant.
+                if let Some(&depth) = self.dt_depth.get(&s) {
+                    let dt = self.m.mk_app(depth, &[t]);
+                    let zero = self.m.mk_int(0);
+                    let ge0 = self.m.mk_ge(dt, zero);
+                    ax.push(ge0);
+                    for (idx, (_, sels, _)) in ctors.iter().enumerate() {
+                        for &sd in sels {
+                            if self.m.func_decl(sd).map(|d| d.range) != Some(s) {
+                                continue; // only recursive (same-sort) selectors
+                            }
+                            let child = self.m.mk_app(sd, &[t]);
+                            let dc = self.m.mk_app(depth, &[child]);
+                            let gt = self.m.mk_gt(dt, dc);
+                            let imp = self.m.mk_implies(testers[idx], gt);
+                            ax.push(imp);
+                        }
+                    }
                 }
             }
             // Constructor application: fix its testers and selectors. Only when
@@ -2824,6 +2862,34 @@ mod tests {
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn recursive_datatype_acyclicity() {
+        let l = "(declare-datatypes ((Lst 0)) (((nil) (cons (hd Int) (tl Lst)))))";
+        // A list cannot contain itself.
+        assert_eq!(
+            run(&alloc::format!(
+                "{l}(declare-const x Lst)(assert (= x (cons 1 x)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Selectors and testers still decide normally.
+        assert_eq!(
+            run(&alloc::format!(
+                "{l}(assert (not (= (hd (cons 3 nil)) 3)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{l}(declare-const x Lst)(assert ((_ is cons) x))(assert (= (hd x) 5))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
