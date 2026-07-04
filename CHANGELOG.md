@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/z3rs/compare/v0.0.4...v0.0.5) - 2026-07-04
+
+### Other
+
+- Fix unsound SAT: opaque exponentiation was not gated as nonlinear
+- Phase 6: accept the (Set T) sort as (Array T Bool)
+- Phase 6: pseudo-boolean cardinality (_ at-least / _ at-most
+- Fix unsound bv2int elimination on compound arguments
+- Reject bit-vector width mismatch in equality (robustness)
+- Phase 6: decide bv2int when the bit-vector is used only via bv2int
+- Phase 5: string-predicate reflexivity on identical arguments
+- Phase 5: symbolic seq.len as a non-negative Int function
+- Fix unsound SAT: symbolic str.len could be negative
+
 ## [0.0.4](https://github.com/KarpelesLab/z3rs/compare/v0.0.3...v0.0.4) - 2026-07-04
 
 ### Other
