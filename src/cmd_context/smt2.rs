@@ -2255,18 +2255,31 @@ impl Context {
     /// Axioms for the string literals mentioned in `goal`: each literal's length
     /// equals its code-point count, and distinct literals are unequal.
     fn string_axioms(&mut self, goal: AstId) -> Vec<AstId> {
-        if self.str_lits.is_empty() {
-            return Vec::new();
+        let present: Vec<AstId> = self.m.postorder(goal);
+        let present_set: BTreeSet<AstId> = present.iter().copied().collect();
+        let mut ax = Vec::new();
+        // Non-negativity: `str.len(t) ≥ 0` for every length application in the
+        // goal (a string has no negative length). Without this a symbolic
+        // `str.len` is an unconstrained UF and `(= (str.len s) -1)` looks sat.
+        if let Some(lenf) = self.str_len_decl {
+            let zero = self.m.mk_int(0);
+            for &t in &present {
+                if self.m.is_app(t) && self.m.app_decl(t) == lenf {
+                    let ge = self.m.mk_ge(t, zero);
+                    ax.push(ge);
+                }
+            }
         }
-        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        if self.str_lits.is_empty() {
+            return ax;
+        }
         // Literals occurring in the goal, with their lengths.
         let lits: Vec<(AstId, i64)> = self
             .str_lits
             .iter()
-            .filter(|(_, c)| present.contains(*c))
+            .filter(|(_, c)| present_set.contains(*c))
             .map(|(text, &c)| (c, text.chars().count() as i64))
             .collect();
-        let mut ax = Vec::new();
         if !lits.is_empty() {
             let lenf = self.str_len_fn();
             for &(c, n) in &lits {
@@ -7019,6 +7032,25 @@ mod tests {
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn str_len_nonnegative() {
+        // A string's length is never negative — the symbolic str.len must carry
+        // this axiom (regression: it was an unconstrained UF, so -1 looked sat).
+        assert_eq!(
+            run("(declare-const s String)(assert (= (str.len s) (- 1)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const s String)(assert (< (str.len s) 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // …but a non-negative constraint is still satisfiable.
+        assert_eq!(
+            run("(declare-const s String)(assert (= (str.len s) 0))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
