@@ -30,12 +30,19 @@ pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Optio
         return None;
     }
 
-    // All operands must be numerals to fold.
+    let is_int = m.is_int_sort(m.get_sort(args[0]));
+
+    // Collect like terms in a sum even when some operands are symbolic, so
+    // cancelling / combining terms happens (e.g. x + (-x) + 3 → 3, 2x + 3x → 5x).
+    if kind == ArithOp::Add as DeclKind && args.iter().any(|&a| m.as_numeral(a).is_none()) {
+        return collect_sum(m, args, is_int);
+    }
+
+    // All remaining folds require every operand to be a numeral.
     let mut nums: Vec<Rational> = Vec::with_capacity(args.len());
     for &a in args {
         nums.push(m.as_numeral(a)?);
     }
-    let is_int = m.is_int_sort(m.get_sort(args[0]));
 
     if kind == ArithOp::Add as DeclKind {
         let mut acc = nums[0].clone();
@@ -74,6 +81,78 @@ fn bool_of(m: &mut AstManager, b: bool) -> AstId {
     if b { m.mk_true() } else { m.mk_false() }
 }
 
+/// Decompose an addend into `(base term, coefficient)`; `base == None` for a
+/// pure numeral. Recognizes `(- t)` and `(* c t)` / `(* t c)` with a numeral
+/// factor so their coefficients combine.
+fn addend(m: &AstManager, a: AstId) -> (Option<AstId>, Rational) {
+    if let Some(n) = m.as_numeral(a) {
+        return (None, n);
+    }
+    if let Some(app) = m.app(a) {
+        let kind = m
+            .func_decl(app.decl)
+            .map(|d| (d.info.family_id, d.info.decl_kind));
+        let afid = m.get_family_id(Symbol::new("arith"));
+        if let (Some(fid), Some(afid)) = (kind, afid)
+            && fid.0 == afid
+        {
+            if fid.1 == ArithOp::Uminus as DeclKind && app.args.len() == 1 {
+                let (b, c) = addend(m, app.args[0]);
+                return (b, -&c);
+            }
+            if fid.1 == ArithOp::Mul as DeclKind && app.args.len() == 2 {
+                if let Some(c) = m.as_numeral(app.args[0]) {
+                    return (Some(app.args[1]), c);
+                }
+                if let Some(c) = m.as_numeral(app.args[1]) {
+                    return (Some(app.args[0]), c);
+                }
+            }
+        }
+    }
+    (Some(a), Rational::from_integer(puremp::Int::from(1)))
+}
+
+/// Rebuild a sum after collecting like terms; `None` if nothing changed.
+fn collect_sum(m: &mut AstManager, args: &[AstId], is_int: bool) -> Option<AstId> {
+    let mut coeffs: Vec<(AstId, Rational)> = Vec::new();
+    let mut constant = Rational::from_integer(puremp::Int::from(0));
+    for &a in args {
+        let (base, c) = addend(m, a);
+        match base {
+            None => constant = &constant + &c,
+            Some(t) => {
+                if let Some(e) = coeffs.iter_mut().find(|(u, _)| *u == t) {
+                    e.1 = &e.1 + &c;
+                } else {
+                    coeffs.push((t, c));
+                }
+            }
+        }
+    }
+    let zero = Rational::from_integer(puremp::Int::from(0));
+    let one = Rational::from_integer(puremp::Int::from(1));
+    let mut parts: Vec<AstId> = Vec::new();
+    for (t, c) in &coeffs {
+        if *c == zero {
+            continue; // cancelled
+        } else if *c == one {
+            parts.push(*t);
+        } else {
+            let k = m.mk_numeral(c.clone(), is_int);
+            parts.push(m.mk_mul(&[k, *t]));
+        }
+    }
+    if constant != zero || parts.is_empty() {
+        parts.push(m.mk_numeral(constant, is_int));
+    }
+    Some(if parts.len() == 1 {
+        parts[0]
+    } else {
+        m.mk_add(&parts)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::ast::manager::AstManager;
@@ -101,6 +180,26 @@ mod tests {
         let gt = m.mk_gt(two, three);
         assert_eq!(simplify(&mut m, le), m.mk_true());
         assert_eq!(simplify(&mut m, gt), m.mk_false());
+    }
+
+    #[test]
+    fn collects_like_terms_in_sums() {
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let three = m.mk_int(3);
+        // x + (-x) + 3 = 3
+        let neg_x = m.mk_uminus(x);
+        let sum = m.mk_add(&[x, neg_x, three]);
+        assert_eq!(simplify(&mut m, sum), three);
+        // 2x + 3x = 5x
+        let two = m.mk_int(2);
+        let three2 = m.mk_int(3);
+        let t1 = m.mk_mul(&[two, x]);
+        let t2 = m.mk_mul(&[three2, x]);
+        let sum2 = m.mk_add(&[t1, t2]);
+        let five = m.mk_int(5);
+        let expect = m.mk_mul(&[five, x]);
+        assert_eq!(simplify(&mut m, sum2), expect);
     }
 
     #[test]
