@@ -562,7 +562,7 @@ struct LiftCtx {
 }
 
 /// An s-expression.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SExpr {
     Atom(String),
     List(Vec<SExpr>),
@@ -2261,7 +2261,31 @@ impl Context {
                 _ => None,
             }
         };
-        let literal = |s: &SExpr| -> Option<Vec<u32>> {
+        // If either side is a concatenation, flatten both (a bare term is a
+        // one-element sequence), cancel a common prefix and suffix (sound
+        // left/right cancellation), then decide the residual — so
+        // `(str.++ x y) = (str.++ x z)` reduces to `y = z`, `(str.++ x y) = x`
+        // reduces to `y = ""`, and concat-vs-literal reuses the split search.
+        if concat_parts(a).is_some() || concat_parts(b).is_some() {
+            let mut pa = concat_parts(a).unwrap_or_else(|| alloc::vec![a.clone()]);
+            let mut pb = concat_parts(b).unwrap_or_else(|| alloc::vec![b.clone()]);
+            while !pa.is_empty() && !pb.is_empty() && pa[0] == pb[0] {
+                pa.remove(0);
+                pb.remove(0);
+            }
+            while !pa.is_empty() && !pb.is_empty() && pa.last() == pb.last() {
+                pa.pop();
+                pb.pop();
+            }
+            return self.concat_residual_eq(&pa, &pb);
+        }
+        Ok(None)
+    }
+
+    /// Decide (or gate) the residual `(str.++ pa…) = (str.++ pb…)` after prefix
+    /// and suffix cancellation.
+    fn concat_residual_eq(&mut self, pa: &[SExpr], pb: &[SExpr]) -> Result<Option<AstId>, String> {
+        let lit = |s: &SExpr| -> Option<Vec<u32>> {
             match s {
                 SExpr::Atom(a) if a.starts_with('"') => {
                     Some(unquote_string(a).chars().map(|c| c as u32).collect())
@@ -2269,11 +2293,42 @@ impl Context {
                 _ => None,
             }
         };
-        let (parts, lit) = match (concat_parts(a), literal(b), concat_parts(b), literal(a)) {
-            (Some(p), Some(l), _, _) | (_, _, Some(p), Some(l)) => (p, l),
-            _ => return Ok(None),
-        };
-        Ok(Some(self.split_concat_eq(&parts, &lit)?))
+        // Nothing left on either side: the equation held identically.
+        if pa.is_empty() && pb.is_empty() {
+            return Ok(Some(self.m.mk_true()));
+        }
+        // One side empty: every remaining part of the other must be "".
+        if pa.is_empty() || pb.is_empty() {
+            let rest = if pa.is_empty() { pb } else { pa };
+            let empty = self.mk_str_lit("");
+            let mut eqs = Vec::new();
+            for p in rest {
+                let t = self.term(p)?;
+                eqs.push(self.m.mk_eq(t, empty));
+            }
+            return Ok(Some(match eqs.len() {
+                1 => eqs[0],
+                _ => self.m.mk_and(&eqs),
+            }));
+        }
+        // A single literal against a concatenation: reuse the split search.
+        if pa.len() == 1
+            && let Some(l) = lit(&pa[0])
+        {
+            return Ok(Some(self.split_concat_eq(pb, &l)?));
+        }
+        if pb.len() == 1
+            && let Some(l) = lit(&pb[0])
+        {
+            return Ok(Some(self.split_concat_eq(pa, &l)?));
+        }
+        // Both reduced to a single term: a direct equality.
+        if pa.len() == 1 && pb.len() == 1 {
+            let (ta, tb) = (self.term(&pa[0])?, self.term(&pb[0])?);
+            return Ok(Some(self.m.mk_eq(ta, tb)));
+        }
+        // General concat = concat with variables on both sides: gate to unknown.
+        Ok(None)
     }
 
     /// The disjunction over split points of `(str.++ parts…) = lit`.
@@ -6474,6 +6529,35 @@ mod tests {
                 "script: {script}"
             );
         }
+    }
+
+    #[test]
+    fn concat_equation_cancellation() {
+        // Left cancellation: (str.++ x y) = (str.++ x z) ⟹ y = z.
+        assert_eq!(
+            run(
+                "(declare-const x String)(declare-const y String)(declare-const z String)\
+                 (assert (= (str.++ x y) (str.++ x z)))(assert (= y \"a\"))\
+                 (assert (not (= z \"a\")))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Prefix + suffix cancellation around a middle variable.
+        assert_eq!(
+            run("(declare-const x String)(declare-const y String)\
+                 (assert (= (str.++ \"a\" x \"b\") (str.++ \"a\" y \"b\")))\
+                 (assert (= x \"1\"))(assert (not (= y \"1\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // (str.++ x y) = x ⟹ y = "".
+        assert_eq!(
+            run("(declare-const x String)(declare-const y String)\
+                 (assert (= (str.++ x y) x))(assert (not (= y \"\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
