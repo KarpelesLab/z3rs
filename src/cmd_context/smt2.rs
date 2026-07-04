@@ -4068,12 +4068,39 @@ impl Context {
     }
 
     /// Instantiate the array + enum axioms for `lifted` and conjoin them.
+    /// Nonnegativity axioms for square subterms: every `(* t t)` in the goal
+    /// gets `(* t t) ≥ 0`. This is sound over ordered fields and lets the linear
+    /// relaxation refute e.g. `x*x < 0` (which it otherwise treats as a free
+    /// variable and answers `unknown`).
+    fn square_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let mut squares: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
+                let args = self.m.app_args(t);
+                if args.len() == 2 && args[0] == args[1] {
+                    squares.push(t);
+                }
+            }
+        }
+        squares.sort();
+        squares.dedup();
+        squares
+            .into_iter()
+            .map(|sq| {
+                let is_int = self.m.is_int_sort(self.m.get_sort(sq));
+                let zero = self.m.mk_numeral(rat(0), is_int);
+                self.m.mk_ge(sq, zero)
+            })
+            .collect()
+    }
+
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
         axioms.extend(self.record_axioms(lifted));
         axioms.extend(self.datatype_axioms(lifted));
         axioms.extend(self.string_axioms(lifted));
+        axioms.extend(self.square_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -5869,6 +5896,26 @@ mod tests {
             run("(declare-const x Real)(assert (not (is_int x)))(assert (= (* 2 x) 3))(check-sat)")
                 .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn square_nonnegativity() {
+        // A square cannot be negative — the axiom (* x x) ≥ 0 refutes these.
+        assert_eq!(
+            run("(declare-const x Real)(assert (< (* x x) 0.0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Real)(assert (= (* x x) (- 4.0)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Sum of squares plus a positive constant is positive.
+        assert_eq!(
+            run("(declare-const x Real)(declare-const y Real)\
+                 (assert (< (+ (* x x) (* y y) 1.0) 0.0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
