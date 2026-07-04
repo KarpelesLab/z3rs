@@ -815,6 +815,9 @@ struct Context {
     dt_depth: BTreeMap<AstId, AstId>,
     /// Constructor name → its tester declaration (for `((_ is C) t)`).
     tester_of: BTreeMap<String, AstId>,
+    /// Parametric (polymorphic) datatype templates: name → (type parameters,
+    /// constructor s-expressions). Monomorphized on use, e.g. `(Pair Int Bool)`.
+    param_datatypes: BTreeMap<String, (Vec<String>, Vec<SExpr>)>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -975,6 +978,7 @@ impl Context {
             datatypes: BTreeMap::new(),
             dt_depth: BTreeMap::new(),
             tester_of: BTreeMap::new(),
+            param_datatypes: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
@@ -1065,6 +1069,9 @@ impl Context {
                             params.into_iter().zip(l[1..].iter().cloned()).collect();
                         let expanded = subst_sort(&body, &subst);
                         self.resolve_sort(&expanded)
+                    }
+                    name if self.param_datatypes.contains_key(name) => {
+                        self.monomorphize_datatype(name, &l[1..])
                     }
                     other => Err(alloc::format!("unsupported sort constructor {other:?}")),
                 }
@@ -1472,28 +1479,90 @@ impl Context {
         // field may reference a mutually-recursive sibling (e.g. T referencing F
         // before F is fully declared).
         for (i, body) in bodies.iter().enumerate() {
-            let name = if sort_decls.is_empty() {
-                Self::sym(&as_list(body)?[0])?.to_string()
+            let (name, arity) = if sort_decls.is_empty() {
+                (Self::sym(&as_list(body)?[0])?.to_string(), 0usize)
             } else {
-                Self::sym(&as_list(&sort_decls[i])?[0])?.to_string()
+                let sd = as_list(&sort_decls[i])?;
+                let ar = Self::sym(&sd[1])?.parse().unwrap_or(0);
+                (Self::sym(&sd[0])?.to_string(), ar)
             };
-            if !self.sorts.contains_key(&name) {
+            // A parametric datatype (arity > 0) has no concrete sort of its own;
+            // it is monomorphized on use.
+            if arity == 0 && !self.sorts.contains_key(&name) {
                 let sort = self.m.mk_uninterpreted_sort(Symbol::new(&name));
                 self.sorts.insert(name.clone(), sort);
                 self.sort_order.push(name);
             }
         }
-        // Pass 2: build each datatype's constructors, selectors, and axioms.
+        // Pass 2: build each datatype's constructors, selectors, and axioms —
+        // or, for a parametric datatype, store its template for monomorphization.
         for (i, body) in bodies.iter().enumerate() {
             let bodyl = as_list(body)?;
-            // The datatype name and the constructor s-expressions.
             let (name, ctors): (String, &[SExpr]) = if sort_decls.is_empty() {
                 (Self::sym(&bodyl[0])?.to_string(), &bodyl[1..]) // legacy (T c1 c2 …)
             } else {
                 let sd = as_list(&sort_decls[i])?;
                 (Self::sym(&sd[0])?.to_string(), bodyl) // 2.6: name from (T k)
             };
+            // Parametric form: (par (A B …) (ctors…)). Store the template.
+            if let Some(first) = ctors.first()
+                && matches!(first, SExpr::Atom(a) if a == "par")
+            {
+                let par = ctors; // [par, (params), (ctors)]
+                let params: Vec<String> = as_list(&par[1])?
+                    .iter()
+                    .map(Self::sym)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                let ctor_list = as_list(&par[2])?.to_vec();
+                self.param_datatypes.insert(name, (params, ctor_list));
+                continue;
+            }
             let sort = self.sorts[&name];
+            self.build_datatype(sort, ctors)?;
+        }
+        Ok(())
+    }
+
+    /// Monomorphize a parametric datatype at the given argument sorts, e.g.
+    /// `(Pair Int Bool)`. Creates (once) a concrete sort named `Name!arg1!arg2…`
+    /// with its type parameters substituted by the argument sort expressions,
+    /// then builds its constructors. Returns the concrete sort.
+    fn monomorphize_datatype(&mut self, name: &str, args: &[SExpr]) -> Result<AstId, String> {
+        let (params, ctors) = self.param_datatypes[name].clone();
+        if params.len() != args.len() {
+            return Err(alloc::format!("datatype {name}: wrong arity"));
+        }
+        // A distinct concrete name per instantiation (resolve args to canonical
+        // sort ids first, so `(Pair Int Bool)` always maps to the same instance).
+        let arg_sorts: Vec<AstId> = args
+            .iter()
+            .map(|a| self.resolve_sort(a))
+            .collect::<Result<_, _>>()?;
+        let mut mono = name.to_string();
+        for &s in &arg_sorts {
+            mono.push_str(&alloc::format!("!{}", s.0));
+        }
+        if let Some(&sort) = self.sorts.get(&mono) {
+            return Ok(sort); // already built
+        }
+        let sort = self.m.mk_uninterpreted_sort(Symbol::new(&mono));
+        self.sorts.insert(mono.clone(), sort);
+        self.sort_order.push(mono);
+        // Substitute the type parameters by the concrete argument sort exprs in
+        // every constructor field, then build the instance.
+        let subst: Vec<(String, SExpr)> = params.into_iter().zip(args.iter().cloned()).collect();
+        let mono_ctors: Vec<SExpr> = ctors.iter().map(|c| subst_sort(c, &subst)).collect();
+        self.build_datatype(sort, &mono_ctors)?;
+        Ok(sort)
+    }
+
+    /// Build the constructors, selectors, testers, and axioms of a monomorphic
+    /// datatype `sort` from its constructor s-expressions.
+    fn build_datatype(&mut self, sort: AstId, ctors: &[SExpr]) -> Result<(), String> {
+        {
             // Parse each constructor into (name, [(field name, field sort sexpr)]).
             let mut parsed: Vec<(String, Vec<(String, SExpr)>)> = Vec::new();
             for c in ctors {
@@ -5997,6 +6066,30 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn parametric_datatypes() {
+        // (Pair A B) monomorphized at two distinct instantiations.
+        let pair = "(declare-datatypes ((Pair 2)) ((par (A B) ((mk-pair (fst A) (snd B))))))";
+        assert_eq!(
+            run(&alloc::format!(
+                "{pair}(declare-const p (Pair Int Bool))\
+                 (assert (= p (mk-pair 3 true)))(assert (not (= (fst p) 3)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A parametric recursive list: (Lst X) refers to itself.
+        assert_eq!(
+            run(
+                "(declare-datatypes ((Lst 1)) ((par (X) ((nil) (cons (hd X) (tl (Lst X)))))))\
+                 (declare-const l (Lst Int))(assert (= l (cons 1 nil)))\
+                 (assert (not (= (hd l) 1)))(check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
