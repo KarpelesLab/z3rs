@@ -5596,6 +5596,17 @@ impl Context {
                 })
             }
             "=" => {
+                // Operands must share a sort; a bit-vector width mismatch (e.g.
+                // a 4-bit variable against an 8-bit literal) is ill-typed.
+                for w in args.windows(2) {
+                    if let (Some(x), Some(y)) = (
+                        m.bv_sort_width(m.get_sort(w[0])),
+                        m.bv_sort_width(m.get_sort(w[1])),
+                    ) && x != y
+                    {
+                        return Err(alloc::format!("=: bit-vector width mismatch ({x} vs {y})"));
+                    }
+                }
                 // chainable: (= a b c) => (and (= a b) (= b c))
                 if args.len() == 2 {
                     Ok(m.mk_eq(args[0], args[1]))
