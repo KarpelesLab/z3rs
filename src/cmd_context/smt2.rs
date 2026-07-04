@@ -828,8 +828,14 @@ impl Context {
     /// (so a definite `sat`/`unsat` is always sound).
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         // Bit-vector formulas are decided by bit-blasting (no model produced yet).
+        // The bit-blaster handles only pure QF_BV; a goal mixing bit-vectors with
+        // uninterpreted, array, or arithmetic terms is not combined yet, so return
+        // a sound `unknown` rather than a possibly-wrong verdict.
         if self.is_bv_goal(goal) {
-            return (check_bv(&self.m, goal), None);
+            if self.bv_goal_is_pure(goal) {
+                return (check_bv(&self.m, goal), None);
+            }
+            return (SmtResult::Unknown, None);
         }
         let (res, model) = check_model(&self.m, goal);
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
@@ -845,6 +851,28 @@ impl Context {
             .postorder(goal)
             .iter()
             .any(|&t| self.m.bv_sort_width(self.m.get_sort(t)).is_some())
+    }
+
+    /// Is `goal` decidable by the bit-blaster alone — every term bit-vector- or
+    /// Boolean-sorted, and no *uninterpreted function application* (which the
+    /// bit-blaster cannot give congruence)? Uninterpreted 0-ary constants are
+    /// fine (they act as free bit-vector variables).
+    fn bv_goal_is_pure(&self, goal: AstId) -> bool {
+        self.m.postorder(goal).iter().all(|&t| {
+            let s = self.m.get_sort(t);
+            if self.m.bv_sort_width(s).is_none() && !self.m.is_bool_sort(s) {
+                return false; // an uninterpreted/array/arithmetic-sorted term
+            }
+            // Reject applications of uninterpreted functions (null family, arity ≥ 1).
+            if let Some(app) = self.m.app(t)
+                && !app.args.is_empty()
+                && let Some(fd) = self.m.func_decl(app.decl)
+                && fd.info.family_id == crate::ast::NULL_FAMILY_ID
+            {
+                return false;
+            }
+            true
+        })
     }
 
     /// Does `goal` contain nonlinear arithmetic the linear solver treats as an
@@ -1323,12 +1351,13 @@ impl Context {
             // --- bit-vectors ---
             "bvnot" => Ok(m.mk_bvnot(args[0])),
             "bvneg" => Ok(m.mk_bvneg(args[0])),
-            "bvand" => Ok(m.mk_bvand(args[0], args[1])),
-            "bvor" => Ok(m.mk_bvor(args[0], args[1])),
-            "bvxor" => Ok(m.mk_bvxor(args[0], args[1])),
-            "bvadd" => Ok(m.mk_bvadd(args[0], args[1])),
+            // bvand/bvor/bvxor/bvadd/bvmul are left-associative and variadic.
+            "bvand" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvand(a, b))),
+            "bvor" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvor(a, b))),
+            "bvxor" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvxor(a, b))),
+            "bvadd" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvadd(a, b))),
+            "bvmul" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvmul(a, b))),
             "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
-            "bvmul" => Ok(m.mk_bvmul(args[0], args[1])),
             "bvshl" => Ok(m.mk_bvshl(args[0], args[1])),
             "bvlshr" => Ok(m.mk_bvlshr(args[0], args[1])),
             "bvult" => Ok(m.mk_bvult(args[0], args[1])),
