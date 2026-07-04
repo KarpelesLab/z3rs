@@ -303,6 +303,113 @@ fn bv_abs(m: &mut AstManager, x: AstId) -> AstId {
 
 /// `(bvsdiv s t)` — signed division (round toward zero), per the SMT-LIB theory
 /// definition in terms of `bvudiv`/`bvneg` and the operand signs.
+/// Zero-extend `a` by `k` high bits.
+fn zero_ext(m: &mut AstManager, a: AstId, k: u32) -> AstId {
+    if k == 0 {
+        return a;
+    }
+    let z = m.mk_bv(0, k);
+    m.mk_bv_concat(z, a)
+}
+
+/// Sign-extend `a` (width `w`) by `k` high bits.
+fn sign_ext(m: &mut AstManager, a: AstId, k: u32, w: u32) -> AstId {
+    if k == 0 {
+        return a;
+    }
+    let sign = m.mk_bv_extract(w - 1, w - 1, a);
+    let mut top = sign;
+    for _ in 1..k {
+        top = m.mk_bv_concat(top, sign);
+    }
+    m.mk_bv_concat(top, a)
+}
+
+/// The most-significant (sign) bit of `a` equals `#b1`.
+fn msb_set(m: &mut AstManager, a: AstId, w: u32) -> AstId {
+    let s = m.mk_bv_extract(w - 1, w - 1, a);
+    let one = m.mk_bv(1, 1);
+    m.mk_eq(s, one)
+}
+
+/// Bit-vector overflow predicates (Bool), matching z3's `bvXovo` operators.
+fn bv_overflow(m: &mut AstManager, op: &str, a: AstId, b: AstId, w: u32) -> AstId {
+    match op {
+        // Unsigned add: carry out of the (w+1)-bit sum.
+        "bvuaddo" => {
+            let (za, zb) = (zero_ext(m, a, 1), zero_ext(m, b, 1));
+            let s = m.mk_bvadd(za, zb);
+            let top = m.mk_bv_extract(w, w, s);
+            let one = m.mk_bv(1, 1);
+            m.mk_eq(top, one)
+        }
+        // Signed add: operands same sign, result differs.
+        "bvsaddo" => {
+            let (sa, sb) = (msb_set(m, a, w), msb_set(m, b, w));
+            let sum = m.mk_bvadd(a, b);
+            let ssum = msb_set(m, sum, w);
+            let same = m.mk_eq(sa, sb);
+            let ne = m.mk_eq(ssum, sa);
+            let ne = m.mk_not(ne);
+            m.mk_and(&[same, ne])
+        }
+        // Unsigned subtract: borrow, i.e. a <u b.
+        "bvusubo" => m.mk_bvult(a, b),
+        // Signed subtract: operands differ in sign, result differs from a.
+        "bvssubo" => {
+            let (sa, sb) = (msb_set(m, a, w), msb_set(m, b, w));
+            let diff = m.mk_bvsub(a, b);
+            let sd = msb_set(m, diff, w);
+            let opp = m.mk_eq(sa, sb);
+            let opp = m.mk_not(opp);
+            let ne = m.mk_eq(sd, sa);
+            let ne = m.mk_not(ne);
+            m.mk_and(&[opp, ne])
+        }
+        // Signed negation: a is the minimum value (100…0).
+        "bvnego" => {
+            let lo = m.mk_bv(0, w - 1);
+            let hi = m.mk_bv(1, 1);
+            let min = m.mk_bv_concat(hi, lo);
+            m.mk_eq(a, min)
+        }
+        // Unsigned multiply: high `w` bits of the 2w-bit product are nonzero.
+        "bvumulo" => {
+            let (za, zb) = (zero_ext(m, a, w), zero_ext(m, b, w));
+            let p = m.mk_bvmul(za, zb);
+            let hi = m.mk_bv_extract(2 * w - 1, w, p);
+            let zero = m.mk_bv(0, w);
+            let eqz = m.mk_eq(hi, zero);
+            m.mk_not(eqz)
+        }
+        // Signed multiply: the top w+1 bits of the 2w-bit product are not all
+        // equal (not a clean sign extension of the low w bits).
+        "bvsmulo" => {
+            let (sa2, sb2) = (sign_ext(m, a, w, w), sign_ext(m, b, w, w));
+            let p = m.mk_bvmul(sa2, sb2);
+            let hi = m.mk_bv_extract(2 * w - 1, w - 1, p); // w+1 bits
+            let zero = m.mk_bv(0, w + 1);
+            let ones = m.mk_bvnot(zero);
+            let is0 = m.mk_eq(hi, zero);
+            let is1 = m.mk_eq(hi, ones);
+            let clean = m.mk_or(&[is0, is1]);
+            m.mk_not(clean)
+        }
+        // Signed division: only INT_MIN / -1 overflows.
+        "bvsdivo" => {
+            let lo = m.mk_bv(0, w - 1);
+            let hi = m.mk_bv(1, 1);
+            let min = m.mk_bv_concat(hi, lo);
+            let a_min = m.mk_eq(a, min);
+            let zero = m.mk_bv(0, w);
+            let neg1 = m.mk_bvnot(zero);
+            let b_neg1 = m.mk_eq(b, neg1);
+            m.mk_and(&[a_min, b_neg1])
+        }
+        _ => m.mk_false(),
+    }
+}
+
 fn bv_sdiv(m: &mut AstManager, s: AstId, t: AstId) -> AstId {
     let (ss, st) = (bv_sign(m, s), bv_sign(m, t));
     let (ns, nt) = (m.mk_bvneg(s), m.mk_bvneg(t));
@@ -5085,6 +5192,14 @@ impl Context {
             "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
             "bvudiv" => Ok(m.mk_bvudiv(args[0], args[1])),
             "bvurem" => Ok(m.mk_bvurem(args[0], args[1])),
+            "bvuaddo" | "bvsaddo" | "bvusubo" | "bvssubo" | "bvumulo" | "bvsmulo" | "bvsdivo" => {
+                let w = m.bv_sort_width(m.get_sort(args[0])).unwrap_or(1);
+                Ok(bv_overflow(m, head, args[0], args[1], w))
+            }
+            "bvnego" => {
+                let w = m.bv_sort_width(m.get_sort(args[0])).unwrap_or(1);
+                Ok(bv_overflow(m, head, args[0], args[0], w))
+            }
             "bvsdiv" => Ok(bv_sdiv(m, args[0], args[1])),
             "bvsrem" => Ok(bv_srem(m, args[0], args[1])),
             "bvsmod" => Ok(bv_smod(m, args[0], args[1])),
@@ -6069,6 +6184,27 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(declare-const y Int)\
                  (assert (= (seq.unit x) (seq.unit y)))(assert (not (= x y)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn bitvector_overflow_predicates() {
+        // #xf + #xf overflows unsigned 4-bit addition.
+        assert_eq!(
+            run("(assert (not (bvuaddo #xf #xf)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // #x8 (=-8) negated overflows signed 4-bit (it is INT_MIN).
+        assert_eq!(
+            run("(assert (not (bvnego #x8)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Symbolic: an 8-bit a ≤ 15 cannot overflow a*a.
+        assert_eq!(
+            run("(declare-const a (_ BitVec 8))(assert (bvumulo a a))\
+                 (assert (bvule a #x0f))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
