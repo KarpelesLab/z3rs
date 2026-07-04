@@ -6039,6 +6039,24 @@ mod tests {
             .unwrap(),
             alloc::vec!["unsat"]
         );
+        // Three variables: gcd(6,10,15)=1 divides 1 → sat; a wrong-parity RHS is
+        // unsat.
+        assert_eq!(
+            run(
+                "(declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (= (+ (* 6 a) (* 10 b) (* 15 c)) 1))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run(
+                "(declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (= (+ (* 6 a) (* 10 b) (* 4 c)) 1))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]

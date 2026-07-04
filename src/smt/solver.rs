@@ -563,6 +563,40 @@ fn egcd(a: i128, b: i128) -> (i128, i128, i128) {
     }
 }
 
+fn gcd_i128(a: i128, b: i128) -> i128 {
+    if b == 0 { a.abs() } else { gcd_i128(b, a % b) }
+}
+
+/// A particular integer solution of `Σ coeffs[i]·xᵢ = target`, or `None` if the
+/// gcd of the coefficients does not divide `target` (unsolvable) or an
+/// intermediate product overflows `i128`.
+fn solve_dioph(coeffs: &[i128], target: i128) -> Option<Vec<i128>> {
+    match coeffs {
+        [] => (target == 0).then(Vec::new),
+        [a] => {
+            if *a == 0 {
+                (target == 0).then(|| alloc::vec![0])
+            } else {
+                (target % a == 0).then(|| alloc::vec![target / a])
+            }
+        }
+        [a, rest @ ..] => {
+            let a = *a;
+            let g_rest = rest.iter().fold(0i128, |g, &x| gcd_i128(g, x));
+            let (g, s, _) = egcd(a, g_rest);
+            if g == 0 || target % g != 0 {
+                return None;
+            }
+            let mult = target / g;
+            let x1 = s.checked_mul(mult)?;
+            let remaining = target.checked_sub(a.checked_mul(x1)?)?;
+            let mut sol = alloc::vec![x1];
+            sol.extend(solve_dioph(rest, remaining)?);
+            Some(sol)
+        }
+    }
+}
+
 /// Try to build a verified integer witness for a system whose only equality is a
 /// two-variable linear Diophantine `c₁·v₁ + c₂·v₂ + k = 0`. Searches the general
 /// solution `(v₁,v₂) = (x₀,y₀) + t·(c₂/g, −c₁/g)` over a bounded `t`, sets the
@@ -590,57 +624,57 @@ fn dioph_witness(
         .terms()
         .map(|(v, c)| as_i128(c).map(|n| (v, n)))
         .collect::<Option<_>>()?;
-    if terms.len() != 2 {
+    if terms.is_empty() || terms.iter().any(|&(_, c)| c == 0) {
         return None;
     }
     let k = as_i128(e.const_term())?;
-    let (v1, c1) = terms[0];
-    let (v2, c2) = terms[1];
-    if c1 == 0 || c2 == 0 {
-        return None;
-    }
-    let (mut g, s, t_e) = egcd(c1, c2); // c1·s + c2·t_e = g
-    if g == 0 {
-        return None;
-    }
-    if g < 0 {
-        g = -g;
-    }
-    let rhs = -k; // c1·v1 + c2·v2 = rhs
-    if rhs % g != 0 {
-        return None; // no integer solution (unsat, handled elsewhere)
-    }
-    // Particular solution scaled from the raw egcd cofactors (c1·s + c2·t_e is
-    // the signed gcd, which also divides rhs).
-    let mult = rhs / (c1 * s + c2 * t_e);
-    let (x0, y0) = (s * mult, t_e * mult);
-    let (dx, dy) = (c2 / g, -(c1 / g));
-    let fits = |x: i128| i64::try_from(x).is_ok();
-    for t in -256i128..=256 {
-        let (xv, yv) = (x0 + dx * t, y0 + dy * t);
-        if !fits(xv) || !fits(yv) {
-            continue;
+    let rhs = -k; // Σ cᵢ·vᵢ = rhs
+    let vars: Vec<AstId> = terms.iter().map(|&(v, _)| v).collect();
+    let coeffs: Vec<i128> = terms.iter().map(|&(_, c)| c).collect();
+
+    // Build and verify a candidate: `sol` assigns the equation's variables, all
+    // other integer variables are 0. Accept only if every constraint holds.
+    let verify = |sol: &[i128]| -> Option<Assignment> {
+        if sol.iter().any(|&x| i64::try_from(x).is_err()) {
+            return None;
         }
-        let mut a: Assignment = int_vars
-            .iter()
-            .map(|&v| (v, Rational::from_integer(Int::from(0))))
-            .collect();
-        a.insert(v1, Rational::from_integer(Int::from(xv as i64)));
-        a.insert(v2, Rational::from_integer(Int::from(yv as i64)));
         let zero = Rational::from_integer(Int::from(0));
-        let ok_cons = cons.iter().all(|c| {
+        let mut a: Assignment = int_vars.iter().map(|&v| (v, zero.clone())).collect();
+        for (&v, &x) in vars.iter().zip(sol) {
+            a.insert(v, Rational::from_integer(Int::from(x as i64)));
+        }
+        let ok = cons.iter().all(|c| {
             let val = c.expr.eval(&a);
             match c.rel {
                 Rel::Le => val <= zero,
                 Rel::Lt => val < zero,
                 Rel::Eq => val == zero,
             }
-        });
-        if ok_cons && diseqs.iter().all(|d| d.eval(&a) != zero) {
-            return Some(a);
+        }) && diseqs.iter().all(|d| d.eval(&a) != zero);
+        ok.then_some(a)
+    };
+
+    if terms.len() == 2 {
+        // Two variables: search the general solution to also satisfy any bounds.
+        let (c1, c2) = (coeffs[0], coeffs[1]);
+        let (g, s, t_e) = egcd(c1, c2); // c1·s + c2·t_e = g
+        let gg = g.abs();
+        if gg == 0 || rhs % gg != 0 {
+            return None;
         }
+        let mult = rhs / (c1 * s + c2 * t_e);
+        let (x0, y0) = (s * mult, t_e * mult);
+        let (dx, dy) = (c2 / gg, -(c1 / gg));
+        for t in -256i128..=256 {
+            if let Some(a) = verify(&[x0 + dx * t, y0 + dy * t]) {
+                return Some(a);
+            }
+        }
+        None
+    } else {
+        // n ≥ 3 (or 1): a particular solution, other variables 0.
+        verify(&solve_dioph(&coeffs, rhs)?)
     }
-    None
 }
 
 /// Does the arithmetic system *entail* `u = v`? `Some(true)` iff neither `u < v`
