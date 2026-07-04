@@ -167,10 +167,17 @@ enum SExpr {
     List(Vec<SExpr>),
 }
 
-/// Run an SMT-LIB2 `script`, returning one response line per `check-sat`
-/// (`"sat"`, `"unsat"`, or `"unknown"`).
+/// Run an SMT-LIB `script`, returning one response line per `check-sat`
+/// (`"sat"`, `"unsat"`, or `"unknown"`). Accepts both SMT-LIB 2 command scripts
+/// and the older SMT-LIB 1.2 `(benchmark …)` format.
 pub fn run(script: &str) -> Result<Vec<String>, String> {
     let forms = parse(script)?;
+    // SMT-LIB 1.2: a single top-level (benchmark …) form.
+    if let [SExpr::List(l)] = forms.as_slice()
+        && matches!(l.first(), Some(SExpr::Atom(a)) if a == "benchmark")
+    {
+        return run_v1(l);
+    }
     let mut ctx = Context::new();
     let mut out = Vec::new();
     for form in forms {
@@ -179,6 +186,118 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Interpret an SMT-LIB 1.2 `(benchmark name :attr value …)`: declare its
+/// sorts/functions/predicates, assert the assumptions and formula, and return
+/// the single `check-sat` verdict. Quantifiers are out of scope.
+fn run_v1(l: &[SExpr]) -> Result<Vec<String>, String> {
+    let mut ctx = Context::new();
+    let mut asserts: Vec<SExpr> = Vec::new();
+    // l[0] = "benchmark", l[1] = name, then :keyword value pairs.
+    let mut i = 2;
+    while i < l.len() {
+        let key = Context::sym(&l[i])?.to_string();
+        let val = l
+            .get(i + 1)
+            .ok_or_else(|| alloc::format!("benchmark: {key} has no value"))?;
+        match key.as_str() {
+            ":extrasorts" => {
+                for s in as_list(val)? {
+                    let name = Context::sym(s)?.to_string();
+                    let sort = ctx.m.mk_uninterpreted_sort(Symbol::new(&name));
+                    ctx.sorts.insert(name, sort);
+                }
+            }
+            ":extrafuns" => {
+                for f in as_list(val)? {
+                    // (name dom… range)
+                    let parts = as_list(f)?;
+                    let name = Context::sym(&parts[0])?.to_string();
+                    let range = ctx.resolve_sort(&parts[parts.len() - 1])?;
+                    let domain: Vec<AstId> = parts[1..parts.len() - 1]
+                        .iter()
+                        .map(|s| ctx.resolve_sort(s))
+                        .collect::<Result<_, _>>()?;
+                    let d = ctx.m.mk_func_decl(Symbol::new(&name), &domain, range);
+                    ctx.funcs.insert(name, d);
+                }
+            }
+            ":extrapreds" => {
+                for p in as_list(val)? {
+                    // (name dom…) — range Bool
+                    let parts = as_list(p)?;
+                    let name = Context::sym(&parts[0])?.to_string();
+                    let bool_s = ctx.m.mk_bool_sort();
+                    let domain: Vec<AstId> = parts[1..]
+                        .iter()
+                        .map(|s| ctx.resolve_sort(s))
+                        .collect::<Result<_, _>>()?;
+                    let d = ctx.m.mk_func_decl(Symbol::new(&name), &domain, bool_s);
+                    ctx.funcs.insert(name, d);
+                }
+            }
+            ":assumption" | ":formula" => asserts.push(v1_to_v2(val)),
+            // :logic, :status, :notes, :source, :difficulty, :category, … ignored.
+            _ => {}
+        }
+        i += 2;
+    }
+    for a in &asserts {
+        let t = ctx.term(a)?;
+        ctx.assertions.push(t);
+    }
+    let goal = ctx.goal();
+    let (res, _) = ctx.decide(goal);
+    Ok(alloc::vec![verdict_word(res).to_string()])
+}
+
+/// The elements of a list s-expression.
+fn as_list(s: &SExpr) -> Result<&[SExpr], String> {
+    match s {
+        SExpr::List(l) => Ok(l),
+        SExpr::Atom(_) => Err("expected a list".to_string()),
+    }
+}
+
+/// Rewrite an SMT-LIB 1.2 formula into the equivalent SMT-LIB 2 s-expression:
+/// `implies`→`=>`, `if_then_else`→`ite`, `iff`→`=`, and the single-binding
+/// `(let (v t) b)` / `(flet (v f) b)` into `(let ((v t)) b)`.
+fn v1_to_v2(s: &SExpr) -> SExpr {
+    let SExpr::List(l) = s else {
+        return s.clone();
+    };
+    let head = match l.first() {
+        Some(SExpr::Atom(a)) => a.as_str(),
+        _ => return SExpr::List(l.iter().map(v1_to_v2).collect()),
+    };
+    let atom = |s: &str| SExpr::Atom(String::from(s));
+    match head {
+        "implies" if l.len() == 3 => {
+            SExpr::List(alloc::vec![atom("=>"), v1_to_v2(&l[1]), v1_to_v2(&l[2])])
+        }
+        "if_then_else" if l.len() == 4 => SExpr::List(alloc::vec![
+            atom("ite"),
+            v1_to_v2(&l[1]),
+            v1_to_v2(&l[2]),
+            v1_to_v2(&l[3]),
+        ]),
+        "iff" if l.len() == 3 => {
+            SExpr::List(alloc::vec![atom("="), v1_to_v2(&l[1]), v1_to_v2(&l[2])])
+        }
+        "let" | "flet" if l.len() == 3 => {
+            // (let (v t) body) → (let ((v t)) body)
+            if let SExpr::List(bind) = &l[1]
+                && bind.len() == 2
+            {
+                let inner = SExpr::List(alloc::vec![bind[0].clone(), v1_to_v2(&bind[1])]);
+                let binds = SExpr::List(alloc::vec![inner]);
+                return SExpr::List(alloc::vec![atom("let"), binds, v1_to_v2(&l[2])]);
+            }
+            SExpr::List(l.iter().map(v1_to_v2).collect())
+        }
+        _ => SExpr::List(l.iter().map(v1_to_v2).collect()),
+    }
 }
 
 // --- tokenizer + parser ---------------------------------------------------
@@ -202,6 +321,26 @@ fn tokenize(input: &str) -> Vec<String> {
             '(' | ')' => {
                 toks.push(c.to_string());
                 chars.next();
+            }
+            '{' => {
+                // SMT-LIB v1 annotation block `{ … }` (e.g. :source); depth-matched
+                // and kept as one opaque token.
+                chars.next();
+                let mut s = String::from("{");
+                let mut depth = 1;
+                for c in chars.by_ref() {
+                    if c == '{' {
+                        depth += 1;
+                    } else if c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    s.push(c);
+                }
+                s.push('}');
+                toks.push(s);
             }
             '"' => {
                 // String literal "…"; a doubled "" is an embedded quote. Kept
@@ -2051,6 +2190,36 @@ mod tests {
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn smtlib_v1_benchmark_euf() {
+        // SMT-LIB 1.2 (benchmark …) format: sorts/funs/preds, assumptions,
+        // implies, if_then_else, single-binding let, {…} source blocks.
+        let script = "
+            (benchmark euf_test
+              :logic QF_UF
+              :extrasorts (U)
+              :extrafuns ((a U) (b U) (c U) (f U U))
+              :assumption (= a b)
+              :assumption (= b c)
+              :formula (not (= (f a) (f c)))
+              :status unsat
+              :source { a hand-written test })
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn smtlib_v1_arith_let_and_implies() {
+        let script = "
+            (benchmark lia_test
+              :logic QF_LIA
+              :extrafuns ((x Int) (y Int))
+              :formula (and (< x y) (let (?d (- y x)) (<= ?d 0)))
+              :status unsat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
