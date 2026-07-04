@@ -1390,7 +1390,42 @@ impl Context {
                     // Flatten `∀x.∀y.φ` into a single `∀x,y.φ` so E-matching /
                     // instantiation handle it instead of gating the inner
                     // quantifier to `unknown`.
-                    let (binders, inner) = if kind == "forall" {
+                    if kind == "exists" {
+                        // Skolemize the existential block as fresh constants, then
+                        // handle an inner universal block (∃x.∀y.φ): the assertion
+                        // is satisfiable iff the eliminated/instantiated ∀y.φ[k] is.
+                        let mut scope = Vec::new();
+                        for b in as_list(&ql[1])? {
+                            let pair = as_list(b)?;
+                            let nm = Self::sym(&pair[0])?.to_string();
+                            let s = self.resolve_sort(&pair[1])?;
+                            scope.push((nm, self.fresh_const(s)));
+                        }
+                        self.scopes.push(scope);
+                        let (fbinders, inner) = flatten_foralls(&ql[2]);
+                        if fbinders.is_empty() {
+                            let body = self.term(&inner);
+                            self.scopes.pop();
+                            self.assertions.push(body?);
+                            self.assert_names.push(None);
+                        } else {
+                            let blist = SExpr::List(fbinders);
+                            let parsed = self.parse_quantifier(&blist, &inner);
+                            self.scopes.pop();
+                            let (vars, body) = parsed?;
+                            if let Some(qf) = self.qe_forall(&vars, body) {
+                                self.assertions.push(qf);
+                                self.assert_names.push(None);
+                            } else {
+                                self.universals.push((vars, body));
+                            }
+                        }
+                        self.last_model = None;
+                        self.last_verdict = None;
+                        return Ok(None);
+                    }
+                    // forall: flatten nested universals, then eliminate/instantiate.
+                    let (binders, inner) = {
                         let (extra, inner) = flatten_foralls(&ql[2]);
                         if extra.is_empty() {
                             (ql[1].clone(), ql[2].clone())
@@ -1399,16 +1434,9 @@ impl Context {
                             bs.extend(extra);
                             (SExpr::List(bs), inner)
                         }
-                    } else {
-                        (ql[1].clone(), ql[2].clone())
                     };
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
-                    if kind == "exists" {
-                        // ∃x. P(x) is equisatisfiable with P(k) for fresh k.
-                        self.assertions.push(body);
-                        self.assert_names.push(None);
-                    } else if let Some(qf) = self.qe_forall(&vars, body) {
-                        // Real linear ∀ eliminated to a quantifier-free formula.
+                    if let Some(qf) = self.qe_forall(&vars, body) {
                         self.assertions.push(qf);
                         self.assert_names.push(None);
                     } else {
@@ -6668,6 +6696,22 @@ mod tests {
             run(&alloc::format!(
                 "{dt}(declare-const x T)(assert ((_ is tcons) x))(assert (= (th x) 9))(check-sat)"
             ))
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn exists_forall_alternation() {
+        // ∃x.∀y. y ≥ x is false over the (unbounded) integers — no minimum.
+        assert_eq!(
+            run("(assert (exists ((x Int)) (forall ((y Int)) (>= y x))))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // But with y bounded to [0,5] there is such an x (e.g. 5).
+        assert_eq!(
+            run("(assert (exists ((x Int)) (forall ((y Int)) \
+                 (=> (and (<= 0 y) (<= y 5)) (<= y x)))))(check-sat)")
             .unwrap(),
             alloc::vec!["sat"]
         );
