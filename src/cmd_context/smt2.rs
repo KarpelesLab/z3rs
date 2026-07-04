@@ -5132,7 +5132,8 @@ mod tests {
         );
         assert_eq!(
             run(&alloc::format!(
-                "{d}(assert (fp.eq x y))(assert (fp.isNaN x))(check-sat)"
+                "{d}(declare-const y (_ FloatingPoint 11 53))\
+                 (assert (fp.eq x y))(assert (fp.isNaN x))(check-sat)"
             ))
             .unwrap(),
             alloc::vec!["unsat"]
