@@ -1049,6 +1049,9 @@ struct Context {
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
     /// `empty`), for structural folding of `seq.len`/`nth`/`at`/`extract`/`=`.
     seq_of: BTreeMap<AstId, Vec<AstId>>,
+    /// `seq.len` function declarations (one per element sort), tracked so a
+    /// non-negativity axiom can be attached to each application.
+    seq_len_decls: BTreeSet<AstId>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -1206,6 +1209,7 @@ impl Context {
             fp_bv: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
+            seq_len_decls: BTreeSet::new(),
         }
     }
 
@@ -2261,10 +2265,15 @@ impl Context {
         // Non-negativity: `str.len(t) ≥ 0` for every length application in the
         // goal (a string has no negative length). Without this a symbolic
         // `str.len` is an unconstrained UF and `(= (str.len s) -1)` looks sat.
-        if let Some(lenf) = self.str_len_decl {
+        let len_decls: BTreeSet<AstId> = self
+            .str_len_decl
+            .into_iter()
+            .chain(self.seq_len_decls.iter().copied())
+            .collect();
+        if !len_decls.is_empty() {
             let zero = self.m.mk_int(0);
             for &t in &present {
-                if self.m.is_app(t) && self.m.app_decl(t) == lenf {
+                if self.m.is_app(t) && len_decls.contains(&self.m.app_decl(t)) {
                     let ge = self.m.mk_ge(t, zero);
                     ax.push(ge);
                 }
@@ -3001,7 +3010,13 @@ impl Context {
                 if let Some(l) = self.seq_of.get(&args[0]) {
                     return Ok(self.m.mk_int(l.len() as i64));
                 }
-                self.symbolic_seq(op, args)
+                // Symbolic sequence length: a genuine Int-valued function (like
+                // str.len), carrying a non-negativity axiom (see string_axioms).
+                let s = self.m.get_sort(args[0]);
+                let int = self.m.mk_int_sort();
+                let d = self.m.mk_func_decl(Symbol::new("seq.len"), &[s], int);
+                self.seq_len_decls.insert(d);
+                Ok(self.m.mk_app(d, &[args[0]]))
             }
             "seq.nth" => {
                 if let (Some(l), Some(i)) =
@@ -7032,6 +7047,26 @@ mod tests {
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn seq_len_symbolic() {
+        // Symbolic sequence length is a non-negative Int, so arithmetic bounds
+        // decide (previously gated to unknown).
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (< (seq.len s) 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (>= (seq.len s) 5))\
+                 (assert (<= (seq.len s) 3))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (= (seq.len s) 3))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
