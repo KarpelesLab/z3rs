@@ -10,24 +10,27 @@ so the resolved dependency tree is just `z3rs → puremp`. The library is
 `no_std` (needs only `alloc`); the optional `std` feature adds std-backed
 conveniences. It aims to be behaviourally faithful to upstream Z3.
 
-> ⚠️ **Status: early, in progress.** In place: a hash-consing AST (boolean,
-> arithmetic, bit-vector theories), a simplifying rewriter, a **CDCL SAT core**
-> (DIMACS), and a **lazy DPLL(T) SMT engine** deciding **QF_UF / QF_LRA / QF_LIA**
-> with congruence closure (incl. predicate congruence), Fourier–Motzkin linear
-> arithmetic, integer branch-and-bound, and **bidirectional Nelson–Oppen** theory
-> combination — driven by an **SMT-LIB 2 front end** (`check-sat`, `get-value`,
-> `get-model`, `get-unsat-core`, `check-sat-assuming`, `push`/`pop`, `define-fun`,
-> …). Verdicts are **differential-tested against upstream z3**. Still ahead: more
-> theories (bit-vectors, arrays, strings), quantifiers, the fixedpoint/optimization
-> engines, and the C API. See [`ROADMAP.md`](ROADMAP.md) for the phased plan and
-> live progress.
+> ⚠️ **Status: early, in progress.** In place: a hash-consing AST, a simplifying
+> rewriter, a **CDCL SAT core** (DIMACS), and a **lazy DPLL(T) SMT engine** that
+> decides **QF_UF / QF_LRA / QF_LIA / QF_AX** and their combinations — congruence
+> closure (incl. predicate congruence), Fourier–Motzkin linear arithmetic,
+> integer branch-and-bound, read-over-write + extensionality arrays, and
+> **bidirectional Nelson–Oppen** theory combination — plus a **bit-blasting engine
+> for QF_BV** (bitwise, add/sub/mul, shifts, signed/unsigned compares,
+> concat/extract, extend). It is **sound and terminating** (a work budget yields a
+> sound `unknown` rather than a wrong answer or a hang) and
+> **differential-tested against upstream z3** across three rounds of fuzzing. A
+> full **SMT-LIB 2 front end** drives it (`check-sat(-assuming)`, `get-value`,
+> `get-model`, `get-unsat-core`, `push`/`pop`, `define-fun`, …). Still ahead:
+> quantifiers, more theories, the fixedpoint/optimization engines, and the C API.
+> See [`ROADMAP.md`](ROADMAP.md).
 >
 > ```sh
 > $ z3rs problem.cnf          # DIMACS CNF
 > s SATISFIABLE
 > v 1 2 3 0
 >
-> $ z3rs problem.smt2         # SMT-LIB2 (QF_UF / QF_LRA / QF_LIA)
+> $ z3rs problem.smt2         # SMT-LIB2 (QF_UF/LRA/LIA/AX/BV)
 > unsat
 > ```
 
