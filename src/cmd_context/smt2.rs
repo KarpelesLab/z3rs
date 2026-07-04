@@ -565,6 +565,11 @@ struct Context {
     /// `(constructor decl, selector decls)`. Reasoned about with the
     /// selector-over-constructor and constructor-surjectivity (eta) axioms.
     records: BTreeMap<AstId, (AstId, Vec<AstId>)>,
+    /// General non-recursive datatypes with ≥2 constructors that have fields:
+    /// sort → per-constructor `(constructor decl, selector decls, tester decl)`.
+    datatypes: BTreeMap<AstId, Vec<(AstId, Vec<AstId>, AstId)>>,
+    /// Constructor name → its tester declaration (for `((_ is C) t)`).
+    tester_of: BTreeMap<String, AstId>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -597,6 +602,8 @@ impl Context {
             quant_atoms: BTreeSet::new(),
             enums: BTreeMap::new(),
             records: BTreeMap::new(),
+            datatypes: BTreeMap::new(),
+            tester_of: BTreeMap::new(),
             universals: Vec::new(),
         }
     }
@@ -1015,9 +1022,32 @@ impl Context {
                 }
                 self.records.insert(sort, (cdecl, sel_decls));
             } else {
-                return Err("declare-datatypes: multi-constructor datatypes with \
-                            fields are not supported yet"
-                    .to_string());
+                // General non-recursive datatype: ≥2 constructors, some with
+                // fields. Each gets a constructor, its selectors, and a tester
+                // predicate `is-C : sort → Bool`.
+                let bool_sort = self.m.mk_bool_sort();
+                let mut ctor_infos = Vec::new();
+                for (cname, fields) in &parsed {
+                    let field_sorts: Vec<AstId> = fields
+                        .iter()
+                        .map(|(_, s)| self.resolve_sort(s))
+                        .collect::<Result<_, _>>()?;
+                    let cdecl = self.m.mk_func_decl(Symbol::new(cname), &field_sorts, sort);
+                    self.funcs.insert(cname.clone(), cdecl);
+                    self.decl_order.push(cname.clone());
+                    let mut sel_decls = Vec::new();
+                    for ((fname, _), &fsort) in fields.iter().zip(&field_sorts) {
+                        let sdecl = self.m.mk_func_decl(Symbol::new(fname), &[sort], fsort);
+                        self.funcs.insert(fname.clone(), sdecl);
+                        self.decl_order.push(fname.clone());
+                        sel_decls.push(sdecl);
+                    }
+                    let tname = alloc::format!("is-{cname}");
+                    let tdecl = self.m.mk_func_decl(Symbol::new(&tname), &[sort], bool_sort);
+                    self.tester_of.insert(cname.clone(), tdecl);
+                    ctor_infos.push((cdecl, sel_decls, tdecl));
+                }
+                self.datatypes.insert(sort, ctor_infos);
             }
         }
         Ok(())
@@ -1035,6 +1065,73 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Axioms for general (multi-constructor, non-recursive) datatypes in `goal`.
+    /// For each datatype term `t`: exhaustiveness (`t` is one of the
+    /// constructors), pairwise tester exclusivity, and each tester's definition
+    /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
+    /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    fn datatype_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.datatypes.is_empty() {
+            return Vec::new();
+        }
+        let terms = self.m.postorder(goal);
+        let mut ax = Vec::new();
+        for &t in &terms {
+            let s = self.m.get_sort(t);
+            if let Some(ctors) = self.datatypes.get(&s).cloned() {
+                // Testers applied to t, and the exhaustiveness/exclusivity axioms.
+                let testers: Vec<AstId> = ctors
+                    .iter()
+                    .map(|(_, _, td)| self.m.mk_app(*td, &[t]))
+                    .collect();
+                ax.push(self.m.mk_or(&testers));
+                for i in 0..testers.len() {
+                    for j in i + 1..testers.len() {
+                        let both = self.m.mk_and(&[testers[i], testers[j]]);
+                        ax.push(self.m.mk_not(both));
+                    }
+                }
+                // is-Cᵢ(t) ⇒ t = Cᵢ(sel₁(t), …).
+                for (idx, (cdecl, sels, _)) in ctors.iter().enumerate() {
+                    let applied: Vec<AstId> =
+                        sels.iter().map(|&sd| self.m.mk_app(sd, &[t])).collect();
+                    let ct = self.m.mk_app(*cdecl, &applied);
+                    let eq = self.m.mk_eq(t, ct);
+                    let imp = self.m.mk_implies(testers[idx], eq);
+                    ax.push(imp);
+                }
+            }
+            // Constructor application: fix its testers and selectors. Only when
+            // `t` is genuinely built by one of the constructors — a plain
+            // datatype variable is not, and must stay free to be any constructor.
+            if self.m.is_app(t) {
+                let decl = self.m.app_decl(t);
+                let sort = self.m.get_sort(t);
+                if let Some(ctors) = self.datatypes.get(&sort).cloned()
+                    && ctors.iter().any(|(cd, _, _)| *cd == decl)
+                {
+                    for (cdecl, sels, tdecl) in &ctors {
+                        let is_this = *cdecl == decl;
+                        let applied = self.m.mk_app(*tdecl, &[t]);
+                        ax.push(if is_this {
+                            applied
+                        } else {
+                            self.m.mk_not(applied)
+                        });
+                        if is_this {
+                            let args = self.m.app_args(t).to_vec();
+                            for (k, &sd) in sels.iter().enumerate() {
+                                let sel_app = self.m.mk_app(sd, &[t]);
+                                ax.push(self.m.mk_eq(sel_app, args[k]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ax
     }
 
     /// Axioms for record/tuple datatypes mentioned in `goal`: selector-over-
@@ -1251,6 +1348,7 @@ impl Context {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
         axioms.extend(self.record_axioms(lifted));
+        axioms.extend(self.datatype_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -1659,6 +1757,10 @@ impl Context {
                         // ((_ is C) x) — the datatype tester.
                         let cname = Self::sym(&qid[2])?.to_string();
                         let x = self.term(&l[1])?;
+                        // General multi-constructor datatype: apply the predicate.
+                        if let Some(&tdecl) = self.tester_of.get(&cname) {
+                            return Ok(self.m.mk_app(tdecl, &[x]));
+                        }
                         // A record has a single constructor, so its tester is true.
                         if self.records.contains_key(&self.m.get_sort(x)) {
                             return Ok(self.m.mk_true());
@@ -2722,6 +2824,36 @@ mod tests {
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn variant_datatypes_decide() {
+        let o = "(declare-datatypes ((Opt 0)) (((none) (some (val Int)))))";
+        // Selector-over-constructor and distinctness.
+        assert_eq!(
+            run(&alloc::format!("{o}(assert (not (= (val (some 7)) 7)))(check-sat)")).unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!("{o}(assert (= none (some 3)))(check-sat)")).unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A value can't satisfy two testers (exclusivity).
+        assert_eq!(
+            run(&alloc::format!(
+                "{o}(declare-const a Opt)(assert ((_ is none) a))(assert ((_ is some) a))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A tagged value with a constraint on its field is satisfiable.
+        assert_eq!(
+            run(&alloc::format!(
+                "{o}(declare-const a Opt)(assert ((_ is some) a))(assert (> (val a) 5))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
