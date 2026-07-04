@@ -38,10 +38,29 @@ use crate::smt::{
 enum RealOpt {
     /// A proven-exact attained optimum.
     Attained(Rational),
+    /// A strict supremum/infimum (the bound value, not attained).
+    Supremum(Rational),
     /// Unbounded in the optimizing direction.
     Unbounded,
-    /// Not determined exactly (supremum, non-linear, or verification failed).
+    /// Not determined exactly (non-linear or verification failed).
     Unknown,
+}
+
+/// Render a rational as an SMT-LIB real term always keeping the fractional part
+/// (`n.0`, `(- n.0)`, `(/ p.0 q.0)`), matching z3's epsilon expressions.
+fn render_real(r: &Rational) -> String {
+    let real = |n: &Int| -> String {
+        if *n < Int::from(0) {
+            alloc::format!("(- {}.0)", n.abs())
+        } else {
+            alloc::format!("{n}.0")
+        }
+    };
+    if r.is_integer() {
+        real(r.numerator())
+    } else {
+        alloc::format!("(/ {} {})", real(r.numerator()), real(r.denominator()))
+    }
 }
 
 /// Render a rational as an SMT-LIB real term (`n.0`, `(- n.0)`, or `(/ p.0 q.0)`).
@@ -2143,6 +2162,14 @@ impl Context {
                         fixed.push(eq);
                         model = self.check_with(&fixed).1;
                     }
+                    RealOpt::Supremum(r) => {
+                        // z3 form: max → r - ε, min → r + ε.
+                        values[i] = if maximize {
+                            alloc::format!("(+ {} (* (- 1.0) epsilon))", render_real(&r))
+                        } else {
+                            alloc::format!("(+ {} epsilon)", render_real(&r))
+                        };
+                    }
                     RealOpt::Unbounded => {
                         values[i] = if maximize {
                             "oo".to_string()
@@ -2227,7 +2254,23 @@ impl Context {
                     RealOpt::Unknown
                 }
             }
-            OptOutcome::Bound(_) | OptOutcome::Exhausted => RealOpt::Unknown,
+            OptOutcome::Bound(r) => {
+                // A strict bound: verify `obj` cannot reach r.
+                let rv = self.m.mk_numeral(r.clone(), false);
+                let reach = if maximize {
+                    self.m.mk_ge(obj, rv)
+                } else {
+                    self.m.mk_le(obj, rv)
+                };
+                let mut ex = fixed.to_vec();
+                ex.push(reach);
+                if self.check_with(&ex).0 == SmtResult::Unsat {
+                    RealOpt::Supremum(r)
+                } else {
+                    RealOpt::Unknown
+                }
+            }
+            OptOutcome::Exhausted => RealOpt::Unknown,
         }
     }
 
@@ -4349,6 +4392,15 @@ mod tests {
             run("(declare-const x Real)(assert (>= x 0.0))(maximize x)(check-sat)(get-objectives)")
                 .unwrap();
         assert!(out[1].contains("(x oo)"), "got {:?}", out[1]);
+        // A strict supremum in z3's epsilon form.
+        let out =
+            run("(declare-const x Real)(assert (< x 5.0))(maximize x)(check-sat)(get-objectives)")
+                .unwrap();
+        assert!(
+            out[1].contains("(+ 5.0 (* (- 1.0) epsilon))"),
+            "got {:?}",
+            out[1]
+        );
     }
 
     #[test]
