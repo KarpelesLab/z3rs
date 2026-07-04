@@ -148,23 +148,23 @@ impl<'a> BitBlaster<'a> {
     }
 
     /// A barrel shifter: shift `a` by the (unsigned) amount `b`, left if `left`
-    /// else logical right. A shift by `2^i` is applied conditionally on bit `i`
-    /// of `b`; amounts ≥ width zero the result.
-    fn barrel_shift(&mut self, a: &[Lit], b: &[Lit], left: bool) -> Vec<Lit> {
+    /// else right. A shift by `2^i` is applied conditionally on bit `i` of `b`.
+    /// Bits shifted in (and amounts ≥ width) take the value `fill` — `false` for
+    /// logical shifts (`bvshl`/`bvlshr`), the sign bit for arithmetic (`bvashr`).
+    fn barrel_shift(&mut self, a: &[Lit], b: &[Lit], left: bool, fill: Lit) -> Vec<Lit> {
         let n = a.len();
-        let false_lit = !self.true_lit;
         let mut acc = a.to_vec();
         for (i, &sel) in b.iter().enumerate() {
             let sh = 1usize.checked_shl(i as u32).unwrap_or(usize::MAX);
             let shifted: Vec<Lit> = if sh >= n {
-                alloc::vec![false_lit; n]
+                alloc::vec![fill; n]
             } else if left {
                 (0..n)
-                    .map(|j| if j >= sh { acc[j - sh] } else { false_lit })
+                    .map(|j| if j >= sh { acc[j - sh] } else { fill })
                     .collect()
             } else {
                 (0..n)
-                    .map(|j| if j + sh < n { acc[j + sh] } else { false_lit })
+                    .map(|j| if j + sh < n { acc[j + sh] } else { fill })
                     .collect()
             };
             acc = self.mux(sel, &shifted, &acc);
@@ -244,12 +244,20 @@ impl<'a> BitBlaster<'a> {
                 BvOp::Shl => {
                     let a = self.blast_bv(args[0]);
                     let b = self.blast_bv(args[1]);
-                    self.barrel_shift(&a, &b, true)
+                    let z = !self.true_lit;
+                    self.barrel_shift(&a, &b, true, z)
                 }
                 BvOp::Lshr => {
                     let a = self.blast_bv(args[0]);
                     let b = self.blast_bv(args[1]);
-                    self.barrel_shift(&a, &b, false)
+                    let z = !self.true_lit;
+                    self.barrel_shift(&a, &b, false, z)
+                }
+                BvOp::Ashr => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    let sign = *a.last().expect("ashr of empty bv");
+                    self.barrel_shift(&a, &b, false, sign)
                 }
                 BvOp::Concat => {
                     // a (high) ++ b (low): low bits are b, high bits are a.

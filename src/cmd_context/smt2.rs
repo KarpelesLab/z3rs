@@ -1173,6 +1173,32 @@ impl Context {
         Ok(out)
     }
 
+    /// `((_ repeat k) x)` — concatenate `x` with itself `k` times.
+    fn bv_repeat(&mut self, k: u32, x: AstId) -> AstId {
+        let mut acc = x;
+        for _ in 1..k {
+            acc = self.m.mk_bv_concat(acc, x);
+        }
+        acc
+    }
+
+    /// `((_ rotate_left k) x)` / rotate_right: a cyclic bit rotation, built from
+    /// `extract` + `concat`. Rotating by a multiple of the width is the identity.
+    fn bv_rotate(&mut self, k: u32, x: AstId, left: bool) -> AstId {
+        let n = self
+            .m
+            .bv_sort_width(self.m.get_sort(x))
+            .expect("rotate: not bv");
+        let k = if left { k % n } else { (n - k % n) % n }; // reduce to a left rotate
+        if k == 0 {
+            return x;
+        }
+        // left rotate by k: high (n-k) bits from x[0..n-k-1], low k bits from x[n-k..n-1].
+        let hi = self.m.mk_bv_extract(n - 1 - k, 0, x);
+        let lo = self.m.mk_bv_extract(n - 1, n - k, x);
+        self.m.mk_bv_concat(hi, lo)
+    }
+
     /// Look up a name in the active `let` scopes (innermost first).
     fn lookup_bound(&self, name: &str) -> Option<AstId> {
         self.scopes.iter().rev().find_map(|scope| {
@@ -1247,6 +1273,21 @@ impl Context {
                         } else {
                             self.m.mk_bv_sign_extend(k, x)
                         });
+                    }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "rotate_left" || a == "rotate_right" || a == "repeat")
+                    {
+                        let k: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "bad index".to_string())?;
+                        let x = self.term(&l[1])?;
+                        let op = Self::sym(&qid[1])?;
+                        return match op {
+                            "repeat" => Ok(self.bv_repeat(k, x)),
+                            "rotate_left" => Ok(self.bv_rotate(k, x, true)),
+                            _ => Ok(self.bv_rotate(k, x, false)),
+                        };
                     }
                     return Err("unsupported qualified application".to_string());
                 }
@@ -1522,6 +1563,7 @@ impl Context {
             "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
             "bvshl" => Ok(m.mk_bvshl(args[0], args[1])),
             "bvlshr" => Ok(m.mk_bvlshr(args[0], args[1])),
+            "bvashr" => Ok(m.mk_bvashr(args[0], args[1])),
             "bvult" => Ok(m.mk_bvult(args[0], args[1])),
             "bvule" => Ok(m.mk_bvule(args[0], args[1])),
             "bvugt" => Ok(m.mk_bvult(args[1], args[0])), // a >u b  ⟺  b <u a
@@ -1531,6 +1573,19 @@ impl Context {
             "bvsgt" => Ok(m.mk_bvslt(args[1], args[0])), // a >s b  ⟺  b <s a
             "bvsge" => Ok(m.mk_bvsle(args[1], args[0])), // a ≥s b  ⟺  b ≤s a
             "concat" => Ok(m.mk_bv_concat(args[0], args[1])),
+            // Derived bitwise ops: nand/nor/xnor = not of and/or/xor.
+            "bvnand" => {
+                let t = m.mk_bvand(args[0], args[1]);
+                Ok(m.mk_bvnot(t))
+            }
+            "bvnor" => {
+                let t = m.mk_bvor(args[0], args[1]);
+                Ok(m.mk_bvnot(t))
+            }
+            "bvxnor" => {
+                let t = m.mk_bvxor(args[0], args[1]);
+                Ok(m.mk_bvnot(t))
+            }
             name => {
                 let d = *self
                     .funcs

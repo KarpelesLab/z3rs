@@ -365,6 +365,22 @@ const CORPUS: &[Case] = &[
         name: "lira_div_by_one",
         script: "(declare-const x Int)(assert (>= (/ x 1) 5))(assert (< x 5))(check-sat)",
     },
+    Case {
+        name: "bv_nand_xnor",
+        script: "(declare-const x (_ BitVec 4))(assert (not (= (bvnand x x) (bvnot x))))(check-sat)",
+    },
+    Case {
+        name: "bv_rotate",
+        script: "(assert (not (= ((_ rotate_left 1) #x80) #x01)))(check-sat)",
+    },
+    Case {
+        name: "bv_repeat",
+        script: "(assert (not (= ((_ repeat 3) #b10) #b101010)))(check-sat)",
+    },
+    Case {
+        name: "bv_ashr_sign",
+        script: "(assert (not (= (bvashr #x80 #x01) #xc0)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
