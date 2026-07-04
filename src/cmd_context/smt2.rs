@@ -1191,6 +1191,38 @@ impl Context {
                 self.last_model = None;
                 Ok(None)
             }
+            "declare-datatype" => {
+                // (declare-datatype Name (ctor…)) — the single-datatype form.
+                let name = Self::sym(&list[1])?.to_string();
+                let sort_decls = SExpr::List(alloc::vec![SExpr::List(alloc::vec![
+                    SExpr::Atom(name),
+                    SExpr::Atom("0".to_string()),
+                ])]);
+                let bodies = SExpr::List(alloc::vec![list[2].clone()]);
+                self.declare_datatypes(&sort_decls, &bodies)?;
+                self.last_model = None;
+                Ok(None)
+            }
+            "simplify" => {
+                // (simplify term [:opt v …]) — return the simplified term.
+                let t = self.term(&list[1])?;
+                let folded = self.dt_fold(t);
+                let s = crate::rewriter::simplify(&mut self.m, folded);
+                Ok(Some(self.m.pp(s)))
+            }
+            "eval" => {
+                // (eval term) — the value of `term` in the current model.
+                if self.last_model.is_none() {
+                    return Err("eval requires a preceding satisfiable check-sat".to_string());
+                }
+                let id = self.term(&list[1])?;
+                let mut model = self.last_model.take().unwrap();
+                let v = self
+                    .enum_value_name(&mut model, id)
+                    .unwrap_or_else(|| model.value_string(&self.m, id));
+                self.last_model = Some(model);
+                Ok(Some(v))
+            }
             "declare-const" => {
                 // (declare-const c S)
                 let name = Self::sym(&list[1])?.to_string();
@@ -6136,6 +6168,28 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn singular_datatype_eval_simplify() {
+        // (declare-datatype …) — the single-datatype form, incl. recursive.
+        assert_eq!(
+            run("(declare-datatype Lst ((nil) (cons (hd Int) (tl Lst))))\
+                 (declare-const l Lst)(assert (= l (cons 5 nil)))\
+                 (assert (not (= (hd l) 5)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // (eval term) reports the model value.
+        assert_eq!(
+            run("(declare-const x Int)(assert (= x 7))(check-sat)(eval (* x 2))").unwrap(),
+            alloc::vec!["sat", "14"]
+        );
+        // (simplify …) folds Booleans.
+        assert_eq!(
+            run("(simplify (and true (or false true)))").unwrap(),
+            alloc::vec!["true"]
         );
     }
 
