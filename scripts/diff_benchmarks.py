@@ -17,6 +17,17 @@ DEFINITE = ("sat", "unsat")
 ERR_MARKERS = ("error", "unsupported", "unknown symbol", "unknown function", "unknown sort")
 
 
+def file_status(path):
+    """The `:status sat|unsat|unknown` annotation of a benchmark, if any."""
+    try:
+        txt = open(path, encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return None
+    import re
+    m = re.search(r":status\s+(sat|unsat|unknown)", txt)
+    return m.group(1) if m else None
+
+
 def verdicts(cmd, timeout):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -44,7 +55,20 @@ def main():
             err += 1; continue
         theirs, _ = verdicts(["z3", f], timeout)
         if not theirs:
-            z3fail += 1; continue
+            # z3 could not decide (e.g. SMT-LIB v1, which modern z3 rejects).
+            # Fall back to the file's own `:status` annotation as the oracle.
+            status = file_status(f)
+            if status in ("sat", "unsat") and ours:
+                if ours[0] == "unknown":
+                    unk += 1
+                elif ours[0] == status:
+                    agree += 1
+                else:
+                    disagree += 1
+                    mismatches.append((os.path.basename(f), ours, [f"status:{status}"]))
+            else:
+                z3fail += 1
+            continue
         bad = False
         for o, t in zip(ours, theirs):
             if o == "unknown":
