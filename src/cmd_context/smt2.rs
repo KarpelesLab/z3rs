@@ -41,6 +41,19 @@ enum OptResult {
     Unknown,
 }
 
+/// Substitute sort-macro parameters (atoms) by their argument s-expressions in
+/// a `define-sort` body.
+fn subst_sort(body: &SExpr, subst: &[(String, SExpr)]) -> SExpr {
+    match body {
+        SExpr::Atom(a) => subst
+            .iter()
+            .find(|(p, _)| p == a)
+            .map(|(_, arg)| arg.clone())
+            .unwrap_or_else(|| body.clone()),
+        SExpr::List(l) => SExpr::List(l.iter().map(|e| subst_sort(e, subst)).collect()),
+    }
+}
+
 /// Left-fold a non-empty list of regexes with a binary combinator.
 fn fold_regex(mut parts: Vec<Regex>, f: impl Fn(Regex, Regex) -> Regex) -> Regex {
     let mut acc = parts.remove(0);
@@ -714,6 +727,8 @@ struct Context {
     reglan_sort: Option<AstId>,
     /// Regex terms whose structure is fully constant, for `str.in_re` folding.
     regex_of: BTreeMap<AstId, Regex>,
+    /// Parametric sort macros from `define-sort`: name → (params, body).
+    sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
 }
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
@@ -842,6 +857,7 @@ impl Context {
             str_symbolic: BTreeSet::new(),
             reglan_sort: None,
             regex_of: BTreeMap::new(),
+            sort_defs: BTreeMap::new(),
         }
     }
 
@@ -885,6 +901,18 @@ impl Context {
                             .parse()
                             .map_err(|_| "BitVec: bad width".to_string())?;
                         Ok(self.m.mk_bv_sort(w))
+                    }
+                    name if self.sort_defs.contains_key(name) => {
+                        // A parametric sort macro (define-sort): substitute the
+                        // arguments for the parameters in the body, then resolve.
+                        let (params, body) = self.sort_defs[name].clone();
+                        if params.len() != l.len() - 1 {
+                            return Err(alloc::format!("sort {name}: wrong arity"));
+                        }
+                        let subst: Vec<(String, SExpr)> =
+                            params.into_iter().zip(l[1..].iter().cloned()).collect();
+                        let expanded = subst_sort(&body, &subst);
+                        self.resolve_sort(&expanded)
                     }
                     other => Err(alloc::format!("unsupported sort constructor {other:?}")),
                 }
@@ -977,6 +1005,22 @@ impl Context {
                 let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
                 self.sorts.insert(name.clone(), s);
                 self.sort_order.push(name);
+                Ok(None)
+            }
+            "define-sort" => {
+                // (define-sort Name (params…) body) — a sort macro.
+                let name = Self::sym(&list[1])?.to_string();
+                let params: Vec<String> = as_list(&list[2])?
+                    .iter()
+                    .map(|p| Self::sym(p).map(str::to_string))
+                    .collect::<Result<_, _>>()?;
+                if params.is_empty() {
+                    let s = self.resolve_sort(&list[3])?;
+                    self.sorts.insert(name.clone(), s);
+                    self.sort_order.push(name);
+                } else {
+                    self.sort_defs.insert(name, (params, list[3].clone()));
+                }
                 Ok(None)
             }
             "declare-datatypes" => {
@@ -3739,6 +3783,26 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn define_sort_macros() {
+        // Non-parametric alias.
+        assert_eq!(
+            run("(define-sort MyInt () Int)(declare-const x MyInt)\
+                 (assert (> x 5))(assert (< x 5))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Parametric macro expanded with arguments.
+        assert_eq!(
+            run(
+                "(define-sort Pair (X Y) (Array X Y))(declare-const a (Pair Int Bool))\
+                 (assert (select a 3))(assert (not (select a 3)))(check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
