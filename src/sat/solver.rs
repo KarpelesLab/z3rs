@@ -38,6 +38,15 @@ pub struct Solver {
     clauses: Vec<Vec<Lit>>,
     /// `watches[l.index()]` = clauses watching literal `~l` (MiniSat convention).
     watches: Vec<Vec<usize>>,
+    /// Per-clause: is it a learnt clause (deletable), its activity, and whether
+    /// it has been lazily deleted (skipped in propagation, freed).
+    learnt: Vec<bool>,
+    cla_activity: Vec<f64>,
+    deleted: Vec<bool>,
+    cla_inc: f64,
+    /// Number of live (non-deleted) learnt clauses, and the current cap.
+    n_learnt: usize,
+    max_learnt: usize,
 
     trail: Vec<Lit>,
     trail_lim: Vec<usize>,
@@ -64,6 +73,12 @@ impl Solver {
             var_inc: 1.0,
             clauses: Vec::new(),
             watches: Vec::new(),
+            learnt: Vec::new(),
+            cla_activity: Vec::new(),
+            deleted: Vec::new(),
+            cla_inc: 1.0,
+            n_learnt: 0,
+            max_learnt: 2000,
             trail: Vec::new(),
             trail_lim: Vec::new(),
             qhead: 0,
@@ -148,16 +163,66 @@ impl Solver {
                 self.ok = false;
             }
         } else {
-            self.attach_clause(ps);
+            self.attach_clause(ps, false);
         }
     }
 
-    fn attach_clause(&mut self, ps: Vec<Lit>) {
+    fn attach_clause(&mut self, ps: Vec<Lit>, learnt: bool) {
         let cref = self.clauses.len();
         let (w0, w1) = ((!ps[0]).index() as usize, (!ps[1]).index() as usize);
         self.clauses.push(ps);
+        self.learnt.push(learnt);
+        self.cla_activity.push(0.0);
+        self.deleted.push(false);
         self.watches[w0].push(cref);
         self.watches[w1].push(cref);
+        if learnt {
+            self.n_learnt += 1;
+            self.bump_clause(cref);
+        }
+    }
+
+    /// Bump a clause's activity (rescaling all activities if it overflows).
+    fn bump_clause(&mut self, cref: usize) {
+        self.cla_activity[cref] += self.cla_inc;
+        if self.cla_activity[cref] > 1e100 {
+            for a in &mut self.cla_activity {
+                *a *= 1e-100;
+            }
+            self.cla_inc *= 1e-100;
+        }
+    }
+
+    /// Is clause `cref` the reason for a currently-assigned literal (so it must
+    /// not be deleted, to keep the implication graph intact)?
+    fn locked(&self, cref: usize) -> bool {
+        let c = &self.clauses[cref];
+        !c.is_empty()
+            && self.lit_value(c[0]) == LBool::True
+            && self.reason[c[0].var() as usize] == cref as i32
+    }
+
+    /// Delete about half of the low-activity, unlocked learnt clauses when the
+    /// learnt DB exceeds its cap. Deletion is lazy: the clause is marked and its
+    /// literals freed; `propagate` drops stale watches on encounter. Only learnt
+    /// (redundant) clauses are ever removed, so verdicts are unaffected.
+    fn reduce_db(&mut self) {
+        let mut cand: Vec<usize> = (0..self.clauses.len())
+            .filter(|&i| self.learnt[i] && !self.deleted[i] && !self.locked(i))
+            .collect();
+        // Sort ascending by activity so the least useful come first.
+        cand.sort_by(|&a, &b| {
+            self.cla_activity[a]
+                .partial_cmp(&self.cla_activity[b])
+                .unwrap_or(core::cmp::Ordering::Equal)
+        });
+        let remove = cand.len() / 2;
+        for &cref in cand.iter().take(remove) {
+            self.deleted[cref] = true;
+            self.clauses[cref].clear(); // free the literals; watches drop lazily
+            self.n_learnt -= 1;
+        }
+        self.max_learnt += self.max_learnt / 2; // grow the cap geometrically
     }
 
     /// Assign `l` true with the given antecedent. Returns `false` on conflict.
@@ -188,6 +253,10 @@ impl Solver {
             let mut i = 0;
             'next_clause: while i < ws.len() {
                 let cref = ws[i];
+                if self.deleted[cref] {
+                    ws.swap_remove(i); // drop stale watch of a deleted clause
+                    continue;
+                }
                 // Ensure the false watched literal is at position 1.
                 if self.clauses[cref][0] == false_lit {
                     self.clauses[cref].swap(0, 1);
@@ -255,6 +324,9 @@ impl Solver {
         let mut index = self.trail.len();
 
         loop {
+            if self.learnt[confl] {
+                self.bump_clause(confl); // clauses that drive conflicts are useful
+            }
             let clause = self.clauses[confl].clone();
             let start = usize::from(p.is_some());
             for &q in &clause[start..] {
@@ -392,10 +464,11 @@ impl Solver {
                     self.enqueue(asserting, REASON_NONE);
                 } else {
                     let cref = self.clauses.len();
-                    self.attach_clause(learnt);
+                    self.attach_clause(learnt, true);
                     self.enqueue(asserting, cref as i32);
                 }
                 self.var_inc /= 0.95; // decay
+                self.cla_inc /= 0.999; // clause-activity decay
                 total_conflicts += 1;
                 if total_conflicts > max_conflicts {
                     self.cancel_until(0);
@@ -407,6 +480,11 @@ impl Solver {
                     luby_index += 1;
                     restart_limit = luby(luby_index) * 100;
                     self.cancel_until(n_assump); // keep the assumption prefix
+                    // At a restart (decision level = assumptions) it is safe to
+                    // reduce the learnt DB: nothing beyond the prefix is locked.
+                    if self.n_learnt > self.max_learnt {
+                        self.reduce_db();
+                    }
                 }
             } else if self.decision_level() < n_assump {
                 // Place the next assumption as its own decision level.
@@ -467,6 +545,32 @@ mod tests {
     fn empty_problem_is_sat() {
         let mut s = Solver::new();
         assert_eq!(s.solve(), SatResult::Sat);
+    }
+
+    #[test]
+    fn pigeonhole_unsat_with_clause_deletion() {
+        // PHP(n+1, n): n+1 pigeons into n holes is unsat. This generates enough
+        // learnt clauses to exercise reduce_db while staying decidable.
+        let n = 6usize;
+        let mut s = Solver::new();
+        // var(p, h) = pigeon p in hole h, 1-indexed literal p*n + h + 1.
+        let var = |p: usize, h: usize| (p * n + h) as i32 + 1;
+        // Each pigeon occupies at least one hole.
+        for p in 0..=n {
+            let clause: Vec<i32> = (0..n).map(|h| var(p, h)).collect();
+            s.add_clause(&lits(&clause));
+        }
+        // No hole holds two pigeons.
+        for h in 0..n {
+            for p1 in 0..=n {
+                for p2 in (p1 + 1)..=n {
+                    s.add_clause(&lits(&[-var(p1, h), -var(p2, h)]));
+                }
+            }
+        }
+        // Force early reduction to cover the deletion path.
+        s.max_learnt = 50;
+        assert_eq!(s.solve_budgeted(10_000_000), Some(SatResult::Unsat));
     }
 
     #[test]
