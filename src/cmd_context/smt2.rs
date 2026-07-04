@@ -4068,30 +4068,56 @@ impl Context {
     }
 
     /// Instantiate the array + enum axioms for `lifted` and conjoin them.
-    /// Nonnegativity axioms for square subterms: every `(* t t)` in the goal
-    /// gets `(* t t) ≥ 0`. This is sound over ordered fields and lets the linear
-    /// relaxation refute e.g. `x*x < 0` (which it otherwise treats as a free
-    /// variable and answers `unknown`).
+    /// Sign axioms for binary product subterms `(* a b)`: a square `(* t t)`
+    /// gets `≥ 0` directly, and a general product gets the four sign rules
+    /// `(a⋛0 ∧ b⋛0) ⇒ ab⋛0`. Sound over ordered fields, these let the linear
+    /// relaxation refute e.g. `x*x < 0` or `x>0 ∧ y>0 ∧ x*y<0` (otherwise a free
+    /// variable, answered `unknown`).
     fn square_axioms(&mut self, goal: AstId) -> Vec<AstId> {
-        let mut squares: Vec<AstId> = Vec::new();
+        let mut prods: Vec<(AstId, AstId, AstId)> = Vec::new();
         for t in self.m.postorder(goal) {
             if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
                 let args = self.m.app_args(t);
-                if args.len() == 2 && args[0] == args[1] {
-                    squares.push(t);
+                if args.len() == 2
+                    && self.m.as_numeral(args[0]).is_none()
+                    && self.m.as_numeral(args[1]).is_none()
+                {
+                    prods.push((t, args[0], args[1]));
                 }
             }
         }
-        squares.sort();
-        squares.dedup();
-        squares
-            .into_iter()
-            .map(|sq| {
-                let is_int = self.m.is_int_sort(self.m.get_sort(sq));
-                let zero = self.m.mk_numeral(rat(0), is_int);
-                self.m.mk_ge(sq, zero)
-            })
-            .collect()
+        prods.sort();
+        prods.dedup();
+        let mut axioms = Vec::new();
+        // Guard against goal blow-up when many products are present.
+        if prods.len() > 12 {
+            prods.truncate(12);
+        }
+        for (p, a, b) in prods {
+            let is_int = self.m.is_int_sort(self.m.get_sort(p));
+            let zero = self.m.mk_numeral(rat(0), is_int);
+            let p_nn = self.m.mk_ge(p, zero);
+            if a == b {
+                axioms.push(p_nn); // a square is nonnegative
+                continue;
+            }
+            // The four sign rules `(a⋛0 ∧ b⋛0) ⇒ ab⋛0`. Non-strict (≤/≥) keeps
+            // the case split small; it still refutes any product with the wrong
+            // sign (the common goal), while the strict boundary stays `unknown`.
+            let p_np = self.m.mk_le(p, zero);
+            let (a_nn, a_np) = (self.m.mk_ge(a, zero), self.m.mk_le(a, zero));
+            let (b_nn, b_np) = (self.m.mk_ge(b, zero), self.m.mk_le(b, zero));
+            for (ca, cb, concl) in [
+                (a_nn, b_nn, p_nn),
+                (a_np, b_np, p_nn),
+                (a_nn, b_np, p_np),
+                (a_np, b_nn, p_np),
+            ] {
+                let hyp = self.m.mk_and(&[ca, cb]);
+                axioms.push(self.m.mk_implies(hyp, concl));
+            }
+        }
+        axioms
     }
 
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
@@ -5904,6 +5930,13 @@ mod tests {
         // A square cannot be negative — the axiom (* x x) ≥ 0 refutes these.
         assert_eq!(
             run("(declare-const x Real)(assert (< (* x x) 0.0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Product-sign rule: two positives cannot multiply to a negative.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (> x 0))(assert (> y 0))(assert (< (* x y) 0))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
