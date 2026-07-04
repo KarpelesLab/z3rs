@@ -2879,6 +2879,22 @@ impl Context {
         }
         // DNF of ¬body: a disjunction of cubes (conjunctions of constraints).
         let cubes = self.body_dnf(body, false)?;
+        // A binder may appear ONLY as a linear variable. If one occurs inside a
+        // compound term — e.g. an uninterpreted application `f(x)`, which
+        // `ast_to_lin` opaquely treats as a single variable — Fourier–Motzkin
+        // cannot eliminate it (projecting the binder would leave it free in that
+        // term, unsound). Fall back to instantiation in that case.
+        let bound: BTreeSet<AstId> = vars.iter().copied().collect();
+        for cube in &cubes {
+            for c in cube {
+                for (u, _) in c.expr.terms() {
+                    if !bound.contains(&u) && self.m.postorder(u).iter().any(|t| bound.contains(t))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
         // Fourier–Motzkin is exact for the reals; for integers it is exact only
         // when the body is pure LIA (integer coefficients) and every binder
         // appears with coefficient ±1 (real shadow = integer shadow). Otherwise
@@ -5604,6 +5620,28 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn quantified_uf_instantiates_not_qe() {
+        // Regression: `∀x. f(x)=0` binds x inside an uninterpreted application,
+        // so Fourier–Motzkin QE must NOT fire (it would leave x free, an
+        // unsound over-approximation that once returned `sat`). Instantiation
+        // decides it: x = a yields f(a)=0, contradicting `f(a)≠0`.
+        assert_eq!(
+            run("(declare-fun f (Int) Int)(declare-const a Int)\
+                 (assert (forall ((x Int)) (= (f x) 0)))(assert (not (= (f a) 0)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // With a :pattern annotation on the body, likewise.
+        assert_eq!(
+            run("(declare-fun f (Int) Int)(declare-fun g (Int) Int)\
+                 (assert (forall ((x Int)) (! (= (f x) (g x)) :pattern ((f x)))))\
+                 (declare-const a Int)(assert (not (= (f a) (g a))))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
