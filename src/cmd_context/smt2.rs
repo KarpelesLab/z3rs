@@ -1288,6 +1288,22 @@ impl Context {
                     Ok(Some("(:version \"0.0.1\")".to_string()))
                 }
                 Some(SExpr::Atom(k)) if k == ":name" => Ok(Some("(:name \"z3rs\")".to_string())),
+                Some(SExpr::Atom(k)) if k == ":authors" => {
+                    Ok(Some("(:authors \"z3rs\")".to_string()))
+                }
+                Some(SExpr::Atom(k)) if k == ":error-behavior" => {
+                    Ok(Some("(:error-behavior continued-execution)".to_string()))
+                }
+                Some(SExpr::Atom(k)) if k == ":reason-unknown" => {
+                    // Why the most recent check returned `unknown` (empty if it
+                    // was decided), mirroring z3's response shape.
+                    let r = if self.last_verdict == Some(SmtResult::Unknown) {
+                        "incomplete"
+                    } else {
+                        ""
+                    };
+                    Ok(Some(alloc::format!("(:reason-unknown \"{r}\")")))
+                }
                 _ => Ok(None),
             },
             "push" => {
