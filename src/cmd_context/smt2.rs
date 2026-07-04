@@ -4765,18 +4765,25 @@ impl Context {
                             _ => Ok(self.bv_rotate(k, x, false)),
                         };
                     }
-                    if qid.len() == 4
+                    if (qid.len() == 4
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
-                        && matches!(&qid[1], SExpr::Atom(a) if a == "re.loop")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "re.loop"))
+                        || (qid.len() == 3
+                            && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                            && matches!(&qid[1], SExpr::Atom(a) if a == "re.^"))
                     {
-                        // ((_ re.loop n m) r): r repeated between n and m times,
-                        // i.e. ⋃_{k=n}^{m} rᵏ.
+                        // ((_ re.loop n m) r): r repeated between n and m times.
+                        // ((_ re.^ n) r): exactly n times (n = m).
                         let lo: usize = Self::sym(&qid[2])?
                             .parse()
                             .map_err(|_| "re.loop: bad lower bound".to_string())?;
-                        let hi: usize = Self::sym(&qid[3])?
-                            .parse()
-                            .map_err(|_| "re.loop: bad upper bound".to_string())?;
+                        let hi: usize = if qid.len() == 4 {
+                            Self::sym(&qid[3])?
+                                .parse()
+                                .map_err(|_| "re.loop: bad upper bound".to_string())?
+                        } else {
+                            lo
+                        };
                         let rt = self.term(&l[1])?;
                         if let Some(r) = self.regex_of.get(&rt).cloned() {
                             let mut alts: Vec<Regex> = Vec::new();
@@ -7110,6 +7117,19 @@ mod tests {
             run("(assert (not (str.in_re \"ab\" \
                  (re.++ (re.comp (str.to_re \"x\")) (str.to_re \"b\")))))(check-sat)")
             .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn regex_power() {
+        // ((_ re.^ 3) a) matches exactly aaa.
+        assert_eq!(
+            run("(assert (str.in_re \"aaa\" ((_ re.^ 3) (str.to_re \"a\"))))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(assert (str.in_re \"aa\" ((_ re.^ 3) (str.to_re \"a\"))))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
