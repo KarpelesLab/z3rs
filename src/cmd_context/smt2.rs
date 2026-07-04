@@ -311,6 +311,42 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// A persistent SMT-LIB2 session. Unlike [`run`], declarations, assertions, the
+/// push/pop stack, and options carry across [`Session::eval`] calls, so a caller
+/// can drive the solver incrementally (the C API's solver object builds on it).
+pub struct Session {
+    ctx: Context,
+}
+
+impl Default for Session {
+    fn default() -> Session {
+        Session::new()
+    }
+}
+
+impl Session {
+    /// A fresh session with no declarations or assertions.
+    pub fn new() -> Session {
+        Session {
+            ctx: Context::new(),
+        }
+    }
+
+    /// Interpret more SMT-LIB2 `script` against the accumulated state, returning
+    /// one response line per command that produces output (e.g. `check-sat`,
+    /// `get-value`).
+    pub fn eval(&mut self, script: &str) -> Result<Vec<String>, String> {
+        let forms = parse(script)?;
+        let mut out = Vec::new();
+        for form in forms {
+            if let Some(resp) = self.ctx.command(&form)? {
+                out.push(resp);
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// Interpret an SMT-LIB 1.2 `(benchmark name :attr value …)`: declare its
 /// sorts/functions/predicates, assert the assumptions and formula, and return
 /// the single `check-sat` verdict. Quantifiers are out of scope.
@@ -3413,6 +3449,22 @@ mod tests {
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn session_is_incremental() {
+        let mut s = Session::new();
+        // State carries across eval calls, including the push/pop stack.
+        assert!(
+            s.eval("(declare-const n Int)(assert (> n 0))")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.eval("(push)(assert (< n 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]

@@ -28,6 +28,19 @@ int main(void) {
     assert(strstr(r3, "sat") != NULL && strstr(r3, "#x0f") != NULL);
     z3rs_string_free(r3);
 
+    /* Incremental session: state carries across eval calls, including push/pop. */
+    Z3rsSession *s = z3rs_mk_session();
+    z3rs_string_free(z3rs_session_eval(s, "(declare-const n Int)(assert (> n 0))"));
+    char *s1 = z3rs_session_eval(s, "(push)(assert (< n 0))(check-sat)");
+    printf("s1 = %s\n", s1);
+    assert(strcmp(s1, "unsat") == 0); /* n>0 and n<0 */
+    z3rs_string_free(s1);
+    char *s2 = z3rs_session_eval(s, "(pop)(check-sat)");
+    printf("s2 = %s\n", s2);
+    assert(strcmp(s2, "sat") == 0); /* just n>0 after pop */
+    z3rs_string_free(s2);
+    z3rs_del_session(s);
+
     puts("ffi_smoke: OK");
     return 0;
 }

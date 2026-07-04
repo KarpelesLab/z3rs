@@ -12,4 +12,4 @@
 
 pub mod smt2;
 
-pub use smt2::run as run_smt2;
+pub use smt2::{Session, run as run_smt2};
