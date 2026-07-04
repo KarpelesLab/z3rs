@@ -5724,8 +5724,10 @@ mod tests {
         // a deep arithmetic recursion stays a sound `unknown` rather than a parse
         // error, and must terminate (constant `ite`/arith fold on instantiation).
         assert_eq!(
-            run("(define-fun-rec f ((n Int)) Int (ite (<= n 0) 0 (f (- n 1))))\
-                 (assert (= (f 2) 0))(check-sat)")
+            run(
+                "(define-fun-rec f ((n Int)) Int (ite (<= n 0) 0 (f (- n 1))))\
+                 (assert (= (f 2) 0))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["unknown"]
         );
