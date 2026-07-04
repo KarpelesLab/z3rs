@@ -171,6 +171,22 @@ impl<'a> BitBlaster<'a> {
                     let zero = alloc::vec![!self.true_lit; width];
                     self.ripple_add(&na, &zero, self.true_lit)
                 }
+                BvOp::Concat => {
+                    // a (high) ++ b (low): low bits are b, high bits are a.
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    let mut bits = b;
+                    bits.extend(a);
+                    bits
+                }
+                BvOp::Extract => {
+                    let (high, low) = self
+                        .m
+                        .bv_extract_params(t)
+                        .expect("extract without indices");
+                    let a = self.blast_bv(args[0]);
+                    a[low as usize..=high as usize].to_vec()
+                }
                 // Unsupported bv operators become fresh (unconstrained) bits.
                 _ => (0..width).map(|_| self.fresh()).collect(),
             }

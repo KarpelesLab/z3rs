@@ -310,6 +310,15 @@ const CORPUS: &[Case] = &[
         name: "bv_bitwise_unsat",
         script: "(declare-const x (_ BitVec 4))(assert (not (= (bvand x #b0000) #b0000)))(check-sat)",
     },
+    Case {
+        name: "bv_concat_extract_identity",
+        script: "(declare-const x (_ BitVec 8))
+                 (assert (not (= (concat ((_ extract 7 4) x) ((_ extract 3 0) x)) x)))(check-sat)",
+    },
+    Case {
+        name: "bv_concat_literal",
+        script: "(assert (not (= (concat #x0f #xf0) #x0ff0)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

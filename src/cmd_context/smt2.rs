@@ -1036,6 +1036,19 @@ impl Context {
                         let value = self.term(&l[1])?;
                         return Ok(self.m.mk_const_array(array_sort, value));
                     }
+                    if qid.len() == 4
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "extract")
+                    {
+                        let high: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "extract: bad index".to_string())?;
+                        let low: u32 = Self::sym(&qid[3])?
+                            .parse()
+                            .map_err(|_| "extract: bad index".to_string())?;
+                        let x = self.term(&l[1])?;
+                        return Ok(self.m.mk_bv_extract(high, low, x));
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();
@@ -1305,6 +1318,7 @@ impl Context {
             "bvule" => Ok(m.mk_bvule(args[0], args[1])),
             "bvugt" => Ok(m.mk_bvult(args[1], args[0])), // a >u b  ⟺  b <u a
             "bvuge" => Ok(m.mk_bvule(args[1], args[0])), // a ≥u b  ⟺  b ≤u a
+            "concat" => Ok(m.mk_bv_concat(args[0], args[1])),
             name => {
                 let d = *self
                     .funcs
@@ -1956,6 +1970,22 @@ mod tests {
         assert_eq!(
             run("(assert (= (_ bv5 8) #x05))(check-sat)").unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn bitvector_concat_extract() {
+        // Splitting a byte and recombining gives it back.
+        let id = "
+            (declare-const x (_ BitVec 8))
+            (assert (not (= (concat ((_ extract 7 4) x) ((_ extract 3 0) x)) x)))
+            (check-sat)
+        ";
+        assert_eq!(run(id).unwrap(), alloc::vec!["unsat"]);
+        // concat literal.
+        assert_eq!(
+            run("(assert (not (= (concat #x0f #xf0) #x0ff0)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 

@@ -51,6 +51,10 @@ pub enum BvOp {
     BNot = 32,
     /// `bvxor` (bitwise XOR)
     BXor = 33,
+    /// `concat`
+    Concat = 37,
+    /// `(_ extract i j)`
+    Extract = 40,
 }
 
 impl BvOp {
@@ -208,6 +212,41 @@ impl AstManager {
         self.mk_bv_binop("bvxor", BvOp::BXor, flags, a, b)
     }
 
+    /// `(concat a b)` — `a` in the high bits, `b` in the low bits; the result
+    /// width is the sum of the operand widths.
+    pub fn mk_bv_concat(&mut self, a: AstId, b: AstId) -> AstId {
+        let wa = self.bv_sort_width(self.get_sort(a)).expect("concat: a not bv");
+        let wb = self.bv_sort_width(self.get_sort(b)).expect("concat: b not bv");
+        let sa = self.get_sort(a);
+        let sb = self.get_sort(b);
+        let range = self.mk_bv_sort(wa + wb);
+        self.mk_bv_app(
+            "concat",
+            BvOp::Concat,
+            &[sa, sb],
+            range,
+            FuncDeclFlags::default(),
+            &[a, b],
+        )
+    }
+
+    /// `((_ extract high low) x)` — bits `[low, high]` of `x` (inclusive), a
+    /// bit-vector of width `high - low + 1`.
+    pub fn mk_bv_extract(&mut self, high: u32, low: u32, x: AstId) -> AstId {
+        assert!(high >= low, "extract: high < low");
+        let sx = self.get_sort(x);
+        let range = self.mk_bv_sort(high - low + 1);
+        let fid = self.bv_fid();
+        let info = DeclInfo::new(
+            fid,
+            BvOp::Extract as DeclKind,
+            vec![Parameter::Int(high as i32), Parameter::Int(low as i32)],
+        );
+        let decl =
+            self.mk_func_decl_full(Symbol::new("extract"), &[sx], range, info, FuncDeclFlags::default());
+        self.mk_app(decl, &[x])
+    }
+
     /// `(bvnot a)` — bitwise NOT.
     pub fn mk_bvnot(&mut self, a: AstId) -> AstId {
         let sort = self.get_sort(a);
@@ -297,9 +336,22 @@ impl AstManager {
             BvOp::BOr,
             BvOp::BNot,
             BvOp::BXor,
+            BvOp::Concat,
+            BvOp::Extract,
         ]
         .into_iter()
         .find(|op| *op as DeclKind == k)
+    }
+
+    /// The `(high, low)` indices of an `(_ extract high low)` application.
+    pub fn bv_extract_params(&self, id: AstId) -> Option<(u32, u32)> {
+        if self.bv_op(id)? != BvOp::Extract {
+            return None;
+        }
+        let d = self.func_decl(self.app(id)?.decl)?;
+        let high = d.info.parameters.first()?.get_int()? as u32;
+        let low = d.info.parameters.get(1)?.get_int()? as u32;
+        Some((high, low))
     }
 }
 
