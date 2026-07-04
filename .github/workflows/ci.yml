@@ -109,7 +109,8 @@ jobs:
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
 
-# Not yet ported from puremp's CI (will return as the matching phases land):
-#   * fuzz.yml            — needs cargo-fuzz targets (add with the numeral/parser fuzzers)
-#   * release-plz.yml     — crates.io publishing (premature for a 0.0.x scaffold)
-#   * release-binaries.yml — needs the C ABI (Phase 9) and a stable CLI (Phase 8)
+# Sibling workflows (matching puremp's CI):
+#   * fuzz.yml             — weekly cargo-fuzz over the SMT-LIB / DIMACS parsers
+#   * release-plz.yml      — crates.io publishing + GitHub releases
+#   * release-binaries.yml — cross-built `z3rs` CLI attached to each release
+#                            (the C library will be added once the C ABI lands, Phase 9)

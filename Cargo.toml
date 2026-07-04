@@ -1,3 +1,10 @@
+# The `fuzz/` crate is a separate workspace (it pulls in libfuzzer-sys and
+# arbitrary, which are third-party). Excluding it here keeps them out of z3rs's
+# own resolved dependency tree, so the no-third-party-deps guarantee (and
+# tests/no_external_deps.rs) is unaffected.
+[workspace]
+exclude = ["fuzz"]
+
 [package]
 name = "z3rs"
 version = "0.0.1"

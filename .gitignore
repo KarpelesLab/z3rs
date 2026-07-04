@@ -1,3 +1,9 @@
 .*.swp
 /z3/
 /target/
+
+# cargo-fuzz
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+fuzz/Cargo.lock

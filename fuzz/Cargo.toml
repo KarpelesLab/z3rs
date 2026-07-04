@@ -1,0 +1,29 @@
+# A standalone workspace (excluded from z3rs's, see the root Cargo.toml) so the
+# fuzz-only third-party deps (libfuzzer-sys, arbitrary) never enter z3rs's own
+# dependency tree. Run with the weekly Fuzz workflow or `cargo +nightly fuzz run`.
+[package]
+name = "z3rs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+z3rs = { path = ".." }
+
+[[bin]]
+name = "smt2_run"
+path = "fuzz_targets/smt2_run.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dimacs_parse"
+path = "fuzz_targets/dimacs_parse.rs"
+test = false
+doc = false
+bench = false
