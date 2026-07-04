@@ -30,8 +30,8 @@ use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::rewriter::substitute;
 use crate::smt::{
-    Model, OptOutcome, SmtResult, Value, arith_optimize, ast_to_lin, check_bv_model, check_model,
-    linear_constraints,
+    Constraint, Model, OptOutcome, Rel, SmtResult, Value, arith_optimize, ast_to_lin,
+    check_bv_model, check_model, linear_constraints, project,
 };
 
 /// The result of optimizing a real-valued objective.
@@ -1210,6 +1210,10 @@ impl Context {
                     if kind == "exists" {
                         // ∃x. P(x) is equisatisfiable with P(k) for fresh k.
                         self.assertions.push(body);
+                        self.assert_names.push(None);
+                    } else if let Some(qf) = self.qe_forall(&vars, body) {
+                        // Real linear ∀ eliminated to a quantifier-free formula.
+                        self.assertions.push(qf);
                         self.assert_names.push(None);
                     } else {
                         self.universals.push((vars, body));
@@ -2629,6 +2633,200 @@ impl Context {
         }
         out.push_str("\n)");
         out
+    }
+
+    /// Quantifier elimination for a top-level `∀ vars. body` over **real**
+    /// linear arithmetic: `∀x.φ ≡ ¬∃x.¬φ`; the DNF of `¬φ` is projected
+    /// variable-by-variable (Fourier–Motzkin, exact for the reals), and the
+    /// result is rebuilt as a quantifier-free formula. `None` if the body is not
+    /// purely linear or a projection exceeds budget (→ fall back to instantiation).
+    fn qe_forall(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
+        if !vars.iter().all(|&v| {
+            let s = self.m.get_sort(v);
+            self.m.is_arith_sort(s) && !self.m.is_int_sort(s) // FM is exact only for reals
+        }) {
+            return None;
+        }
+        // DNF of ¬body: a disjunction of cubes (conjunctions of constraints).
+        let cubes = self.body_dnf(body, false)?;
+        let mut budget: u64 = 100_000;
+        // Project every bound variable out of each cube, then rebuild ∃x.¬body.
+        let mut disjuncts: Vec<AstId> = Vec::new();
+        for mut cube in cubes {
+            for &v in vars {
+                cube = project(&cube, v, &mut budget)?;
+            }
+            let atoms: Vec<AstId> = cube.iter().map(|c| self.constraint_atom(c)).collect();
+            disjuncts.push(match atoms.len() {
+                0 => self.m.mk_true(),
+                1 => atoms[0],
+                _ => self.m.mk_and(&atoms),
+            });
+        }
+        let exists_neg = match disjuncts.len() {
+            0 => self.m.mk_false(),
+            1 => disjuncts[0],
+            _ => self.m.mk_or(&disjuncts),
+        };
+        Some(self.m.mk_not(exists_neg)) // ¬∃x.¬body
+    }
+
+    /// The DNF of `term` (or its negation when `positive` is false) as a list of
+    /// cubes, each a conjunction of linear [`Constraint`]s. `None` if `term` is
+    /// not built from `and`/`or`/`not`/`=>`/`ite`-free linear (in)equalities.
+    fn body_dnf(&self, term: AstId, positive: bool) -> Option<Vec<Vec<Constraint>>> {
+        let m = &self.m;
+        if m.is_true(term) {
+            return Some(if positive {
+                alloc::vec![Vec::new()]
+            } else {
+                Vec::new()
+            });
+        }
+        if m.is_false(term) {
+            return Some(if positive {
+                Vec::new()
+            } else {
+                alloc::vec![Vec::new()]
+            });
+        }
+        if m.is_not(term) {
+            return self.body_dnf(m.app_args(term)[0], !positive);
+        }
+        // (and …) positive = ⋀; negative = ⋁ of negations (De Morgan). `or` dual.
+        let is_and = m.is_and(term);
+        let is_or = m.is_or(term);
+        if is_and || is_or {
+            let args = m.app_args(term).to_vec();
+            // Conjunctive if (and,positive) or (or,negative); else disjunctive.
+            let conjunctive = is_and == positive;
+            let mut acc: Vec<Vec<Constraint>> = alloc::vec![Vec::new()];
+            let mut disj: Vec<Vec<Constraint>> = Vec::new();
+            for a in args {
+                let sub = self.body_dnf(a, positive)?;
+                if conjunctive {
+                    // Cross product acc × sub.
+                    let mut next = Vec::new();
+                    for c1 in &acc {
+                        for c2 in &sub {
+                            let mut c = c1.clone();
+                            c.extend(c2.clone());
+                            next.push(c);
+                            if next.len() > 256 {
+                                return None; // DNF blow-up guard
+                            }
+                        }
+                    }
+                    acc = next;
+                } else {
+                    disj.extend(sub);
+                    if disj.len() > 256 {
+                        return None;
+                    }
+                }
+            }
+            return Some(if conjunctive { acc } else { disj });
+        }
+        if m.is_implies(term) {
+            // (=> a b) ≡ (or (not a) b).
+            let args = m.app_args(term).to_vec();
+            let (na, b) = (
+                self.body_dnf(args[0], !positive)?,
+                self.body_dnf(args[1], positive)?,
+            );
+            if positive {
+                // positive (=> a b): disjunctive → union.
+                let mut out = na;
+                out.extend(b);
+                return Some(out);
+            }
+            // negative (=> a b) = a ∧ ¬b: conjunctive cross product.
+            let a = self.body_dnf(args[0], true)?;
+            let nb = self.body_dnf(args[1], false)?;
+            let mut out = Vec::new();
+            for c1 in &a {
+                for c2 in &nb {
+                    let mut c = c1.clone();
+                    c.extend(c2.clone());
+                    out.push(c);
+                }
+            }
+            return Some(out);
+        }
+        // A linear atom.
+        self.atom_dnf(term, positive)
+    }
+
+    /// The DNF cubes of a single linear atom under the given polarity.
+    fn atom_dnf(&self, atom: AstId, positive: bool) -> Option<Vec<Vec<Constraint>>> {
+        let m = &self.m;
+        let (a, b, op) = if m.is_eq(atom) {
+            let args = m.app_args(atom);
+            if !m.is_arith_sort(m.get_sort(args[0])) {
+                return None;
+            }
+            (args[0], args[1], "=")
+        } else if let Some(o) = m.arith_op(atom) {
+            let args = m.app_args(atom);
+            let s = match o {
+                ArithOp::Le => "<=",
+                ArithOp::Lt => "<",
+                ArithOp::Ge => ">=",
+                ArithOp::Gt => ">",
+                _ => return None,
+            };
+            (args[0], args[1], s)
+        } else {
+            return None;
+        };
+        let diff = ast_to_lin(m, a).sub(&ast_to_lin(m, b)); // a - b
+        // Build the constraint(s) for `op` (positive) or its negation.
+        let le = |e: crate::smt::LinExpr| alloc::vec![alloc::vec![Constraint::le(e)]];
+        let lt = |e: crate::smt::LinExpr| alloc::vec![alloc::vec![Constraint::lt(e)]];
+        Some(match (op, positive) {
+            ("<=", true) | (">=", false) => le(diff),      // a ≤ b
+            ("<=", false) | (">", true) => lt(diff.neg()), // a > b  ⟺ b < a
+            ("<", true) | (">", false) => lt(diff),        // a < b
+            ("<", false) | (">=", true) => le(diff.neg()), // a ≥ b
+            ("=", true) => alloc::vec![alloc::vec![Constraint::eq(diff)]],
+            ("=", false) => alloc::vec![
+                alloc::vec![Constraint::lt(diff.clone())], // a < b
+                alloc::vec![Constraint::lt(diff.neg())],   // a > b
+            ],
+            _ => return None,
+        })
+    }
+
+    /// Rebuild the AST atom `expr ⋈ 0` from a linear [`Constraint`] (over reals).
+    fn constraint_atom(&mut self, c: &Constraint) -> AstId {
+        let t = self.lin_to_term(&c.expr);
+        let zero = self.m.mk_numeral(rat(0), false);
+        match c.rel {
+            Rel::Le => self.m.mk_le(t, zero),
+            Rel::Lt => self.m.mk_lt(t, zero),
+            Rel::Eq => self.m.mk_eq(t, zero),
+        }
+    }
+
+    /// Build the real-sorted AST term of a linear expression.
+    fn lin_to_term(&mut self, e: &crate::smt::LinExpr) -> AstId {
+        let mut parts: Vec<AstId> = Vec::new();
+        for (v, coeff) in e.terms() {
+            if coeff == &rat(1) {
+                parts.push(v);
+            } else {
+                let k = self.m.mk_numeral(coeff.clone(), false);
+                parts.push(self.m.mk_mul(&[k, v]));
+            }
+        }
+        let c = e.const_term().clone();
+        if !c.is_zero() || parts.is_empty() {
+            parts.push(self.m.mk_numeral(c, false));
+        }
+        match parts.len() {
+            1 => parts[0],
+            _ => self.m.mk_add(&parts),
+        }
     }
 
     /// Parse a quantifier's binder list `((x S) …)` and body into fresh
@@ -4902,6 +5100,31 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((x #x0f))");
+    }
+
+    #[test]
+    fn quantifier_elimination_real_lra() {
+        // ∀x∈[0,1]. x ≤ a  ⟺  a ≥ 1; contradicts a < 1.
+        assert_eq!(
+            run("(declare-const a Real)\
+                 (assert (forall ((x Real)) (=> (and (<= 0.0 x) (<= x 1.0)) (<= x a))))\
+                 (assert (< a 1.0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // …satisfiable when a is large enough.
+        assert_eq!(
+            run("(declare-const a Real)\
+                 (assert (forall ((x Real)) (=> (and (<= 0.0 x) (<= x 1.0)) (<= x a))))\
+                 (assert (>= a 5.0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // ∀x. x < 0 is false.
+        assert_eq!(
+            run("(assert (forall ((x Real)) (< x 0.0)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]

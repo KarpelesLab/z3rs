@@ -111,6 +111,16 @@ impl LinExpr {
         self.coeffs.keys().copied()
     }
 
+    /// The `(variable, coefficient)` terms.
+    pub fn terms(&self) -> impl Iterator<Item = (AstId, &Rational)> + '_ {
+        self.coeffs.iter().map(|(&v, c)| (v, c))
+    }
+
+    /// The constant term.
+    pub fn const_term(&self) -> &Rational {
+        &self.constant
+    }
+
     /// Assuming every variable ranges over the integers, is the equation
     /// `self = 0` unsatisfiable? A linear Diophantine equation `Σ aᵢ·xᵢ = -b`
     /// (integer coefficients) has a solution iff `gcd(aᵢ)` divides `b`. Clearing
@@ -430,6 +440,54 @@ pub fn model_budgeted(constraints: &[Constraint], budget: &mut u64) -> SolveOutc
         assign.insert(v, pick_between(lo, hi));
     }
     SolveOutcome::Sat(assign)
+}
+
+/// Project the variable `x` out of a conjunction of linear `constraints` by
+/// Fourier–Motzkin elimination, returning the equivalent `x`-free conjunction
+/// (`∃x. ⋀ constraints`). `None` if the FM resolution exceeds `budget`.
+pub fn project(constraints: &[Constraint], x: AstId, budget: &mut u64) -> Option<Vec<Constraint>> {
+    let ineqs: Vec<Ineq> = constraints.iter().flat_map(|c| c.to_ineqs()).collect();
+    let mut upper = Vec::new(); // coeff(x) > 0
+    let mut lower = Vec::new(); // coeff(x) < 0
+    let mut rest = Vec::new(); // x-free
+    for i in ineqs {
+        let c = i.expr.coeff(x);
+        if c.is_zero() {
+            rest.push(i);
+        } else if c > zero() {
+            upper.push(i);
+        } else {
+            lower.push(i);
+        }
+    }
+    for u in &upper {
+        let au = u.expr.coeff(x);
+        for l in &lower {
+            if *budget == 0 {
+                return None;
+            }
+            *budget -= 1;
+            let al = l.expr.coeff(x);
+            // resolvent = (-al)·U + (au)·L, cancelling x, keeping strictness.
+            let mut e = u.expr.scale(&al.neg());
+            e.add_scaled(&l.expr, &au);
+            rest.push(Ineq {
+                expr: e,
+                strict: u.strict || l.strict,
+            });
+        }
+    }
+    Some(
+        rest.into_iter()
+            .map(|i| {
+                if i.strict {
+                    Constraint::lt(i.expr)
+                } else {
+                    Constraint::le(i.expr)
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The result of optimizing a linear objective over a feasible constraint set.
