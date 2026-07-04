@@ -4120,6 +4120,44 @@ impl Context {
         axioms
     }
 
+    /// Euclidean linking axioms for `div`/`mod` by a constant: for each such
+    /// term over dividend `a` and constant divisor `n≠0`, assert
+    /// `a = n·(a div n) + (a mod n)` and `0 ≤ (a mod n) < |n|`. This ties the
+    /// otherwise-opaque `div`/`mod` variables to `a`, so e.g. `x mod 2 = 0 ∧
+    /// (x+1) mod 2 = 0` is refuted.
+    fn divmod_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let mut targets: Vec<(AstId, Int)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if matches!(self.m.arith_op(t), Some(ArithOp::Mod | ArithOp::Idiv)) {
+                let args = self.m.app_args(t);
+                if let Some(n) = self.m.as_numeral(args[1]).and_then(|r| r.to_integer())
+                    && !n.is_zero()
+                {
+                    targets.push((args[0], n));
+                }
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        if targets.len() > 12 {
+            targets.truncate(12);
+        }
+        let mut axioms = Vec::new();
+        for (a, n) in targets {
+            let n_num = self.m.mk_numeral(Rational::from_integer(n.clone()), true);
+            let divt = self.m.mk_idiv(a, n_num);
+            let modt = self.m.mk_mod(a, n_num);
+            let prod = self.m.mk_mul(&[n_num, divt]);
+            let sum = self.m.mk_add(&[prod, modt]);
+            axioms.push(self.m.mk_eq(a, sum)); // a = n·div + mod
+            let zero = self.m.mk_int(0);
+            axioms.push(self.m.mk_ge(modt, zero)); // 0 ≤ mod
+            let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
+            axioms.push(self.m.mk_lt(modt, abs_n)); // mod < |n|
+        }
+        axioms
+    }
+
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
@@ -4127,6 +4165,7 @@ impl Context {
         axioms.extend(self.datatype_axioms(lifted));
         axioms.extend(self.string_axioms(lifted));
         axioms.extend(self.square_axioms(lifted));
+        axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -5922,6 +5961,32 @@ mod tests {
             run("(declare-const x Real)(assert (not (is_int x)))(assert (= (* 2 x) 3))(check-sat)")
                 .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn divmod_linking() {
+        // mod is in range and consistent with div.
+        assert_eq!(
+            run("(declare-const x Int)(assert (>= (mod x 5) 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(
+                "(declare-const x Int)(assert (= (mod x 4) 1))(assert (= (div x 4) 2))\
+                 (assert (not (= x 9)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Common multiple: nothing in (0,6) is divisible by both 2 and 3.
+        assert_eq!(
+            run(
+                "(declare-const x Int)(assert (= (mod x 2) 0))(assert (= (mod x 3) 0))\
+                 (assert (> x 0))(assert (< x 6))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
