@@ -561,6 +561,10 @@ struct Context {
     /// Enumeration datatypes: sort → its constructor constants. Reasoned about
     /// as a finite uninterpreted sort with distinct elements and a domain axiom.
     enums: BTreeMap<AstId, Vec<AstId>>,
+    /// Record/tuple datatypes (a single constructor with fields): sort →
+    /// `(constructor decl, selector decls)`. Reasoned about with the
+    /// selector-over-constructor and constructor-surjectivity (eta) axioms.
+    records: BTreeMap<AstId, (AstId, Vec<AstId>)>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -592,6 +596,7 @@ impl Context {
             fresh_counter: 0,
             quant_atoms: BTreeSet::new(),
             enums: BTreeMap::new(),
+            records: BTreeMap::new(),
             universals: Vec::new(),
         }
     }
@@ -962,24 +967,58 @@ impl Context {
             let sort = self.m.mk_uninterpreted_sort(Symbol::new(&name));
             self.sorts.insert(name.clone(), sort);
             self.sort_order.push(name);
-            let mut ctor_ids = Vec::new();
+            // Parse each constructor into (name, [(field name, field sort sexpr)]).
+            let mut parsed: Vec<(String, Vec<(String, SExpr)>)> = Vec::new();
             for c in ctors {
-                let cname = match c {
-                    SExpr::Atom(a) => a.clone(),
-                    SExpr::List(cl) if cl.len() == 1 => Self::sym(&cl[0])?.to_string(),
-                    _ => {
-                        return Err("declare-datatypes: only enumeration datatypes \
-                                    (nullary constructors) are supported"
-                            .to_string());
+                match c {
+                    SExpr::Atom(a) => parsed.push((a.clone(), Vec::new())),
+                    SExpr::List(cl) if !cl.is_empty() => {
+                        let cname = Self::sym(&cl[0])?.to_string();
+                        let mut fields = Vec::new();
+                        for f in &cl[1..] {
+                            let fl = as_list(f)?;
+                            fields.push((Self::sym(&fl[0])?.to_string(), fl[1].clone()));
+                        }
+                        parsed.push((cname, fields));
                     }
-                };
-                let d = self.m.mk_func_decl(Symbol::new(&cname), &[], sort);
-                let cid = self.m.mk_const(d);
-                self.funcs.insert(cname.clone(), d);
-                self.decl_order.push(cname);
-                ctor_ids.push(cid);
+                    _ => return Err("declare-datatypes: malformed constructor".to_string()),
+                }
             }
-            self.enums.insert(sort, ctor_ids);
+            let all_nullary = parsed.iter().all(|(_, f)| f.is_empty());
+            if all_nullary {
+                // Enumeration: distinct constants, domain axiom.
+                let mut ctor_ids = Vec::new();
+                for (cname, _) in &parsed {
+                    let d = self.m.mk_func_decl(Symbol::new(cname), &[], sort);
+                    let cid = self.m.mk_const(d);
+                    self.funcs.insert(cname.clone(), d);
+                    self.decl_order.push(cname.clone());
+                    ctor_ids.push(cid);
+                }
+                self.enums.insert(sort, ctor_ids);
+            } else if parsed.len() == 1 {
+                // Record/tuple: one constructor with fields, plus selectors.
+                let (cname, fields) = &parsed[0];
+                let field_sorts: Vec<AstId> = fields
+                    .iter()
+                    .map(|(_, s)| self.resolve_sort(s))
+                    .collect::<Result<_, _>>()?;
+                let cdecl = self.m.mk_func_decl(Symbol::new(cname), &field_sorts, sort);
+                self.funcs.insert(cname.clone(), cdecl);
+                self.decl_order.push(cname.clone());
+                let mut sel_decls = Vec::new();
+                for ((fname, _), &fsort) in fields.iter().zip(&field_sorts) {
+                    let sdecl = self.m.mk_func_decl(Symbol::new(fname), &[sort], fsort);
+                    self.funcs.insert(fname.clone(), sdecl);
+                    self.decl_order.push(fname.clone());
+                    sel_decls.push(sdecl);
+                }
+                self.records.insert(sort, (cdecl, sel_decls));
+            } else {
+                return Err("declare-datatypes: multi-constructor datatypes with \
+                            fields are not supported yet"
+                    .to_string());
+            }
         }
         Ok(())
     }
@@ -996,6 +1035,44 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Axioms for record/tuple datatypes mentioned in `goal`: selector-over-
+    /// constructor (`selᵢ(C(a₁,…,aₙ)) = aᵢ` for each constructor application) and
+    /// constructor surjectivity (`t = C(sel₁(t),…,selₙ(t))` for each record term,
+    /// sound because the single constructor is total).
+    fn record_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.records.is_empty() {
+            return Vec::new();
+        }
+        let terms = self.m.postorder(goal);
+        let mut ax = Vec::new();
+        for &t in &terms {
+            let s = self.m.get_sort(t);
+            if let Some((cdecl, selectors)) = self.records.get(&s).cloned() {
+                // Surjectivity: t = C(sel₁(t), …, selₙ(t)).
+                let sels: Vec<AstId> = selectors
+                    .iter()
+                    .map(|&sd| self.m.mk_app(sd, &[t]))
+                    .collect();
+                let ct = self.m.mk_app(cdecl, &sels);
+                ax.push(self.m.mk_eq(t, ct));
+            }
+            // Selector-over-constructor for a constructor application.
+            if self.m.is_app(t) {
+                let decl = self.m.app_decl(t);
+                if let Some((_, selectors)) =
+                    self.records.values().find(|(cd, _)| *cd == decl).cloned()
+                {
+                    let args = self.m.app_args(t).to_vec();
+                    for (k, &sd) in selectors.iter().enumerate() {
+                        let sel_app = self.m.mk_app(sd, &[t]);
+                        ax.push(self.m.mk_eq(sel_app, args[k]));
+                    }
+                }
+            }
+        }
+        ax
     }
 
     /// Axioms for the declared enumeration datatypes: the constructors of each
@@ -1173,6 +1250,7 @@ impl Context {
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
+        axioms.extend(self.record_axioms(lifted));
         if axioms.is_empty() {
             lifted
         } else {
@@ -1578,10 +1656,14 @@ impl Context {
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "is")
                     {
-                        // ((_ is C) x) — the enum tester: x = C.
+                        // ((_ is C) x) — the datatype tester.
                         let cname = Self::sym(&qid[2])?.to_string();
-                        let c = self.term(&SExpr::Atom(cname))?;
                         let x = self.term(&l[1])?;
+                        // A record has a single constructor, so its tester is true.
+                        if self.records.contains_key(&self.m.get_sort(x)) {
+                            return Ok(self.m.mk_true());
+                        }
+                        let c = self.term(&SExpr::Atom(cname))?;
                         return Ok(self.m.mk_eq(x, c));
                     }
                     if qid.len() == 3
@@ -2639,6 +2721,37 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn record_datatypes_decide() {
+        let p = "(declare-datatypes ((Pair 0)) (((mk-pair (fst Int) (snd Int)))))";
+        // Selector-over-constructor (projection).
+        assert_eq!(
+            run(&alloc::format!(
+                "{p}(assert (not (= (fst (mk-pair 3 4)) 3)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Constructor injectivity.
+        assert_eq!(
+            run(&alloc::format!(
+                "{p}(declare-const a Int)(declare-const b Int)\
+                 (assert (= (mk-pair a 1) (mk-pair 2 b)))\
+                 (assert (not (and (= a 2) (= b 1))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Surjectivity (eta): every Pair is its own (fst, snd).
+        assert_eq!(
+            run(&alloc::format!(
+                "{p}(declare-const q Pair)(assert (not (= q (mk-pair (fst q) (snd q)))))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
