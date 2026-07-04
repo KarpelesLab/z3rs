@@ -2360,6 +2360,40 @@ impl Context {
             let (ta, tb) = (self.term(&pa[0])?, self.term(&pb[0])?);
             return Ok(Some(self.m.mk_eq(ta, tb)));
         }
+        // Boundary characters: the first (last) character of each side is
+        // determinable up to the first variable from that end. If both sides
+        // have a known first (or last) character and they differ, the two
+        // concatenations cannot be equal.
+        let first_char = |parts: &[SExpr]| -> Option<u32> {
+            for p in parts {
+                match lit(p) {
+                    Some(l) if !l.is_empty() => return Some(l[0]),
+                    Some(_) => continue, // empty literal: look further
+                    None => return None, // variable: first char unknown
+                }
+            }
+            None
+        };
+        let last_char = |parts: &[SExpr]| -> Option<u32> {
+            for p in parts.iter().rev() {
+                match lit(p) {
+                    Some(l) if !l.is_empty() => return Some(*l.last().unwrap()),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+            None
+        };
+        if let (Some(fa), Some(fb)) = (first_char(pa), first_char(pb))
+            && fa != fb
+        {
+            return Ok(Some(self.m.mk_false()));
+        }
+        if let (Some(la), Some(lb)) = (last_char(pa), last_char(pb))
+            && la != lb
+        {
+            return Ok(Some(self.m.mk_false()));
+        }
         // General concat = concat with variables on both sides: gate to unknown.
         Ok(None)
     }
@@ -6647,6 +6681,24 @@ mod tests {
                 "script: {script}"
             );
         }
+    }
+
+    #[test]
+    fn concat_boundary_char_mismatch() {
+        // Differing determinable last characters make the equation unsat.
+        assert_eq!(
+            run("(declare-const x String)(declare-const y String)\
+                 (assert (= (str.++ x \"a\") (str.++ y \"b\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Differing first characters, likewise.
+        assert_eq!(
+            run("(declare-const x String)(declare-const y String)\
+                 (assert (= (str.++ \"a\" x) (str.++ \"b\" y)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
