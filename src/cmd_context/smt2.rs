@@ -4197,6 +4197,38 @@ impl Context {
                             _ => Ok(self.bv_rotate(k, x, false)),
                         };
                     }
+                    if qid.len() == 4
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "re.loop")
+                    {
+                        // ((_ re.loop n m) r): r repeated between n and m times,
+                        // i.e. ⋃_{k=n}^{m} rᵏ.
+                        let lo: usize = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "re.loop: bad lower bound".to_string())?;
+                        let hi: usize = Self::sym(&qid[3])?
+                            .parse()
+                            .map_err(|_| "re.loop: bad upper bound".to_string())?;
+                        let rt = self.term(&l[1])?;
+                        if let Some(r) = self.regex_of.get(&rt).cloned() {
+                            let mut alts: Vec<Regex> = Vec::new();
+                            for k in lo..=hi.max(lo) {
+                                let mut acc = Regex::Lit(Vec::new());
+                                for _ in 0..k {
+                                    acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                                }
+                                alts.push(acc);
+                            }
+                            let looped =
+                                fold_regex(alts, |a, b| Regex::Union(Box::new(a), Box::new(b)));
+                            let sort = self.reglan_sort();
+                            let t = self.fresh_const(sort);
+                            self.regex_of.insert(t, looped);
+                            return Ok(t);
+                        }
+                        let sort = self.reglan_sort();
+                        return Ok(self.fresh_const(sort));
+                    }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "divisible")
@@ -6168,6 +6200,24 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn regex_loop() {
+        // ((_ re.loop 3 5) a) matches a³…a⁵. "aa" is out (unsat), "aaaa" is in.
+        assert_eq!(
+            run("(assert (str.in_re \"aa\" ((_ re.loop 3 5) (str.to_re \"a\"))))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(
+                "(assert (str.in_re \"aaa\" ((_ re.loop 3 5) (str.to_re \"a\"))))\
+                 (assert (not (str.in_re \"aa\" ((_ re.loop 3 5) (str.to_re \"a\")))))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
