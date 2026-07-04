@@ -562,7 +562,12 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     if let Some(a) = dioph_witness(&cons, &sys.diseqs, &int_vars) {
         return Feas::Sat(a);
     }
-    let feas = integer_feasible(&cons, &sys.diseqs, &int_vars, budget, 0);
+    // Branch-and-bound runs on a *copy* of the budget: on an unbounded system it
+    // can otherwise drain the shared budget the Nelson–Oppen interface phase
+    // needs, turning an Omega-decided `sat` into a spurious `unknown`. Per-call
+    // and per-round bounds still guarantee termination.
+    let mut bb_budget = *budget;
+    let feas = integer_feasible(&cons, &sys.diseqs, &int_vars, &mut bb_budget, 0);
     // Omega-style last resort when B&B gave up on a pure-integer system:
     // eliminate every variable by Fourier–Motzkin, GCD-tightening the residual
     // constraints after each step. Because tightening preserves the integer
@@ -607,27 +612,88 @@ fn omega_dark_witness(
 ) -> Option<Assignment> {
     let zero = Rational::from_integer(Int::from(0));
     let one = Rational::from_integer(Int::from(1));
+    let neg_one = one.neg();
+    let int_set: BTreeSet<AstId> = int_vars.iter().copied().collect();
     let coeff = |e: &LinExpr, x: AstId| -> Rational {
         e.terms()
             .find(|(v, _)| *v == x)
             .map(|(_, c)| c.clone())
             .unwrap_or_else(|| zero.clone())
     };
-    // Normalize to a list of `e ≤ 0` expressions.
-    let mut work: Vec<LinExpr> = Vec::new();
-    for c in cons {
-        match c.rel {
-            Rel::Le => work.push(c.expr.clone()),
-            Rel::Lt => work.push(c.expr.integer_strict_tighten()),
-            Rel::Eq => {
-                work.push(c.expr.clone());
-                work.push(c.expr.neg());
+    // Eliminate equalities FIRST by substitution: a unit-coefficient integer
+    // variable, or a lone variable `a·x + k = 0` when `a | k`. The dark shadow's
+    // interval widening is valid only for genuine inequalities, so equalities
+    // must be removed first (else e.g. `2b = 6` yields a spurious `1 ≤ 0`). Bail
+    // (a sound missed `sat`) on any equality this cannot eliminate.
+    let mut eqs: Vec<LinExpr> = cons
+        .iter()
+        .filter(|c| c.rel == Rel::Eq)
+        .map(|c| c.expr.clone())
+        .collect();
+    let mut work: Vec<LinExpr> = cons
+        .iter()
+        .filter(|c| c.rel != Rel::Eq)
+        .map(|c| match c.rel {
+            Rel::Lt => c.expr.integer_strict_tighten(),
+            _ => c.expr.clone(),
+        })
+        .collect();
+    let mut eq_subs: Vec<(AstId, LinExpr)> = Vec::new();
+    let mut eliminated: BTreeSet<AstId> = BTreeSet::new();
+    'elim: loop {
+        for i in 0..eqs.len() {
+            // Choose how to solve equation `i` for one of its variables:
+            // a ±1-coefficient variable, or a lone variable `a·x + k = 0` with
+            // integral `x = −k/a`. Compute `(v, v_expr)` before mutating `eqs`.
+            let choice: Option<(AstId, LinExpr)> = {
+                let e = &eqs[i];
+                if let Some((v, cv)) = e
+                    .terms()
+                    .find(|(v, c)| int_set.contains(v) && (**c == one || **c == neg_one))
+                    .map(|(v, c)| (v, c.clone()))
+                {
+                    let rest = e.sub(&LinExpr::var(v).scale(&cv));
+                    Some((v, rest.scale(&cv.neg().recip())))
+                } else if e.vars().count() == 1 {
+                    let (v, a) = e.terms().next().map(|(v, c)| (v, c.clone())).unwrap();
+                    let xval = &e.const_term().neg() / &a;
+                    (int_set.contains(&v) && xval.is_integer())
+                        .then(|| (v, LinExpr::constant(xval)))
+                } else {
+                    None
+                }
+            };
+            if let Some((v, v_expr)) = choice {
+                eqs.remove(i);
+                for eq in &mut eqs {
+                    *eq = substitute_lin(eq, v, &v_expr);
+                }
+                for e in &mut work {
+                    *e = substitute_lin(e, v, &v_expr);
+                }
+                for (_, se) in &mut eq_subs {
+                    *se = substitute_lin(se, v, &v_expr);
+                }
+                eliminated.insert(v);
+                eq_subs.push((v, v_expr));
+                continue 'elim;
             }
         }
+        break;
     }
-    // Eliminate each variable, recording its lower/upper bounds for back-substitution.
+    // Any equality left must be the trivial `0 = 0`; otherwise we cannot decide.
+    for e in &eqs {
+        if e.as_constant() != Some(zero.clone()) {
+            return None;
+        }
+    }
+    // Eliminate each remaining (non-equality-bound) variable by the dark shadow,
+    // recording its lower/upper bounds for back-substitution.
     let mut steps: Vec<(AstId, Vec<LinExpr>, Vec<LinExpr>)> = Vec::new();
     for &x in int_vars {
+        if eliminated.contains(&x) {
+            continue;
+        }
         let (mut lower, mut upper, mut rest) = (Vec::new(), Vec::new(), Vec::new());
         for e in &work {
             let c = coeff(e, x);
@@ -697,6 +763,12 @@ fn omega_dark_witness(
         }
         let x_val = lo.or(hi).unwrap_or_else(|| zero.clone());
         a.insert(*x, x_val);
+    }
+    // Assign the equality-eliminated variables from their substitutions (each is
+    // now in terms of the dark-shadow-assigned variables).
+    for (v, v_expr) in eq_subs.iter().rev() {
+        let val = v_expr.eval(&a);
+        a.insert(*v, val);
     }
     // Safety net: accept only a genuinely satisfying assignment.
     let ok = cons.iter().all(|c| {

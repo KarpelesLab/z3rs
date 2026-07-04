@@ -6360,6 +6360,22 @@ mod tests {
     }
 
     #[test]
+    fn integer_dark_shadow_with_equality() {
+        // Equality + unbounded inequalities: 2b=6 ⇒ b=3, leaving a≤2 ∧ c≤a−1
+        // (both unbounded below). The dark shadow eliminates equalities first,
+        // then builds and verifies a witness (a=2,b=3,c=1).
+        assert_eq!(
+            run(
+                "(declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (<= (+ a b) 5))(assert (>= (- a c) 1))(assert (= (* 2 b) 6))\
+                 (check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
     fn integer_dark_shadow_sat() {
         // Unbounded feasible integer systems that branch-and-bound cannot
         // converge on: the dark shadow constructs and verifies a witness.
