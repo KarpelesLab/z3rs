@@ -4149,6 +4149,13 @@ impl Context {
         const MAX_ROUNDS: usize = 8;
         const MAX_TOTAL: usize = 400;
         let universals = self.universals.clone();
+        // Set when Phase 2 enumerates a datatype-sorted binder. Such a binder
+        // ranges over an infinite constructor domain, so enumerating the *present*
+        // ground terms can expose a counterexample (→ unsat) but can never prove
+        // the universal for every value — the run is then never "saturated" and a
+        // `sat` stays a sound `unknown`. (A recursive *function* over a datatype
+        // is handled by E-matching instead and can still saturate.)
+        let mut dt_enumerated = false;
 
         // User-function declarations (targets for E-matching triggers) and, per
         // universal, a trigger that covers all its binders (if one exists).
@@ -4187,6 +4194,9 @@ impl Context {
         let mut instances: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
         let mut ematch_saturated = false;
+        // How many instances E-matching produced per universal (a datatype
+        // universal whose trigger matched nothing needs enumeration instead).
+        let mut ematch_counts = alloc::vec![0usize; universals.len()];
         // Phase 1 — E-matching to a fixpoint: instantiate each universal by
         // matching its trigger against ground applications of the same function,
         // so only *relevant* instances are generated (a recursive/UF universal
@@ -4216,6 +4226,7 @@ impl Context {
                             continue;
                         }
                         instances.push(inst);
+                        ematch_counts[ui] += 1;
                         for t in self.m.postorder(inst) {
                             let s = self.m.get_sort(t);
                             if by_sort.entry(s).or_default().insert(t) {
@@ -4245,8 +4256,23 @@ impl Context {
         for _round in 0..MAX_ROUNDS {
             let mut fresh_term = false;
             for (ui, (vars, body)) in universals.iter().enumerate() {
-                if !trigs[ui].is_empty() {
+                // Universals with a covering trigger are left to E-matching —
+                // EXCEPT a datatype universal whose trigger matched *nothing*
+                // (e.g. a selector/tester `hd(x)`/`is_cons(x)` with no ground
+                // selector application): enumeration over the ground constructor
+                // terms is what reaches the relevant instance (x = cons(-1, nil)).
+                // A datatype universal whose E-matching DID fire (a recursive
+                // function unfolding on a concrete list) is left to E-matching so
+                // it can still saturate.
+                let dt_binder = vars
+                    .iter()
+                    .any(|&v| self.datatypes.contains_key(&self.m.get_sort(v)));
+                let enumerate = trigs[ui].is_empty() || (dt_binder && ematch_counts[ui] == 0);
+                if !enumerate {
                     continue; // handled completely by E-matching
+                }
+                if dt_binder {
+                    dt_enumerated = true; // infinite domain → cannot claim saturation
                 }
                 let cands: Vec<Vec<AstId>> = vars
                     .iter()
@@ -4278,7 +4304,17 @@ impl Context {
                     // arithmetic fold away, so recursive definitions bottom out
                     // (e.g. `f(0) = ite(0≤0, 0, f(-1))` collapses to `0`) instead
                     // of unfolding without bound.
-                    let inst = crate::rewriter::simplify(&mut self.m, raw);
+                    let mut inst = crate::rewriter::simplify(&mut self.m, raw);
+                    // Fold datatype selector/tester chains so a constructor
+                    // instance collapses (is_cons(cons …)=true, hd(cons a …)=a).
+                    for _ in 0..3 {
+                        let folded = self.dt_fold(inst);
+                        let next = crate::rewriter::simplify(&mut self.m, folded);
+                        if next == inst {
+                            break;
+                        }
+                        inst = next;
+                    }
                     if !seen.insert(inst) {
                         continue;
                     }
@@ -4296,8 +4332,9 @@ impl Context {
             }
             if !fresh_term {
                 // Enumeration fixpoint; overall completeness also needs the
-                // E-matching phase to have reached its own fixpoint.
-                return (instances, ematch_saturated);
+                // E-matching phase to have reached its own fixpoint AND no
+                // infinite-domain (datatype) binder to have been enumerated.
+                return (instances, ematch_saturated && !dt_enumerated);
             }
         }
         (instances, false) // ran out of rounds: not saturated
@@ -7347,6 +7384,23 @@ mod tests {
             )
             .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn datatype_universal_selector_property_is_sound() {
+        // ∀x. is_cons(x) ⇒ hd(x) ≥ 0, with a witness l = cons(-1, nil): the
+        // selector trigger matches no ground application, so enumeration over the
+        // ground constructor term derives the contradiction. Previously an unsound
+        // `sat` (the run wrongly claimed saturation).
+        assert_eq!(
+            run(
+                "(declare-datatypes ((L 0)) (((nl) (cons (hd Int) (tl L)))))\
+                 (assert (forall ((x L)) (=> ((_ is cons) x) (>= (hd x) 0))))\
+                 (declare-const l L)(assert (= l (cons (- 1) nl)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
