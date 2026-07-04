@@ -288,6 +288,11 @@ impl Model {
     }
 
     /// Do `a` and `b` evaluate to the same value?
+    /// Do `a` and `b` evaluate to the same value under this model?
+    pub fn terms_equal(&mut self, m: &AstManager, a: AstId, b: AstId) -> bool {
+        self.values_eq(m, a, b)
+    }
+
     fn values_eq(&mut self, m: &AstManager, a: AstId, b: AstId) -> bool {
         match (self.eval(m, a), self.eval(m, b)) {
             (Value::Bool(x), Value::Bool(y)) => x == y,

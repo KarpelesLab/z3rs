@@ -942,6 +942,20 @@ impl Context {
         Ok(())
     }
 
+    /// If `id` has an enum sort, the name of the constructor it equals under
+    /// `model` (so `get-value` prints `green`, not `Color!val!2`).
+    fn enum_value_name(&self, model: &mut Model, id: AstId) -> Option<String> {
+        let ctors = self.enums.get(&self.m.get_sort(id))?;
+        for &c in ctors {
+            if model.terms_equal(&self.m, id, c) {
+                let decl = self.m.app_decl(c);
+                let name = self.m.func_decl(decl)?.name.as_str()?;
+                return Some(name.to_string());
+            }
+        }
+        None
+    }
+
     /// Axioms for the declared enumeration datatypes: the constructors of each
     /// enum are pairwise distinct, and every term of an enum sort in `goal`
     /// equals one of that enum's constructors (the domain axiom).
@@ -1285,7 +1299,9 @@ impl Context {
             if i > 0 {
                 out.push(' ');
             }
-            let v = model.value_string(&self.m, *id);
+            let v = self
+                .enum_value_name(&mut model, *id)
+                .unwrap_or_else(|| model.value_string(&self.m, *id));
             out.push_str(&alloc::format!("({text} {v})"));
         }
         out.push(')');
