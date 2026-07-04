@@ -1272,6 +1272,12 @@ impl Context {
                         let e = self.resolve_sort(&l[1])?;
                         Ok(self.seq_sort(e))
                     }
+                    // A set is its characteristic function: (Set T) = (Array T Bool).
+                    "Set" if l.len() == 2 => {
+                        let e = self.resolve_sort(&l[1])?;
+                        let b = self.m.mk_bool_sort();
+                        Ok(self.m.mk_array_sort(e, b))
+                    }
                     "_" if l.len() == 4 && Self::sym(&l[1])? == "FloatingPoint" => {
                         let eb: u32 = Self::sym(&l[2])?
                             .parse()
@@ -7166,6 +7172,20 @@ mod tests {
         assert_eq!(
             run("(declare-const x String)\
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn set_sort_is_array_to_bool() {
+        // (Set T) is (Array T Bool): a set backed by a const-false array has no
+        // members. (z3 supports the sort; its set.* operation names are cvc5-only,
+        // so we do not interpret those — matching z3, which errors on them.)
+        assert_eq!(
+            run("(declare-const s (Set Int))\
+                 (assert (= s ((as const (Set Int)) false)))\
+                 (assert (select s 5))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
