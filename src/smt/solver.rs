@@ -438,6 +438,39 @@ enum Feas {
     Unknown,
 }
 
+/// If `goal` is a conjunction of linear (in)equalities (`and`, `≤`/`<`/`≥`/`>`,
+/// or arithmetic `=`), the equivalent list of [`Constraint`]s; `None` if it has
+/// any other structure (disjunctions, negations, non-arithmetic atoms). Used by
+/// the optimizer to build the LP for a linear objective.
+pub fn linear_constraints(m: &AstManager, goal: AstId) -> Option<Vec<Constraint>> {
+    if m.is_true(goal) {
+        return Some(Vec::new());
+    }
+    if m.is_and(goal) {
+        let mut out = Vec::new();
+        for &a in m.app_args(goal) {
+            out.extend(linear_constraints(m, a)?);
+        }
+        return Some(out);
+    }
+    if m.is_eq(goal) {
+        let args = m.app_args(goal);
+        if !m.is_arith_sort(m.get_sort(args[0])) {
+            return None;
+        }
+        let diff = ast_to_lin(m, args[0]).sub(&ast_to_lin(m, args[1]));
+        return Some(alloc::vec![Constraint::eq(diff)]);
+    }
+    if let Some(op) = m.arith_op(goal)
+        && matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
+    {
+        let args = m.app_args(goal);
+        let diff = ast_to_lin(m, args[0]).sub(&ast_to_lin(m, args[1]));
+        return Some(alloc::vec![comparison_constraint(op, true, diff)]);
+    }
+    None
+}
+
 /// The arithmetic constraint system for the current atom assignment: equality /
 /// comparison constraints, disequalities (`expr ≠ 0`), and the integer-sorted
 /// leaf variables.
@@ -760,7 +793,7 @@ fn comparison_constraint(op: ArithOp, holds: bool, diff: LinExpr) -> Constraint 
 /// Convert an arithmetic AST term to a linear expression. Non-linear or
 /// non-arithmetic subterms are treated as opaque variables (sound: they become
 /// unconstrained).
-fn ast_to_lin(m: &AstManager, t: AstId) -> LinExpr {
+pub fn ast_to_lin(m: &AstManager, t: AstId) -> LinExpr {
     if let Some(r) = m.as_numeral(t) {
         return LinExpr::constant(r);
     }

@@ -17,9 +17,9 @@ pub mod euf;
 pub mod solver;
 
 pub use arith::{
-    Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible, feasible_with_diseqs, model,
-    model_with_diseqs, model_with_diseqs_budgeted,
+    Assignment, Constraint, LinExpr, OptOutcome, Rel, SolveOutcome, feasible, feasible_with_diseqs,
+    model, model_with_diseqs, model_with_diseqs_budgeted, optimize as arith_optimize,
 };
 pub use bv::{check_bv, check_bv_model};
 pub use euf::Egraph;
-pub use solver::{Model, SmtResult, Value, check, check_model};
+pub use solver::{Model, SmtResult, Value, ast_to_lin, check, check_model, linear_constraints};

@@ -432,6 +432,102 @@ pub fn model_budgeted(constraints: &[Constraint], budget: &mut u64) -> SolveOutc
     SolveOutcome::Sat(assign)
 }
 
+/// The result of optimizing a linear objective over a feasible constraint set.
+#[derive(Clone, Debug, PartialEq)]
+pub enum OptOutcome {
+    /// The optimum value, attained by some feasible point.
+    Attained(Rational),
+    /// The value is a supremum/infimum not attained (a strict bound).
+    Bound(Rational),
+    /// The objective is unbounded in the optimizing direction.
+    Unbounded,
+    /// Fourier–Motzkin blew past the budget.
+    Exhausted,
+}
+
+/// Optimize the linear objective `obj` over `constraints` (assumed feasible),
+/// with `z` a fresh variable identifier standing for the objective. Introduces
+/// `z = obj` and eliminates every other variable by Fourier–Motzkin, leaving the
+/// tightest bound on `z`.
+pub fn optimize(
+    constraints: &[Constraint],
+    obj: &LinExpr,
+    z: AstId,
+    maximize: bool,
+    budget: &mut u64,
+) -> OptOutcome {
+    // z - obj = 0.
+    let mut cons = constraints.to_vec();
+    cons.push(Constraint::eq(LinExpr::var(z).sub(obj)));
+    let mut ineqs: Vec<Ineq> = cons.iter().flat_map(|c| c.to_ineqs()).collect();
+
+    // Eliminate every variable except z.
+    while let Some(v) = ineqs
+        .iter()
+        .find_map(|i| i.expr.coeffs.keys().find(|&&k| k != z).copied())
+    {
+        let mut upper = Vec::new();
+        let mut lower = Vec::new();
+        let mut next = Vec::new();
+        for i in ineqs {
+            let c = i.expr.coeff(v);
+            if c.is_zero() {
+                next.push(i);
+            } else if c > zero() {
+                upper.push(i);
+            } else {
+                lower.push(i);
+            }
+        }
+        for u in &upper {
+            let au = u.expr.coeff(v);
+            for l in &lower {
+                if *budget == 0 {
+                    return OptOutcome::Exhausted;
+                }
+                *budget -= 1;
+                let al = l.expr.coeff(v);
+                let mut e = u.expr.scale(&al.neg());
+                e.add_scaled(&l.expr, &au);
+                next.push(Ineq {
+                    expr: e,
+                    strict: u.strict || l.strict,
+                });
+            }
+        }
+        ineqs = next;
+    }
+
+    // Remaining rows are in `z` (and constants) only: collect the tightest
+    // upper/lower bound on z. For `cz·z + k ⋈ 0`: z ⋈' -k/cz (flip if cz < 0).
+    let mut upper: Option<(Rational, bool)> = None; // z ≤ bound
+    let mut lower: Option<(Rational, bool)> = None; // z ≥ bound
+    for i in &ineqs {
+        let cz = i.expr.coeff(z);
+        if cz.is_zero() {
+            continue; // constant row (feasibility already assumed)
+        }
+        let bound = &i.expr.constant.neg() / &cz;
+        if cz > zero() {
+            upper = Some(match upper {
+                Some((h, hs)) if h < bound || (h == bound && !hs) => (h, hs),
+                _ => (bound, i.strict),
+            });
+        } else {
+            lower = Some(match lower {
+                Some((l, ls)) if l > bound || (l == bound && !ls) => (l, ls),
+                _ => (bound, i.strict),
+            });
+        }
+    }
+    let chosen = if maximize { upper } else { lower };
+    match chosen {
+        None => OptOutcome::Unbounded,
+        Some((b, true)) => OptOutcome::Bound(b),
+        Some((b, false)) => OptOutcome::Attained(b),
+    }
+}
+
 /// Choose a rational strictly (or non-strictly) inside `(lo, hi)`. Feasibility
 /// guarantees such a point exists; when both bounds are present the midpoint is
 /// always valid, and one-sided bounds step off by one.

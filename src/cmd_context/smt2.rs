@@ -29,7 +29,37 @@ use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::rewriter::substitute;
-use crate::smt::{Model, SmtResult, Value, check_bv_model, check_model};
+use crate::smt::{
+    Model, OptOutcome, SmtResult, Value, arith_optimize, ast_to_lin, check_bv_model, check_model,
+    linear_constraints,
+};
+
+/// The result of optimizing a real-valued objective.
+enum RealOpt {
+    /// A proven-exact attained optimum.
+    Attained(Rational),
+    /// Unbounded in the optimizing direction.
+    Unbounded,
+    /// Not determined exactly (supremum, non-linear, or verification failed).
+    Unknown,
+}
+
+/// Render a rational as an SMT-LIB real term (`n.0`, `(- n.0)`, or `(/ p.0 q.0)`).
+fn render_rational(r: &Rational) -> String {
+    let real = |n: &Int| -> String {
+        if *n < Int::from(0) {
+            alloc::format!("(- {}.0)", n.abs())
+        } else {
+            alloc::format!("{n}.0")
+        }
+    };
+    if r.is_integer() {
+        // z3 prints an integer-valued real without the fractional part.
+        render_int(&r.numerator().clone())
+    } else {
+        alloc::format!("(/ {} {})", real(r.numerator()), real(r.denominator()))
+    }
+}
 
 /// The result of optimizing one objective.
 enum OptResult {
@@ -2102,8 +2132,30 @@ impl Context {
         }
         for (i, (obj, maximize, _)) in objs.iter().enumerate() {
             let (obj, maximize) = (*obj, *maximize);
+            let osort = self.m.get_sort(obj);
+            if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
+                // Real objective: Fourier–Motzkin optimum, then verify it.
+                match self.real_optimize(obj, maximize, &fixed) {
+                    RealOpt::Attained(r) => {
+                        values[i] = render_rational(&r);
+                        let rv = self.m.mk_numeral(r, false);
+                        let eq = self.m.mk_eq(obj, rv);
+                        fixed.push(eq);
+                        model = self.check_with(&fixed).1;
+                    }
+                    RealOpt::Unbounded => {
+                        values[i] = if maximize {
+                            "oo".to_string()
+                        } else {
+                            "(- oo)".to_string()
+                        };
+                    }
+                    RealOpt::Unknown => {}
+                }
+                continue;
+            }
             if !self.m.is_int_sort(self.m.get_sort(obj)) {
-                continue; // only integer objectives are optimized soundly for now
+                continue; // only Int/Real objectives are optimized
             }
             let v0 = match model.as_mut().map(|m| m.eval(&self.m, obj)) {
                 Some(Value::Num(r, _)) => r.numerator().clone(),
@@ -2130,6 +2182,53 @@ impl Context {
         // `get-objectives` reports only the user objectives, not the penalty.
         self.objective_values = values.split_off(user_start);
         (SmtResult::Sat, model)
+    }
+
+    /// Optimize a real-valued objective by Fourier–Motzkin bound extraction, and
+    /// **verify** the candidate with the full solver so only a proven-exact
+    /// attained optimum is reported (a supremum not attained, a non-linear goal,
+    /// or a verification failure all fall back to `Unknown`).
+    fn real_optimize(&mut self, obj: AstId, maximize: bool, fixed: &[AstId]) -> RealOpt {
+        // The constraint system: base assertions plus the objective-fix set.
+        let mut conj = self.assertions.clone();
+        conj.extend_from_slice(fixed);
+        let combined = match conj.len() {
+            0 => self.m.mk_true(),
+            1 => conj[0],
+            _ => self.m.mk_and(&conj),
+        };
+        let lifted = self.lift(combined);
+        let Some(cons) = linear_constraints(&self.m, lifted) else {
+            return RealOpt::Unknown; // not a pure conjunction of linear constraints
+        };
+        let obj_lin = ast_to_lin(&self.m, obj);
+        let real = self.m.mk_real_sort();
+        let z = self.fresh_const(real);
+        let mut budget: u64 = 200_000;
+        match arith_optimize(&cons, &obj_lin, z, maximize, &mut budget) {
+            OptOutcome::Unbounded => RealOpt::Unbounded,
+            OptOutcome::Attained(r) => {
+                // Verify: `obj` reaches r, and cannot pass it.
+                let rv = self.m.mk_numeral(r.clone(), false);
+                let (reach, pass) = if maximize {
+                    (self.m.mk_ge(obj, rv), self.m.mk_gt(obj, rv))
+                } else {
+                    (self.m.mk_le(obj, rv), self.m.mk_lt(obj, rv))
+                };
+                let mut ex = fixed.to_vec();
+                ex.push(reach);
+                let achievable = self.check_with(&ex).0 == SmtResult::Sat;
+                let mut ex = fixed.to_vec();
+                ex.push(pass);
+                let bounded = self.check_with(&ex).0 == SmtResult::Unsat;
+                if achievable && bounded {
+                    RealOpt::Attained(r)
+                } else {
+                    RealOpt::Unknown
+                }
+            }
+            OptOutcome::Bound(_) | OptOutcome::Exhausted => RealOpt::Unknown,
+        }
     }
 
     /// The MaxSAT penalty term `Σ (ite pᵢ wᵢ 0)` over the soft constraints, or
@@ -4227,6 +4326,29 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((a false) (b true))");
+    }
+
+    #[test]
+    fn real_optimization() {
+        // Attained maximum.
+        let out = run(
+            "(declare-const x Real)(assert (<= x 10.0))(assert (>= x 0.0))\
+             (maximize x)(check-sat)(get-objectives)",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(out[1].contains("(x 10)"), "got {:?}", out[1]);
+        // A fractional optimum.
+        let out = run(
+            "(declare-const x Real)(assert (>= (* 2.0 x) 3.0))(minimize x)(check-sat)(get-objectives)",
+        )
+        .unwrap();
+        assert!(out[1].contains("(/ 3.0 2.0)"), "got {:?}", out[1]);
+        // Unbounded.
+        let out =
+            run("(declare-const x Real)(assert (>= x 0.0))(maximize x)(check-sat)(get-objectives)")
+                .unwrap();
+        assert!(out[1].contains("(x oo)"), "got {:?}", out[1]);
     }
 
     #[test]
