@@ -4615,7 +4615,72 @@ impl Context {
     /// Decide `goal`, capping a `sat` verdict to `unknown` when the formula
     /// contains genuine nonlinear arithmetic the linear core over-approximates
     /// (so a definite `sat`/`unsat` is always sound).
+    /// Eliminate `bv2int(a)` when the bit-vector `a` is consumed *only* by
+    /// `bv2int` (never in a bit-vector operation): replace it with a fresh
+    /// integer bounded to `[0, 2ⁿ−1]`. This is a sound bijection (the value
+    /// exists iff an integer in range does), and it removes the bit-vector so a
+    /// goal that was only mixed via `bv2int` becomes pure integer and decidable.
+    fn eliminate_pure_bv2int(&mut self, goal: AstId) -> AstId {
+        let sub = self.m.postorder(goal);
+        let mut apps: Vec<(AstId, AstId)> = Vec::new(); // (bv2int(a), a)
+        let mut impure: BTreeSet<AstId> = BTreeSet::new();
+        for &t in &sub {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            let args = self.m.app_args(t).to_vec();
+            let is_b2i = args.len() == 1
+                && matches!(
+                    self.decl_name(self.m.app_decl(t)).as_deref(),
+                    Some("bv2int" | "bv2nat" | "ubv_to_int")
+                );
+            for &arg in &args {
+                if self.m.bv_sort_width(self.m.get_sort(arg)).is_some() {
+                    if is_b2i {
+                        apps.push((t, arg));
+                    } else {
+                        impure.insert(arg);
+                    }
+                }
+            }
+        }
+        let int = self.m.mk_int_sort();
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut ranges: Vec<AstId> = Vec::new();
+        let mut assigned: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for (app, a) in apps {
+            if impure.contains(&a) {
+                continue;
+            }
+            let w = match self.m.bv_sort_width(self.m.get_sort(a)) {
+                Some(w) if w <= 32 => w,
+                _ => continue,
+            };
+            let n = if let Some(&n) = assigned.get(&a) {
+                n
+            } else {
+                let n = self.fresh_const(int);
+                assigned.insert(a, n);
+                let zero = self.m.mk_int(0);
+                let ub = self.m.mk_int((1i64 << w) - 1);
+                let lo = self.m.mk_le(zero, n);
+                let hi = self.m.mk_le(n, ub);
+                ranges.push(lo);
+                ranges.push(hi);
+                n
+            };
+            subst.push((app, n));
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g2 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        ranges.push(g2);
+        self.m.mk_and(&ranges)
+    }
+
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        let goal = self.eliminate_pure_bv2int(goal);
         // Quantified formulas and symbolic string operations are not fully
         // decided: if the goal mentions either kind of sentinel, answer a sound
         // `unknown`.
@@ -7057,6 +7122,33 @@ mod tests {
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn bv2int_range() {
+        // bv2int of an n-bit vector lies in [0, 2ⁿ−1]. When the vector is used
+        // only via bv2int, it is replaced by a bounded integer, so these decide.
+        assert_eq!(
+            run("(declare-const a (_ BitVec 4))(assert (< (bv2int a) 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const a (_ BitVec 4))(assert (> (bv2int a) 15))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Sum of two 8-bit values cannot exceed 510.
+        assert_eq!(
+            run(
+                "(declare-const a (_ BitVec 8))(declare-const b (_ BitVec 8))\
+                 (assert (> (+ (bv2int a) (bv2int b)) 600))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const a (_ BitVec 4))(assert (= (bv2int a) 7))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
