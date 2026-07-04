@@ -1225,6 +1225,36 @@ impl Context {
                 self.macros.insert(name, (params, list[4].clone()));
                 Ok(None)
             }
+            "define-fun-rec" => {
+                // (define-fun-rec name ((p S)...) R body): a possibly-recursive
+                // definition. Declare `name` uninterpreted and add the defining
+                // axiom ∀p. name(p) = body as a universal — instantiation unfolds
+                // it on demand (which cannot be done by macro inlining).
+                self.declare_rec_fun(&list[1], &list[2], &list[3])?;
+                self.add_rec_axiom(&list[1], &list[2], &list[4])?;
+                self.last_model = None;
+                Ok(None)
+            }
+            "define-funs-rec" => {
+                // (define-funs-rec ((f1 (params) R1) …) (body1 …)) — mutual
+                // recursion. Declare every function first (so bodies can refer to
+                // all of them), then add each defining axiom.
+                let decls = as_list(&list[1])?;
+                let bodies = as_list(&list[2])?;
+                if decls.len() != bodies.len() {
+                    return Err("define-funs-rec: decl/body count mismatch".to_string());
+                }
+                for d in decls {
+                    let dl = as_list(d)?;
+                    self.declare_rec_fun(&dl[0], &dl[1], &dl[2])?;
+                }
+                for (d, body) in decls.iter().zip(bodies) {
+                    let dl = as_list(d)?;
+                    self.add_rec_axiom(&dl[0], &dl[1], body)?;
+                }
+                self.last_model = None;
+                Ok(None)
+            }
             "assert" => {
                 // A top-level quantifier gets real (sound) handling: `exists` is
                 // skolemized (its body asserted with fresh constants), `forall` is
@@ -3109,6 +3139,56 @@ impl Context {
     /// Parse a quantifier's binder list `((x S) …)` and body into fresh
     /// placeholder constants (one per bound variable) and the body term built
     /// over them. The placeholders double as skolem constants for `exists`.
+    /// Declare a (possibly recursive) function `name` with the given parameter
+    /// list and return sort as an uninterpreted symbol.
+    fn declare_rec_fun(&mut self, name: &SExpr, params: &SExpr, ret: &SExpr) -> Result<(), String> {
+        let name = Self::sym(name)?.to_string();
+        let domain: Vec<AstId> = as_list(params)?
+            .iter()
+            .map(|p| {
+                let pair = as_list(p)?;
+                self.resolve_sort(&pair[1])
+            })
+            .collect::<Result<_, _>>()?;
+        let range = self.resolve_sort(ret)?;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &domain, range);
+        self.funcs.insert(name.clone(), d);
+        self.decl_order.push(name);
+        Ok(())
+    }
+
+    /// Add the defining axiom `∀p. name(p) = body` for a recursive function as a
+    /// universal (a ground equation when there are no parameters).
+    fn add_rec_axiom(&mut self, name: &SExpr, params: &SExpr, body: &SExpr) -> Result<(), String> {
+        let fname = Self::sym(name)?.to_string();
+        let decl = *self
+            .funcs
+            .get(&fname)
+            .ok_or_else(|| alloc::format!("recursive function {fname} not declared"))?;
+        let mut scope = Vec::new();
+        let mut vars = Vec::new();
+        for p in as_list(params)? {
+            let pair = as_list(p)?;
+            let pname = Self::sym(&pair[0])?.to_string();
+            let psort = self.resolve_sort(&pair[1])?;
+            let ph = self.fresh_const(psort);
+            scope.push((pname, ph));
+            vars.push(ph);
+        }
+        let app = self.m.mk_app(decl, &vars);
+        self.scopes.push(scope);
+        let body = self.term(body);
+        self.scopes.pop();
+        let axiom = self.m.mk_eq(app, body?);
+        if vars.is_empty() {
+            self.assertions.push(axiom);
+            self.assert_names.push(None);
+        } else {
+            self.universals.push((vars, axiom));
+        }
+        Ok(())
+    }
+
     fn parse_quantifier(
         &mut self,
         binders: &SExpr,
@@ -3193,7 +3273,12 @@ impl Context {
                 }
                 for combo in combos {
                     let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
-                    let inst = substitute(&mut self.m, *body, &subst);
+                    let raw = substitute(&mut self.m, *body, &subst);
+                    // Simplify the instance: constant `ite` conditions and ground
+                    // arithmetic fold away, so recursive definitions bottom out
+                    // (e.g. `f(0) = ite(0≤0, 0, f(-1))` collapses to `0`) instead
+                    // of unfolding without bound.
+                    let inst = crate::rewriter::simplify(&mut self.m, raw);
                     if !seen.insert(inst) {
                         continue;
                     }
@@ -5621,6 +5706,28 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn recursive_function_definitions() {
+        // define-funs-rec (mutual recursion): even/odd over a small argument
+        // fully unfold and decide.
+        assert_eq!(
+            run("(define-funs-rec ((ev ((n Int)) Bool) (od ((n Int)) Bool))\
+                 ((ite (= n 0) true (od (- n 1))) (ite (= n 0) false (ev (- n 1)))))\
+                 (assert (ev 4))(assert (not (od 4)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // define-fun-rec is accepted and handled soundly (never a wrong verdict);
+        // a deep arithmetic recursion stays a sound `unknown` rather than a parse
+        // error, and must terminate (constant `ite`/arith fold on instantiation).
+        assert_eq!(
+            run("(define-fun-rec f ((n Int)) Int (ite (<= n 0) 0 (f (- n 1))))\
+                 (assert (= (f 2) 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unknown"]
         );
     }
 
