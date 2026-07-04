@@ -155,8 +155,30 @@ fn fold_string_pred(op: &str, parts: &[Vec<u32>]) -> bool {
         "str.prefixof" => a.len() <= b.len() && b[..a.len()] == a[..],
         // (str.suffixof s t): is `s` (=a) a suffix of `t` (=b)?
         "str.suffixof" => a.len() <= b.len() && b[b.len() - a.len()..] == a[..],
+        // Lexicographic (code-point) order.
+        "str.<" => a < b,
+        "str.<=" => a <= b,
         _ => false,
     }
+}
+
+/// `(str.replace_all s from to)` — replace every non-overlapping occurrence.
+fn replace_all(s: &[u32], from: &[u32], to: &[u32]) -> String {
+    if from.is_empty() || from.len() > s.len() {
+        return code_points_to_string(s);
+    }
+    let mut out: Vec<u32> = Vec::new();
+    let mut i = 0;
+    while i < s.len() {
+        if i + from.len() <= s.len() && s[i..i + from.len()] == from[..] {
+            out.extend_from_slice(to);
+            i += from.len();
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    code_points_to_string(&out)
 }
 
 /// `(str.replace s from to)` — replace the first occurrence of `from` in `s`.
@@ -1858,7 +1880,7 @@ impl Context {
                 }
                 self.symbolic_string(op, raw)
             }
-            "str.contains" | "str.prefixof" | "str.suffixof" => {
+            "str.contains" | "str.prefixof" | "str.suffixof" | "str.<" | "str.<=" => {
                 if let Some(parts) = &strs {
                     let b = fold_string_pred(op, parts);
                     return Ok(if b {
@@ -1872,7 +1894,24 @@ impl Context {
                 let atom = self.symbolic_string(op, raw)?;
                 Ok(atom)
             }
-            "str.indexof" | "str.to_int" | "str.to-int" => {
+            "str.replace_all" | "str.replace-all" => {
+                if let Some(parts) = &strs {
+                    let out = replace_all(&parts[0], &parts[1], &parts[2]);
+                    return Ok(self.mk_str_lit(&out));
+                }
+                self.symbolic_string(op, raw)
+            }
+            "str.from_code" | "str.from-code" => {
+                if let Some(n) = self.int_arg(raw[0]) {
+                    let s = char::from_u32(n as u32)
+                        .filter(|_| (0..=0x10FFFF).contains(&n))
+                        .map(String::from)
+                        .unwrap_or_default();
+                    return Ok(self.mk_str_lit(&s));
+                }
+                self.symbolic_string(op, raw)
+            }
+            "str.indexof" | "str.to_int" | "str.to-int" | "str.to_code" | "str.to-code" => {
                 if let Some(v) = self.fold_string_to_int(op, raw) {
                     return Ok(self.m.mk_int(v));
                 }
@@ -2340,9 +2379,14 @@ impl Context {
         self.m.as_numeral(t)?.to_integer()?.to_i64()
     }
 
-    /// Fold a string→int op (`str.to_int`, `str.indexof`) over literal arguments.
+    /// Fold a string→int op (`str.to_int`, `str.indexof`, `str.to_code`).
     fn fold_string_to_int(&self, op: &str, raw: &[AstId]) -> Option<i64> {
         match op {
+            "str.to_code" | "str.to-code" => {
+                let s = self.str_value(raw[0])?;
+                // The code point of a single-character string, else -1.
+                Some(if s.len() == 1 { s[0] as i64 } else { -1 })
+            }
             "str.to_int" | "str.to-int" => {
                 let s = self.str_value(raw[0])?;
                 // A non-empty run of ASCII digits is its value; otherwise -1.
@@ -4988,6 +5032,32 @@ mod tests {
             .unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn more_string_operations() {
+        // Lexicographic order, replace-all, and code conversions fold.
+        for (script, expect) in [
+            ("(assert (not (str.< \"abc\" \"abd\")))(check-sat)", "unsat"),
+            (
+                "(assert (not (= (str.replace_all \"aXaXa\" \"X\" \"-\") \"a-a-a\")))(check-sat)",
+                "unsat",
+            ),
+            (
+                "(assert (not (= (str.to_code \"A\") 65)))(check-sat)",
+                "unsat",
+            ),
+            (
+                "(assert (not (= (str.from_code 66) \"B\")))(check-sat)",
+                "unsat",
+            ),
+        ] {
+            assert_eq!(
+                run(script).unwrap(),
+                alloc::vec![expect],
+                "script: {script}"
+            );
+        }
     }
 
     #[test]
