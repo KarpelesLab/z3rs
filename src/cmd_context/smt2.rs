@@ -595,6 +595,35 @@ fn attr_int(list: &[SExpr], key: &str) -> Option<i64> {
 }
 
 /// If `s` is a top-level `(forall …)` or `(exists …)`, its keyword.
+/// Peel nested `forall` binders (and transparent `!` annotations) from a
+/// quantifier body, returning the extra binders and the innermost body. So
+/// `∀y.∀z. φ` contributes `[y, z]` and `φ`.
+fn flatten_foralls(body: &SExpr) -> (Vec<SExpr>, SExpr) {
+    let mut extra: Vec<SExpr> = Vec::new();
+    let mut cur = body.clone();
+    loop {
+        let step = match &cur {
+            SExpr::List(l) if l.len() >= 2 && matches!(&l[0], SExpr::Atom(a) if a == "!") => {
+                Some(l[1].clone())
+            }
+            SExpr::List(l) if l.len() == 3 && matches!(&l[0], SExpr::Atom(a) if a == "forall") => {
+                if let SExpr::List(bs) = &l[1] {
+                    extra.extend(bs.iter().cloned());
+                    Some(l[2].clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        match step {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    (extra, cur)
+}
+
 fn top_level_quantifier(s: &SExpr) -> Option<&'static str> {
     if let SExpr::List(l) = s
         && l.len() == 3
@@ -1358,7 +1387,22 @@ impl Context {
                 // nested inside a formula fall back to the `unknown` sentinel.
                 if let Some(kind) = top_level_quantifier(&list[1]) {
                     let ql = as_list(&list[1])?;
-                    let (vars, body) = self.parse_quantifier(&ql[1], &ql[2])?;
+                    // Flatten `∀x.∀y.φ` into a single `∀x,y.φ` so E-matching /
+                    // instantiation handle it instead of gating the inner
+                    // quantifier to `unknown`.
+                    let (binders, inner) = if kind == "forall" {
+                        let (extra, inner) = flatten_foralls(&ql[2]);
+                        if extra.is_empty() {
+                            (ql[1].clone(), ql[2].clone())
+                        } else {
+                            let mut bs = as_list(&ql[1])?.to_vec();
+                            bs.extend(extra);
+                            (SExpr::List(bs), inner)
+                        }
+                    } else {
+                        (ql[1].clone(), ql[2].clone())
+                    };
+                    let (vars, body) = self.parse_quantifier(&binders, &inner)?;
                     if kind == "exists" {
                         // ∃x. P(x) is equisatisfiable with P(k) for fresh k.
                         self.assertions.push(body);
@@ -6626,6 +6670,29 @@ mod tests {
             ))
             .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn nested_forall_flattened() {
+        // ∀x.∀y. f(x,y)=f(y,x) is flattened to ∀x,y. …, so E-matching derives
+        // f(1,2)=f(2,1) and refutes 5≠6.
+        assert_eq!(
+            run("(declare-fun f (Int Int) Int)\
+                 (assert (forall ((x Int)) (forall ((y Int)) (= (f x y) (f y x)))))\
+                 (assert (= (f 1 2) 5))(assert (= (f 2 1) 6))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Three nested levels flatten too.
+        assert_eq!(
+            run("(declare-fun g (Int Int Int) Bool)\
+                 (assert (forall ((x Int)) (forall ((y Int)) (forall ((z Int)) \
+                   (=> (g x y z) (g z y x))))))\
+                 (declare-const a Int)(declare-const b Int)(declare-const c Int)\
+                 (assert (g a b c))(assert (not (g c b a)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
