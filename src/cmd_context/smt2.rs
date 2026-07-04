@@ -103,6 +103,34 @@ fn subst_sort(body: &SExpr, subst: &[(String, SExpr)]) -> SExpr {
     }
 }
 
+/// The `(exponent bits, significand bits)` of a named floating-point format.
+fn fp_format(name: &str) -> Option<(u32, u32)> {
+    match name {
+        "Float16" => Some((5, 11)),
+        "Float32" => Some((8, 24)),
+        "Float64" => Some((11, 53)),
+        "Float128" => Some((15, 113)),
+        _ => None,
+    }
+}
+
+/// Whether `name` is a `RoundingMode` constant.
+fn is_rm_name(name: &str) -> bool {
+    matches!(
+        name,
+        "RNE"
+            | "RNA"
+            | "RTP"
+            | "RTN"
+            | "RTZ"
+            | "roundNearestTiesToEven"
+            | "roundNearestTiesToAway"
+            | "roundTowardPositive"
+            | "roundTowardNegative"
+            | "roundTowardZero"
+    )
+}
+
 /// Left-fold a non-empty list of regexes with a binary combinator.
 fn fold_regex(mut parts: Vec<Regex>, f: impl Fn(Regex, Regex) -> Regex) -> Regex {
     let mut acc = parts.remove(0);
@@ -791,6 +819,14 @@ struct Context {
     regex_of: BTreeMap<AstId, Regex>,
     /// Parametric sort macros from `define-sort`: name → (params, body).
     sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
+    /// Floating-point sorts `(_ FloatingPoint eb sb)`, keyed by `(eb, sb)`.
+    fp_sorts: BTreeMap<(u32, u32), AstId>,
+    /// The `RoundingMode` sort, once used.
+    rm_sort: Option<AstId>,
+    /// Floating-point constants: term → `(raw bits, eb, sb)`. Only `Float64`
+    /// `(eb, sb) = (11, 53)` constants are folded (via `f64`); other formats and
+    /// symbolic values are gated to a sound `unknown`.
+    fp_of: BTreeMap<AstId, (u64, u32, u32)>,
     /// `(Seq E)` sorts, keyed by element sort.
     seq_sorts: BTreeMap<AstId, AstId>,
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
@@ -925,6 +961,9 @@ impl Context {
             reglan_sort: None,
             regex_of: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
+            fp_sorts: BTreeMap::new(),
+            rm_sort: None,
+            fp_of: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
         }
@@ -952,6 +991,11 @@ impl Context {
         match s {
             SExpr::Atom(name) if name == "String" => Ok(self.string_sort()),
             SExpr::Atom(name) if name == "RegLan" => Ok(self.reglan_sort()),
+            SExpr::Atom(name) if name == "RoundingMode" => Ok(self.rm_sort()),
+            SExpr::Atom(name) if fp_format(name).is_some() => {
+                let (eb, sb) = fp_format(name).unwrap();
+                Ok(self.fp_sort(eb, sb))
+            }
             SExpr::Atom(name) => self
                 .sorts
                 .get(name)
@@ -974,6 +1018,15 @@ impl Context {
                     "Seq" if l.len() == 2 => {
                         let e = self.resolve_sort(&l[1])?;
                         Ok(self.seq_sort(e))
+                    }
+                    "_" if l.len() == 4 && Self::sym(&l[1])? == "FloatingPoint" => {
+                        let eb: u32 = Self::sym(&l[2])?
+                            .parse()
+                            .map_err(|_| "bad eb".to_string())?;
+                        let sb: u32 = Self::sym(&l[3])?
+                            .parse()
+                            .map_err(|_| "bad sb".to_string())?;
+                        Ok(self.fp_sort(eb, sb))
                     }
                     name if self.sort_defs.contains_key(name) => {
                         // A parametric sort macro (define-sort): substitute the
@@ -1768,6 +1821,204 @@ impl Context {
             "str.to_re" | "str.to.re" => self.regex_op(op, raw),
             _ => Err(alloc::format!("unsupported string op {op:?}")),
         }
+    }
+
+    /// `(fp sign exp significand)` — a bit-pattern FP literal from three BVs.
+    fn mk_fp_literal(&mut self, args: &[AstId]) -> Result<AstId, String> {
+        let mut bits: u64 = 0;
+        let mut width: u32 = 0;
+        // Assemble sign : exponent : significand from most- to least-significant.
+        for &a in args {
+            let w = self
+                .m
+                .bv_sort_width(self.m.get_sort(a))
+                .ok_or_else(|| "fp: expected bit-vector fields".to_string())?;
+            let v = self
+                .m
+                .bv_numeral_value(a)
+                .and_then(|n| n.to_i64())
+                .ok_or_else(|| "fp: non-constant field".to_string())? as u64;
+            bits = (bits << w) | (v & ((1u128 << w) - 1) as u64);
+            width += w;
+        }
+        // Field widths: sign 1, exponent eb, significand sb-1 ⇒ eb = w1, sb = w2+1.
+        let eb = self.m.bv_sort_width(self.m.get_sort(args[1])).unwrap();
+        let sb = self.m.bv_sort_width(self.m.get_sort(args[2])).unwrap() + 1;
+        debug_assert_eq!(width, eb + sb);
+        Ok(self.mk_fp(bits, eb, sb))
+    }
+
+    /// A named FP special value (`+oo`/`-oo`/`NaN`/`+zero`/`-zero`) of format
+    /// `(eb, sb)`.
+    fn fp_special(&mut self, name: &str, eb: u32, sb: u32) -> AstId {
+        let mant_bits = sb - 1;
+        let exp_ones: u64 = (1u64 << eb) - 1;
+        let sign_shift = eb + mant_bits;
+        let bits = match name {
+            "+oo" => exp_ones << mant_bits,
+            "-oo" => (1u64 << sign_shift) | (exp_ones << mant_bits),
+            "NaN" => (exp_ones << mant_bits) | (1u64 << (mant_bits - 1)), // canonical qNaN
+            "+zero" => 0,
+            "-zero" => 1u64 << sign_shift,
+            _ => 0,
+        };
+        self.mk_fp(bits, eb, sb)
+    }
+
+    /// The `(_ FloatingPoint eb sb)` sort (interned).
+    fn fp_sort(&mut self, eb: u32, sb: u32) -> AstId {
+        if let Some(&s) = self.fp_sorts.get(&(eb, sb)) {
+            return s;
+        }
+        let s = self
+            .m
+            .mk_uninterpreted_sort(Symbol::new(&alloc::format!("FP{eb}_{sb}")));
+        self.fp_sorts.insert((eb, sb), s);
+        s
+    }
+
+    /// The `RoundingMode` sort (interned).
+    fn rm_sort(&mut self) -> AstId {
+        if let Some(s) = self.rm_sort {
+            return s;
+        }
+        let s = self.m.mk_uninterpreted_sort(Symbol::new("RoundingMode"));
+        self.rm_sort = Some(s);
+        s
+    }
+
+    /// A floating-point constant of the given bits/format, recorded in `fp_of`.
+    fn mk_fp(&mut self, bits: u64, eb: u32, sb: u32) -> AstId {
+        let sort = self.fp_sort(eb, sb);
+        let t = self.fresh_const(sort);
+        self.fp_of.insert(t, (bits, eb, sb));
+        t
+    }
+
+    /// The `f64` value of `t` if it is a `Float64` constant.
+    fn fp64(&self, t: AstId) -> Option<f64> {
+        match self.fp_of.get(&t) {
+            Some(&(bits, 11, 53)) => Some(f64::from_bits(bits)),
+            _ => None,
+        }
+    }
+
+    /// Build/fold a floating-point operation. Only `Float64` operands with the
+    /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
+    fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // fp.* ops take a rounding-mode first argument for the rounding ops.
+        let rne = |ctx: &Self, a: AstId| {
+            ctx.rm_name(a)
+                .as_deref()
+                .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
+        };
+        let f64_bits = |v: f64| v.to_bits();
+        match op {
+            "fp.add" | "fp.sub" | "fp.mul" | "fp.div" if args.len() == 3 => {
+                if let (true, Some(a), Some(b)) =
+                    (rne(self, args[0]), self.fp64(args[1]), self.fp64(args[2]))
+                {
+                    let r = match op {
+                        "fp.add" => a + b,
+                        "fp.sub" => a - b,
+                        "fp.mul" => a * b,
+                        _ => a / b,
+                    };
+                    return Ok(self.mk_fp(f64_bits(r), 11, 53));
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.abs" | "fp.neg" if args.len() == 1 => {
+                if let Some(a) = self.fp64(args[0]) {
+                    let bits = a.to_bits();
+                    let r = if op == "fp.abs" {
+                        bits & !(1u64 << 63)
+                    } else {
+                        bits ^ (1u64 << 63)
+                    };
+                    return Ok(self.mk_fp(r, 11, 53));
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.min" | "fp.max" if args.len() == 2 => {
+                if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
+                    let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
+                    return Ok(self.mk_fp(f64_bits(r), 11, 53));
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.eq" | "fp.lt" | "fp.leq" | "fp.gt" | "fp.geq" if args.len() == 2 => {
+                if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
+                    let r = match op {
+                        "fp.eq" => a == b,
+                        "fp.lt" => a < b,
+                        "fp.leq" => a <= b,
+                        "fp.gt" => a > b,
+                        _ => a >= b,
+                    };
+                    return Ok(self.mk_bool(r));
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.isNaN" | "fp.isInfinite" | "fp.isZero" | "fp.isNormal" | "fp.isSubnormal"
+            | "fp.isNegative" | "fp.isPositive"
+                if args.len() == 1 =>
+            {
+                if let Some(a) = self.fp64(args[0]) {
+                    let r = match op {
+                        "fp.isNaN" => a.is_nan(),
+                        "fp.isInfinite" => a.is_infinite(),
+                        "fp.isZero" => a == 0.0,
+                        "fp.isNormal" => a.is_normal(),
+                        "fp.isSubnormal" => {
+                            a != 0.0 && !a.is_normal() && !a.is_nan() && a.is_finite()
+                        }
+                        "fp.isNegative" => a.is_sign_negative() && !a.is_nan(),
+                        _ => a.is_sign_positive() && !a.is_nan(),
+                    };
+                    return Ok(self.mk_bool(r));
+                }
+                self.symbolic_fp(op, args)
+            }
+            _ => self.symbolic_fp(op, args),
+        }
+    }
+
+    /// The `RoundingMode` constant name of `t`, if it is one.
+    fn rm_name(&self, t: AstId) -> Option<String> {
+        let d = self.m.app_decl(t);
+        let name = self.m.func_decl(d)?.name.as_str()?;
+        matches!(
+            name,
+            "RNE" | "RNA" | "RTP" | "RTN" | "RTZ" | "roundNearestTiesToEven"
+        )
+        .then(|| name.to_string())
+    }
+
+    fn mk_bool(&mut self, b: bool) -> AstId {
+        if b {
+            self.m.mk_true()
+        } else {
+            self.m.mk_false()
+        }
+    }
+
+    /// A fresh uninterpreted term for a symbolic FP operation, gated to `unknown`.
+    fn symbolic_fp(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        let sort = match op {
+            "fp.eq" | "fp.lt" | "fp.leq" | "fp.gt" | "fp.geq" | "fp.isNaN" | "fp.isInfinite"
+            | "fp.isZero" | "fp.isNormal" | "fp.isSubnormal" | "fp.isNegative"
+            | "fp.isPositive" => self.m.mk_bool_sort(),
+            // Rounding ops carry an RM first arg; the result is like the last FP arg.
+            _ => self.m.get_sort(*args.last().unwrap()),
+        };
+        let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
+        let name = alloc::format!("!fpop!{}!{}", op, self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
+        let app = self.m.mk_app(d, args);
+        self.str_symbolic.insert(app);
+        Ok(app)
     }
 
     /// The `(Seq E)` sort for element sort `e` (interned per element sort).
@@ -2882,6 +3133,12 @@ impl Context {
                 name if name.starts_with("re.") && self.lookup_bound(name).is_none() => {
                     self.regex_op(name, &[])
                 }
+                // RoundingMode constants (RNE, RTP, …) as named constants.
+                name if is_rm_name(name) && self.lookup_bound(name).is_none() => {
+                    let s = self.rm_sort();
+                    let d = self.m.mk_func_decl(Symbol::new(name), &[], s);
+                    Ok(self.m.mk_const(d))
+                }
                 name => {
                     if let Some(id) = self.lookup_bound(name) {
                         return Ok(id);
@@ -2992,6 +3249,38 @@ impl Context {
                         let d = self.m.mk_func_decl(Symbol::new("int2bv"), &[its], bvs);
                         return Ok(self.m.mk_app(d, &[t]));
                     }
+                    if qid.len() == 4
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "to_fp" || a == "to_fp_unsigned")
+                    {
+                        // ((_ to_fp eb sb) RM x): fold a constant real to Float64
+                        // under RNE; otherwise a gated symbolic FP term.
+                        let eb: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "bad eb".to_string())?;
+                        let sb: u32 = Self::sym(&qid[3])?
+                            .parse()
+                            .map_err(|_| "bad sb".to_string())?;
+                        let rm = self.term(&l[1])?;
+                        let x = self.term(&l[2])?;
+                        if (eb, sb) == (11, 53)
+                            && self
+                                .rm_name(rm)
+                                .as_deref()
+                                .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
+                            && let Some(r) = self.m.as_numeral(x)
+                        {
+                            let num = r.numerator().to_i64();
+                            let den = r.denominator().to_i64();
+                            if let (Some(n), Some(d)) = (num, den) {
+                                return Ok(self.mk_fp((n as f64 / d as f64).to_bits(), 11, 53));
+                            }
+                        }
+                        let s = self.fp_sort(eb, sb);
+                        let t = self.fresh_const(s);
+                        self.str_symbolic.insert(t);
+                        return Ok(t);
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();
@@ -3034,6 +3323,17 @@ impl Context {
                 if head == "_" {
                     // Indexed identifier, e.g. (_ bv5 8) — a bit-vector numeral.
                     let name = Self::sym(&l[1])?;
+                    // FP special values: (_ +oo eb sb), (_ NaN eb sb), …
+                    if l.len() == 4 && matches!(name, "+oo" | "-oo" | "NaN" | "+zero" | "-zero") {
+                        let kind = name.to_string();
+                        let eb: u32 = Self::sym(&l[2])?
+                            .parse()
+                            .map_err(|_| "bad eb".to_string())?;
+                        let sb: u32 = Self::sym(&l[3])?
+                            .parse()
+                            .map_err(|_| "bad sb".to_string())?;
+                        return Ok(self.fp_special(&kind, eb, sb));
+                    }
                     if let Some(digits) = name.strip_prefix("bv") {
                         let v = Int::from_str_radix(digits, 10)
                             .map_err(|_| "bad bv numeral".to_string())?;
@@ -3059,6 +3359,21 @@ impl Context {
                 }
                 if head.starts_with("seq.") {
                     return self.seq_op(&head, &args);
+                }
+                if head.starts_with("fp.") {
+                    return self.fp_op(&head, &args);
+                }
+                if head == "fp" && args.len() == 3 {
+                    return self.mk_fp_literal(&args);
+                }
+                // Structural equality of two FP constants compares their bits.
+                if head == "="
+                    && args.len() == 2
+                    && let (Some(&(ba, ea, sa)), Some(&(bb, _, _))) =
+                        (self.fp_of.get(&args[0]), self.fp_of.get(&args[1]))
+                {
+                    let _ = (ea, sa);
+                    return Ok(self.mk_bool(ba == bb));
                 }
                 // Fold equality of two structural sequences (element-wise, or
                 // false on a length mismatch).
@@ -4303,6 +4618,36 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn floating_point_folding() {
+        let fp = "((_ to_fp 11 53) RNE";
+        // IEEE arithmetic: 1.5 + 2.5 = 4.0.
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (= (fp.add RNE {fp} 1.5) {fp} 2.5)) {fp} 4.0))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Division by zero yields infinity.
+        assert_eq!(
+            run(&alloc::format!(
+                "(assert (not (fp.eq (fp.div RNE {fp} 1.0) {fp} 0.0)) (_ +oo 11 53))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // NaN is not fp.eq to itself; +0 and -0 are fp.eq but structurally unequal.
+        assert_eq!(
+            run("(assert (fp.eq (_ NaN 11 53) (_ NaN 11 53)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (= (_ +zero 11 53) (_ -zero 11 53)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
