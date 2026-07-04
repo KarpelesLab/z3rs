@@ -742,6 +742,11 @@ struct Context {
     regex_of: BTreeMap<AstId, Regex>,
     /// Parametric sort macros from `define-sort`: name → (params, body).
     sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
+    /// `(Seq E)` sorts, keyed by element sort.
+    seq_sorts: BTreeMap<AstId, AstId>,
+    /// Sequence terms with a known element list (built from `seq.unit`/`++`/
+    /// `empty`), for structural folding of `seq.len`/`nth`/`at`/`extract`/`=`.
+    seq_of: BTreeMap<AstId, Vec<AstId>>,
 }
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
@@ -871,6 +876,8 @@ impl Context {
             reglan_sort: None,
             regex_of: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
+            seq_sorts: BTreeMap::new(),
+            seq_of: BTreeMap::new(),
         }
     }
 
@@ -914,6 +921,10 @@ impl Context {
                             .parse()
                             .map_err(|_| "BitVec: bad width".to_string())?;
                         Ok(self.m.mk_bv_sort(w))
+                    }
+                    "Seq" if l.len() == 2 => {
+                        let e = self.resolve_sort(&l[1])?;
+                        Ok(self.seq_sort(e))
                     }
                     name if self.sort_defs.contains_key(name) => {
                         // A parametric sort macro (define-sort): substitute the
@@ -1708,6 +1719,128 @@ impl Context {
             "str.to_re" | "str.to.re" => self.regex_op(op, raw),
             _ => Err(alloc::format!("unsupported string op {op:?}")),
         }
+    }
+
+    /// The `(Seq E)` sort for element sort `e` (interned per element sort).
+    fn seq_sort(&mut self, e: AstId) -> AstId {
+        if let Some(&s) = self.seq_sorts.get(&e) {
+            return s;
+        }
+        let name = alloc::format!("Seq!{}", self.seq_sorts.len());
+        let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
+        self.seq_sorts.insert(e, s);
+        s
+    }
+
+    /// Build a sequence-theory term. Structural operations on sequences with a
+    /// known element list (`seq.unit`/`++`/`empty`) fold exactly; a symbolic
+    /// sequence operation is marked so the goal is answered `unknown`.
+    fn seq_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // Known element list of each argument (if all are structural sequences).
+        let lists: Option<Vec<Vec<AstId>>> =
+            args.iter().map(|a| self.seq_of.get(a).cloned()).collect();
+        match op {
+            "seq.unit" => {
+                let elem = self.m.get_sort(args[0]);
+                let sort = self.seq_sort(elem);
+                let t = self.fresh_const(sort);
+                self.seq_of.insert(t, alloc::vec![args[0]]);
+                Ok(t)
+            }
+            "seq.++" => {
+                if let Some(parts) = lists {
+                    let joined: Vec<AstId> = parts.into_iter().flatten().collect();
+                    return Ok(self.mk_seq(joined));
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.len" => {
+                if let Some(l) = self.seq_of.get(&args[0]) {
+                    return Ok(self.m.mk_int(l.len() as i64));
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.nth" => {
+                if let (Some(l), Some(i)) =
+                    (self.seq_of.get(&args[0]).cloned(), self.int_arg(args[1]))
+                    && i >= 0
+                    && (i as usize) < l.len()
+                {
+                    return Ok(l[i as usize]);
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.at" => {
+                if let (Some(l), Some(i)) =
+                    (self.seq_of.get(&args[0]).cloned(), self.int_arg(args[1]))
+                {
+                    let out = if i >= 0 && (i as usize) < l.len() {
+                        alloc::vec![l[i as usize]]
+                    } else {
+                        Vec::new()
+                    };
+                    return Ok(self.mk_seq(out));
+                }
+                self.symbolic_seq(op, args)
+            }
+            "seq.extract" => {
+                if let (Some(l), Some(i), Some(n)) = (
+                    self.seq_of.get(&args[0]).cloned(),
+                    self.int_arg(args[1]),
+                    self.int_arg(args[2]),
+                ) && i >= 0
+                    && n >= 0
+                    && (i as usize) <= l.len()
+                {
+                    let start = i as usize;
+                    let end = (start + n as usize).min(l.len());
+                    return Ok(self.mk_seq(l[start..end].to_vec()));
+                }
+                self.symbolic_seq(op, args)
+            }
+            _ => self.symbolic_string(op, args),
+        }
+    }
+
+    /// The element sort of a `(Seq E)` sort, if known.
+    fn seq_elem_sort(&self, seq_sort: AstId) -> Option<AstId> {
+        self.seq_sorts
+            .iter()
+            .find(|(_, s)| **s == seq_sort)
+            .map(|(&e, _)| e)
+    }
+
+    /// A fresh uninterpreted term for a symbolic sequence operation, with the
+    /// correct result sort, recorded so the goal is answered `unknown`.
+    fn symbolic_seq(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        let sort = match op {
+            "seq.len" | "seq.indexof" => self.m.mk_int_sort(),
+            "seq.contains" | "seq.prefixof" | "seq.suffixof" => self.m.mk_bool_sort(),
+            "seq.nth" => self
+                .seq_elem_sort(self.m.get_sort(args[0]))
+                .unwrap_or_else(|| self.m.mk_int_sort()),
+            // seq.++/at/extract and the rest return a sequence like args[0].
+            _ => self.m.get_sort(args[0]),
+        };
+        let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
+        let name = alloc::format!("!seqop!{}!{}", op, self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
+        let app = self.m.mk_app(d, args);
+        self.str_symbolic.insert(app);
+        Ok(app)
+    }
+
+    /// A fresh sequence constant with the given element list recorded.
+    fn mk_seq(&mut self, elems: Vec<AstId>) -> AstId {
+        let elem_sort = elems
+            .first()
+            .map(|&e| self.m.get_sort(e))
+            .unwrap_or_else(|| self.m.mk_int_sort());
+        let sort = self.seq_sort(elem_sort);
+        let t = self.fresh_const(sort);
+        self.seq_of.insert(t, elems);
+        t
     }
 
     /// The interned `RegLan` sort (registered on first use).
@@ -2726,6 +2859,17 @@ impl Context {
                 if head == "match" {
                     return self.term_match(&l[1], &l[2]);
                 }
+                if head == "as" && l.len() == 3 {
+                    // (as t Sort) — a sort-annotated term. `seq.empty` needs the
+                    // annotation to know its element type.
+                    if matches!(&l[1], SExpr::Atom(a) if a == "seq.empty") {
+                        let s = self.resolve_sort(&l[2])?;
+                        let t = self.fresh_const(s);
+                        self.seq_of.insert(t, Vec::new());
+                        return Ok(t);
+                    }
+                    return self.term(&l[1]);
+                }
                 if head == "!" {
                     // (! t :annotation value …) — annotations are transparent to
                     // the term's meaning; evaluate the annotated term.
@@ -2770,6 +2914,32 @@ impl Context {
                 }
                 if head.starts_with("re.") {
                     return self.regex_op(&head, &args);
+                }
+                if head.starts_with("seq.") {
+                    return self.seq_op(&head, &args);
+                }
+                // Fold equality of two structural sequences (element-wise, or
+                // false on a length mismatch).
+                if head == "="
+                    && args.len() == 2
+                    && let (Some(a), Some(b)) = (
+                        self.seq_of.get(&args[0]).cloned(),
+                        self.seq_of.get(&args[1]).cloned(),
+                    )
+                {
+                    if a.len() != b.len() {
+                        return Ok(self.m.mk_false());
+                    }
+                    let eqs: Vec<AstId> = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(&x, &y)| self.m.mk_eq(x, y))
+                        .collect();
+                    return Ok(match eqs.len() {
+                        0 => self.m.mk_true(),
+                        1 => eqs[0],
+                        _ => self.m.mk_and(&eqs),
+                    });
                 }
                 self.apply(&head, args)
             }
@@ -3991,6 +4161,31 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn sequence_structural_fragment() {
+        // Length and indexing of a structurally-built sequence.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (not (= (seq.nth (seq.++ (seq.unit x) (seq.unit y)) 1) y)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Length mismatch makes sequences unequal.
+        assert_eq!(
+            run("(declare-const x Int)\
+                 (assert (= (seq.++ (seq.unit x) (seq.unit x)) (seq.unit x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Element-wise equality: (seq.unit x) = (seq.unit y) forces x = y.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (= (seq.unit x) (seq.unit y)))(assert (not (= x y)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
