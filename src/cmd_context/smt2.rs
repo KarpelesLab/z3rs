@@ -2624,6 +2624,9 @@ impl Context {
                 if head == "let" {
                     return self.term_let(&l[1], &l[2]);
                 }
+                if head == "match" {
+                    return self.term_match(&l[1], &l[2]);
+                }
                 if head == "!" {
                     // (! t :annotation value …) — annotations are transparent to
                     // the term's meaning; evaluate the annotated term.
@@ -2696,6 +2699,113 @@ impl Context {
     }
 
     /// `(let ((v t) ...) body)` — parallel binding, then evaluate `body`.
+    /// The declaration name of a function/constant.
+    fn decl_name(&self, decl: AstId) -> Option<String> {
+        Some(self.m.func_decl(decl)?.name.as_str()?.to_string())
+    }
+
+    /// For a datatype `sort` and constructor name `cname`, the tester guard
+    /// `is-C(e)` and the selector declarations of that constructor.
+    fn constructor_info(
+        &mut self,
+        e: AstId,
+        sort: AstId,
+        cname: &str,
+    ) -> Option<(AstId, Vec<AstId>)> {
+        if let Some(ctors) = self.datatypes.get(&sort).cloned() {
+            for (cdecl, sels, tdecl) in ctors {
+                if self.decl_name(cdecl).as_deref() == Some(cname) {
+                    let guard = self.m.mk_app(tdecl, &[e]);
+                    return Some((guard, sels));
+                }
+            }
+        }
+        if let Some((cdecl, sels)) = self.records.get(&sort).cloned()
+            && self.decl_name(cdecl).as_deref() == Some(cname)
+        {
+            let guard = self.m.mk_true();
+            return Some((guard, sels));
+        }
+        if let Some(ctors) = self.enums.get(&sort).cloned() {
+            for c in ctors {
+                let cd = self.m.app_decl(c);
+                if self.decl_name(cd).as_deref() == Some(cname) {
+                    let guard = self.m.mk_eq(e, c);
+                    return Some((guard, Vec::new()));
+                }
+            }
+        }
+        None
+    }
+
+    /// `(match e ((pat body)…))` — datatype pattern matching, desugared to a
+    /// guarded `ite` chain over the constructor testers, binding each pattern's
+    /// variables to the corresponding selectors. Matches are exhaustive, so the
+    /// final case is the `else` branch.
+    fn term_match(&mut self, scrutinee: &SExpr, cases: &SExpr) -> Result<AstId, String> {
+        let e = self.term(scrutinee)?;
+        let sort = self.m.get_sort(e);
+        let cases = as_list(cases)?;
+        let mut result: Option<AstId> = None;
+        // Build from the last case (the else) up to the first.
+        for case in cases.iter().rev() {
+            let cl = as_list(case)?;
+            if cl.len() != 2 {
+                return Err("match: each case is (pattern body)".to_string());
+            }
+            let (guard, scope) = self.match_pattern(e, sort, &cl[0])?;
+            self.scopes.push(scope);
+            let body = self.term(&cl[1]);
+            self.scopes.pop();
+            let body = body?;
+            result = Some(match result {
+                None => body,
+                Some(rest) => self.m.mk_ite(guard, body, rest),
+            });
+        }
+        result.ok_or_else(|| "match: no cases".to_string())
+    }
+
+    /// A match pattern's `(guard, variable bindings)`: a constructor pattern
+    /// `C` / `(C x…)` guards on its tester and binds fields to selectors; a plain
+    /// variable (or `_`) matches anything and binds the whole scrutinee.
+    fn match_pattern(
+        &mut self,
+        e: AstId,
+        sort: AstId,
+        pattern: &SExpr,
+    ) -> Result<(AstId, Vec<(String, AstId)>), String> {
+        match pattern {
+            SExpr::Atom(name) => {
+                if let Some((guard, _)) = self.constructor_info(e, sort, name) {
+                    Ok((guard, Vec::new()))
+                } else {
+                    let scope = if name == "_" {
+                        Vec::new()
+                    } else {
+                        alloc::vec![(name.clone(), e)]
+                    };
+                    let t = self.m.mk_true();
+                    Ok((t, scope))
+                }
+            }
+            SExpr::List(pl) if !pl.is_empty() => {
+                let cname = Self::sym(&pl[0])?.to_string();
+                let (guard, sels) = self
+                    .constructor_info(e, sort, &cname)
+                    .ok_or_else(|| alloc::format!("match: unknown constructor {cname:?}"))?;
+                let mut scope = Vec::new();
+                for (v, &sel) in pl[1..].iter().zip(&sels) {
+                    let name = Self::sym(v)?.to_string();
+                    let app = self.m.mk_app(sel, &[e]);
+                    scope.push((name, app));
+                }
+                Ok((guard, scope))
+            }
+            _ => Err("match: bad pattern".to_string()),
+        }
+    }
+
     fn term_let(&mut self, bindings: &SExpr, body: &SExpr) -> Result<AstId, String> {
         let bs = match bindings {
             SExpr::List(bs) => bs,
@@ -3629,6 +3739,29 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn datatype_match_expression() {
+        let o = "(declare-datatypes ((Opt 0)) (((none) (some (val Int)))))";
+        // (match o ((none 0) ((some v) v))) selects the field for `some`.
+        assert_eq!(
+            run(&alloc::format!(
+                "{o}(declare-const o Opt)(assert (= o (some 7)))\
+                 (assert (not (= (match o ((none 0) ((some v) v))) 7)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // …and the constant for `none`, via a wildcard-free exhaustive match.
+        assert_eq!(
+            run(&alloc::format!(
+                "{o}(declare-const o Opt)(assert (= o none))\
+                 (assert (not (= (match o ((none 0) ((some v) v))) 0)))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
