@@ -336,6 +336,18 @@ fn run_v1(l: &[SExpr]) -> Result<Vec<String>, String> {
     Ok(alloc::vec![verdict_word(res).to_string()])
 }
 
+/// The integer value following the keyword `key` in a command's tail, if any
+/// (e.g. `:weight 5`).
+fn attr_int(list: &[SExpr], key: &str) -> Option<i64> {
+    let pos = list
+        .iter()
+        .position(|s| matches!(s, SExpr::Atom(a) if a == key))?;
+    match list.get(pos + 1) {
+        Some(SExpr::Atom(a)) => a.parse().ok(),
+        _ => None,
+    }
+}
+
 /// If `s` is a top-level `(forall …)` or `(exists …)`, its keyword.
 fn top_level_quantifier(s: &SExpr) -> Option<&'static str> {
     if let SExpr::List(l) = s
@@ -600,6 +612,9 @@ struct Context {
     objectives: Vec<(AstId, bool, String)>,
     /// The rendered optimal value of each objective after the last `check-sat`.
     objective_values: Vec<String>,
+    /// Soft constraints (`assert-soft`) as `(penalty indicator bool, weight)`;
+    /// `check-sat` minimizes the total weight of the violated ones (MaxSAT).
+    soft: Vec<(AstId, i64)>,
 }
 
 impl Context {
@@ -635,6 +650,7 @@ impl Context {
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
+            soft: Vec::new(),
         }
     }
 
@@ -743,6 +759,7 @@ impl Context {
                 self.universals.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
+                self.soft.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -756,6 +773,7 @@ impl Context {
                 self.universals.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
+                self.soft.clear();
                 self.scope_stack.clear();
                 self.last_model = None;
                 self.last_verdict = None;
@@ -853,9 +871,27 @@ impl Context {
                 self.last_model = None;
                 Ok(None)
             }
+            "assert-soft" => {
+                // (assert-soft F [:weight w] [:id g]) — prefer F. Hard-assert
+                // (F ∨ pᵢ) with a fresh penalty bool pᵢ; check-sat minimizes the
+                // total weight of the softs whose pᵢ is forced true.
+                let f = self.term(&list[1])?;
+                let weight = attr_int(list, ":weight").unwrap_or(1);
+                let name = alloc::format!("!soft!{}", self.fresh_counter);
+                self.fresh_counter += 1;
+                let b = self.m.mk_bool_sort();
+                let pdecl = self.m.mk_func_decl(Symbol::new(&name), &[], b);
+                let penalty = self.m.mk_const(pdecl);
+                let relaxed = self.m.mk_or(&[f, penalty]);
+                self.assertions.push(relaxed);
+                self.assert_names.push(None);
+                self.soft.push((penalty, weight));
+                self.last_model = None;
+                Ok(None)
+            }
             "get-objectives" => Ok(Some(self.get_objectives())),
             "check-sat" => {
-                let (res, model) = if self.objectives.is_empty() {
+                let (res, model) = if self.objectives.is_empty() && self.soft.is_empty() {
                     self.check_sat()
                 } else {
                     self.optimize()
@@ -1351,13 +1387,27 @@ impl Context {
     /// binary search; a non-integer objective or one not bounded within budget
     /// is reported as `unknown` (or `oo`/`(- oo)` when provably unbounded).
     fn optimize(&mut self) -> (SmtResult, Option<Model>) {
-        let objs = self.objectives.clone();
-        self.objective_values = alloc::vec!["unknown".to_string(); objs.len()];
-        let (res, mut model) = self.check_with(&[]);
+        // The MaxSAT penalty (minimize the violated soft weight) is optimized
+        // first, then the user objectives, lexicographically. The penalty is
+        // bound to a fresh variable `pen = Σ(ite pᵢ wᵢ 0)`, threaded through the
+        // optimization via `fixed`.
+        let mut objs: Vec<(AstId, bool, String)> = Vec::new();
+        let mut fixed: Vec<AstId> = Vec::new();
+        if let Some(sum) = self.soft_penalty() {
+            let int = self.m.mk_int_sort();
+            let pen = self.fresh_const(int);
+            let c = self.m.mk_eq(pen, sum);
+            fixed.push(c);
+            objs.push((pen, false, "!penalty".to_string()));
+        }
+        let user_start = objs.len();
+        objs.extend(self.objectives.clone());
+        let mut values = alloc::vec!["unknown".to_string(); objs.len()];
+        let (res, mut model) = self.check_with(&fixed);
         if res != SmtResult::Sat {
+            self.objective_values = values.split_off(user_start);
             return (res, model);
         }
-        let mut fixed: Vec<AstId> = Vec::new();
         for (i, (obj, maximize, _)) in objs.iter().enumerate() {
             let (obj, maximize) = (*obj, *maximize);
             if !self.m.is_int_sort(self.m.get_sort(obj)) {
@@ -1369,14 +1419,14 @@ impl Context {
             };
             match self.opt_int_search(obj, maximize, v0, &fixed) {
                 OptResult::Optimum(v) => {
-                    self.objective_values[i] = render_int(&v);
+                    values[i] = render_int(&v);
                     let iv = self.m.mk_numeral(Rational::from_integer(v), true);
                     let eq = self.m.mk_eq(obj, iv);
                     fixed.push(eq);
                     model = self.check_with(&fixed).1;
                 }
                 OptResult::Unbounded => {
-                    self.objective_values[i] = if maximize {
+                    values[i] = if maximize {
                         "oo".to_string()
                     } else {
                         "(- oo)".to_string()
@@ -1385,7 +1435,31 @@ impl Context {
                 OptResult::Unknown => {}
             }
         }
+        // `get-objectives` reports only the user objectives, not the penalty.
+        self.objective_values = values.split_off(user_start);
         (SmtResult::Sat, model)
+    }
+
+    /// The MaxSAT penalty term `Σ (ite pᵢ wᵢ 0)` over the soft constraints, or
+    /// `None` if there are none.
+    fn soft_penalty(&mut self) -> Option<AstId> {
+        if self.soft.is_empty() {
+            return None;
+        }
+        let soft = self.soft.clone();
+        let zero = self.m.mk_int(0);
+        let terms: Vec<AstId> = soft
+            .iter()
+            .map(|&(p, w)| {
+                let wv = self.m.mk_int(w);
+                self.m.mk_ite(p, wv, zero)
+            })
+            .collect();
+        Some(if terms.len() == 1 {
+            terms[0]
+        } else {
+            self.m.mk_add(&terms)
+        })
     }
 
     /// The bound constraint `obj ≥ k` (maximize) or `obj ≤ k` (minimize).
@@ -3038,6 +3112,19 @@ mod tests {
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn maxsat_soft_constraints() {
+        // Two conflicting softs with weights 1 and 5: the optimum keeps the
+        // weight-5 one, so a is sacrificed (a=false, b=true) — a unique optimum.
+        let out = run(
+            "(declare-const a Bool)(declare-const b Bool)(assert (not (and a b)))\
+             (assert-soft a :weight 1)(assert-soft b :weight 5)(check-sat)(get-value (a b))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "((a false) (b true))");
     }
 
     #[test]
