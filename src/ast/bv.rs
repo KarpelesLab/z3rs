@@ -57,6 +57,10 @@ pub enum BvOp {
     BXor = 33,
     /// `concat`
     Concat = 37,
+    /// `(_ sign_extend k)`
+    SignExt = 38,
+    /// `(_ zero_extend k)`
+    ZeroExt = 39,
     /// `(_ extract i j)`
     Extract = 40,
 }
@@ -251,6 +255,26 @@ impl AstManager {
         self.mk_app(decl, &[x])
     }
 
+    /// `((_ zero_extend k) x)` — widen `x` by `k` zero bits (unsigned).
+    pub fn mk_bv_zero_extend(&mut self, k: u32, x: AstId) -> AstId {
+        self.mk_bv_extend("zero_extend", BvOp::ZeroExt, k, x)
+    }
+
+    /// `((_ sign_extend k) x)` — widen `x` by `k` copies of its sign bit.
+    pub fn mk_bv_sign_extend(&mut self, k: u32, x: AstId) -> AstId {
+        self.mk_bv_extend("sign_extend", BvOp::SignExt, k, x)
+    }
+
+    fn mk_bv_extend(&mut self, name: &str, op: BvOp, k: u32, x: AstId) -> AstId {
+        let w = self.bv_sort_width(self.get_sort(x)).expect("extend: not bv");
+        let sx = self.get_sort(x);
+        let range = self.mk_bv_sort(w + k);
+        let fid = self.bv_fid();
+        let info = DeclInfo::new(fid, op as DeclKind, vec![Parameter::Int(k as i32)]);
+        let decl = self.mk_func_decl_full(Symbol::new(name), &[sx], range, info, FuncDeclFlags::default());
+        self.mk_app(decl, &[x])
+    }
+
     /// `(bvnot a)` — bitwise NOT.
     pub fn mk_bvnot(&mut self, a: AstId) -> AstId {
         let sort = self.get_sort(a);
@@ -353,6 +377,8 @@ impl AstManager {
             BvOp::Sleq,
             BvOp::Slt,
             BvOp::Concat,
+            BvOp::SignExt,
+            BvOp::ZeroExt,
             BvOp::Extract,
         ]
         .into_iter()
@@ -368,6 +394,17 @@ impl AstManager {
         let high = d.info.parameters.first()?.get_int()? as u32;
         let low = d.info.parameters.get(1)?.get_int()? as u32;
         Some((high, low))
+    }
+
+    /// The extension amount `k` of a `zero_extend` / `sign_extend` application.
+    pub fn bv_extend_amount(&self, id: AstId) -> Option<u32> {
+        match self.bv_op(id)? {
+            BvOp::ZeroExt | BvOp::SignExt => {
+                let d = self.func_decl(self.app(id)?.decl)?;
+                Some(d.info.parameters.first()?.get_int()? as u32)
+            }
+            _ => None,
+        }
     }
 }
 

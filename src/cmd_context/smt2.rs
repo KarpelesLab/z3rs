@@ -1049,6 +1049,20 @@ impl Context {
                         let x = self.term(&l[1])?;
                         return Ok(self.m.mk_bv_extract(high, low, x));
                     }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "zero_extend" || a == "sign_extend")
+                    {
+                        let k: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "extend: bad amount".to_string())?;
+                        let x = self.term(&l[1])?;
+                        return Ok(if Self::sym(&qid[1])? == "zero_extend" {
+                            self.m.mk_bv_zero_extend(k, x)
+                        } else {
+                            self.m.mk_bv_sign_extend(k, x)
+                        });
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();

@@ -213,6 +213,21 @@ impl<'a> BitBlaster<'a> {
                     let a = self.blast_bv(args[0]);
                     a[low as usize..=high as usize].to_vec()
                 }
+                BvOp::ZeroExt => {
+                    let k = self.m.bv_extend_amount(t).expect("zero_extend amount");
+                    let mut a = self.blast_bv(args[0]);
+                    let false_lit = !self.true_lit;
+                    a.extend(core::iter::repeat_n(false_lit, k as usize));
+                    a
+                }
+                BvOp::SignExt => {
+                    let k = self.m.bv_extend_amount(t).expect("sign_extend amount");
+                    let a = self.blast_bv(args[0]);
+                    let sign = *a.last().expect("sign_extend of empty bv");
+                    let mut out = a;
+                    out.extend(core::iter::repeat_n(sign, k as usize));
+                    out
+                }
                 // Unsupported bv operators become fresh (unconstrained) bits.
                 _ => (0..width).map(|_| self.fresh()).collect(),
             }
