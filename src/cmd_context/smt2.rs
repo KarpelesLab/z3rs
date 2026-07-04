@@ -1468,6 +1468,22 @@ impl Context {
     fn declare_datatypes(&mut self, sort_decls: &SExpr, bodies: &SExpr) -> Result<(), String> {
         let sort_decls = as_list(sort_decls)?;
         let bodies = as_list(bodies)?;
+        // Pass 1: register every datatype sort name up front, so a constructor
+        // field may reference a mutually-recursive sibling (e.g. T referencing F
+        // before F is fully declared).
+        for (i, body) in bodies.iter().enumerate() {
+            let name = if sort_decls.is_empty() {
+                Self::sym(&as_list(body)?[0])?.to_string()
+            } else {
+                Self::sym(&as_list(&sort_decls[i])?[0])?.to_string()
+            };
+            if !self.sorts.contains_key(&name) {
+                let sort = self.m.mk_uninterpreted_sort(Symbol::new(&name));
+                self.sorts.insert(name.clone(), sort);
+                self.sort_order.push(name);
+            }
+        }
+        // Pass 2: build each datatype's constructors, selectors, and axioms.
         for (i, body) in bodies.iter().enumerate() {
             let bodyl = as_list(body)?;
             // The datatype name and the constructor s-expressions.
@@ -1477,9 +1493,7 @@ impl Context {
                 let sd = as_list(&sort_decls[i])?;
                 (Self::sym(&sd[0])?.to_string(), bodyl) // 2.6: name from (T k)
             };
-            let sort = self.m.mk_uninterpreted_sort(Symbol::new(&name));
-            self.sorts.insert(name.clone(), sort);
-            self.sort_order.push(name);
+            let sort = self.sorts[&name];
             // Parse each constructor into (name, [(field name, field sort sexpr)]).
             let mut parsed: Vec<(String, Vec<(String, SExpr)>)> = Vec::new();
             for c in ctors {
@@ -5915,6 +5929,29 @@ mod tests {
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn mutually_recursive_datatypes() {
+        // T and F reference each other; both must be registered before either's
+        // constructors are parsed. Cross-type selection resolves.
+        let dt = "(declare-datatypes ((T 0) (F 0))\
+                  (((tnil) (tcons (th Int) (tf F))) ((fnil) (fcons (fh Int) (ft T)))))";
+        assert_eq!(
+            run(&alloc::format!(
+                "{dt}(declare-const x T)(assert (= x (tcons 5 (fcons 6 tnil))))\
+                 (assert (not (= (fh (tf x)) 6)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{dt}(declare-const x T)(assert ((_ is tcons) x))(assert (= (th x) 9))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
