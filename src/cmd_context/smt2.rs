@@ -2127,63 +2127,86 @@ impl Context {
         Ok((vars, result?))
     }
 
-    /// Ground instances of every recorded universal: substitute the bound-var
-    /// placeholders by ground terms of the matching sort drawn from the current
-    /// assertions (bounded to keep the instance set finite).
+    /// Ground instances of every recorded universal. Bound-var placeholders are
+    /// substituted by ground terms of the matching sort, drawn from the
+    /// assertions **and from previously generated instances** — iterating to a
+    /// fixpoint so chained/inductive universals (`∀x. p(x) ⇒ p(x+1)` with
+    /// `p(0)`, `¬p(3)`) fully unfold. Bounded by rounds and a total-instance cap.
     fn universal_instances(&mut self) -> Vec<AstId> {
         if self.universals.is_empty() {
             return Vec::new();
         }
-        // Ground terms by sort, collected from the assertions.
-        let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
+        const MAX_ROUNDS: usize = 8;
+        const MAX_TOTAL: usize = 400;
+        let universals = self.universals.clone();
+
+        // Ground terms by sort, seeded from the assertions.
+        let mut by_sort: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
         for a in self.assertions.clone() {
             for t in self.m.postorder(a) {
-                let s = self.m.get_sort(t);
-                by_sort.entry(s).or_default().push(t);
+                by_sort.entry(self.m.get_sort(t)).or_default().insert(t);
             }
         }
-        for v in by_sort.values_mut() {
-            v.sort_unstable();
-            v.dedup();
-        }
-        const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
-        let mut instances = Vec::new();
-        for (vars, body) in self.universals.clone() {
-            // Candidate ground terms for each bound variable.
-            let mut cands: Vec<Vec<AstId>> = Vec::new();
-            for &v in &vars {
+        // Ensure every binder sort has at least one ground term (a fresh rep).
+        for (vars, _) in &universals {
+            for &v in vars {
                 let s = self.m.get_sort(v);
-                let mut c = by_sort.get(&s).cloned().unwrap_or_default();
-                if c.is_empty() {
-                    // No ground term of this sort: use a fresh representative
-                    // (uninterpreted sorts are non-empty; sound for the others).
-                    c.push(self.fresh_const(s));
+                if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
+                    let rep = self.fresh_const(s);
+                    by_sort.entry(s).or_default().insert(rep);
                 }
-                cands.push(c);
             }
-            // Bounded cartesian product of the candidates.
-            let mut combos: Vec<Vec<AstId>> = alloc::vec![Vec::new()];
-            for c in &cands {
-                let mut next = Vec::new();
-                for combo in &combos {
-                    for &g in c {
-                        let mut nc = combo.clone();
-                        nc.push(g);
-                        next.push(nc);
+        }
+
+        let mut instances: Vec<AstId> = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for _round in 0..MAX_ROUNDS {
+            let mut fresh_term = false;
+            for (vars, body) in &universals {
+                let cands: Vec<Vec<AstId>> = vars
+                    .iter()
+                    .map(|&v| by_sort[&self.m.get_sort(v)].iter().copied().collect())
+                    .collect();
+                // Bounded cartesian product of the candidate ground terms.
+                let mut combos: Vec<Vec<AstId>> = alloc::vec![Vec::new()];
+                for c in &cands {
+                    let mut next = Vec::new();
+                    for combo in &combos {
+                        for &g in c {
+                            let mut nc = combo.clone();
+                            nc.push(g);
+                            next.push(nc);
+                            if next.len() >= MAX_INSTANCES_PER_UNIVERSAL {
+                                break;
+                            }
+                        }
                         if next.len() >= MAX_INSTANCES_PER_UNIVERSAL {
                             break;
                         }
                     }
-                    if next.len() >= MAX_INSTANCES_PER_UNIVERSAL {
-                        break;
+                    combos = next;
+                }
+                for combo in combos {
+                    let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
+                    let inst = substitute(&mut self.m, *body, &subst);
+                    if !seen.insert(inst) {
+                        continue;
+                    }
+                    instances.push(inst);
+                    // Feed the instance's ground terms into the next round.
+                    for t in self.m.postorder(inst) {
+                        if by_sort.entry(self.m.get_sort(t)).or_default().insert(t) {
+                            fresh_term = true;
+                        }
+                    }
+                    if instances.len() >= MAX_TOTAL {
+                        return instances;
                     }
                 }
-                combos = next;
             }
-            for combo in combos {
-                let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
-                let inst = substitute(&mut self.m, body, &subst);
-                instances.push(inst);
+            if !fresh_term {
+                break; // fixpoint: no new ground terms to instantiate over
             }
         }
         instances
@@ -4161,6 +4184,28 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((x #x0f))");
+    }
+
+    #[test]
+    fn quantifier_iterative_instantiation() {
+        // Inductive unfolding: p(0), ∀x. p(x) ⇒ p(x+1), ¬p(3) is unsat only if
+        // instantiation chains 0→1→2→3 (fixpoint instantiation).
+        assert_eq!(
+            run(
+                "(declare-fun p (Int) Bool)(assert (forall ((x Int)) (=> (p x) (p (+ x 1)))))\
+                 (assert (p 0))(assert (not (p 3)))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Chained UF: f(f(x)) = x forces f^4(a) = a.
+        assert_eq!(
+            run("(declare-sort S)(declare-fun f (S) S)(declare-const a S)\
+                 (assert (forall ((x S)) (= (f (f x)) x)))\
+                 (assert (not (= (f (f (f (f a)))) a)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
