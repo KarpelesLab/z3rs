@@ -5220,6 +5220,25 @@ impl Context {
 
     fn apply(&mut self, head: &str, args: Vec<AstId>) -> Result<AstId, String> {
         let m = &mut self.m;
+        // Bit-vector binary ops and comparisons require equal operand widths;
+        // reject a mismatch (as z3 does) instead of building a garbage term.
+        const BV_SAME_WIDTH: &[&str] = &[
+            "bvadd", "bvsub", "bvmul", "bvand", "bvor", "bvxor", "bvnand", "bvnor", "bvxnor",
+            "bvudiv", "bvurem", "bvsdiv", "bvsrem", "bvsmod", "bvshl", "bvlshr", "bvashr", "bvult",
+            "bvule", "bvugt", "bvuge", "bvslt", "bvsle", "bvsgt", "bvsge", "bvcomp", "bvuaddo",
+            "bvsaddo", "bvusubo", "bvssubo", "bvumulo", "bvsmulo", "bvsdivo",
+        ];
+        if BV_SAME_WIDTH.contains(&head) && args.len() == 2 {
+            let w0 = m.bv_sort_width(m.get_sort(args[0]));
+            let w1 = m.bv_sort_width(m.get_sort(args[1]));
+            if let (Some(a), Some(b)) = (w0, w1)
+                && a != b
+            {
+                return Err(alloc::format!(
+                    "{head}: operand width mismatch ({a} vs {b})"
+                ));
+            }
+        }
         match head {
             "not" => Ok(m.mk_not(args[0])),
             "and" => Ok(match args.len() {
@@ -6535,6 +6554,24 @@ mod tests {
                  (assert (= (seq.unit x) (seq.unit y)))(assert (not (= x y)))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn bitvector_width_mismatch_rejected() {
+        // A bit-vector op with mismatched operand widths is ill-typed (z3 errors
+        // too) — reject it rather than build a garbage term that could answer
+        // unsoundly.
+        assert!(
+            run("(declare-const a (_ BitVec 4))(assert (bvsgt (concat a a) a))(check-sat)")
+                .is_err()
+        );
+        assert!(
+            run(
+                "(declare-const a (_ BitVec 8))(declare-const b (_ BitVec 4))\
+                 (assert (= (bvadd a b) a))(check-sat)"
+            )
+            .is_err()
         );
     }
 
