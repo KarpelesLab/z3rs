@@ -113,6 +113,27 @@ impl<'a> BitBlaster<'a> {
         (sum, carry)
     }
 
+    /// `a · b` (mod 2^n) via shift-and-add of the partial products.
+    fn multiply(&mut self, a: &[Lit], b: &[Lit]) -> Vec<Lit> {
+        let n = a.len();
+        let false_lit = !self.true_lit;
+        let mut acc = alloc::vec![false_lit; n];
+        for i in 0..n {
+            // partial = (a << i) & b[i], truncated to n bits.
+            let mut partial = Vec::with_capacity(n);
+            for j in 0..n {
+                if j >= i {
+                    let bit = self.and2(a[j - i], b[i]);
+                    partial.push(bit);
+                } else {
+                    partial.push(false_lit);
+                }
+            }
+            acc = self.ripple_add(&acc, &partial, false_lit);
+        }
+        acc
+    }
+
     /// `a + b` (mod 2^n) via ripple-carry, `cin` the initial carry.
     fn ripple_add(&mut self, a: &[Lit], b: &[Lit], cin: Lit) -> Vec<Lit> {
         let mut carry = cin;
@@ -170,6 +191,11 @@ impl<'a> BitBlaster<'a> {
                     let na: Vec<Lit> = a.iter().map(|&l| !l).collect();
                     let zero = alloc::vec![!self.true_lit; width];
                     self.ripple_add(&na, &zero, self.true_lit)
+                }
+                BvOp::Mul => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    self.multiply(&a, &b)
                 }
                 BvOp::Concat => {
                     // a (high) ++ b (low): low bits are b, high bits are a.
@@ -351,6 +377,27 @@ mod tests {
         assert_eq!(check_bv(&m, lt2), SmtResult::Sat);
         let lt3 = m.mk_bvult(b, a);
         assert_eq!(check_bv(&m, lt3), SmtResult::Unsat);
+    }
+
+    #[test]
+    fn multiply_commutes_and_solves() {
+        let mut m = AstManager::new();
+        let x = bvc(&mut m, "x", 8);
+        let y = bvc(&mut m, "y", 8);
+        // x·y = y·x always.
+        let xy = m.mk_bvmul(x, y);
+        let yx = m.mk_bvmul(y, x);
+        let e = m.mk_eq(xy, yx);
+        let ne = m.mk_not(e);
+        assert_eq!(check_bv(&m, ne), SmtResult::Unsat);
+        // 4·4 = 0 in 4-bit (overflow).
+        let mut m2 = AstManager::new();
+        let four = m2.mk_bv(4, 4);
+        let zero = m2.mk_bv(0, 4);
+        let prod = m2.mk_bvmul(four, four);
+        let e2 = m2.mk_eq(prod, zero);
+        let ne2 = m2.mk_not(e2);
+        assert_eq!(check_bv(&m2, ne2), SmtResult::Unsat);
     }
 
     #[test]

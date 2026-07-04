@@ -1314,6 +1314,7 @@ impl Context {
             "bvxor" => Ok(m.mk_bvxor(args[0], args[1])),
             "bvadd" => Ok(m.mk_bvadd(args[0], args[1])),
             "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
+            "bvmul" => Ok(m.mk_bvmul(args[0], args[1])),
             "bvult" => Ok(m.mk_bvult(args[0], args[1])),
             "bvule" => Ok(m.mk_bvule(args[0], args[1])),
             "bvugt" => Ok(m.mk_bvult(args[1], args[0])), // a >u b  ⟺  b <u a

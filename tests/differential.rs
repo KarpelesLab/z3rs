@@ -319,6 +319,15 @@ const CORPUS: &[Case] = &[
         name: "bv_concat_literal",
         script: "(assert (not (= (concat #x0f #xf0) #x0ff0)))(check-sat)",
     },
+    Case {
+        name: "bv_mul_commutes",
+        script: "(declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))
+                 (assert (not (= (bvmul x y) (bvmul y x))))(check-sat)",
+    },
+    Case {
+        name: "bv_mul_solve",
+        script: "(declare-const x (_ BitVec 8))(assert (= (bvmul x #x03) #x0f))(assert (not (= x #x05)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
