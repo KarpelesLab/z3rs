@@ -35,6 +35,10 @@ puremp = { version = "0.1.4", default-features = false, features = ["rational", 
 # turns on `puremp`'s std layer. The `z3rs` binary links std itself regardless.
 default = []
 std = ["puremp/std"]
+# C ABI: builds the `ffi` module (the only place `unsafe` is used for FFI). Build
+# a C library with `cargo rustc --lib --features ffi --crate-type staticlib` (or
+# `--crate-type cdylib`); the exported symbols are declared in `include/z3rs.h`.
+ffi = ["std"]
 
 [lib]
 name = "z3rs"

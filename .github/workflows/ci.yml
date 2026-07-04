@@ -92,6 +92,29 @@ jobs:
       - name: cargo check --all-features --all-targets
         run: cargo check --all-features --all-targets
 
+  c_abi:
+    name: C ABI smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the C library (static + shared)
+        run: |
+          cargo rustc --lib --release --features ffi --crate-type staticlib
+          cargo rustc --lib --release --features ffi --crate-type cdylib
+
+      - name: Compile and run the C smoke test
+        run: |
+          cc tests/ffi_smoke.c -I include target/release/libz3rs.a \
+             -lpthread -ldl -lm -o ffi_smoke
+          ./ffi_smoke
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest
