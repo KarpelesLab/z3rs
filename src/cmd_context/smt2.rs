@@ -27,7 +27,7 @@ use puremp::{Int, Rational};
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
-use crate::smt::{Model, SmtResult, check_bv, check_model};
+use crate::smt::{Model, SmtResult, check_bv_model, check_model};
 use crate::util::symbol::Symbol;
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -1051,7 +1051,8 @@ impl Context {
         // a sound `unknown` rather than a possibly-wrong verdict.
         if self.is_bv_goal(goal) {
             if self.bv_goal_is_pure(goal) {
-                return (check_bv(&self.m, goal), None);
+                let (res, bv) = check_bv_model(&self.m, goal);
+                return (res, bv.map(Model::from_bv));
             }
             return (SmtResult::Unknown, None);
         }
@@ -2375,6 +2376,16 @@ mod tests {
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
+    }
+
+    #[test]
+    fn bv_get_value_produces_model() {
+        let out = run(
+            "(declare-const x (_ BitVec 8))(assert (= (bvadd x #x01) #x10))(check-sat)(get-value (x))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "((x #x0f))");
     }
 
     #[test]

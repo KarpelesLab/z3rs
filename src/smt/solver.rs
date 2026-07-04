@@ -136,6 +136,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         bools,
                         arith: BTreeMap::new(),
                         euf: Egraph::new(m, &[]),
+                        bv: BTreeMap::new(),
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -150,7 +151,12 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                 ) {
                     // Both theories consistent under this assignment → SAT.
                     TheoryOutcome::Sat(arith, euf) => {
-                        let model = Model { bools, arith, euf };
+                        let model = Model {
+                            bools,
+                            arith,
+                            euf,
+                            bv: BTreeMap::new(),
+                        };
                         return (SmtResult::Sat, Some(model));
                     }
                     // Undecidable here: neither confirm SAT nor soundly block.
@@ -177,6 +183,8 @@ pub struct Model {
     arith: Assignment,
     /// Congruence classes over the uninterpreted terms (equal terms share an id).
     euf: Egraph,
+    /// Concrete `(value, width)` of blasted bit-vector terms (QF_BV models).
+    bv: BTreeMap<AstId, (Int, u32)>,
 }
 
 /// A concrete value in a [`Model`].
@@ -188,13 +196,28 @@ pub enum Value {
     Num(Rational, bool),
     /// An element of an uninterpreted sort, identified by its congruence class.
     Uninterp(AstId, usize),
+    /// A bit-vector value `(value, width)`.
+    Bv(Int, u32),
 }
 
 impl Model {
+    /// A bit-vector-only model: the concrete value of each blasted term.
+    pub fn from_bv(bv: BTreeMap<AstId, (Int, u32)>) -> Model {
+        Model {
+            bools: BTreeMap::new(),
+            arith: BTreeMap::new(),
+            euf: Egraph::new_empty(),
+            bv,
+        }
+    }
+
     /// Evaluate `t` under this model.
     pub fn eval(&mut self, m: &AstManager, t: AstId) -> Value {
         let s = m.get_sort(t);
-        if m.is_bool_sort(s) {
+        if let Some(width) = m.bv_sort_width(s) {
+            let v = self.eval_bv(m, t);
+            Value::Bv(v, width)
+        } else if m.is_bool_sort(s) {
             Value::Bool(self.eval_bool(m, t))
         } else if m.is_arith_sort(s) {
             Value::Num(ast_to_lin(m, t).eval(&self.arith), m.is_int_sort(s))
@@ -202,6 +225,27 @@ impl Model {
             let class = self.euf.class_of(m, t);
             Value::Uninterp(s, class)
         }
+    }
+
+    /// The value of a bit-vector term. Blasted terms (every subterm of the
+    /// checked formula, so every declared constant) are read from the satisfying
+    /// assignment; a bit-vector `ite` and numerals are evaluated directly.
+    fn eval_bv(&mut self, m: &AstManager, t: AstId) -> Int {
+        if let Some((v, _)) = self.bv.get(&t) {
+            return v.clone();
+        }
+        if let Some(v) = m.bv_numeral_value(t) {
+            return v;
+        }
+        if m.is_ite(t) {
+            let a = m.app_args(t).to_vec();
+            return if self.eval_bool(m, a[0]) {
+                self.eval_bv(m, a[1])
+            } else {
+                self.eval_bv(m, a[2])
+            };
+        }
+        Int::from(0)
     }
 
     /// Render `t`'s value as an SMT-LIB2 term (`true`, `5`, `(/ 1.0 2.0)`, …).
@@ -249,6 +293,7 @@ impl Model {
             (Value::Bool(x), Value::Bool(y)) => x == y,
             (Value::Num(x, _), Value::Num(y, _)) => x == y,
             (Value::Uninterp(_, x), Value::Uninterp(_, y)) => x == y,
+            (Value::Bv(x, _), Value::Bv(y, _)) => x == y,
             _ => false,
         }
     }
@@ -265,7 +310,33 @@ impl Value {
                 let name = m.sort(*sort).and_then(|s| s.name.as_str()).unwrap_or("U");
                 alloc::format!("{name}!val!{class}")
             }
+            Value::Bv(v, width) => render_bv(v, *width),
         }
+    }
+}
+
+/// Render a bit-vector value as `#x…` when the width is a multiple of 4, else
+/// `#b…` (matching Z3's output convention).
+fn render_bv(v: &Int, width: u32) -> alloc::string::String {
+    let v = v.mod_2k(width);
+    if width > 0 && width.is_multiple_of(4) {
+        let mut s = alloc::string::String::from("#x");
+        for nibble in (0..width / 4).rev() {
+            let mut d = 0u8;
+            for b in 0..4 {
+                if v.bit(nibble * 4 + b) {
+                    d |= 1 << b;
+                }
+            }
+            s.push(char::from_digit(d as u32, 16).unwrap());
+        }
+        s
+    } else {
+        let mut s = alloc::string::String::from("#b");
+        for i in (0..width).rev() {
+            s.push(if v.bit(i) { '1' } else { '0' });
+        }
+        s
     }
 }
 

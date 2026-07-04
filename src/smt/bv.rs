@@ -24,12 +24,38 @@ use crate::smt::solver::SmtResult;
 
 /// Decide a quantifier-free bit-vector formula by bit-blasting to SAT.
 pub fn check_bv(m: &AstManager, formula: AstId) -> SmtResult {
+    check_bv_model(m, formula).0
+}
+
+/// A concrete bit-vector value per blasted term: `(value, width)`.
+pub type BvValuation = BTreeMap<AstId, (puremp::Int, u32)>;
+
+/// Like [`check_bv`], but on `Sat` also returns the concrete value of every
+/// blasted bit-vector term (read off the satisfying SAT assignment), for models.
+pub fn check_bv_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<BvValuation>) {
     let mut bb = BitBlaster::new(m);
     let top = bb.blast_bool(formula);
     bb.sat.add_clause(&[top]);
     match bb.sat.solve() {
-        SatResult::Sat => SmtResult::Sat,
-        SatResult::Unsat => SmtResult::Unsat,
+        SatResult::Unsat => (SmtResult::Unsat, None),
+        SatResult::Sat => {
+            let two = puremp::Int::from(2);
+            let one = puremp::Int::from(1);
+            let mut val = BvValuation::new();
+            for (&t, bits) in &bb.bits {
+                let width = bits.len() as u32;
+                // Assemble the value from the most-significant bit down.
+                let mut v = puremp::Int::from(0);
+                for &lit in bits.iter().rev() {
+                    v = v.mul(&two);
+                    if bb.sat.model_holds(lit) {
+                        v = v.add(&one);
+                    }
+                }
+                val.insert(t, (v, width));
+            }
+            (SmtResult::Sat, Some(val))
+        }
     }
 }
 

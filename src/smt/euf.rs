@@ -24,6 +24,16 @@ pub struct Egraph {
 }
 
 impl Egraph {
+    /// An empty e-graph (no terms), for models without uninterpreted content.
+    pub fn new_empty() -> Egraph {
+        Egraph {
+            ids: BTreeMap::new(),
+            terms: Vec::new(),
+            parent: Vec::new(),
+            app: Vec::new(),
+        }
+    }
+
     /// Build an e-graph over every subterm reachable from the given roots.
     pub fn new(m: &AstManager, roots: &[AstId]) -> Egraph {
         let mut g = Egraph {

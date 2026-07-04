@@ -20,6 +20,6 @@ pub use arith::{
     Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible, feasible_with_diseqs, model,
     model_with_diseqs, model_with_diseqs_budgeted,
 };
-pub use bv::check_bv;
+pub use bv::{check_bv, check_bv_model};
 pub use euf::Egraph;
 pub use solver::{Model, SmtResult, Value, check, check_model};
