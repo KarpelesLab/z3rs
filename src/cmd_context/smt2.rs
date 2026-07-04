@@ -262,6 +262,14 @@ use crate::util::symbol::Symbol;
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
 fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
+    // z3 leniently accepts a negative literal such as `-1` or `-2.5` (strict
+    // SMT-LIB writes these as `(- 1)`); accept it too for compatibility.
+    if let Some(rest) = s.strip_prefix('-')
+        && !rest.is_empty()
+    {
+        let (r, is_int) = parse_numeral(rest)?;
+        return Some((r.neg(), is_int));
+    }
     let is_digits = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
     if is_digits(s) {
         let i = Int::from_str_radix(s, 10).ok()?;
@@ -6355,6 +6363,29 @@ mod tests {
             run("(declare-const x Int)(declare-const y Int)\
                  (assert (= (- (* 3 x) (* 3 y)) 3))(check-sat)")
             .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn negative_literals() {
+        // z3 accepts `-1` / `-2.5` as numerals (strict SMT-LIB writes `(- 1)`).
+        assert_eq!(
+            run("(declare-const x Int)(assert (= x -5))(assert (> x 0))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const b Int)(assert (= (* -1 b) 2))(assert (>= (* -1 b) 8))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Real)(assert (= x -2.5))(assert (< x 0.0))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // The `-` operator is unaffected.
+        assert_eq!(
+            run("(declare-const x Int)(assert (= (- 3 1) 2))(check-sat)").unwrap(),
             alloc::vec!["sat"]
         );
     }
