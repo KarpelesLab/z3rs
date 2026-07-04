@@ -1219,6 +1219,15 @@ impl Context {
         }
     }
 
+    /// Does a tactic expression mention `name` anywhere (as a leaf tactic or
+    /// inside a combinator like `(then …)`)?
+    fn tactic_mentions(t: &SExpr, name: &str) -> bool {
+        match t {
+            SExpr::Atom(a) => a == name,
+            SExpr::List(l) => l.iter().any(|s| Self::tactic_mentions(s, name)),
+        }
+    }
+
     fn resolve_sort(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
             SExpr::Atom(name) if name == "String" => Ok(self.string_sort()),
@@ -1501,15 +1510,23 @@ impl Context {
             }
             "apply" => {
                 // (apply tactic) — apply a goal-transforming tactic and print the
-                // residual subgoal. The simplifying tactics (simplify /
-                // ctx-simplify / propagate-values, and combinators over them)
-                // reduce here to simplifying each assertion; trivially-true ones
-                // are dropped, and a false assertion collapses the goal.
+                // residual subgoal. Recognized leaves: `nnf` (negation normal
+                // form) and the simplifying tactics (simplify / ctx-simplify /
+                // propagate-values); combinators (then / and-then / par-then / …)
+                // are traversed for their leaves. Trivially-true assertions are
+                // dropped and a false one collapses the goal.
+                let use_nnf = list
+                    .get(1)
+                    .map(|t| Self::tactic_mentions(t, "nnf"))
+                    .unwrap_or(false);
                 let asserts = self.assertions.clone();
                 let mut lines: Vec<String> = Vec::new();
                 for a in asserts {
-                    let folded = self.dt_fold(a);
-                    let s = crate::rewriter::simplify(&mut self.m, folded);
+                    let mut s = self.dt_fold(a);
+                    if use_nnf {
+                        s = crate::rewriter::to_nnf(&mut self.m, s);
+                    }
+                    s = crate::rewriter::simplify(&mut self.m, s);
                     if self.m.is_false(s) {
                         lines = alloc::vec!["false".to_string()];
                         break;
@@ -7434,6 +7451,15 @@ mod tests {
         assert_eq!(out.len(), 1);
         assert!(out[0].contains("(goal"), "output: {}", out[0]);
         assert!(out[0].contains("x 5"), "output: {}", out[0]);
+        // The `nnf` tactic (and combinators over it) pushes negation inward.
+        let nnf = run("(declare-const p Bool)(declare-const q Bool)\
+                       (assert (not (and p q)))(apply (then simplify nnf))")
+        .unwrap();
+        assert!(
+            nnf[0].contains("(or (not p) (not q))"),
+            "output: {}",
+            nnf[0]
+        );
     }
 
     #[test]
