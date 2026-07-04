@@ -63,6 +63,10 @@ pub enum BvOp {
     ZeroExt = 39,
     /// `(_ extract i j)`
     Extract = 40,
+    /// `bvshl` (shift left)
+    Shl = 45,
+    /// `bvlshr` (logical shift right)
+    Lshr = 46,
 }
 
 impl BvOp {
@@ -288,6 +292,16 @@ impl AstManager {
         )
     }
 
+    /// `(bvshl a b)` — shift `a` left by `b` bits.
+    pub fn mk_bvshl(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_binop("bvshl", BvOp::Shl, FuncDeclFlags::default(), a, b)
+    }
+
+    /// `(bvlshr a b)` — logical (zero-filling) shift `a` right by `b` bits.
+    pub fn mk_bvlshr(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_binop("bvlshr", BvOp::Lshr, FuncDeclFlags::default(), a, b)
+    }
+
     fn mk_bv_cmp(&mut self, name: &str, op: BvOp, a: AstId, b: AstId) -> AstId {
         let sort = self.get_sort(a);
         let bool_sort = self.mk_bool_sort();
@@ -380,6 +394,8 @@ impl AstManager {
             BvOp::SignExt,
             BvOp::ZeroExt,
             BvOp::Extract,
+            BvOp::Shl,
+            BvOp::Lshr,
         ]
         .into_iter()
         .find(|op| *op as DeclKind == k)

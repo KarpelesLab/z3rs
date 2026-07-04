@@ -345,6 +345,18 @@ const CORPUS: &[Case] = &[
         name: "bv_sign_extend_neg",
         script: "(declare-const x (_ BitVec 4))(assert (= x #xf))(assert (not (= ((_ sign_extend 4) x) #xff)))(check-sat)",
     },
+    Case {
+        name: "bv_shl_is_mul2",
+        script: "(declare-const x (_ BitVec 8))(assert (not (= (bvshl x #x01) (bvmul x #x02))))(check-sat)",
+    },
+    Case {
+        name: "bv_shl_variable",
+        script: "(declare-const x (_ BitVec 8))(assert (= (bvshl #x01 x) #x10))(assert (not (= x #x04)))(check-sat)",
+    },
+    Case {
+        name: "bv_lshr",
+        script: "(assert (not (= (bvlshr #x80 #x03) #x10)))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

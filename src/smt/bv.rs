@@ -7,9 +7,10 @@
 //! `z3/src/sat` (Z3 4.17.0, MIT).
 //!
 //! Supported so far: bit-vector constants and numerals; `bvnot`/`bvand`/`bvor`/
-//! `bvxor`; `bvneg`/`bvadd`/`bvsub`/`bvmul` (shift-and-add); `bvult`/`bvule`;
-//! `concat`/`extract`; equality; and the Boolean connectives over them. Wider
-//! coverage (div/rem, shifts, signed comparisons) builds on the same gates.
+//! `bvxor`; `bvneg`/`bvadd`/`bvsub`/`bvmul` (shift-and-add); `bvshl`/`bvlshr`
+//! (barrel shifter); unsigned and signed comparisons; `concat`/`extract`,
+//! `zero_extend`/`sign_extend`; equality; and the Boolean connectives over them.
+//! Wider coverage (div/rem, `bvashr`, rotates) builds on the same gates.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -134,6 +135,43 @@ impl<'a> BitBlaster<'a> {
         acc
     }
 
+    /// Per-bit multiplexer: `sel ? then : els`.
+    fn mux(&mut self, sel: Lit, then: &[Lit], els: &[Lit]) -> Vec<Lit> {
+        then.iter()
+            .zip(els)
+            .map(|(&t, &e)| {
+                let a = self.and2(sel, t);
+                let b = self.and2(!sel, e);
+                self.or2(a, b)
+            })
+            .collect()
+    }
+
+    /// A barrel shifter: shift `a` by the (unsigned) amount `b`, left if `left`
+    /// else logical right. A shift by `2^i` is applied conditionally on bit `i`
+    /// of `b`; amounts ≥ width zero the result.
+    fn barrel_shift(&mut self, a: &[Lit], b: &[Lit], left: bool) -> Vec<Lit> {
+        let n = a.len();
+        let false_lit = !self.true_lit;
+        let mut acc = a.to_vec();
+        for (i, &sel) in b.iter().enumerate() {
+            let sh = 1usize.checked_shl(i as u32).unwrap_or(usize::MAX);
+            let shifted: Vec<Lit> = if sh >= n {
+                alloc::vec![false_lit; n]
+            } else if left {
+                (0..n)
+                    .map(|j| if j >= sh { acc[j - sh] } else { false_lit })
+                    .collect()
+            } else {
+                (0..n)
+                    .map(|j| if j + sh < n { acc[j + sh] } else { false_lit })
+                    .collect()
+            };
+            acc = self.mux(sel, &shifted, &acc);
+        }
+        acc
+    }
+
     /// `a + b` (mod 2^n) via ripple-carry, `cin` the initial carry.
     fn ripple_add(&mut self, a: &[Lit], b: &[Lit], cin: Lit) -> Vec<Lit> {
         let mut carry = cin;
@@ -196,6 +234,16 @@ impl<'a> BitBlaster<'a> {
                     let a = self.blast_bv(args[0]);
                     let b = self.blast_bv(args[1]);
                     self.multiply(&a, &b)
+                }
+                BvOp::Shl => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    self.barrel_shift(&a, &b, true)
+                }
+                BvOp::Lshr => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    self.barrel_shift(&a, &b, false)
                 }
                 BvOp::Concat => {
                     // a (high) ++ b (low): low bits are b, high bits are a.
