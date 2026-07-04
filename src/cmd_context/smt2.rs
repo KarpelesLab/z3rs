@@ -18,6 +18,7 @@
 //! about them exactly. (Nonlinear terms remain opaque — a known incompleteness
 //! pending `nlsat`.)
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -38,6 +39,15 @@ enum OptResult {
     Unbounded,
     /// Could not determine within budget.
     Unknown,
+}
+
+/// Left-fold a non-empty list of regexes with a binary combinator.
+fn fold_regex(mut parts: Vec<Regex>, f: impl Fn(Regex, Regex) -> Regex) -> Regex {
+    let mut acc = parts.remove(0);
+    for p in parts {
+        acc = f(acc, p);
+    }
+    acc
 }
 
 /// A Rust string from a slice of Unicode code points.
@@ -700,6 +710,96 @@ struct Context {
     /// mentions any is answered `unknown` (their word semantics aren't solved),
     /// keeping every definite verdict sound.
     str_symbolic: BTreeSet<AstId>,
+    /// The interned `RegLan` (regular language) sort, once used.
+    reglan_sort: Option<AstId>,
+    /// Regex terms whose structure is fully constant, for `str.in_re` folding.
+    regex_of: BTreeMap<AstId, Regex>,
+}
+
+/// A constant regular expression (the decidable, fully-literal fragment). Used
+/// to fold `(str.in_re "literal" r)` by matching.
+#[derive(Clone, Debug)]
+enum Regex {
+    /// Matches exactly this code-point sequence (`str.to_re` of a literal).
+    Lit(Vec<u32>),
+    /// Any single code point in `[lo, hi]` (`re.range`).
+    Range(u32, u32),
+    /// Any single code point (`re.allchar`).
+    AllChar,
+    /// Every string (`re.all`).
+    All,
+    /// No string (`re.none`).
+    None,
+    Concat(Box<Regex>, Box<Regex>),
+    Union(Box<Regex>, Box<Regex>),
+    Inter(Box<Regex>, Box<Regex>),
+    Star(Box<Regex>),
+}
+
+impl Regex {
+    /// The set of end positions after matching `self` in `s` starting at `from`.
+    fn ends(&self, s: &[u32], from: usize) -> BTreeSet<usize> {
+        let mut out = BTreeSet::new();
+        match self {
+            Regex::Lit(l) => {
+                if from + l.len() <= s.len() && s[from..from + l.len()] == l[..] {
+                    out.insert(from + l.len());
+                }
+            }
+            Regex::Range(lo, hi) => {
+                if from < s.len() && (*lo..=*hi).contains(&s[from]) {
+                    out.insert(from + 1);
+                }
+            }
+            Regex::AllChar => {
+                if from < s.len() {
+                    out.insert(from + 1);
+                }
+            }
+            Regex::All => {
+                for p in from..=s.len() {
+                    out.insert(p);
+                }
+            }
+            Regex::None => {}
+            Regex::Concat(a, b) => {
+                for mid in a.ends(s, from) {
+                    out.extend(b.ends(s, mid));
+                }
+            }
+            Regex::Union(a, b) => {
+                out.extend(a.ends(s, from));
+                out.extend(b.ends(s, from));
+            }
+            Regex::Inter(a, b) => {
+                let ea = a.ends(s, from);
+                for p in b.ends(s, from) {
+                    if ea.contains(&p) {
+                        out.insert(p);
+                    }
+                }
+            }
+            Regex::Star(r) => {
+                // Reachable end positions by repeating `r` zero or more times;
+                // the visited set prevents looping on empty matches.
+                out.insert(from);
+                let mut frontier = alloc::vec![from];
+                while let Some(p) = frontier.pop() {
+                    for q in r.ends(s, p) {
+                        if out.insert(q) {
+                            frontier.push(q);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Does `self` match the whole string `s`?
+    fn matches(&self, s: &[u32]) -> bool {
+        self.ends(s, 0).contains(&s.len())
+    }
 }
 
 impl Context {
@@ -740,6 +840,8 @@ impl Context {
             str_lits: BTreeMap::new(),
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
+            reglan_sort: None,
+            regex_of: BTreeMap::new(),
         }
     }
 
@@ -764,6 +866,7 @@ impl Context {
     fn resolve_sort(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
             SExpr::Atom(name) if name == "String" => Ok(self.string_sort()),
+            SExpr::Atom(name) if name == "RegLan" => Ok(self.reglan_sort()),
             SExpr::Atom(name) => self
                 .sorts
                 .get(name)
@@ -1533,8 +1636,80 @@ impl Context {
                 }
                 self.symbolic_string(op, raw)
             }
+            "str.in_re" | "str.in.re" => {
+                // (str.in_re s r): if s is a literal and r a constant regex, match.
+                if let (Some(s), Some(r)) = (self.str_value(raw[0]), self.regex_of.get(&raw[1])) {
+                    let hit = r.matches(&s);
+                    return Ok(if hit {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    });
+                }
+                self.symbolic_string(op, raw)
+            }
+            "str.to_re" | "str.to.re" => self.regex_op(op, raw),
             _ => Err(alloc::format!("unsupported string op {op:?}")),
         }
+    }
+
+    /// The interned `RegLan` sort (registered on first use).
+    fn reglan_sort(&mut self) -> AstId {
+        if let Some(s) = self.reglan_sort {
+            return s;
+        }
+        let s = self.m.mk_uninterpreted_sort(Symbol::new("RegLan"));
+        self.reglan_sort = Some(s);
+        self.sorts.insert("RegLan".to_string(), s);
+        s
+    }
+
+    /// Build a regex term. Every result is a fresh `RegLan` constant; when all
+    /// of its parts are constant regexes, its [`Regex`] structure is recorded in
+    /// `regex_of` (enabling `str.in_re` folding).
+    fn regex_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // Sub-regex structures, if every argument is a tracked constant regex.
+        let subs: Option<Vec<Regex>> = args.iter().map(|a| self.regex_of.get(a).cloned()).collect();
+        let structure: Option<Regex> = match op {
+            "str.to_re" | "str.to.re" => self.str_value(args[0]).map(Regex::Lit),
+            "re.range" => match (self.str_value(args[0]), self.str_value(args[1])) {
+                (Some(a), Some(b)) if a.len() == 1 && b.len() == 1 => {
+                    Some(Regex::Range(a[0], b[0]))
+                }
+                _ => None,
+            },
+            "re.none" | "re.empty" => Some(Regex::None),
+            "re.all" => Some(Regex::All),
+            "re.allchar" => Some(Regex::AllChar),
+            "re.++" => subs.map(|s| fold_regex(s, |a, b| Regex::Concat(Box::new(a), Box::new(b)))),
+            "re.union" => {
+                subs.map(|s| fold_regex(s, |a, b| Regex::Union(Box::new(a), Box::new(b))))
+            }
+            "re.inter" => {
+                subs.map(|s| fold_regex(s, |a, b| Regex::Inter(Box::new(a), Box::new(b))))
+            }
+            "re.*" => subs.map(|s| Regex::Star(Box::new(s.into_iter().next().unwrap()))),
+            "re.+" => subs.map(|s| {
+                let r = s.into_iter().next().unwrap();
+                Regex::Concat(Box::new(r.clone()), Box::new(Regex::Star(Box::new(r))))
+            }),
+            "re.opt" => subs.map(|s| {
+                Regex::Union(
+                    Box::new(s.into_iter().next().unwrap()),
+                    Box::new(Regex::Lit(Vec::new())),
+                )
+            }),
+            _ => None,
+        };
+        let sort = self.reglan_sort();
+        let name = alloc::format!("!re!{}", self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
+        let term = self.m.mk_const(d);
+        if let Some(r) = structure {
+            self.regex_of.insert(term, r);
+        }
+        Ok(term)
     }
 
     /// A fresh uninterpreted term standing for a symbolic string operation,
@@ -2348,6 +2523,10 @@ impl Context {
                     let text = unquote_string(name);
                     Ok(self.mk_str_lit(&text))
                 }
+                // 0-ary regex constants: re.none / re.all / re.allchar.
+                name if name.starts_with("re.") && self.lookup_bound(name).is_none() => {
+                    self.regex_op(name, &[])
+                }
                 name => {
                     if let Some(id) = self.lookup_bound(name) {
                         return Ok(id);
@@ -2486,6 +2665,9 @@ impl Context {
                 }
                 if head.starts_with("str.") {
                     return self.string_op(&head, &args);
+                }
+                if head.starts_with("re.") {
+                    return self.regex_op(&head, &args);
                 }
                 self.apply(&head, args)
             }
@@ -3447,6 +3629,25 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x (_ BitVec 8))(assert (bvult x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn regex_membership_folds() {
+        // "a5z" matches letter·digit·letter.
+        let re = "(re.++ (re.range \"a\" \"z\") (re.++ (re.range \"0\" \"9\") (re.range \"a\" \"z\")))";
+        assert_eq!(
+            run(&alloc::format!("(assert (not (str.in_re \"a5z\" {re})))(check-sat)")).unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // (ab)* matches "abab" but not "aba".
+        assert_eq!(
+            run("(assert (not (str.in_re \"abab\" (re.* (str.to_re \"ab\")))))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(assert (str.in_re \"aba\" (re.* (str.to_re \"ab\"))))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
     }
