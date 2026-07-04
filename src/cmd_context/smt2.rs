@@ -3230,6 +3230,65 @@ impl Context {
     /// assertions **and from previously generated instances** — iterating to a
     /// fixpoint so chained/inductive universals (`∀x. p(x) ⇒ p(x+1)` with
     /// `p(0)`, `¬p(3)`) fully unfold. Bounded by rounds and a total-instance cap.
+    /// Fold datatype selector/tester applications on constructor terms
+    /// (`selᵢ(C(a₁,…))=aᵢ`, `is-C(D(…))` = `C==D`), bottom-up. This lets a
+    /// recursive function over a datatype bottom out under instantiation (e.g.
+    /// `tail(cons h t)` collapses to `t`, exposing the next argument to
+    /// E-matching) instead of unfolding an opaque selector chain forever.
+    fn dt_fold(&mut self, root: AstId) -> AstId {
+        // Reverse lookups: selector decl → (constructor decl, field index);
+        // tester decl → constructor decl; and the set of constructor decls.
+        let mut sel_of: BTreeMap<AstId, (AstId, usize)> = BTreeMap::new();
+        let mut test_of: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let mut ctors: BTreeSet<AstId> = BTreeSet::new();
+        for infos in self.datatypes.values() {
+            for (cdecl, sels, tdecl) in infos {
+                ctors.insert(*cdecl);
+                test_of.insert(*tdecl, *cdecl);
+                for (j, &s) in sels.iter().enumerate() {
+                    sel_of.insert(s, (*cdecl, j));
+                }
+            }
+        }
+        for (cdecl, sels) in self.records.values() {
+            ctors.insert(*cdecl);
+            for (j, &s) in sels.iter().enumerate() {
+                sel_of.insert(s, (*cdecl, j));
+            }
+        }
+        if sel_of.is_empty() && test_of.is_empty() {
+            return root;
+        }
+        let order = self.m.postorder(root);
+        let mut cache: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for id in order {
+            let folded = match self.m.app(id).cloned() {
+                Some(a) => {
+                    let args: Vec<AstId> = a.args.iter().map(|c| cache[c]).collect();
+                    let arg0 = args.first().and_then(|&x| self.m.app(x).cloned());
+                    if let (Some(&cdecl), Some(a0)) = (test_of.get(&a.decl), &arg0)
+                        && ctors.contains(&a0.decl)
+                    {
+                        if a0.decl == cdecl {
+                            self.m.mk_true()
+                        } else {
+                            self.m.mk_false()
+                        }
+                    } else if let (Some(&(cdecl, j)), Some(a0)) = (sel_of.get(&a.decl), &arg0)
+                        && a0.decl == cdecl
+                    {
+                        a0.args[j]
+                    } else {
+                        self.m.mk_app(a.decl, &args)
+                    }
+                }
+                None => id,
+            };
+            cache.insert(id, folded);
+        }
+        cache[&root]
+    }
+
     /// Trigger *sets* for E-matching. Each returned set is a group of
     /// user-function applications from `body` that jointly contain every bound
     /// variable; matching a set binds all binders. A single application covering
@@ -3433,7 +3492,17 @@ impl Context {
                         let subst: Vec<(AstId, AstId)> =
                             vars.iter().map(|&v| (v, binding[&v])).collect();
                         let raw = substitute(&mut self.m, *body, &subst);
-                        let inst = crate::rewriter::simplify(&mut self.m, raw);
+                        // Alternate arithmetic/Boolean simplification with
+                        // datatype folding so selector/tester chains collapse.
+                        let mut inst = crate::rewriter::simplify(&mut self.m, raw);
+                        for _ in 0..3 {
+                            let folded = self.dt_fold(inst);
+                            let next = crate::rewriter::simplify(&mut self.m, folded);
+                            if next == inst {
+                                break;
+                            }
+                            inst = next;
+                        }
                         if !seen.insert(inst) {
                             continue;
                         }
@@ -5928,6 +5997,29 @@ mod tests {
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
             run("(declare-const x Int)(assert (= x 3))(assert (> x 5))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn recursive_function_over_datatype() {
+        // len over a list decides: selector/tester folding (tail(cons h t)=t,
+        // is-nil(cons …)=false) lets E-matching unfold the spine.
+        let lst = "(declare-datatypes ((Lst 0)) (((nil) (cons (head Int) (tail Lst)))))\
+                   (define-fun-rec len ((l Lst)) Int \
+                    (ite ((_ is nil) l) 0 (+ 1 (len (tail l)))))";
+        assert_eq!(
+            run(&alloc::format!(
+                "{lst}(assert (= (len (cons 1 (cons 2 nil))) 2))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{lst}(assert (= (len (cons 1 (cons 2 nil))) 3))(check-sat)"
+            ))
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
