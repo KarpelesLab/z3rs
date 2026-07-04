@@ -2046,6 +2046,28 @@ impl Context {
         Some(bv)
     }
 
+    /// Symbolic IEEE `fp.eq` as a Boolean over the BV representations: neither
+    /// operand is NaN, and either the bits are equal or both are zero (−0 = +0).
+    /// Decided by the QF_BV engine. `None` for ops other than `fp.eq`.
+    fn fp_compare_bv(&mut self, op: &str, a: AstId, b: AstId) -> Option<AstId> {
+        if op != "fp.eq" {
+            return None;
+        }
+        let nan_a = self.fp_classify_bv("fp.isNaN", a)?;
+        let nan_b = self.fp_classify_bv("fp.isNaN", b)?;
+        let not_nan_a = self.m.mk_not(nan_a);
+        let not_nan_b = self.m.mk_not(nan_b);
+        let no_nan = self.m.mk_and(&[not_nan_a, not_nan_b]);
+        let zero_a = self.fp_classify_bv("fp.isZero", a)?;
+        let zero_b = self.fp_classify_bv("fp.isZero", b)?;
+        let both_zero = self.m.mk_and(&[zero_a, zero_b]);
+        let bva = self.fp_to_bv(a)?;
+        let bvb = self.fp_to_bv(b)?;
+        let bv_eq = self.m.mk_eq(bva, bvb);
+        let val_eq = self.m.mk_or(&[bv_eq, both_zero]);
+        Some(self.m.mk_and(&[val_eq, no_nan]))
+    }
+
     /// A classification predicate (`fp.isNaN` …) as a Boolean over the bits of
     /// the FP term `t` (format `(eb, sb)`), decided by the QF_BV engine.
     fn fp_classify_bv(&mut self, op: &str, t: AstId) -> Option<AstId> {
@@ -2146,6 +2168,15 @@ impl Context {
                         _ => a >= b,
                     };
                     return Ok(self.mk_bool(r));
+                }
+                // fp.eq is cheap to bit-blast (equality + zero handling); the
+                // ordered comparisons need a key-transform + bvult circuit the
+                // basic CDCL core handles too slowly, so they stay a sound
+                // `unknown` (constant operands still fold above).
+                if op == "fp.eq"
+                    && let Some(t) = self.fp_compare_bv(op, args[0], args[1])
+                {
+                    return Ok(t);
                 }
                 self.symbolic_fp(op, args)
             }
@@ -5093,6 +5124,18 @@ mod tests {
         assert_eq!(
             run(&alloc::format!("{d}(assert (fp.isNaN x))(check-sat)")).unwrap(),
             alloc::vec!["sat"]
+        );
+        // IEEE fp.eq: NaN is not equal to itself; a NaN operand rules it out.
+        assert_eq!(
+            run("(assert (fp.eq (_ NaN 11 53) (_ NaN 11 53)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(assert (fp.eq x y))(assert (fp.isNaN x))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 

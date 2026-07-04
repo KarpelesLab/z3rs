@@ -36,9 +36,14 @@ pub fn check_bv_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<BvVa
     let mut bb = BitBlaster::new(m);
     let top = bb.blast_bool(formula);
     bb.sat.add_clause(&[top]);
-    match bb.sat.solve() {
-        SatResult::Unsat => (SmtResult::Unsat, None),
-        SatResult::Sat => {
+    // Bound the CDCL search so a hard-but-decidable bit-vector instance (e.g. a
+    // wide floating-point comparison circuit) yields a sound `unknown` rather
+    // than hanging.
+    const BV_CONFLICT_BUDGET: u64 = 300_000;
+    match bb.sat.solve_budgeted(BV_CONFLICT_BUDGET) {
+        None => (SmtResult::Unknown, None),
+        Some(SatResult::Unsat) => (SmtResult::Unsat, None),
+        Some(SatResult::Sat) => {
             let two = puremp::Int::from(2);
             let one = puremp::Int::from(1);
             let mut val = BvValuation::new();

@@ -343,8 +343,21 @@ impl Solver {
     /// Each assumption occupies a decision level; a conflict that would have to
     /// undo an assumption yields [`SatResult::Unsat`].
     pub fn solve_assumptions(&mut self, assumptions: &[Lit]) -> SatResult {
+        // Unbounded search never runs out of budget, so `None` is impossible.
+        self.search(assumptions, u64::MAX)
+            .unwrap_or(SatResult::Unsat)
+    }
+
+    /// Solve, giving up after `max_conflicts` conflicts. Returns `None` when the
+    /// budget is exhausted (the caller treats that as `unknown`), so a
+    /// hard-but-decidable instance cannot hang the solver.
+    pub fn solve_budgeted(&mut self, max_conflicts: u64) -> Option<SatResult> {
+        self.search(&[], max_conflicts)
+    }
+
+    fn search(&mut self, assumptions: &[Lit], max_conflicts: u64) -> Option<SatResult> {
         if !self.ok {
-            return SatResult::Unsat;
+            return Some(SatResult::Unsat);
         }
         self.cancel_until(0);
         // Re-propagate level 0 against the full clause DB. Clauses added since the
@@ -357,6 +370,7 @@ impl Solver {
         let n_assump = assumptions.len() as u32;
 
         let mut restart_conflicts = 0u64;
+        let mut total_conflicts = 0u64;
         let mut luby_index = 1u32; // Luby is 1-indexed
         let mut restart_limit = luby(luby_index) * 100;
 
@@ -364,13 +378,13 @@ impl Solver {
             if let Some(confl) = self.propagate() {
                 if self.decision_level() == 0 {
                     self.ok = false;
-                    return SatResult::Unsat;
+                    return Some(SatResult::Unsat);
                 }
                 let (learnt, btlevel) = self.analyze(confl);
                 if btlevel < n_assump {
                     // Backjumping would undo an assumption: unsat under assumptions.
                     self.cancel_until(0);
-                    return SatResult::Unsat;
+                    return Some(SatResult::Unsat);
                 }
                 self.cancel_until(btlevel);
                 let asserting = learnt[0];
@@ -382,6 +396,11 @@ impl Solver {
                     self.enqueue(asserting, cref as i32);
                 }
                 self.var_inc /= 0.95; // decay
+                total_conflicts += 1;
+                if total_conflicts > max_conflicts {
+                    self.cancel_until(0);
+                    return None; // budget exhausted → unknown
+                }
                 restart_conflicts += 1;
                 if restart_conflicts >= restart_limit {
                     restart_conflicts = 0;
@@ -395,7 +414,7 @@ impl Solver {
                 match self.lit_value(a) {
                     LBool::False => {
                         self.cancel_until(0);
-                        return SatResult::Unsat;
+                        return Some(SatResult::Unsat);
                     }
                     LBool::True => self.trail_lim.push(self.trail.len()), // empty level
                     LBool::Undef => {
@@ -405,7 +424,7 @@ impl Solver {
                 }
             } else {
                 match self.pick_branch_var() {
-                    None => return SatResult::Sat, // all variables assigned
+                    None => return Some(SatResult::Sat), // all variables assigned
                     Some(v) => {
                         self.trail_lim.push(self.trail.len());
                         let sign = self.polarity[v as usize];
