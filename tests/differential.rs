@@ -381,6 +381,26 @@ const CORPUS: &[Case] = &[
         name: "bv_ashr_sign",
         script: "(assert (not (= (bvashr #x80 #x01) #xc0)))(check-sat)",
     },
+    Case {
+        name: "bv_udiv_urem",
+        script: "(assert (not (and (= (bvudiv #x0f #x04) #x03) (= (bvurem #x0f #x04) #x03))))(check-sat)",
+    },
+    Case {
+        name: "bv_udiv_by_zero",
+        script: "(assert (not (= (bvudiv #x0a #x00) #xff)))(check-sat)",
+    },
+    Case {
+        name: "bv_sdiv_negative",
+        script: "(assert (not (= (bvsdiv #xf8 #x02) #xfc)))(check-sat)",
+    },
+    Case {
+        name: "bv_smod_signs",
+        script: "(assert (not (= (bvsmod #xf9 #x02) #x01)))(check-sat)",
+    },
+    Case {
+        name: "bv_ite_and_implies",
+        script: "(declare-const c Bool)(assert c)(assert (=> c (not (= (ite c #x01 #x02) #x01))))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`

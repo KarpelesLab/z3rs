@@ -172,6 +172,45 @@ impl<'a> BitBlaster<'a> {
         acc
     }
 
+    /// Unsigned division: `(quotient, remainder)` of `a / b` via restoring long
+    /// division. SMT-LIB division-by-zero: quotient is all-ones, remainder is `a`.
+    fn udivrem(&mut self, a: &[Lit], b: &[Lit]) -> (Vec<Lit>, Vec<Lit>) {
+        let n = a.len();
+        let false_lit = !self.true_lit;
+        let mut rem = alloc::vec![false_lit; n];
+        let mut quot = alloc::vec![false_lit; n];
+        // Process the dividend from most- to least-significant bit.
+        for i in (0..n).rev() {
+            // shifted = (rem << 1) | a[i], as n+1 bits (LSB first).
+            let mut shifted = Vec::with_capacity(n + 1);
+            shifted.push(a[i]);
+            shifted.extend_from_slice(&rem); // n+1 bits
+            // b_ext = b zero-extended to n+1 bits.
+            let mut b_ext = b.to_vec();
+            b_ext.push(false_lit);
+            // diff = shifted - b_ext = shifted + ~b_ext + 1; final carry == "no borrow".
+            let mut carry = self.true_lit;
+            let mut diff = Vec::with_capacity(n + 1);
+            for j in 0..=n {
+                let (s, c) = self.full_adder(shifted[j], !b_ext[j], carry);
+                diff.push(s);
+                carry = c;
+            }
+            let ge = carry; // shifted >= b_ext
+            let new_rem = self.mux(ge, &diff, &shifted); // n+1 bits
+            rem = new_rem[..n].to_vec(); // top bit is 0 (rem < b ≤ 2^n)
+            quot[i] = ge;
+        }
+        // Division by zero: quotient all-ones, remainder = a.
+        let nonzero = self.or_all(b);
+        let is_zero = !nonzero;
+        let all_ones = alloc::vec![self.true_lit; n];
+        let a_vec = a.to_vec();
+        let quot = self.mux(is_zero, &all_ones, &quot);
+        let rem = self.mux(is_zero, &a_vec, &rem);
+        (quot, rem)
+    }
+
     /// `a + b` (mod 2^n) via ripple-carry, `cin` the initial carry.
     fn ripple_add(&mut self, a: &[Lit], b: &[Lit], cin: Lit) -> Vec<Lit> {
         let mut carry = cin;
@@ -241,6 +280,16 @@ impl<'a> BitBlaster<'a> {
                     let b = self.blast_bv(args[1]);
                     self.multiply(&a, &b)
                 }
+                BvOp::Udiv => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    self.udivrem(&a, &b).0
+                }
+                BvOp::Urem => {
+                    let a = self.blast_bv(args[0]);
+                    let b = self.blast_bv(args[1]);
+                    self.udivrem(&a, &b).1
+                }
                 BvOp::Shl => {
                     let a = self.blast_bv(args[0]);
                     let b = self.blast_bv(args[1]);
@@ -293,6 +342,14 @@ impl<'a> BitBlaster<'a> {
                 // Unsupported bv operators become fresh (unconstrained) bits.
                 _ => (0..width).map(|_| self.fresh()).collect(),
             }
+        } else if self.m.is_ite(t) {
+            // A bit-vector-sorted `ite`: select the branch bit-vectors by the
+            // Boolean condition. (Used by the signed div/rem/mod macros.)
+            let args = self.m.app_args(t).to_vec();
+            let cond = self.blast_bool(args[0]);
+            let then_bits = self.blast_bv(args[1]);
+            let else_bits = self.blast_bv(args[2]);
+            self.mux(cond, &then_bits, &else_bits)
         } else {
             // An uninterpreted bit-vector constant: one fresh variable per bit.
             (0..width).map(|_| self.fresh()).collect()
@@ -354,6 +411,28 @@ impl<'a> BitBlaster<'a> {
                 let x = self.xor2(a, b);
                 !x
             }
+        } else if self.m.is_ite(t) {
+            // Boolean ite: (c ∧ a) ∨ (¬c ∧ b). Arises from lifting a
+            // bit-vector-sorted ite into a fresh variable plus this constraint.
+            let args = self.m.app_args(t).to_vec();
+            let c = self.blast_bool(args[0]);
+            let a = self.blast_bool(args[1]);
+            let b = self.blast_bool(args[2]);
+            let ca = self.and2(c, a);
+            let ncb = self.and2(!c, b);
+            self.or2(ca, ncb)
+        } else if self.m.is_implies(t) {
+            // (a ⇒ b) ≡ ¬a ∨ b. (Lifting term-level ites emits implications.)
+            let args = self.m.app_args(t).to_vec();
+            let a = self.blast_bool(args[0]);
+            let b = self.blast_bool(args[1]);
+            self.or2(!a, b)
+        } else if self.m.is_xor(t) {
+            let args = self.m.app_args(t).to_vec();
+            args[1..].iter().fold(self.blast_bool(args[0]), |acc, &x| {
+                let xl = self.blast_bool(x);
+                self.xor2(acc, xl)
+            })
         } else if let Some(op) = self.m.bv_op(t) {
             let args = self.m.app_args(t).to_vec();
             match op {

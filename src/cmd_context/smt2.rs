@@ -56,6 +56,70 @@ fn rat(n: i64) -> Rational {
     Rational::from_integer(Int::from(n))
 }
 
+/// The Boolean "the sign bit of the bit-vector `x` is set".
+fn bv_sign(m: &mut AstManager, x: AstId) -> AstId {
+    let n = m.bv_sort_width(m.get_sort(x)).expect("bv_sign: not a bv");
+    let msb = m.mk_bv_extract(n - 1, n - 1, x);
+    let one = m.mk_bv(1, 1);
+    m.mk_eq(msb, one)
+}
+
+/// `|x|` as a bit-vector: `ite(sign, -x, x)`.
+fn bv_abs(m: &mut AstManager, x: AstId) -> AstId {
+    let s = bv_sign(m, x);
+    let neg = m.mk_bvneg(x);
+    m.mk_ite(s, neg, x)
+}
+
+/// `(bvsdiv s t)` — signed division (round toward zero), per the SMT-LIB theory
+/// definition in terms of `bvudiv`/`bvneg` and the operand signs.
+fn bv_sdiv(m: &mut AstManager, s: AstId, t: AstId) -> AstId {
+    let (ss, st) = (bv_sign(m, s), bv_sign(m, t));
+    let (ns, nt) = (m.mk_bvneg(s), m.mk_bvneg(t));
+    let d_pp = m.mk_bvudiv(s, t); // ¬ss ∧ ¬st
+    let u_np = m.mk_bvudiv(ns, t);
+    let d_np = m.mk_bvneg(u_np); // ss ∧ ¬st
+    let u_pn = m.mk_bvudiv(s, nt);
+    let d_pn = m.mk_bvneg(u_pn); // ¬ss ∧ st
+    let d_nn = m.mk_bvudiv(ns, nt); // ss ∧ st
+    let ss_true = m.mk_ite(st, d_nn, d_np);
+    let ss_false = m.mk_ite(st, d_pn, d_pp);
+    m.mk_ite(ss, ss_true, ss_false)
+}
+
+/// `(bvsrem s t)` — signed remainder (sign follows the dividend `s`).
+fn bv_srem(m: &mut AstManager, s: AstId, t: AstId) -> AstId {
+    let (ss, st) = (bv_sign(m, s), bv_sign(m, t));
+    let (ns, nt) = (m.mk_bvneg(s), m.mk_bvneg(t));
+    let r_pp = m.mk_bvurem(s, t);
+    let u_np = m.mk_bvurem(ns, t);
+    let r_np = m.mk_bvneg(u_np);
+    let r_pn = m.mk_bvurem(s, nt);
+    let u_nn = m.mk_bvurem(ns, nt);
+    let r_nn = m.mk_bvneg(u_nn);
+    let ss_true = m.mk_ite(st, r_nn, r_np);
+    let ss_false = m.mk_ite(st, r_pn, r_pp);
+    m.mk_ite(ss, ss_true, ss_false)
+}
+
+/// `(bvsmod s t)` — signed modulo (sign follows the divisor `t`).
+fn bv_smod(m: &mut AstManager, s: AstId, t: AstId) -> AstId {
+    let (ss, st) = (bv_sign(m, s), bv_sign(m, t));
+    let abs_s = bv_abs(m, s);
+    let abs_t = bv_abs(m, t);
+    let u = m.mk_bvurem(abs_s, abs_t);
+    let neg_u = m.mk_bvneg(u);
+    let n = m.bv_sort_width(m.get_sort(s)).expect("bvsmod: not a bv");
+    let zero = m.mk_bv(0, n);
+    let u_zero = m.mk_eq(u, zero);
+    let neg_u_plus_t = m.mk_bvadd(neg_u, t); // ss ∧ ¬st
+    let u_plus_t = m.mk_bvadd(u, t); // ¬ss ∧ st
+    let ss_true = m.mk_ite(st, neg_u, neg_u_plus_t);
+    let ss_false = m.mk_ite(st, u_plus_t, u);
+    let nonzero = m.mk_ite(ss, ss_true, ss_false);
+    m.mk_ite(u_zero, u, nonzero)
+}
+
 /// Parse a bit-vector literal `#x1a` (hex, 4 bits/digit) or `#b101` (binary,
 /// 1 bit/digit) into `(value, width)`.
 fn parse_bv_literal(s: &str) -> Option<(Int, u32)> {
@@ -1561,6 +1625,11 @@ impl Context {
             "bvadd" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvadd(a, b))),
             "bvmul" => Ok(args[1..].iter().fold(args[0], |a, &b| m.mk_bvmul(a, b))),
             "bvsub" => Ok(m.mk_bvsub(args[0], args[1])),
+            "bvudiv" => Ok(m.mk_bvudiv(args[0], args[1])),
+            "bvurem" => Ok(m.mk_bvurem(args[0], args[1])),
+            "bvsdiv" => Ok(bv_sdiv(m, args[0], args[1])),
+            "bvsrem" => Ok(bv_srem(m, args[0], args[1])),
+            "bvsmod" => Ok(bv_smod(m, args[0], args[1])),
             "bvshl" => Ok(m.mk_bvshl(args[0], args[1])),
             "bvlshr" => Ok(m.mk_bvlshr(args[0], args[1])),
             "bvashr" => Ok(m.mk_bvashr(args[0], args[1])),

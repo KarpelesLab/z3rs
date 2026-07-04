@@ -123,6 +123,14 @@ impl AstManager {
     pub fn is_ite(&self, id: AstId) -> bool {
         self.is_basic(id, BasicOp::Ite)
     }
+    /// Is `id` an `=>` (implies) application?
+    pub fn is_implies(&self, id: AstId) -> bool {
+        self.is_basic(id, BasicOp::Implies)
+    }
+    /// Is `id` an `xor` application?
+    pub fn is_xor(&self, id: AstId) -> bool {
+        self.is_basic(id, BasicOp::Xor)
+    }
 
     /// Is `id` an uninterpreted constant (nullary app, null family)?
     pub fn is_uninterp_const(&self, id: AstId) -> bool {

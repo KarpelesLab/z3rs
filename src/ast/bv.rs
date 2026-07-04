@@ -39,6 +39,10 @@ pub enum BvOp {
     Sub = 5,
     /// `bvmul`
     Mul = 6,
+    /// `bvudiv` (unsigned division)
+    Udiv = 8,
+    /// `bvurem` (unsigned remainder)
+    Urem = 10,
     /// `bvule`
     Uleq = 22,
     /// `bvsle` (signed `<=`)
@@ -197,6 +201,16 @@ impl AstManager {
             ..FuncDeclFlags::default()
         };
         self.mk_bv_binop("bvmul", BvOp::Mul, flags, a, b)
+    }
+
+    /// `(bvudiv a b)` — unsigned division.
+    pub fn mk_bvudiv(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_binop("bvudiv", BvOp::Udiv, FuncDeclFlags::default(), a, b)
+    }
+
+    /// `(bvurem a b)` — unsigned remainder.
+    pub fn mk_bvurem(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_binop("bvurem", BvOp::Urem, FuncDeclFlags::default(), a, b)
     }
 
     /// `(bvand a b)` — bitwise AND.
@@ -406,6 +420,8 @@ impl AstManager {
             BvOp::Add,
             BvOp::Sub,
             BvOp::Mul,
+            BvOp::Udiv,
+            BvOp::Urem,
             BvOp::Uleq,
             BvOp::Ult,
             BvOp::BAnd,
