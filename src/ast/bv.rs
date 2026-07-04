@@ -41,8 +41,12 @@ pub enum BvOp {
     Mul = 6,
     /// `bvule`
     Uleq = 22,
+    /// `bvsle` (signed `<=`)
+    Sleq = 23,
     /// `bvult`
     Ult = 26,
+    /// `bvslt` (signed `<`)
+    Slt = 27,
     /// `bvand` (bitwise AND)
     BAnd = 30,
     /// `bvor` (bitwise OR)
@@ -283,6 +287,16 @@ impl AstManager {
         self.mk_bv_cmp("bvult", BvOp::Ult, a, b)
     }
 
+    /// `(bvslt a b)` — signed `<`.
+    pub fn mk_bvslt(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_cmp("bvslt", BvOp::Slt, a, b)
+    }
+
+    /// `(bvsle a b)` — signed `<=`.
+    pub fn mk_bvsle(&mut self, a: AstId, b: AstId) -> AstId {
+        self.mk_bv_cmp("bvsle", BvOp::Sleq, a, b)
+    }
+
     // --- recognizers ------------------------------------------------------
 
     /// The width of a bit-vector sort (or `None` if `sort_id` is not one).
@@ -336,6 +350,8 @@ impl AstManager {
             BvOp::BOr,
             BvOp::BNot,
             BvOp::BXor,
+            BvOp::Sleq,
+            BvOp::Slt,
             BvOp::Concat,
             BvOp::Extract,
         ]

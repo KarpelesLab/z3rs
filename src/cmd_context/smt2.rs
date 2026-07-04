@@ -1319,6 +1319,10 @@ impl Context {
             "bvule" => Ok(m.mk_bvule(args[0], args[1])),
             "bvugt" => Ok(m.mk_bvult(args[1], args[0])), // a >u b  ⟺  b <u a
             "bvuge" => Ok(m.mk_bvule(args[1], args[0])), // a ≥u b  ⟺  b ≤u a
+            "bvslt" => Ok(m.mk_bvslt(args[0], args[1])),
+            "bvsle" => Ok(m.mk_bvsle(args[0], args[1])),
+            "bvsgt" => Ok(m.mk_bvslt(args[1], args[0])), // a >s b  ⟺  b <s a
+            "bvsge" => Ok(m.mk_bvsle(args[1], args[0])), // a ≥s b  ⟺  b ≤s a
             "concat" => Ok(m.mk_bv_concat(args[0], args[1])),
             name => {
                 let d = *self

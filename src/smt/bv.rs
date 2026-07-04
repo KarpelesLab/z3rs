@@ -277,6 +277,12 @@ impl<'a> BitBlaster<'a> {
                     let eq = self.bv_eq(args[0], args[1]);
                     self.or2(lt, eq)
                 }
+                BvOp::Slt => self.bv_slt(args[0], args[1]),
+                BvOp::Sleq => {
+                    let lt = self.bv_slt(args[0], args[1]);
+                    let eq = self.bv_eq(args[0], args[1]);
+                    self.or2(lt, eq)
+                }
                 _ => self.fresh(),
             }
         } else {
@@ -302,12 +308,8 @@ impl<'a> BitBlaster<'a> {
         self.and_all(&eqs)
     }
 
-    /// `a <u b` (unsigned): subtract and read the borrow, i.e. `a - b` overflows.
-    /// Implemented as the carry-out of `a + ~b + 1` being 0.
-    fn bv_ult(&mut self, a: AstId, b: AstId) -> Lit {
-        let a = self.blast_bv(a);
-        let b = self.blast_bv(b);
-        // Compute a + ~b + 1 and take the final carry; carry == 0 ⟺ a < b.
+    /// `a <u b` (unsigned) on bit vectors: the carry-out of `a + ~b + 1` is 0.
+    fn ult_bits(&mut self, a: &[Lit], b: &[Lit]) -> Lit {
         let mut carry = self.true_lit;
         for i in 0..a.len() {
             let nb = !b[i];
@@ -315,6 +317,23 @@ impl<'a> BitBlaster<'a> {
             carry = c;
         }
         !carry
+    }
+
+    fn bv_ult(&mut self, a: AstId, b: AstId) -> Lit {
+        let a = self.blast_bv(a);
+        let b = self.blast_bv(b);
+        self.ult_bits(&a, &b)
+    }
+
+    /// `a <s b` (signed): flip the sign bits and compare unsigned, since that maps
+    /// two's-complement order onto unsigned order.
+    fn bv_slt(&mut self, a: AstId, b: AstId) -> Lit {
+        let mut a = self.blast_bv(a);
+        let mut b = self.blast_bv(b);
+        let top = a.len() - 1;
+        a[top] = !a[top];
+        b[top] = !b[top];
+        self.ult_bits(&a, &b)
     }
 }
 
