@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/z3rs/compare/v0.0.3...v0.0.4) - 2026-07-04
+
+### Other
+
+- Bump puremp to 0.2.0
+- Accept negative numeric literals (z3 compatibility)
+- Phase 5: recover implied equalities from opposing inequalities
+- Phase 5: dark shadow eliminates equalities first (+ budget isolation)
+
 ## [0.0.3](https://github.com/KarpelesLab/z3rs/compare/v0.0.2...v0.0.3) - 2026-07-04
 
 ### Other
