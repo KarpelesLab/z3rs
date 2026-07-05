@@ -2116,11 +2116,22 @@ impl Context {
                     self.tester_of.insert(cname.clone(), tdecl);
                     ctor_infos.push((cdecl, sel_decls, tdecl));
                 }
-                // Recursive if any selector's field sort is the datatype itself.
+                // Give the datatype a depth measure if it has any field of a
+                // non-primitive sort — the field's sort is itself (direct
+                // recursion) or another datatype (mutual recursion), both of which
+                // need the acyclicity depth constraints. A depth measure is sound
+                // for any datatype, so over-creating (e.g. a field of an unrelated
+                // uninterpreted sort) is harmless.
                 let recursive = ctor_infos
                     .iter()
                     .flat_map(|(_, sels, _)| sels)
-                    .any(|&sd| self.m.func_decl(sd).map(|d| d.range) == Some(sort));
+                    .any(|&sd| {
+                        self.m.func_decl(sd).map(|d| d.range).is_some_and(|r| {
+                            !self.m.is_arith_sort(r)
+                                && !self.m.is_bool_sort(r)
+                                && self.m.bv_sort_width(r).is_none()
+                        })
+                    });
                 if recursive {
                     let int_sort = self.m.mk_int_sort();
                     let name = alloc::format!("depth!{}", self.fresh_counter);
@@ -2193,11 +2204,20 @@ impl Context {
                     ax.push(ge0);
                     for (idx, (_, sels, _)) in ctors.iter().enumerate() {
                         for &sd in sels {
-                            if self.m.func_decl(sd).map(|d| d.range) != Some(s) {
-                                continue; // only recursive (same-sort) selectors
-                            }
+                            // A child whose sort is *any* datatype with a depth
+                            // measure must be strictly shallower — including
+                            // cross-sort children of mutually-recursive datatypes
+                            // (otherwise `x = nodeA(nodeB(x))` is not refuted).
+                            let child_sort = match self.m.func_decl(sd).map(|d| d.range) {
+                                Some(cs) => cs,
+                                None => continue,
+                            };
+                            let child_depth = match self.dt_depth.get(&child_sort) {
+                                Some(&d) => d,
+                                None => continue, // non-recursive child sort (e.g. Int, enum)
+                            };
                             let child = self.m.mk_app(sd, &[t]);
-                            let dc = self.m.mk_app(depth, &[child]);
+                            let dc = self.m.mk_app(child_depth, &[child]);
                             let gt = self.m.mk_gt(dt, dc);
                             let imp = self.m.mk_implies(testers[idx], gt);
                             ax.push(imp);
@@ -8700,6 +8720,36 @@ mod tests {
         assert_eq!(
             run(&alloc::format!(
                 "{l}(declare-const x Lst)(assert ((_ is cons) x))(assert (= (hd x) 5))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn mutually_recursive_datatype_acyclicity() {
+        // Acyclicity must hold ACROSS mutually-recursive datatypes (fuzz-found
+        // spurious sat): `x = nodeA(nodeB(x))` is unsat, but a finite term is sat.
+        let d = "(declare-datatypes ((A 0)(B 0)) \
+                 (((leafA)(nodeA (getb B)))((leafB)(nodeB (geta A)))))";
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(declare-const x A)(assert (= x (nodeA (nodeB x))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(declare-const x A)(declare-const y B)\
+                 (assert (= x (nodeA y)))(assert (= y (nodeB x)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(&alloc::format!(
+                "{d}(declare-const x A)(assert (= x (nodeA leafB)))(check-sat)"
             ))
             .unwrap(),
             alloc::vec!["sat"]
