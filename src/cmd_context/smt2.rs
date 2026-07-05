@@ -5627,7 +5627,7 @@ impl Context {
         // invariant). Both are sound; on the resource bound it declines (`None`)
         // and falls through to the general instantiation engine.
         if !self.universals.is_empty()
-            && let Some(r) = self.solve_chc()
+            && let Some(r) = self.solve_chc().or_else(|| self.solve_chc_multi())
         {
             return (r, None);
         }
@@ -5855,6 +5855,176 @@ impl Context {
         }
         let locals: Vec<AstId> = locals.into_iter().collect();
         self.chc_bmc_kinduction(&sorts, &state, &next, init, trans, bad, &locals)
+    }
+
+    /// The image formula of a **linear** CHC rule `body_app ∧ guard ⇒ head_app`
+    /// over the *previous* reachable sets: fresh-rename the binders, substitute
+    /// `reach[body_pred]` at the body arguments, conjoin the guards, and (when a
+    /// head is given) pin `state[head_pred] = head arguments`. Binders left free
+    /// are existential path variables (the SAT engine picks them).
+    fn chc_rule_image(
+        &mut self,
+        binders: &[AstId],
+        body_app: Option<AstId>,
+        guard_parts: &[AstId],
+        head_app: Option<AstId>,
+        reach: &BTreeMap<AstId, AstId>,
+        state: &BTreeMap<AstId, Vec<AstId>>,
+    ) -> Option<AstId> {
+        let fresh: Vec<(AstId, AstId)> = binders
+            .iter()
+            .map(|&b| (b, self.fresh_const(self.m.get_sort(b))))
+            .collect();
+        let mut parts: Vec<AstId> = Vec::new();
+        if let Some(bapp) = body_app {
+            let bp = self.predicate_of(bapp)?;
+            let bargs: Vec<AstId> = self.m.app_args(bapp).to_vec();
+            let canon = state.get(&bp)?.clone();
+            if canon.len() != bargs.len() {
+                return None;
+            }
+            // reach[body] is over the canonical vars; substitute them by the
+            // (fresh-renamed) body arguments.
+            let sub: Vec<(AstId, AstId)> = canon
+                .iter()
+                .zip(bargs.iter())
+                .map(|(&c, &a)| (c, crate::rewriter::substitute(&mut self.m, a, &fresh)))
+                .collect();
+            let rb = crate::rewriter::substitute(&mut self.m, reach[&bp], &sub);
+            parts.push(rb);
+        }
+        for &g in guard_parts {
+            let gf = crate::rewriter::substitute(&mut self.m, g, &fresh);
+            parts.push(gf);
+        }
+        if let Some(happ) = head_app {
+            let hp = self.predicate_of(happ)?;
+            let hargs: Vec<AstId> = self.m.app_args(happ).to_vec();
+            let canon = state.get(&hp)?.clone();
+            if canon.len() != hargs.len() {
+                return None;
+            }
+            for (i, &ha) in hargs.iter().enumerate() {
+                let haf = crate::rewriter::substitute(&mut self.m, ha, &fresh);
+                let eq = self.m.mk_eq(canon[i], haf);
+                parts.push(eq);
+            }
+        }
+        Some(if parts.is_empty() {
+            self.m.mk_true()
+        } else if parts.len() == 1 {
+            parts[0]
+        } else {
+            self.m.mk_and(&parts)
+        })
+    }
+
+    /// Multi-predicate **linear** CHC via bounded symbolic forward reachability:
+    /// grow each predicate's reachable set `reach[P]` by applying the rules, and
+    /// after each round test every query `body ∧ guard ⇒ false`. A satisfiable
+    /// query is a genuine counterexample derivation ⇒ **unsat** (the CHC system
+    /// is unsafe). Sound in that direction; the safe direction (a fixpoint of the
+    /// reach sets) needs model-based projection, so on bound exhaustion it
+    /// declines (`None`) and the goal stays a sound `unknown`.
+    fn solve_chc_multi(&mut self) -> Option<SmtResult> {
+        let mut preds: BTreeSet<AstId> = BTreeSet::new();
+        for (_, body) in &self.universals.clone() {
+            for t in self.m.postorder(*body) {
+                if let Some(p) = self.predicate_of(t) {
+                    preds.insert(p);
+                }
+            }
+        }
+        if preds.len() < 2 || preds.len() > 8 {
+            return None;
+        }
+        for a in &self.assertions.clone() {
+            if self
+                .m
+                .postorder(*a)
+                .iter()
+                .any(|&t| self.predicate_of(t).is_some_and(|p| preds.contains(&p)))
+            {
+                return None;
+            }
+        }
+        // Canonical state variables for each predicate.
+        let mut state: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &p in &preds {
+            let sorts = self.m.func_decl(p)?.domain.clone();
+            let vars: Vec<AstId> = sorts.iter().map(|&s| self.fresh_const(s)).collect();
+            state.insert(p, vars);
+        }
+        // Parse each universal into (binders, body_app, guards, head_app).
+        type MRule = (Vec<AstId>, Option<AstId>, Vec<AstId>, Option<AstId>);
+        let mut rules: Vec<MRule> = Vec::new();
+        for (binders, body) in self.universals.clone() {
+            let (ant, cons) = self.chc_split_rule(body)?;
+            let mut conj = Vec::new();
+            self.icp_flatten_and(ant, &mut conj);
+            let mut body_app = None;
+            let mut guards = Vec::new();
+            for a in conj {
+                if self.predicate_of(a).is_some() {
+                    if body_app.is_some() {
+                        return None; // nonlinear (≥2 body predicates)
+                    }
+                    body_app = Some(a);
+                } else {
+                    guards.push(a);
+                }
+            }
+            let head_app = if self.m.is_false(cons) {
+                None
+            } else if self.predicate_of(cons).is_some() {
+                Some(cons)
+            } else {
+                let neg = self.m.mk_not(cons);
+                guards.push(neg);
+                None
+            };
+            rules.push((binders, body_app, guards, head_app));
+        }
+        // Bounded forward reachability. Without model-based projection the reach
+        // sets never converge to a quantifier-free fixpoint (each rule firing adds
+        // fresh existential path variables), so the bound is kept small: deep
+        // enough to expose shallow counterexamples, shallow enough that the safe
+        // case declines quickly rather than churning on ever-growing formulas.
+        let mut reach: BTreeMap<AstId, AstId> =
+            preds.iter().map(|&p| (p, self.m.mk_false())).collect();
+        const BOUND: usize = 4;
+        for _ in 0..BOUND {
+            let mut new_reach = reach.clone();
+            for (bs, body_app, guards, head_app) in &rules.clone() {
+                let Some(happ) = *head_app else { continue };
+                let hp = self.predicate_of(happ)?;
+                let img = self.chc_rule_image(bs, *body_app, guards, Some(happ), &reach, &state)?;
+                let cur = new_reach[&hp];
+                let or = self.m.mk_or(&[cur, img]);
+                let or = crate::rewriter::simplify(&mut self.m, or);
+                // Without projection the reach formula can bloat; bail to a sound
+                // `unknown` rather than churn once it grows past a size budget.
+                if self.m.postorder(or).len() > 600 {
+                    return None;
+                }
+                new_reach.insert(hp, or);
+            }
+            reach = new_reach;
+            for (bs, body_app, guards, head_app) in &rules.clone() {
+                if head_app.is_some() {
+                    continue;
+                }
+                let q = self.chc_rule_image(bs, *body_app, guards, None, &reach, &state)?;
+                match check_model(&self.m, q).0 {
+                    SmtResult::Sat => return Some(SmtResult::Unsat), // counterexample
+                    // If the query can't be decided (the accumulating reach formula
+                    // outgrew the budget), deeper rounds are only larger — bail.
+                    SmtResult::Unknown => return None,
+                    SmtResult::Unsat => {}
+                }
+            }
+        }
+        None
     }
 
     /// Bounded model checking + k-induction over a parsed transition system.
