@@ -3805,6 +3805,43 @@ impl Context {
         (sgn, sig, exp)
     }
 
+    /// `unpack(normalize=true)` (z3): like [`fp_unpack_add`] but the significand
+    /// is left-normalised (leading zeros of a subnormal shifted out) and the
+    /// leading-zero count `lz` is returned so the caller adjusts the exponent.
+    /// Returns `(sgn[1], sig[sb], exp[eb] unbiased, lz[eb])`. Assumes `eb ≤ sb`.
+    fn fp_unpack_norm(&mut self, bv: AstId, eb: u32, sb: u32) -> (AstId, AstId, AstId, AstId) {
+        let w = eb + sb;
+        let sgn = self.m.mk_bv_extract(w - 1, w - 1, bv);
+        let exp_f = self.m.mk_bv_extract(w - 2, sb - 1, bv); // eb bits
+        let sig_f = self.m.mk_bv_extract(sb - 2, 0, bv); // sb-1 bits
+        let exp_zero = self.m.mk_bv(0, eb);
+        let exp_ones = self.m.mk_bvnot(exp_zero);
+        let is_zero_exp = self.m.mk_eq(exp_f, exp_zero);
+        let is_ones_exp = self.m.mk_eq(exp_f, exp_ones);
+        let not_zero = self.m.mk_not(is_zero_exp);
+        let not_ones = self.m.mk_not(is_ones_exp);
+        let is_norm = self.m.mk_and(&[not_zero, not_ones]);
+        let one1 = self.m.mk_bv(1, 1);
+        let normal_sig = self.m.mk_bv_concat(one1, sig_f); // sb
+        let normal_exp = self.fp_unbias(exp_f, eb);
+        let mut denormal_sig = self.m.mk_bv_zero_extend(1, sig_f); // sb
+        let one_eb = self.m.mk_bv(1, eb);
+        let denormal_exp = self.fp_unbias(one_eb, eb); // emin
+        let zero_e = self.m.mk_bv(0, eb);
+        // Normalisation: shift a subnormal significand left by its leading zeros.
+        let zero_s = self.m.mk_bv(0, sb);
+        let is_sig_zero = self.m.mk_eq(zero_s, denormal_sig);
+        let lz_d = self.fp_leading_zeros(denormal_sig, eb); // eb bits
+        let norm_or_zero = self.m.mk_or(&[is_norm, is_sig_zero]);
+        let lz = self.m.mk_ite(norm_or_zero, zero_e, lz_d);
+        let shift = self.m.mk_ite(is_sig_zero, zero_e, lz);
+        let q = self.m.mk_bv_zero_extend(sb - eb, shift); // sb bits (eb ≤ sb)
+        denormal_sig = self.m.mk_bvshl(denormal_sig, q);
+        let sig = self.m.mk_ite(is_norm, normal_sig, denormal_sig);
+        let exp = self.m.mk_ite(is_norm, normal_exp, denormal_exp);
+        (sgn, sig, exp, lz)
+    }
+
     /// `add_core` (z3): `c_exp ≥ d_exp` precondition (ensured by the caller's
     /// swap). Returns `(res_sgn[1], res_sig[sb+4], res_exp[eb+2])`.
     #[allow(clippy::too_many_arguments)]
@@ -3993,6 +4030,120 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.mul` on symbolic operands to z3's exact packed result
+    /// (port of `fpa2bv_converter::mk_mul`). `None` (→ gated `unknown`) for an
+    /// unsupported format/rm or unavailable operand bits.
+    fn fp_mul_bv(&mut self, rm: AstId, x: AstId, y: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb < 2 || sb < 4 || eb > sb {
+            return None; // sb ≥ 4 for the 4-bit round tail; eb ≤ sb for the shift
+        }
+        let rm_c = self.rm_code(rm)?;
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let w = eb + sb;
+        let bvx = self.fp_to_bv(x)?;
+        let bvy = self.fp_to_bv(y)?;
+
+        let mant = sb - 1;
+        let exp_ones_v = ((1u64 << eb) - 1) << mant;
+        let sign = 1u64 << (w - 1);
+        let nan = self.fp_lit(exp_ones_v | (1u64 << (mant - 1)), w);
+        let pzero = self.fp_lit(0, w);
+        let nzero = self.fp_lit(sign, w);
+        let pinf = self.fp_lit(exp_ones_v, w);
+        let ninf = self.fp_lit(exp_ones_v | sign, w);
+
+        // Classification (nan/inf/zero/neg) of each operand.
+        let clas = |ctx: &mut Self, bv: AstId| -> (AstId, AstId, AstId, AstId) {
+            let exp = ctx.m.mk_bv_extract(w - 2, sb - 1, bv);
+            let sigf = ctx.m.mk_bv_extract(sb - 2, 0, bv);
+            let sbit = ctx.m.mk_bv_extract(w - 1, w - 1, bv);
+            let ez = ctx.m.mk_bv(0, eb);
+            let eo = ctx.m.mk_bvnot(ez);
+            let sz = ctx.m.mk_bv(0, sb - 1);
+            let exp_ones = ctx.m.mk_eq(exp, eo);
+            let exp_zero = ctx.m.mk_eq(exp, ez);
+            let sig_zero = ctx.m.mk_eq(sigf, sz);
+            let sig_nz = ctx.m.mk_not(sig_zero);
+            let is_nan = ctx.m.mk_and(&[exp_ones, sig_nz]);
+            let is_inf = ctx.m.mk_and(&[exp_ones, sig_zero]);
+            let is_zero = ctx.m.mk_and(&[exp_zero, sig_zero]);
+            let one1 = ctx.m.mk_bv(1, 1);
+            let is_neg = ctx.m.mk_eq(sbit, one1);
+            (is_nan, is_inf, is_zero, is_neg)
+        };
+        let (x_nan, x_inf, x_zero, x_neg) = clas(self, bvx);
+        let (y_nan, y_inf, y_zero, y_neg) = clas(self, bvy);
+        let x_pos = self.m.mk_not(x_neg);
+        let y_pos = self.m.mk_not(y_neg);
+
+        // c1: NaN.
+        let c1 = self.m.mk_or(&[x_nan, y_nan]);
+        let v1 = nan;
+        // c2: x = +∞ → (y=0 ? NaN : ∞ with y's sign).
+        let c2 = self.m.mk_and(&[x_inf, x_pos]);
+        let y_sgn_inf = self.m.mk_ite(y_pos, pinf, ninf);
+        let v2 = self.m.mk_ite(y_zero, nan, y_sgn_inf);
+        // c3: y = +∞ → (x=0 ? NaN : ∞ with x's sign).
+        let c3 = self.m.mk_and(&[y_inf, y_pos]);
+        let x_sgn_inf = self.m.mk_ite(x_pos, pinf, ninf);
+        let v3 = self.m.mk_ite(x_zero, nan, x_sgn_inf);
+        // c4: x = −∞ → (y=0 ? NaN : ∞ with −y's sign).
+        let c4 = self.m.mk_and(&[x_inf, x_neg]);
+        let neg_y_sgn_inf = self.m.mk_ite(y_pos, ninf, pinf);
+        let v4 = self.m.mk_ite(y_zero, nan, neg_y_sgn_inf);
+        // c5: y = −∞ → (x=0 ? NaN : ∞ with −x's sign).
+        let c5 = self.m.mk_and(&[y_inf, y_neg]);
+        let neg_x_sgn_inf = self.m.mk_ite(x_pos, ninf, pinf);
+        let v5 = self.m.mk_ite(x_zero, nan, neg_x_sgn_inf);
+        // c6: x=0 ∨ y=0 → signed zero (sign = x.sign ⊕ y.sign).
+        let c6 = self.m.mk_or(&[x_zero, y_zero]);
+        let sa = self.m.mk_and(&[x_pos, y_neg]);
+        let sb_ = self.m.mk_and(&[x_neg, y_pos]);
+        let sign_xor = self.m.mk_or(&[sa, sb_]);
+        let v6 = self.m.mk_ite(sign_xor, nzero, pzero);
+
+        // Core multiplication.
+        let (a_sgn, a_sig, a_exp, a_lz) = self.fp_unpack_norm(bvx, eb, sb);
+        let (b_sgn, b_sig, b_exp, b_lz) = self.fp_unpack_norm(bvy, eb, sb);
+        let res_sgn = self.m.mk_bvxor(a_sgn, b_sgn);
+        let a_exp_ext = self.m.mk_bv_sign_extend(2, a_exp);
+        let b_exp_ext = self.m.mk_bv_sign_extend(2, b_exp);
+        let a_lz_ext = self.m.mk_bv_zero_extend(2, a_lz);
+        let b_lz_ext = self.m.mk_bv_zero_extend(2, b_lz);
+        let ta = self.m.mk_bvsub(a_exp_ext, a_lz_ext);
+        let tb = self.m.mk_bvsub(b_exp_ext, b_lz_ext);
+        let res_exp = self.m.mk_bvadd(ta, tb); // eb+2
+        let a_sig_ext = self.m.mk_bv_zero_extend(sb, a_sig); // 2·sb
+        let b_sig_ext = self.m.mk_bv_zero_extend(sb, b_sig);
+        let product = self.m.mk_bvmul(a_sig_ext, b_sig_ext); // 2·sb
+        let h_p = self.m.mk_bv_extract(2 * sb - 1, sb, product); // sb bits
+        // 4 round bits: top 3 of the low half + sticky (OR of the rest).
+        let part = self.m.mk_bv_extract(sb - 4, 0, product); // sb-3 bits
+        let pz = self.m.mk_bv(0, sb - 3);
+        let part_zero = self.m.mk_eq(part, pz);
+        let zero1 = self.m.mk_bv(0, 1);
+        let one1b = self.m.mk_bv(1, 1);
+        let sticky = self.m.mk_ite(part_zero, zero1, one1b);
+        let top3 = self.m.mk_bv_extract(sb - 1, sb - 3, product); // 3 bits
+        let rbits = self.m.mk_bv_concat(top3, sticky); // 4 bits
+        let res_sig = self.m.mk_bv_concat(h_p, rbits); // sb+4
+        let v7 = self.fp_round(rm3, res_sgn, res_sig, res_exp, eb, sb);
+
+        // Tie special cases together (lower index wins).
+        let r = self.m.mk_ite(c6, v6, v7);
+        let r = self.m.mk_ite(c5, v5, r);
+        let r = self.m.mk_ite(c4, v4, r);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -4016,10 +4167,15 @@ impl Context {
                     };
                     return Ok(self.mk_fp(f64_bits(r), 11, 53));
                 }
-                // Bit-exact symbolic add/sub, bit-blasted to QF_BV (all formats,
-                // all constant rounding modes). Other ops / symbolic rm gate below.
+                // Bit-exact symbolic add/sub/mul, bit-blasted to QF_BV (all
+                // formats, all constant rounding modes). div / symbolic rm gate.
                 if (op == "fp.add" || op == "fp.sub")
                     && let Some(t) = self.fp_add_bv(op, args[0], args[1], args[2])
+                {
+                    return Ok(t);
+                }
+                if op == "fp.mul"
+                    && let Some(t) = self.fp_mul_bv(args[0], args[1], args[2])
                 {
                     return Ok(t);
                 }
@@ -9144,6 +9300,27 @@ mod tests {
                  (assert (fp.lt (fp.min x y) (fp.max x y)))(check-sat)")
             .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn symbolic_fp_mul_bitblast() {
+        // fp.mul bit-blasted (Float16, concrete bit-literals): 2·3=6, 1.5·2=3.
+        assert_eq!(
+            run(
+                "(assert (not (fp.eq (fp.mul RNE (fp #b0 #b10000 #b0000000000) \
+                 (fp #b0 #b10000 #b1000000000)) (fp #b0 #b10001 #b1000000000))))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run(
+                "(assert (not (fp.eq (fp.mul RNE (fp #b0 #b01111 #b1000000000) \
+                 (fp #b0 #b10000 #b0000000000)) (fp #b0 #b10000 #b1000000000))))(check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
