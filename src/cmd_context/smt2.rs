@@ -3310,6 +3310,28 @@ impl Context {
                     };
                     return Ok(self.mk_fp(r, 11, 53));
                 }
+                // Symbolic: `abs` clears the sign bit, `neg` flips it — pure BV ops
+                // (no arithmetic circuit). The result is a fresh FP term whose
+                // bit-vector is the modified input, so classification/comparison of
+                // it is decided by the QF_BV engine.
+                if let Some((eb, sb)) = self.fp_format_of(self.m.get_sort(args[0]))
+                    && let Some(bv) = self.fp_to_bv(args[0])
+                {
+                    let w = eb + sb;
+                    let one_bit = self.m.mk_bv(1, 1);
+                    let zeros = self.m.mk_bv(0, w - 1);
+                    let msb = self.m.mk_bv_concat(one_bit, zeros); // 1 :: 0^{w-1}
+                    let result_bv = if op == "fp.abs" {
+                        let notmsb = self.m.mk_bvnot(msb);
+                        self.m.mk_bvand(bv, notmsb)
+                    } else {
+                        self.m.mk_bvxor(bv, msb)
+                    };
+                    let fps = self.fp_sort(eb, sb);
+                    let result = self.fresh_const(fps);
+                    self.fp_bv.insert(result, result_bv);
+                    return Ok(result);
+                }
                 self.symbolic_fp(op, args)
             }
             "fp.to_real" if args.len() == 1 => {
@@ -8337,6 +8359,28 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn symbolic_fp_abs_neg_decide() {
+        // Symbolic fp.abs/neg are sign-bit ops decided by the BV engine.
+        assert_eq!(
+            run("(declare-const x Float32)(assert (fp.isNegative (fp.abs x)))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(assert (not (fp.eq (fp.neg (fp.neg x)) x)))\
+                 (assert (not (fp.isNaN x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(assert (fp.isPositive (fp.abs x)))\
+                 (assert (not (fp.isZero x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
