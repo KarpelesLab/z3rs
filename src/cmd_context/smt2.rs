@@ -4227,6 +4227,142 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.div` on symbolic operands to z3's exact packed result
+    /// (port of `fpa2bv_converter::mk_div`). `None` (→ gated `unknown`) for an
+    /// unsupported format/rm or unavailable operand bits.
+    fn fp_div_bv(&mut self, rm: AstId, x: AstId, y: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb < 2 || sb < 4 || eb > sb {
+            return None;
+        }
+        let rm_c = self.rm_code(rm)?;
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let w = eb + sb;
+        let bvx = self.fp_to_bv(x)?;
+        let bvy = self.fp_to_bv(y)?;
+
+        let mant = sb - 1;
+        let exp_ones_v = ((1u64 << eb) - 1) << mant;
+        let sign = 1u64 << (w - 1);
+        let nan = self.fp_lit(exp_ones_v | (1u64 << (mant - 1)), w);
+        let pzero = self.fp_lit(0, w);
+        let nzero = self.fp_lit(sign, w);
+        let pinf = self.fp_lit(exp_ones_v, w);
+        let ninf = self.fp_lit(exp_ones_v | sign, w);
+
+        let clas = |ctx: &mut Self, bv: AstId| -> (AstId, AstId, AstId, AstId) {
+            let exp = ctx.m.mk_bv_extract(w - 2, sb - 1, bv);
+            let sigf = ctx.m.mk_bv_extract(sb - 2, 0, bv);
+            let sbit = ctx.m.mk_bv_extract(w - 1, w - 1, bv);
+            let ez = ctx.m.mk_bv(0, eb);
+            let eo = ctx.m.mk_bvnot(ez);
+            let sz = ctx.m.mk_bv(0, sb - 1);
+            let exp_ones = ctx.m.mk_eq(exp, eo);
+            let exp_zero = ctx.m.mk_eq(exp, ez);
+            let sig_zero = ctx.m.mk_eq(sigf, sz);
+            let sig_nz = ctx.m.mk_not(sig_zero);
+            let is_nan = ctx.m.mk_and(&[exp_ones, sig_nz]);
+            let is_inf = ctx.m.mk_and(&[exp_ones, sig_zero]);
+            let is_zero = ctx.m.mk_and(&[exp_zero, sig_zero]);
+            let one1 = ctx.m.mk_bv(1, 1);
+            let is_neg = ctx.m.mk_eq(sbit, one1);
+            (is_nan, is_inf, is_zero, is_neg)
+        };
+        let (x_nan, x_inf, x_zero, x_neg) = clas(self, bvx);
+        let (y_nan, y_inf, y_zero, y_neg) = clas(self, bvy);
+        let x_pos = self.m.mk_not(x_neg);
+        let y_pos = self.m.mk_not(y_neg);
+        let sa = self.m.mk_and(&[x_pos, y_neg]);
+        let sb2 = self.m.mk_and(&[x_neg, y_pos]);
+        let signs_xor = self.m.mk_or(&[sa, sb2]);
+        let xy_zero = self.m.mk_ite(signs_xor, nzero, pzero);
+
+        // c1: NaN.
+        let c1 = self.m.mk_or(&[x_nan, y_nan]);
+        let v1 = nan;
+        // c2: x=+∞ → (y=∞ ? NaN : ∞ with y's sign).
+        let c2 = self.m.mk_and(&[x_inf, x_pos]);
+        let y_sgn_inf = self.m.mk_ite(y_pos, pinf, ninf);
+        let v2 = self.m.mk_ite(y_inf, nan, y_sgn_inf);
+        // c3: y=+∞ → (x=∞ ? NaN : signed zero).
+        let c3 = self.m.mk_and(&[y_inf, y_pos]);
+        let v3 = self.m.mk_ite(x_inf, nan, xy_zero);
+        // c4: x=-∞ → (y=∞ ? NaN : ∞ with −y's sign).
+        let c4 = self.m.mk_and(&[x_inf, x_neg]);
+        let neg_y_sgn_inf = self.m.mk_ite(y_pos, ninf, pinf);
+        let v4 = self.m.mk_ite(y_inf, nan, neg_y_sgn_inf);
+        // c5: y=-∞ → (x=∞ ? NaN : signed zero).
+        let c5 = self.m.mk_and(&[y_inf, y_neg]);
+        let v5 = self.m.mk_ite(x_inf, nan, xy_zero);
+        // c6: y=0 → (x=0 ? NaN : ∞ with xor sign).
+        let c6 = y_zero;
+        let sgn_inf = self.m.mk_ite(signs_xor, ninf, pinf);
+        let v6 = self.m.mk_ite(x_zero, nan, sgn_inf);
+        // c7: x=0 → signed zero.
+        let c7 = x_zero;
+        let v7 = xy_zero;
+
+        // Core division.
+        let (a_sgn, a_sig, a_exp, a_lz) = self.fp_unpack_norm(bvx, eb, sb);
+        let (b_sgn, b_sig, b_exp, b_lz) = self.fp_unpack_norm(bvy, eb, sb);
+        let res_sgn = self.m.mk_bvxor(a_sgn, b_sgn);
+        let a_exp_ext = self.m.mk_bv_sign_extend(2, a_exp);
+        let b_exp_ext = self.m.mk_bv_sign_extend(2, b_exp);
+        let a_lz_ext = self.m.mk_bv_zero_extend(2, a_lz);
+        let b_lz_ext = self.m.mk_bv_zero_extend(2, b_lz);
+        let ta = self.m.mk_bvsub(a_exp_ext, a_lz_ext);
+        let tb = self.m.mk_bvsub(b_exp_ext, b_lz_ext);
+        let res_exp = self.m.mk_bvsub(ta, tb); // eb+2
+        let extra = sb + 2;
+        let zeros_low = self.m.mk_bv(0, sb + extra);
+        let a_sig_ext = self.m.mk_bv_concat(a_sig, zeros_low); // 3·sb+2
+        let b_sig_ext = self.m.mk_bv_zero_extend(sb + extra, b_sig); // 3·sb+2
+        let quotient = self.m.mk_bvudiv(a_sig_ext, b_sig_ext); // 3·sb+2
+        // sticky = OR of quotient[extra-2 : 0].
+        let low = self.m.mk_bv_extract(extra - 2, 0, quotient);
+        let low_z = self.m.mk_bv(0, extra - 1);
+        let low_zero = self.m.mk_eq(low, low_z);
+        let zero1 = self.m.mk_bv(0, 1);
+        let one1 = self.m.mk_bv(1, 1);
+        let sticky = self.m.mk_ite(low_zero, zero1, one1);
+        let midbits = self.m.mk_bv_extract(extra + sb + 1, extra - 1, quotient); // sb+3
+        let res_sig = self.m.mk_bv_concat(midbits, sticky); // sb+4
+        // too_large: any bit set in the top slice.
+        let upper = self.m.mk_bv_extract(3 * sb + 1, extra + sb + 2, quotient); // sb-2
+        let upper_z = self.m.mk_bv(0, sb - 2);
+        let upper_eq = self.m.mk_eq(upper, upper_z);
+        let too_large = self.m.mk_not(upper_eq);
+        let c8 = too_large;
+        let v8 = self.m.mk_ite(signs_xor, ninf, pinf);
+
+        // Normalise the quotient significand.
+        let res_sig_lz = self.fp_leading_zeros(res_sig, sb + 4); // sb+4
+        let one_s4 = self.m.mk_bv(1, sb + 4);
+        let shift_amount = self.m.mk_bvsub(res_sig_lz, one_s4);
+        let shift_cond = self.m.mk_bvule(res_sig_lz, one_s4);
+        let res_sig_shifted = self.m.mk_bvshl(res_sig, shift_amount);
+        let shift_low = self.m.mk_bv_extract(eb + 1, 0, shift_amount); // eb+2
+        let res_exp_shifted = self.m.mk_bvsub(res_exp, shift_low);
+        let res_sig_f = self.m.mk_ite(shift_cond, res_sig, res_sig_shifted);
+        let res_exp_f = self.m.mk_ite(shift_cond, res_exp, res_exp_shifted);
+        let v9 = self.fp_round(rm3, res_sgn, res_sig_f, res_exp_f, eb, sb);
+
+        // Tie together (lower index wins).
+        let r = self.m.mk_ite(c8, v8, v9);
+        let r = self.m.mk_ite(c7, v7, r);
+        let r = self.m.mk_ite(c6, v6, r);
+        let r = self.m.mk_ite(c5, v5, r);
+        let r = self.m.mk_ite(c4, v4, r);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -4259,6 +4395,11 @@ impl Context {
                 }
                 if op == "fp.mul"
                     && let Some(t) = self.fp_mul_bv(args[0], args[1], args[2])
+                {
+                    return Ok(t);
+                }
+                if op == "fp.div"
+                    && let Some(t) = self.fp_div_bv(args[0], args[1], args[2])
                 {
                     return Ok(t);
                 }
