@@ -2519,24 +2519,42 @@ impl Context {
             return None;
         }
         let mut vals: Vec<i64> = alloc::vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, -1, -2, -3, -4, -5, -6, -7, -8,
+            // 0 first: a zero divisor makes `div`/`mod` unconstrained (SMT-LIB
+            // leaves them unspecified), so many otherwise-hard goals are satisfied
+            // by the divisor being 0 (e.g. `mod(-29,y) ≤ -8`, impossible for y≠0).
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, -1, -2, -3, -4, -5, -6, -7,
+            -8,
         ];
-        // Also try nonzero integer constants that appear in the goal (and ±1
-        // around them): a satisfying divisor is often near a goal literal (e.g.
-        // `mod(x,y)=5 ∧ y<20` is sat at y just above 5 or just below 20).
-        for t in &present {
-            if let Some(v) = self.m.as_numeral(*t).and_then(|r| r.to_integer())
-                && let Some(n) = v.to_i64()
-                && n.abs() <= 1000
-            {
-                for cand in [n - 1, n, n + 1] {
-                    if cand != 0 && !vals.contains(&cand) {
-                        vals.push(cand);
-                    }
+        // Try divisors derived from the goal's integer constants. A satisfying
+        // divisor for `mod(a,y) ⋈ k` typically relates to `a` and `k` — e.g.
+        // `mod(-26,y) ≥ 11` needs `y = ±37 = ±(26+11)`, `mod(12,y) ≥ 8 ∧ y<0`
+        // needs `y = -13` (any `|y| > 12`). So take each constant with both
+        // signs, ±1 around it, and all pairwise sums/differences.
+        let consts: Vec<i64> = present
+            .iter()
+            .filter_map(|t| self.m.as_numeral(*t).and_then(|r| r.to_integer()))
+            .filter_map(|v| v.to_i64())
+            .filter(|n| n.abs() <= 2000)
+            .collect();
+        let mut cand_set: Vec<i64> = Vec::new();
+        for &a in &consts {
+            for d in [a, a + 1, a - 1] {
+                cand_set.push(d);
+                cand_set.push(-d);
+            }
+            for &b in &consts {
+                for d in [a + b, a - b, a.saturating_add(b) + 1] {
+                    cand_set.push(d);
+                    cand_set.push(-d);
                 }
             }
         }
-        const MAX_TRIES: usize = 600;
+        for cand in cand_set {
+            if cand != 0 && cand.abs() <= 4000 && !vals.contains(&cand) {
+                vals.push(cand);
+            }
+        }
+        const MAX_TRIES: usize = 4000;
         let mut idx = alloc::vec![0usize; divs.len()];
         let mut tries = 0;
         loop {
