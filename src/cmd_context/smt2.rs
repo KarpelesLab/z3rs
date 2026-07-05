@@ -2518,8 +2518,10 @@ impl Context {
         if divs.is_empty() || divs.len() > 2 {
             return None;
         }
-        let vals: [i64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4];
-        const MAX_TRIES: usize = 300;
+        let vals: [i64; 24] = [
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, -1, -2, -3, -4, -5, -6, -7, -8,
+        ];
+        const MAX_TRIES: usize = 400;
         let mut idx = alloc::vec![0usize; divs.len()];
         let mut tries = 0;
         loop {
