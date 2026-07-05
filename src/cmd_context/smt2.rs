@@ -3416,18 +3416,43 @@ impl Context {
                 if let Some(ps) = &lists {
                     // seq.prefixof/suffixof: (sub, whole); seq.contains: (whole, sub).
                     let (whole, sub) = if op == "seq.contains" {
-                        (&ps[0], &ps[1])
+                        (ps[0].clone(), ps[1].clone())
                     } else {
-                        (&ps[1], &ps[0])
+                        (ps[1].clone(), ps[0].clone())
                     };
-                    let b = match op {
-                        "seq.prefixof" => whole.len() >= sub.len() && whole[..sub.len()] == sub[..],
-                        "seq.suffixof" => {
-                            whole.len() >= sub.len() && whole[whole.len() - sub.len()..] == sub[..]
+                    // Candidate start positions where `sub` could sit in `whole`.
+                    let positions: Vec<usize> = if sub.len() > whole.len() {
+                        Vec::new()
+                    } else {
+                        match op {
+                            "seq.prefixof" => alloc::vec![0],
+                            "seq.suffixof" => alloc::vec![whole.len() - sub.len()],
+                            _ => (0..=whole.len() - sub.len()).collect(),
                         }
-                        _ => find_sub(whole, sub, 0).is_some(),
                     };
-                    return Ok(self.mk_bool(b));
+                    // A match at `p` is the conjunction of element equalities
+                    // `whole[p+k] = sub[k]` — which folds for concrete elements and
+                    // stays symbolic (e.g. `a=b`) for variables, rather than being
+                    // wrongly decided by syntactic AstId comparison.
+                    let mut disj = Vec::new();
+                    for p in positions {
+                        let mut conj = Vec::new();
+                        for k in 0..sub.len() {
+                            let e = self.m.mk_eq(whole[p + k], sub[k]);
+                            conj.push(e);
+                        }
+                        let c = match conj.len() {
+                            0 => self.m.mk_true(),
+                            1 => conj[0],
+                            _ => self.m.mk_and(&conj),
+                        };
+                        disj.push(c);
+                    }
+                    return Ok(match disj.len() {
+                        0 => self.m.mk_false(),
+                        1 => disj[0],
+                        _ => self.m.mk_or(&disj),
+                    });
                 }
                 self.symbolic_seq(op, args)
             }
@@ -9151,6 +9176,22 @@ mod tests {
                 "(assert (not (= (seq.replace (seq.++ (seq.unit 1) (seq.unit 2)) \
                  (seq.unit 2) (seq.unit 9)) (seq.++ (seq.unit 1) (seq.unit 9)))))(check-sat)"
             )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Symbolic elements: `seq.contains (seq.unit a) (seq.unit b)` means `a=b`,
+        // not a syntactic comparison — so it is sat (was a wrong unsat), and
+        // conjoined with `a≠b` it is unsat.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (seq.contains (seq.unit a) (seq.unit b)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)\
+                 (assert (seq.contains (seq.unit a) (seq.unit b)))\
+                 (assert (not (= a b)))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
