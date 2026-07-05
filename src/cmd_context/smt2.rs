@@ -6089,7 +6089,7 @@ impl Context {
                 let or = crate::rewriter::simplify(&mut self.m, or);
                 // Without projection the reach formula can bloat; bail to a sound
                 // `unknown` rather than churn once it grows past a size budget.
-                if self.m.postorder(or).len() > 600 {
+                if self.m.postorder(or).len() > 160 {
                     return None;
                 }
                 new_reach.insert(hp, or);
