@@ -10199,19 +10199,20 @@ mod tests {
     }
 
     #[test]
-    fn opaque_fp_ops_gate_not_contradict() {
-        // fp.fma is still opaque (not bit-blasted) → sound `unknown`, never a wrong
-        // verdict. (A bug once bit-blasted it to a free bit-vector, giving `sat`
-        // where z3 is unsat.)
+    fn fp_ops_decide_and_never_contradict() {
+        // fp.fma / fp.sqrt are now bit-blasted and decide, matching z3 (they must
+        // never give a wrong verdict — a bug once bit-blasted them to a free
+        // bit-vector, giving `sat` where z3 is unsat).
         let t = "((_ to_fp 11 53) RNE";
+        // fma(2,3,1) = 7, not NaN ⇒ `¬isNaN(fma)` is sat.
         assert_eq!(
             run(&alloc::format!(
                 "(assert (not (fp.isNaN (fp.fma RNE {t} 2.0) {t} 3.0) {t} 1.0)))))(check-sat)"
             ))
             .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["sat"]
         );
-        // fp.sqrt is now bit-blasted and decides: √9 = 3, so `¬(√9 = 3)` is unsat.
+        // √9 = 3 ⇒ `¬(√9 = 3)` is unsat.
         assert_eq!(
             run(&alloc::format!(
                 "(assert (not (fp.eq (fp.sqrt RNE {t} 9.0)) {t} 3.0))))(check-sat)"
