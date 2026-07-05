@@ -1061,6 +1061,9 @@ struct Context {
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
     /// `empty`), for structural folding of `seq.len`/`nth`/`at`/`extract`/`=`.
     seq_of: BTreeMap<AstId, Vec<AstId>>,
+    /// Canonical empty sequence per sequence sort, so all `(as seq.empty S)`
+    /// share one constant and `seq.len(s)=0 ⇒ s=empty` is enforceable.
+    seq_empty: BTreeMap<AstId, AstId>,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -1224,6 +1227,7 @@ impl Context {
             fp_bv: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
+            seq_empty: BTreeMap::new(),
             seq_len_decls: BTreeSet::new(),
         }
     }
@@ -2324,12 +2328,22 @@ impl Context {
                 if self.m.is_app(t) && len_decls.contains(&self.m.app_decl(t)) {
                     let ge = self.m.mk_ge(t, zero);
                     ax.push(ge);
-                    if str_len == Some(self.m.app_decl(t)) {
+                    // Emptiness biconditional `len(s)=0 ⇔ s=empty` (both
+                    // directions: catches `len=0 ∧ s≠empty` and `s=empty ∧ len>0`).
+                    let empty_of = if str_len == Some(self.m.app_decl(t)) {
+                        Some(empty)
+                    } else if self.seq_len_decls.contains(&self.m.app_decl(t)) {
+                        let s = self.m.app_args(t)[0];
+                        Some(self.seq_empty_of(self.m.get_sort(s)))
+                    } else {
+                        None
+                    };
+                    if let Some(e) = empty_of {
                         let s = self.m.app_args(t)[0];
                         let len_zero = self.m.mk_eq(t, zero);
-                        let is_empty = self.m.mk_eq(s, empty);
-                        let imp = self.m.mk_implies(len_zero, is_empty);
-                        ax.push(imp);
+                        let is_empty = self.m.mk_eq(s, e);
+                        let iff = self.m.mk_eq(len_zero, is_empty);
+                        ax.push(iff);
                     }
                 }
             }
@@ -2539,6 +2553,18 @@ impl Context {
     /// Is `t` an application of a symbolic string-op marker declaration?
     fn str_op_marker(&self, t: AstId) -> bool {
         self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t))
+    }
+
+    /// The canonical empty sequence of sort `s` (interned, with an empty element
+    /// list so structural folding treats it as empty).
+    fn seq_empty_of(&mut self, s: AstId) -> AstId {
+        if let Some(&e) = self.seq_empty.get(&s) {
+            return e;
+        }
+        let t = self.fresh_const(s);
+        self.seq_of.insert(t, Vec::new());
+        self.seq_empty.insert(s, t);
+        t
     }
 
     /// The interned `String` sort (registered on first use).
@@ -6309,9 +6335,7 @@ impl Context {
                     // annotation to know its element type.
                     if matches!(&l[1], SExpr::Atom(a) if a == "seq.empty") {
                         let s = self.resolve_sort(&l[2])?;
-                        let t = self.fresh_const(s);
-                        self.seq_of.insert(t, Vec::new());
-                        return Ok(t);
+                        return Ok(self.seq_empty_of(s));
                     }
                     return self.term(&l[1]);
                 }
@@ -8407,6 +8431,20 @@ mod tests {
         assert_eq!(
             run("(declare-const s (Seq Int))(assert (= (seq.len s) 3))(check-sat)").unwrap(),
             alloc::vec!["sat"]
+        );
+        // Emptiness biconditional `seq.len(s)=0 ⇔ s=empty` (fuzz-found spurious
+        // sat in both directions).
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (= (seq.len s) 0))\
+                 (assert (not (= s (as seq.empty (Seq Int)))))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (= s (as seq.empty (Seq Int))))\
+                 (assert (> (seq.len s) 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
