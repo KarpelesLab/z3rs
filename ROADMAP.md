@@ -169,13 +169,13 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ exit criterion met.
 | Phase | Gap | Status | Notes |
 |------:|-----|:------:|-------|
 | A | SAT/BV core speed | ⬜ | enables C; BV correct but budget-bound |
-| B | symbolic `div`/`mod` | 🟨 | guarded Euclidean axiom landed; symbolic-`mod` solving remains |
-| C | floating-point theory | 🟨 | ordered-compare monotone-key circuit written (gated on A); arithmetic unstarted |
+| B | symbolic `div`/`mod` | 🟨 | Euclidean lift-abstraction + divisor-witness search: unknown-gap **45%→~6%** (fuzz, 0 unsound); large/unbounded-divisor tail remains |
+| C | floating-point theory | 🟨 | symbolic `fp.abs`/`fp.neg` bit-blasted; ordered-compare circuit written (gated on A); arithmetic (add/mul/div/fma) specced, **gated on A** |
 | D | strings & sequences | ⬜ | length/witness/predicate reasoning done; word equations remain |
-| E | nonlinear real (CAD) | 🟨 | full CAD for the non-degenerate capped fragment done; caps + Hong fallback + ∀ remain |
+| E | nonlinear real (CAD) | 🟨 | full CAD for the non-degenerate capped fragment done; coupled 3-var declines on degenerate projection → needs **Hong fallback** (verified: not a cap issue) |
 | F | quantifiers (MBQI) | ⬜ | E-matching fixpoint done; MBQI/alternation remain |
-| G | Horn (Spacer/PDR) | 🟨 | single-predicate BMC + k-induction done; multi-predicate PDR remains |
-| H | full C ABI | 🟨 | representative `Z3_` slice done; long tail + refcounting remain |
+| G | Horn (Spacer/PDR) | 🟨 | single-predicate BMC + k-induction done; multi-predicate PDR **specced** (`spacer_multi_spec`); implementation remains |
+| H | full C ABI | 🟨 | **80%-path landed** (lifecycle/refcount no-ops, all BV/array/numeral/UF builders, independent per-solver sessions, sort/AST trivia; C smoke green); model-inspection long tail (`get_numeral_int`, `model_eval` structured) remains |
 | I | models & proofs at scale | ⬜ | verdicts sound; model-on-every-path + proofs remain |
 | J | performance & parity validation | ⬜ | PARITY.md v1 published; perf + Parity v2 remain |
 
