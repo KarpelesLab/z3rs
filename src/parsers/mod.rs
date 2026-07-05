@@ -15,7 +15,7 @@
 //! ## Status: IN PROGRESS — all four binary frontends parse & are wired
 
 pub use crate::cmd_context::{Session, run_smt2};
-pub use crate::muz::{parse as parse_datalog, evaluate as eval_datalog};
+pub use crate::muz::{evaluate as eval_datalog, parse as parse_datalog};
 pub use crate::sat::drat::{parse_cnf as parse_drat_cnf, parse_proof as parse_drat_proof};
 pub use crate::sat::parse_dimacs;
 
@@ -32,7 +32,10 @@ mod tests {
             alloc::vec!["sat"]
         );
         // DIMACS
-        assert_eq!(super::parse_dimacs("p cnf 1 1\n1 0\n").unwrap().num_vars(), 1);
+        assert_eq!(
+            super::parse_dimacs("p cnf 1 1\n1 0\n").unwrap().num_vars(),
+            1
+        );
         // DRAT
         assert!(super::parse_drat_proof("1 0\n").is_ok());
         // Datalog

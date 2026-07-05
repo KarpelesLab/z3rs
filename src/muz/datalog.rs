@@ -246,7 +246,9 @@ fn parse_atom_list(s: &str) -> Result<Vec<Atom>, String> {
 
 fn parse_atom(s: &str) -> Result<Atom, String> {
     let s = s.trim();
-    let open = s.find('(').ok_or_else(|| format_err("expected '(' in atom", s))?;
+    let open = s
+        .find('(')
+        .ok_or_else(|| format_err("expected '(' in atom", s))?;
     if !s.ends_with(')') {
         return Err(format_err("atom must end with ')'", s));
     }
@@ -314,7 +316,11 @@ mod tests {
             pred: "path".into(),
             args: alloc::vec![Term::Const("1".into()), Term::Var("Y".into())],
         };
-        let mut ys: Vec<String> = model.query(&q).into_iter().map(|m| m["Y"].clone()).collect();
+        let mut ys: Vec<String> = model
+            .query(&q)
+            .into_iter()
+            .map(|m| m["Y"].clone())
+            .collect();
         ys.sort();
         assert_eq!(ys, alloc::vec!["2", "3", "4"]);
     }

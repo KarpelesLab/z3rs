@@ -33,7 +33,10 @@ pub fn subst_var(poly: &Polynomial, v: Var, repl: &Polynomial) -> Polynomial {
             .filter(|&x| x != v)
             .map(|x| (x, mono.degree_of(x)))
             .collect();
-        let rest = Polynomial::from_terms(alloc::vec![(coeff.clone(), Monomial::from_powers(&rest_powers))]);
+        let rest = Polynomial::from_terms(alloc::vec![(
+            coeff.clone(),
+            Monomial::from_powers(&rest_powers)
+        )]);
         let term = if k == 0 { rest } else { rest.mul(&repl.pow(k)) };
         result = result.add(&term);
     }
@@ -52,7 +55,10 @@ fn solve_linear_for(p: &Polynomial, v: Var) -> Option<(Polynomial, Rational)> {
     for (coeff, mono) in p.terms() {
         match mono.degree_of(v) {
             0 => {
-                rest = rest.add(&Polynomial::from_terms(alloc::vec![(coeff.clone(), mono.clone())]));
+                rest = rest.add(&Polynomial::from_terms(alloc::vec![(
+                    coeff.clone(),
+                    mono.clone()
+                )]));
             }
             1 if mono.total_degree() == 1 => {
                 // The term is exactly `coeff · v`.
@@ -271,10 +277,7 @@ mod tests {
         let (reduced, vars) = remap_vars(&out);
         assert_eq!(vars.len(), 1); // only x remains
         // reduced[0] is a univariate quadratic; decide it as sat (roots x=2,3).
-        assert_eq!(
-            crate::nlsat::univariate::decide(&reduced, 0),
-            Some(true)
-        );
+        assert_eq!(crate::nlsat::univariate::decide(&reduced, 0), Some(true));
     }
 
     // A variable multiplied by another (x*v) is NOT linearly solvable.
@@ -300,7 +303,10 @@ mod tests {
                 ]),
                 Rel::Eq,
             ),
-            (Polynomial::from_terms(alloc::vec![(r(1), mono(&[(1, 1)]))]), Rel::Gt),
+            (
+                Polynomial::from_terms(alloc::vec![(r(1), mono(&[(1, 1)]))]),
+                Rel::Gt
+            ),
         ];
         let out = eliminate_linear(c, |_, _| true);
         let (reduced, vars) = remap_vars(&out);

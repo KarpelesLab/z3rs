@@ -197,8 +197,7 @@ impl Polynomial {
 
     fn canonicalize(&mut self) {
         self.terms.retain(|(c, _)| !c.is_zero());
-        self.terms
-            .sort_by(|(_, a), (_, b)| b.grlex_cmp(a)); // leading (largest) first
+        self.terms.sort_by(|(_, a), (_, b)| b.grlex_cmp(a)); // leading (largest) first
     }
 
     /// Is this the zero polynomial?
@@ -284,7 +283,13 @@ impl Polynomial {
                 let d = m.degree_of(v);
                 let powers: Vec<(Var, u32)> = m
                     .vars()
-                    .map(|x| if x == v { (x, d - 1) } else { (x, m.degree_of(x)) })
+                    .map(|x| {
+                        if x == v {
+                            (x, d - 1)
+                        } else {
+                            (x, m.degree_of(x))
+                        }
+                    })
                     .collect();
                 (
                     c.mul(&Rational::from_integer((d as i64).into())),
@@ -298,7 +303,11 @@ impl Polynomial {
     /// Negate every coefficient.
     pub fn neg(&self) -> Polynomial {
         Polynomial {
-            terms: self.terms.iter().map(|(c, m)| (c.neg(), m.clone())).collect(),
+            terms: self
+                .terms
+                .iter()
+                .map(|(c, m)| (c.neg(), m.clone()))
+                .collect(),
         }
     }
 
@@ -358,7 +367,11 @@ impl Polynomial {
             return Polynomial::zero();
         }
         Polynomial {
-            terms: self.terms.iter().map(|(tc, m)| (tc.mul(c), m.clone())).collect(),
+            terms: self
+                .terms
+                .iter()
+                .map(|(tc, m)| (tc.mul(c), m.clone()))
+                .collect(),
         }
     }
 
@@ -390,11 +403,7 @@ impl Polynomial {
 
     /// The set of variables occurring anywhere, ascending & deduplicated.
     pub fn vars(&self) -> Vec<Var> {
-        let mut vs: Vec<Var> = self
-            .terms
-            .iter()
-            .flat_map(|(_, m)| m.vars())
-            .collect();
+        let mut vs: Vec<Var> = self.terms.iter().flat_map(|(_, m)| m.vars()).collect();
         vs.sort_unstable();
         vs.dedup();
         vs
@@ -451,7 +460,15 @@ mod tests {
             .add(&Polynomial::constant(r(1)))
             .mul(&x.add(&y));
         // Deterministic pseudo-random sample points (no RNG dependency).
-        let samples = [(3i64, 5i64), (-2, 7), (11, -4), (1, 1), (-9, -9), (0, 6), (8, 0)];
+        let samples = [
+            (3i64, 5i64),
+            (-2, 7),
+            (11, -4),
+            (1, 1),
+            (-9, -9),
+            (0, 6),
+            (8, 0),
+        ];
         for (a, b) in samples {
             let want = {
                 // 2a^2 - ab - 3b^2 + a + b, computed in Rational directly.

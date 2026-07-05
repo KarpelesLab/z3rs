@@ -213,7 +213,10 @@ impl AstManager {
         weight: i32,
     ) -> AstId {
         debug_assert_eq!(var_sorts.len(), var_names.len());
-        debug_assert!(!var_sorts.is_empty(), "quantifier needs at least one binder");
+        debug_assert!(
+            !var_sorts.is_empty(),
+            "quantifier needs at least one binder"
+        );
         let sort = match kind {
             QuantifierKind::Forall | QuantifierKind::Exists => self.mk_bool_sort(),
             QuantifierKind::Lambda => {

@@ -5,7 +5,7 @@
 //! `nlsat` decides QF_NRA via CAD, this module implements the cheaper,
 //! one-directional half — proving **unsatisfiability** by interval arithmetic.
 //! Each variable gets an interval box; every constraint `p ⋈ 0` is evaluated
-//! over the box with the exact [`Interval`](crate::math::Interval) arithmetic,
+//! over the box with the exact [`Interval`] arithmetic,
 //! and single-variable linear bounds narrow the box. If any constraint's value
 //! interval is disjoint from the values its relation allows, or a variable's box
 //! becomes empty, the system is UNSAT.
@@ -274,9 +274,16 @@ fn bound_cmp_zero_upper(hi: &Bound) -> SignPos {
 
 fn is_point_zero(i: &Interval) -> bool {
     match i.bounds() {
-        Some((Bound::Finite { value: l, open: false }, Bound::Finite { value: h, open: false })) => {
-            l.is_zero() && h.is_zero()
-        }
+        Some((
+            Bound::Finite {
+                value: l,
+                open: false,
+            },
+            Bound::Finite {
+                value: h,
+                open: false,
+            },
+        )) => l.is_zero() && h.is_zero(),
         _ => false,
     }
 }
@@ -525,9 +532,9 @@ pub fn decide_bounded_int(constraints: &[Constraint], num_vars: usize) -> Option
     let mut point: Vec<i64> = ranges.iter().map(|&(lo, _)| lo).collect();
     loop {
         let sat = constraints.iter().all(|c| {
-            let val = c.poly.eval(&|v| {
-                Rational::from_integer(point[v as usize].into())
-            });
+            let val = c
+                .poly
+                .eval(&|v| Rational::from_integer(point[v as usize].into()));
             match c.rel {
                 Rel::Lt => val.is_negative(),
                 Rel::Le => val.is_negative() || val.is_zero(),

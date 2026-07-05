@@ -2153,16 +2153,13 @@ impl Context {
                 // need the acyclicity depth constraints. A depth measure is sound
                 // for any datatype, so over-creating (e.g. a field of an unrelated
                 // uninterpreted sort) is harmless.
-                let recursive = ctor_infos
-                    .iter()
-                    .flat_map(|(_, sels, _)| sels)
-                    .any(|&sd| {
-                        self.m.func_decl(sd).map(|d| d.range).is_some_and(|r| {
-                            !self.m.is_arith_sort(r)
-                                && !self.m.is_bool_sort(r)
-                                && self.m.bv_sort_width(r).is_none()
-                        })
-                    });
+                let recursive = ctor_infos.iter().flat_map(|(_, sels, _)| sels).any(|&sd| {
+                    self.m.func_decl(sd).map(|d| d.range).is_some_and(|r| {
+                        !self.m.is_arith_sort(r)
+                            && !self.m.is_bool_sort(r)
+                            && self.m.bv_sort_width(r).is_none()
+                    })
+                });
                 if recursive {
                     let int_sort = self.m.mk_int_sort();
                     let name = alloc::format!("depth!{}", self.fresh_counter);
@@ -2484,7 +2481,10 @@ impl Context {
                 .map(|&a| self.refold_str_markers(a, memo))
                 .collect();
             let is_len = self.str_len_decl == Some(decl) || self.seq_len_decls.contains(&decl);
-            if is_len && args.len() == 1 && let Some(v) = self.str_value(args[0]) {
+            if is_len
+                && args.len() == 1
+                && let Some(v) = self.str_value(args[0])
+            {
                 self.m.mk_int(v.len() as i64)
             } else if let Some(op) = self.str_op_decls.get(&decl).cloned() {
                 self.string_op(&op, &args)
@@ -2699,7 +2699,9 @@ impl Context {
     /// signature, so all length applications on that sort are congruent).
     fn seq_len_decl_for(&mut self, seq_sort: AstId) -> AstId {
         let int = self.m.mk_int_sort();
-        let d = self.m.mk_func_decl(Symbol::new("seq.len"), &[seq_sort], int);
+        let d = self
+            .m
+            .mk_func_decl(Symbol::new("seq.len"), &[seq_sort], int);
         self.seq_len_decls.insert(d);
         d
     }
@@ -3203,7 +3205,9 @@ impl Context {
         // magnitude (`exp:significand` = the low `w-1` bits, a plain extract).
         // Unlike the monotone-key transform, the magnitude is a near-free
         // variable, so the SAT core refutes e.g. `x<y ∧ y<x` quickly.
-        let w = self.fp_format_of(self.m.get_sort(a)).map(|(eb, sb)| eb + sb)?;
+        let w = self
+            .fp_format_of(self.m.get_sort(a))
+            .map(|(eb, sb)| eb + sb)?;
         let lt_ab = self.fp_real_lt(bva, bvb, w); // value(a) < value(b), non-NaN
         Some(match op {
             "fp.lt" => {
@@ -3267,7 +3271,11 @@ impl Context {
         };
         let eq_case = self.m.mk_ite(both_zero, zero_res, bva);
         // min: a<b→a, b<a→b; max: a>b→a, b>a→b.
-        let (first, second) = if is_min { (lt_ab, lt_ba) } else { (lt_ba, lt_ab) };
+        let (first, second) = if is_min {
+            (lt_ab, lt_ba)
+        } else {
+            (lt_ba, lt_ab)
+        };
         let inner = self.m.mk_ite(second, bvb, eq_case);
         let core = self.m.mk_ite(first, bva, inner);
         // NaN operand ⇒ the other operand.
@@ -3469,7 +3477,15 @@ impl Context {
     /// The shared rounder (z3 `round`). `sig` is `sb+4` bits (`[o1 o0 . f][g r s]`),
     /// `exp` is `eb+2` signed bits. Returns the packed `(eb+sb)`-bit result.
     #[allow(clippy::too_many_arguments)]
-    fn fp_round(&mut self, rm3: AstId, sgn: AstId, sig: AstId, exp: AstId, eb: u32, sb: u32) -> AstId {
+    fn fp_round(
+        &mut self,
+        rm3: AstId,
+        sgn: AstId,
+        sig: AstId,
+        exp: AstId,
+        eb: u32,
+        sb: u32,
+    ) -> AstId {
         let one1 = self.m.mk_bv(1, 1);
         let emin_v = 2i64 - (1i64 << (eb - 1)); // -(2^(eb-1)-2)
         let emax_v = ((1u64 << (eb - 1)) - 1) as i64;
@@ -3523,7 +3539,9 @@ impl Context {
         let sigma_lt_zero = self.m.mk_bvsle(sigma, neg1_ss);
         let zeros_ss = self.m.mk_bv(0, sig_size);
         let sig_ext = self.m.mk_bv_concat(sig, zeros_ss); // 2*sig_size
-        let ext_r = self.m.mk_bv_zero_extend(2 * sig_size - sigma_size, sigma_neg_capped);
+        let ext_r = self
+            .m
+            .mk_bv_zero_extend(2 * sig_size - sigma_size, sigma_neg_capped);
         let rs_sig = self.m.mk_bvlshr(sig_ext, ext_r);
         let ext_l = self.m.mk_bv_zero_extend(2 * sig_size - sigma_size, sigma);
         let ls_sig = self.m.mk_bvshl(sig_ext, ext_l);
@@ -4567,25 +4585,26 @@ impl Context {
             // the guard is expressed *directly* over the state — no equality
             // bindings, hence `¬Bad` stays a plain inequality rather than a
             // disequality `state ≠ binder` that blows up the linear search.
-            let collect = |ctx: &Self, app: AstId, vars: &[AstId], subst: &mut Vec<(AstId, AstId)>| -> bool {
-                let args = ctx.m.app_args(app).to_vec();
-                if args.len() != vars.len() {
-                    return false;
-                }
-                for (j, &a) in args.iter().enumerate() {
-                    if !ctx.m.is_uninterp_const(a) {
-                        return false; // non-bare argument (e.g. P(x+1)) — decline
-                    }
-                    // A binder reused across the body and head (e.g. an argument
-                    // permutation `P(x,y) ⇒ P(y,x)`) is not a clean transition;
-                    // the substitution would conflict, so decline.
-                    if subst.iter().any(|&(from, _)| from == a) {
+            let collect =
+                |ctx: &Self, app: AstId, vars: &[AstId], subst: &mut Vec<(AstId, AstId)>| -> bool {
+                    let args = ctx.m.app_args(app).to_vec();
+                    if args.len() != vars.len() {
                         return false;
                     }
-                    subst.push((a, vars[j]));
-                }
-                true
-            };
+                    for (j, &a) in args.iter().enumerate() {
+                        if !ctx.m.is_uninterp_const(a) {
+                            return false; // non-bare argument (e.g. P(x+1)) — decline
+                        }
+                        // A binder reused across the body and head (e.g. an argument
+                        // permutation `P(x,y) ⇒ P(y,x)`) is not a clean transition;
+                        // the substitution would conflict, so decline.
+                        if subst.iter().any(|&(from, _)| from == a) {
+                            return false;
+                        }
+                        subst.push((a, vars[j]));
+                    }
+                    true
+                };
             match (body_pred, head_pred) {
                 (None, Some(h)) => {
                     // Fact: guard ⇒ P(s).
@@ -4661,9 +4680,8 @@ impl Context {
         const MAX_K: usize = 40;
         // Step-state variables s_0, s_1, …; extended lazily.
         let mut steps: Vec<Vec<AstId>> = Vec::new();
-        let fresh_state = |ctx: &mut Self| -> Vec<AstId> {
-            sorts.iter().map(|&s| ctx.fresh_const(s)).collect()
-        };
+        let fresh_state =
+            |ctx: &mut Self| -> Vec<AstId> { sorts.iter().map(|&s| ctx.fresh_const(s)).collect() };
         steps.push(fresh_state(self));
 
         for k in 0..=MAX_K {
@@ -6422,8 +6440,10 @@ impl Context {
                 crate::nlsat::univariate::decide(&reduced, 0)
             }
         } else if remaining_int.iter().all(|&b| b) {
-            let cons: Vec<Constraint> =
-                reduced.iter().map(|(p, r)| Constraint::new(p.clone(), *r)).collect();
+            let cons: Vec<Constraint> = reduced
+                .iter()
+                .map(|(p, r)| Constraint::new(p.clone(), *r))
+                .collect();
             crate::nlsat::icp::decide_bounded_int(&cons, k)
         } else {
             None
@@ -8677,8 +8697,10 @@ mod tests {
         );
         // A recursive *function* seeded by a ground application still decides sat.
         assert_eq!(
-            run("(define-fun-rec f ((n Int)) Int (ite (<= n 0) 1 (* n (f (- n 1)))))\
-                 (assert (= (f 3) 6))(check-sat)")
+            run(
+                "(define-fun-rec f ((n Int)) Int (ite (<= n 0) 1 (* n (f (- n 1)))))\
+                 (assert (= (f 3) 6))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["sat"]
         );
@@ -8922,17 +8944,20 @@ mod tests {
         // fp.min/max via the BV ite circuit (uses the ordered comparison).
         assert_eq!(
             run("(declare-const x Float32)(declare-const y Float32)\
-                 (assert (fp.gt (fp.min x y) x))(check-sat)").unwrap(),
+                 (assert (fp.gt (fp.min x y) x))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
             run("(declare-const x Float32)(declare-const y Float32)\
-                 (assert (fp.lt (fp.max x y) y))(check-sat)").unwrap(),
+                 (assert (fp.lt (fp.max x y) y))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
             run("(declare-const x Float32)(declare-const y Float32)\
-                 (assert (fp.lt (fp.min x y) (fp.max x y)))(check-sat)").unwrap(),
+                 (assert (fp.lt (fp.min x y) (fp.max x y)))(check-sat)")
+            .unwrap(),
             alloc::vec!["sat"]
         );
     }
@@ -8945,7 +8970,8 @@ mod tests {
             run("(declare-fun x () (_ FloatingPoint 5 11))\
                  (assert (= x (fp #b0 #b01111 #b0000000000)))\
                  (assert (not (= (fp.add RNE x x) (fp #b0 #b10000 #b0000000000))))\
-                 (check-sat)").unwrap(),
+                 (check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         // Round-to-odd style tie under RTP vs RTZ differs: 1.0 + tiny with RTP
@@ -8955,7 +8981,8 @@ mod tests {
                  (assert (= x (fp #b0 #b01111 #b0000000000)))\
                  (assert (= (fp.add RTP x (fp #b0 #b00000 #b0000000001))\
                              (fp #b0 #b01111 #b0000000001)))\
-                 (check-sat)").unwrap(),
+                 (check-sat)")
+            .unwrap(),
             alloc::vec!["sat"]
         );
         assert_eq!(
@@ -8963,7 +8990,8 @@ mod tests {
                  (assert (= x (fp #b0 #b01111 #b0000000000)))\
                  (assert (not (= (fp.add RTZ x (fp #b0 #b00000 #b0000000001))\
                                   (fp #b0 #b01111 #b0000000000))))\
-                 (check-sat)").unwrap(),
+                 (check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         // fp.sub: 2.0 - 1.0 = 1.0 (Float32).
@@ -8972,7 +9000,8 @@ mod tests {
                  (assert (= x (fp #b0 #x80 #b00000000000000000000000)))\
                  (assert (not (= (fp.sub RNE x (fp #b0 #x7f #b00000000000000000000000))\
                                   (fp #b0 #x7f #b00000000000000000000000))))\
-                 (check-sat)").unwrap(),
+                 (check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         // Overflow to +inf: max-finite + max-finite under RNE (Float16).
@@ -8980,13 +9009,17 @@ mod tests {
             run("(declare-fun x () (_ FloatingPoint 5 11))\
                  (assert (= x (fp #b0 #b11110 #b1111111111)))\
                  (assert (not (= (fp.add RNE x x) (_ +oo 5 11))))\
-                 (check-sat)").unwrap(),
+                 (check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         // +inf + -inf = NaN.
         assert_eq!(
-            run("(assert (not (= (fp.add RNE (_ +oo 5 11) (_ -oo 5 11)) (_ NaN 5 11))))\
-                 (check-sat)").unwrap(),
+            run(
+                "(assert (not (= (fp.add RNE (_ +oo 5 11) (_ -oo 5 11)) (_ NaN 5 11))))\
+                 (check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["unsat"]
         );
     }
@@ -8998,7 +9031,8 @@ mod tests {
         // monotone-key encoding).
         assert_eq!(
             run("(declare-const x Float32)(declare-const y Float32)\
-                 (assert (fp.lt x y))(assert (fp.lt y x))(check-sat)").unwrap(),
+                 (assert (fp.lt x y))(assert (fp.lt y x))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
@@ -9007,12 +9041,15 @@ mod tests {
         );
         assert_eq!(
             run("(declare-const x Float32)(declare-const y Float32)\
-                 (assert (fp.geq x y))(assert (fp.gt y x))(check-sat)").unwrap(),
+                 (assert (fp.geq x y))(assert (fp.gt y x))(check-sat)")
+            .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
-            run("(declare-const x Float32)(declare-const y Float32)(assert (fp.lt x y))(check-sat)")
-                .unwrap(),
+            run(
+                "(declare-const x Float32)(declare-const y Float32)(assert (fp.lt x y))(check-sat)"
+            )
+            .unwrap(),
             alloc::vec!["sat"]
         );
     }
@@ -9021,19 +9058,22 @@ mod tests {
     fn symbolic_fp_abs_neg_decide() {
         // Symbolic fp.abs/neg are sign-bit ops decided by the BV engine.
         assert_eq!(
-            run("(declare-const x Float32)(assert (fp.isNegative (fp.abs x)))(check-sat)")
-                .unwrap(),
+            run("(declare-const x Float32)(assert (fp.isNegative (fp.abs x)))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
-            run("(declare-const x Float32)(assert (not (fp.eq (fp.neg (fp.neg x)) x)))\
-                 (assert (not (fp.isNaN x)))(check-sat)")
+            run(
+                "(declare-const x Float32)(assert (not (fp.eq (fp.neg (fp.neg x)) x)))\
+                 (assert (not (fp.isNaN x)))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["unsat"]
         );
         assert_eq!(
-            run("(declare-const x Float32)(assert (fp.isPositive (fp.abs x)))\
-                 (assert (not (fp.isZero x)))(check-sat)")
+            run(
+                "(declare-const x Float32)(assert (fp.isPositive (fp.abs x)))\
+                 (assert (not (fp.isZero x)))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["sat"]
         );
@@ -9435,8 +9475,10 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(
-            run("(declare-const s (Seq Int))(assert (= s (as seq.empty (Seq Int))))\
-                 (assert (> (seq.len s) 0))(check-sat)")
+            run(
+                "(declare-const s (Seq Int))(assert (= s (as seq.empty (Seq Int))))\
+                 (assert (> (seq.len s) 0))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["unsat"]
         );
@@ -10179,18 +10221,18 @@ mod tests {
     #[test]
     fn apply_ctx_solver_simplify() {
         // A context-implied conjunct (`x > 0`, entailed by `x > 5`) is dropped.
-        let out = run(
-            "(declare-const x Int)(assert (> x 5))(assert (> x 0))\
-             (apply ctx-solver-simplify)",
-        )
+        let out = run("(declare-const x Int)(assert (> x 5))(assert (> x 0))\
+             (apply ctx-solver-simplify)")
         .unwrap();
         assert!(out[0].contains("x 5"), "output: {}", out[0]);
-        assert!(!out[0].contains("x 0"), "redundant conjunct kept: {}", out[0]);
+        assert!(
+            !out[0].contains("x 0"),
+            "redundant conjunct kept: {}",
+            out[0]
+        );
         // A contradictory context collapses the goal to `false`.
-        let unsat = run(
-            "(declare-const p Bool)(assert p)(assert (not p))\
-             (apply ctx-solver-simplify)",
-        )
+        let unsat = run("(declare-const p Bool)(assert p)(assert (not p))\
+             (apply ctx-solver-simplify)")
         .unwrap();
         assert!(unsat[0].contains("false"), "output: {}", unsat[0]);
     }
@@ -10258,9 +10300,11 @@ mod tests {
         // its element-wise semantics, so `sat` would be wrong — must stay sound.
         // `map(-,a,b)=a` forces `b=0`, contradicting `b[0]≠0` (z3: unsat).
         assert_ne!(
-            run("(declare-const a (Array Int Int))(declare-const b (Array Int Int))\
+            run(
+                "(declare-const a (Array Int Int))(declare-const b (Array Int Int))\
                  (assert (= ((_ map (- (Int Int) Int)) a b) a))\
-                 (assert (not (= (select b 0) 0)))(check-sat)")
+                 (assert (not (= (select b 0) 0)))(check-sat)"
+            )
             .unwrap(),
             alloc::vec!["sat"]
         );

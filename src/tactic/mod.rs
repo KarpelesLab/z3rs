@@ -5,7 +5,7 @@
 //! `probe`. A [`Goal`] is a conjunction of formulas over an [`AstManager`]; a
 //! [`Tactic`] maps a goal to a list of subgoals whose conjunction is
 //! equisatisfiable (or fails). The combinators compose tactics; [`Probe`]s
-//! measure a goal so [`cond`] can choose a strategy.
+//! measure a goal so `cond` can choose a strategy.
 //!
 //! This is the framework plus a small but real portfolio (`simplify`,
 //! conjunction splitting, `propagate-values`-style constant propagation). Heavy
@@ -31,7 +31,9 @@ pub struct Goal {
 impl Goal {
     /// An empty (trivially-true) goal.
     pub fn new() -> Goal {
-        Goal { formulas: Vec::new() }
+        Goal {
+            formulas: Vec::new(),
+        }
     }
 
     /// A goal from a list of assertions.
@@ -237,7 +239,10 @@ impl Probe for NumAssertions {
 pub struct NumExprs;
 impl Probe for NumExprs {
     fn eval(&self, m: &AstManager, goal: &Goal) -> f64 {
-        goal.formulas.iter().map(|&f| m.num_subexprs(f)).sum::<usize>() as f64
+        goal.formulas
+            .iter()
+            .map(|&f| m.num_subexprs(f))
+            .sum::<usize>() as f64
     }
 }
 

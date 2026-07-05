@@ -392,7 +392,11 @@ mod tests {
         // The middle interval brackets 0.
         assert!(roots.iter().any(|(a, b)| a < &r(0) && b > &r(0)));
         // √2 ≈ 1.414 is bracketed by one interval.
-        assert!(roots.iter().any(|(a, b)| a < &r(2) && b > &r(1) && a > &r(0)));
+        assert!(
+            roots
+                .iter()
+                .any(|(a, b)| a < &r(2) && b > &r(1) && a > &r(0))
+        );
     }
 
     #[test]

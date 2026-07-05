@@ -418,10 +418,7 @@ pub unsafe extern "C" fn Z3_eval_smtlib2_string(
         Err(e) => alloc::format!("(error \"{e}\")"),
     };
     ctx.last = CString::new(out).ok();
-    ctx.last
-        .as_ref()
-        .map(|s| s.as_ptr())
-        .unwrap_or(ptr::null())
+    ctx.last.as_ref().map(|s| s.as_ptr()).unwrap_or(ptr::null())
 }
 
 // --- Z3-compatible object (handle) API -------------------------------------
@@ -1047,7 +1044,9 @@ fn parse_sort_tokens(toks: &[&str]) -> Sort {
         "Bool" => Sort::Bool,
         "Real" => Sort::Real,
         _ => {
-            if let Some(inner) = s.strip_prefix("(_ BitVec ").and_then(|r| r.strip_suffix(')'))
+            if let Some(inner) = s
+                .strip_prefix("(_ BitVec ")
+                .and_then(|r| r.strip_suffix(')'))
                 && let Ok(w) = inner.trim().parse::<u32>()
             {
                 return Sort::BitVec(w);
@@ -1202,7 +1201,10 @@ pub unsafe extern "C" fn Z3_model_get_const_interp(
 /// # Safety
 /// `m` must be NULL or a valid model handle.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z3_model_get_num_consts(_c: *mut Z3rsZ3Context, m: *const Z3rsModel) -> u32 {
+pub unsafe extern "C" fn Z3_model_get_num_consts(
+    _c: *mut Z3rsZ3Context,
+    m: *const Z3rsModel,
+) -> u32 {
     if m.is_null() {
         return 0;
     }
@@ -1254,8 +1256,12 @@ pub unsafe extern "C" fn Z3_ast_to_string(
 /// `Z3_get_full_version()` — the version string (statically owned; do not free).
 #[unsafe(no_mangle)]
 pub extern "C" fn Z3_get_full_version() -> *const c_char {
-    concat!("z3rs ", env!("CARGO_PKG_VERSION"), " (Z3 4.17.0 compatible)\0").as_ptr()
-        as *const c_char
+    concat!(
+        "z3rs ",
+        env!("CARGO_PKG_VERSION"),
+        " (Z3 4.17.0 compatible)\0"
+    )
+    .as_ptr() as *const c_char
 }
 
 // --- Reference-counting lifecycle (no-ops) ---------------------------------
@@ -1462,13 +1468,19 @@ pub unsafe extern "C" fn Z3_mk_power(
 /// # Safety
 /// `c` valid context; `a` a valid `Z3_ast`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z3_mk_int2real(c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> *const Z3rsAst {
+pub unsafe extern "C" fn Z3_mk_int2real(
+    c: *mut Z3rsZ3Context,
+    a: *const Z3rsAst,
+) -> *const Z3rsAst {
     unsafe { mk_un(c, a, |x| x.int2real()) }
 }
 /// # Safety
 /// `c` valid context; `a` a valid `Z3_ast`.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn Z3_mk_real2int(c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> *const Z3rsAst {
+pub unsafe extern "C" fn Z3_mk_real2int(
+    c: *mut Z3rsZ3Context,
+    a: *const Z3rsAst,
+) -> *const Z3rsAst {
     unsafe { mk_un(c, a, |x| x.real2int()) }
 }
 /// # Safety
@@ -1534,10 +1546,7 @@ macro_rules! bv_unop {
         /// # Safety
         /// `c` valid context; `a` a valid `Z3_ast`.
         #[unsafe(no_mangle)]
-        pub unsafe extern "C" fn $name(
-            c: *mut Z3rsZ3Context,
-            a: *const Z3rsAst,
-        ) -> *const Z3rsAst {
+        pub unsafe extern "C" fn $name(c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> *const Z3rsAst {
             unsafe { mk_un(c, a, |x| x.$method()) }
         }
     };
@@ -1742,11 +1751,7 @@ pub unsafe extern "C" fn Z3_mk_unsigned_int64(
     unsafe { mk_numeral_val(c, v as i128, ty) }
 }
 
-unsafe fn mk_numeral_val(
-    c: *mut Z3rsZ3Context,
-    v: i128,
-    ty: *const Z3rsSort,
-) -> *const Z3rsAst {
+unsafe fn mk_numeral_val(c: *mut Z3rsZ3Context, v: i128, ty: *const Z3rsSort) -> *const Z3rsAst {
     if c.is_null() || ty.is_null() {
         return ptr::null();
     }
@@ -2128,7 +2133,9 @@ pub unsafe extern "C" fn Z3_get_numeral_string(
     if c.is_null() || a.is_null() {
         return ptr::null();
     }
-    let s = unsafe { &*a }.numeral_string().unwrap_or_else(|| "0".to_string());
+    let s = unsafe { &*a }
+        .numeral_string()
+        .unwrap_or_else(|| "0".to_string());
     let ctx = unsafe { &mut *c };
     intern_string(ctx, s)
 }
@@ -2613,7 +2620,16 @@ pub unsafe extern "C" fn Z3_mk_forall_const(
     body: *const Z3rsAst,
 ) -> *const Z3rsAst {
     unsafe {
-        mk_quantifier_const(c, true, weight, num_bound, bound, num_patterns, patterns, body)
+        mk_quantifier_const(
+            c,
+            true,
+            weight,
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
     }
 }
 
@@ -2632,7 +2648,16 @@ pub unsafe extern "C" fn Z3_mk_exists_const(
     body: *const Z3rsAst,
 ) -> *const Z3rsAst {
     unsafe {
-        mk_quantifier_const(c, false, weight, num_bound, bound, num_patterns, patterns, body)
+        mk_quantifier_const(
+            c,
+            false,
+            weight,
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
     }
 }
 
@@ -2885,7 +2910,9 @@ pub unsafe extern "C" fn Z3_mk_constructor_list(
             items.push(unsafe { *constructors.offset(i) });
         }
     }
-    unsafe { &mut *c }.intern_constructor_list(Z3rsConstructorList { constructors: items })
+    unsafe { &mut *c }.intern_constructor_list(Z3rsConstructorList {
+        constructors: items,
+    })
 }
 
 /// `Z3_del_constructor(c, constr)` — no-op (arena-owned until
@@ -2999,7 +3026,9 @@ pub unsafe extern "C" fn Z3_mk_tuple_sort(
         body.push_str(&alloc::format!(" ({} {})", fname, fsort.smt()));
     }
     body.push(')');
-    let sort = unsafe { &mut *c }.build.declare_datatype(&tuple_name, &body);
+    let sort = unsafe { &mut *c }
+        .build
+        .declare_datatype(&tuple_name, &body);
     if !mk_tuple_decl.is_null() {
         let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(ctor_name, sort.clone()));
         unsafe { *mk_tuple_decl = fd };
@@ -3028,6 +3057,9 @@ pub unsafe extern "C" fn Z3_mk_set_sort(
         return ptr::null();
     }
     let d = unsafe { &*elem }.clone();
-    let s = Sort::Array(alloc::boxed::Box::new(d), alloc::boxed::Box::new(Sort::Bool));
+    let s = Sort::Array(
+        alloc::boxed::Box::new(d),
+        alloc::boxed::Box::new(Sort::Bool),
+    );
     unsafe { &mut *c }.intern_sort(s)
 }

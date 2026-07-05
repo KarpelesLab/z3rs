@@ -374,7 +374,10 @@ pub fn decide(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
 
     // Try open-cell samples: exact rational evaluation.
     for q in &open_samples {
-        if ups.iter().all(|(p, rel)| sign_satisfies(p.sign_at(q), *rel)) {
+        if ups
+            .iter()
+            .all(|(p, rel)| sign_satisfies(p.sign_at(q), *rel))
+        {
             return Some(true);
         }
     }
@@ -409,7 +412,11 @@ fn integer_roots(p: &Polynomial, var: Var) -> Option<Vec<i64>> {
     let int_coeffs: Vec<puremp::Int> = up
         .coeffs
         .iter()
-        .map(|c| c.mul(&Rational::from_integer(denom.clone())).numerator().clone())
+        .map(|c| {
+            c.mul(&Rational::from_integer(denom.clone()))
+                .numerator()
+                .clone()
+        })
         .collect();
     let mut cands: Vec<i64> = Vec::new();
     // The lowest-order nonzero coefficient. If it is not `int_coeffs[0]` the
@@ -501,10 +508,13 @@ pub fn decide_int(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
     };
     for c in cands {
         let x = Rational::from_integer(puremp::Int::from(c));
-        if constraints
-            .iter()
-            .all(|(p, rel)| sign_satisfies(p.eval(&|v| if v == var { x.clone() } else { zero() }).signum(), *rel))
-        {
+        if constraints.iter().all(|(p, rel)| {
+            sign_satisfies(
+                p.eval(&|v| if v == var { x.clone() } else { zero() })
+                    .signum(),
+                *rel,
+            )
+        }) {
             return Some(true);
         }
     }
@@ -622,10 +632,7 @@ mod tests {
     // Non-univariate input is declined.
     #[test]
     fn multivariate_declined() {
-        let p = Polynomial::from_terms(vec![(
-            r(1),
-            Monomial::from_powers(&[(0, 1), (1, 1)]),
-        )]);
+        let p = Polynomial::from_terms(vec![(r(1), Monomial::from_powers(&[(0, 1), (1, 1)]))]);
         assert_eq!(decide(&[(p, Rel::Eq)], 0), None);
     }
 
@@ -633,12 +640,21 @@ mod tests {
     // unsat; a perfect-square bound picks x = 4.
     #[test]
     fn integer_square_roots() {
-        assert_eq!(decide_int(&[(poly(&[(1, 2), (-9, 0)]), Rel::Eq)], 0), Some(true));
-        assert_eq!(decide_int(&[(poly(&[(1, 2), (-2, 0)]), Rel::Eq)], 0), Some(false));
+        assert_eq!(
+            decide_int(&[(poly(&[(1, 2), (-9, 0)]), Rel::Eq)], 0),
+            Some(true)
+        );
+        assert_eq!(
+            decide_int(&[(poly(&[(1, 2), (-2, 0)]), Rel::Eq)], 0),
+            Some(false)
+        );
         // x^2 = 9 ∧ x > 0 ⇒ x = 3.
         assert_eq!(
             decide_int(
-                &[(poly(&[(1, 2), (-9, 0)]), Rel::Eq), (poly(&[(1, 1)]), Rel::Gt)],
+                &[
+                    (poly(&[(1, 2), (-9, 0)]), Rel::Eq),
+                    (poly(&[(1, 1)]), Rel::Gt)
+                ],
                 0
             ),
             Some(true)
@@ -661,7 +677,10 @@ mod tests {
     #[test]
     fn integer_inherits_real_unsat() {
         // x^2 = -1 (real-unsat) ⇒ int-unsat.
-        assert_eq!(decide_int(&[(poly(&[(1, 2), (1, 0)]), Rel::Eq)], 0), Some(false));
+        assert_eq!(
+            decide_int(&[(poly(&[(1, 2), (1, 0)]), Rel::Eq)], 0),
+            Some(false)
+        );
     }
 
     // Regression: a polynomial with a zero constant term (`x² − 7x = x(x−7)`)

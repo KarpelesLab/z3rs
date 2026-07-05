@@ -5,7 +5,7 @@
 //! Ported from Z3's `nlsat` / `math/polynomial` (Z3 4.17.0, MIT), implemented as
 //! textbook CAD (project → base → lift → decide) on top of the exact
 //! [`realclosure`](crate::nlsat::realclosure) real-algebraic-number arithmetic
-//! and the [`resultant`](crate::math::resultant) projection primitives.
+//! and the [`resultant`](fn@crate::math::resultant) projection primitives.
 //!
 //! **Soundness is unconditional.** Whenever this procedure returns `Some(sat)` or
 //! `Some(unsat)` the answer is correct: signs are computed exactly at each cell's
@@ -338,7 +338,10 @@ fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec<Vec<Alg>>>
     for f in polys {
         for r in roots_at(f, sample, var)? {
             // Merge coincident roots across polynomials.
-            if !roots.iter().any(|e| e.compare(&r) == core::cmp::Ordering::Equal) {
+            if !roots
+                .iter()
+                .any(|e| e.compare(&r) == core::cmp::Ordering::Equal)
+            {
                 roots.push(r);
             }
         }
@@ -458,10 +461,7 @@ mod tests {
     // A single circle equality x^2 + y^2 = 1 : SAT (the unit circle is nonempty).
     #[test]
     fn circle_equality_sat() {
-        let c = alloc::vec![(
-            poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (-1, &[])]),
-            Rel::Eq,
-        )];
+        let c = alloc::vec![(poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (-1, &[])]), Rel::Eq,)];
         assert_eq!(cad_sat(&c, 2), Some(true));
     }
 
@@ -504,8 +504,14 @@ mod tests {
     #[test]
     fn sphere_vs_plane_unsat() {
         let c = alloc::vec![
-            (poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[(2, 2)]), (-1, &[])]), Rel::Eq),
-            (poly(&[(1, &[(0, 1)]), (1, &[(1, 1)]), (1, &[(2, 1)]), (-2, &[])]), Rel::Gt),
+            (
+                poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[(2, 2)]), (-1, &[])]),
+                Rel::Eq
+            ),
+            (
+                poly(&[(1, &[(0, 1)]), (1, &[(1, 1)]), (1, &[(2, 1)]), (-2, &[])]),
+                Rel::Gt
+            ),
         ];
         assert_eq!(cad_sat(&c, 3), Some(false));
     }
@@ -530,10 +536,7 @@ mod tests {
     // Empty real variety: x^2 + y^2 + 1 = 0 : UNSAT.
     #[test]
     fn empty_variety_unsat() {
-        let c = alloc::vec![(
-            poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[])]),
-            Rel::Eq,
-        )];
+        let c = alloc::vec![(poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[])]), Rel::Eq,)];
         assert_eq!(cad_sat(&c, 2), Some(false));
     }
 }

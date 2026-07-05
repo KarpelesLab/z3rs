@@ -268,7 +268,10 @@ mod tests {
         let p = uni(&[(-1, 0), (0, 1), (1, 2)]); // x^2 - 1
         let q = uni(&[(-2, 0), (0, 1), (2, 2)]); // 2x^2 - 2
         let s = principal_subresultant_coeffs(&p, &q, 0);
-        assert!(s[0].is_zero() && s[1].is_zero(), "proportional ⇒ s0=s1=0: {s:?}");
+        assert!(
+            s[0].is_zero() && s[1].is_zero(),
+            "proportional ⇒ s0=s1=0: {s:?}"
+        );
     }
 
     // s0 equals the resultant (up to sign) for a bivariate elimination.
@@ -284,7 +287,12 @@ mod tests {
         ]);
         let res = resultant(&a, &b, 1);
         let s = principal_subresultant_coeffs(&a, &b, 1);
-        assert!(s[0] == res || s[0] == res.neg(), "s0 vs Res: {:?} {:?}", s[0], res);
+        assert!(
+            s[0] == res || s[0] == res.neg(),
+            "s0 vs Res: {:?} {:?}",
+            s[0],
+            res
+        );
     }
 
     // Res of two bivariate polynomials eliminating y gives a polynomial in x:

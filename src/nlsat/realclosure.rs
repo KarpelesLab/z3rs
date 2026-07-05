@@ -493,10 +493,7 @@ mod tests {
             (r(1), Monomial::from_powers(&[(1, 2)])),
             (r(-3), Monomial::one()),
         ]);
-        assert_eq!(
-            sign_at_point(&g, &[Alg::Rational(r(1)), sqrt2.clone()]),
-            0
-        );
+        assert_eq!(sign_at_point(&g, &[Alg::Rational(r(1)), sqrt2.clone()]), 0);
         // At (x=1, y=√2): x^2+y^2-2 = 1 ⇒ +1.
         let g2 = Polynomial::from_terms(alloc::vec![
             (r(1), Monomial::from_powers(&[(0, 2)])),
@@ -510,7 +507,10 @@ mod tests {
             (r(1), Monomial::from_powers(&[(1, 2)])),
             (r(-4), Monomial::one()),
         ]);
-        assert_eq!(sign_at_point(&g3, &[Alg::Rational(r(1)), sqrt2.clone()]), -1);
+        assert_eq!(
+            sign_at_point(&g3, &[Alg::Rational(r(1)), sqrt2.clone()]),
+            -1
+        );
         // Two algebraic coords: x=√2, y=√2 ; x*y - 2 = 2 - 2 = 0.
         let g4 = Polynomial::from_terms(alloc::vec![
             (r(1), Monomial::from_powers(&[(0, 1), (1, 1)])),

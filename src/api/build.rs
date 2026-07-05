@@ -5,7 +5,7 @@
 //! Where [`crate::api::Solver`] drives the engine with raw SMT-LIB 2 *text*,
 //! this module lets a caller build terms as typed [`Ast`] values through a
 //! [`Context`] and solve them, the way Z3's object API does — but implemented as
-//! a thin, safe layer over the same [`Session`](crate::cmd_context::Session)
+//! a thin, safe layer over the same [`Session`]
 //! front end (each `Ast` carries its SMT-LIB 2 rendering and [`Sort`]). This
 //! keeps the whole reasoning path the differentially-tested one while giving
 //! consumers a builder API instead of string-mashing.
@@ -119,7 +119,10 @@ impl Ast {
             src.push_str(&a.src);
         }
         src.push(')');
-        Ast { src, sort: Sort::Bool }
+        Ast {
+            src,
+            sort: Sort::Bool,
+        }
     }
 
     fn binop(&self, op: &str, rhs: &Ast, sort: Sort) -> Ast {
@@ -434,12 +437,16 @@ pub(crate) fn top_level_parts(s: &str) -> Vec<&str> {
             }
             b')' => {
                 depth -= 1;
-                if depth == 0 && let Some(st) = start.take() {
+                if depth == 0
+                    && let Some(st) = start.take()
+                {
                     parts.push(&s[st..=i]);
                 }
             }
             c if c.is_ascii_whitespace() => {
-                if depth == 0 && let Some(st) = start.take() {
+                if depth == 0
+                    && let Some(st) = start.take()
+                {
                     parts.push(&s[st..i]);
                 }
             }
@@ -759,7 +766,10 @@ impl Context {
         } else {
             v.to_string()
         };
-        Ast { src, sort: Sort::Int }
+        Ast {
+            src,
+            sort: Sort::Int,
+        }
     }
 
     /// A real numeral from an integer value.
@@ -831,7 +841,7 @@ impl Context {
         let _ = self.session.eval("(pop)");
     }
 
-    /// The value of `a` in the model of the most recent satisfiable [`check`], as
+    /// The value of `a` in the model of the most recent satisfiable `check`, as
     /// its printed SMT-LIB 2 form (e.g. `"6"`, `"#x0f"`).
     pub fn eval_value(&mut self, a: &Ast) -> Option<String> {
         let out = self
@@ -842,7 +852,13 @@ impl Context {
         // `((expr value))` → value.
         let inner = line.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
         let inner = inner.strip_prefix('(')?.strip_suffix(')')?.trim();
-        Some(inner.strip_prefix(&a.src).map(str::trim).unwrap_or(inner).to_string())
+        Some(
+            inner
+                .strip_prefix(&a.src)
+                .map(str::trim)
+                .unwrap_or(inner)
+                .to_string(),
+        )
     }
 }
 
@@ -960,7 +976,10 @@ mod tests {
         assert_eq!(bv("(_ bv15 8)").as_int(), Some(15));
         assert_eq!(real("(/ 1 2)").numeral_string().as_deref(), Some("1/2"));
         assert_eq!(real("(/ 1 2)").as_int(), None);
-        assert_eq!(real("(/ (- 3) 6)").numeral_string().as_deref(), Some("-1/2"));
+        assert_eq!(
+            real("(/ (- 3) 6)").numeral_string().as_deref(),
+            Some("-1/2")
+        );
         assert_eq!(real("1.5").numeral_string().as_deref(), Some("3/2"));
         assert_eq!(real("2.0").as_int(), Some(2));
 
@@ -1008,7 +1027,10 @@ mod tests {
         let lst = ctx.declare_datatype("Lst", "(nil) (cons (hd Int) (tl Lst))");
         assert_eq!(lst, Sort::Datatype("Lst".to_string()));
         let l = ctx.const_("l", lst);
-        let cons1 = Ast::new("(cons 1 nil)".to_string(), Sort::Datatype("Lst".to_string()));
+        let cons1 = Ast::new(
+            "(cons 1 nil)".to_string(),
+            Sort::Datatype("Lst".to_string()),
+        );
         ctx.assert(&l.eq(&cons1));
         let hd_l = Ast::new("(hd l)".to_string(), Sort::Int);
         ctx.assert(&hd_l.eq(&Context::int(1)));

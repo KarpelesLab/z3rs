@@ -142,8 +142,16 @@ impl Interval {
     /// Minkowski sum: `[a,b] + [c,d] = [a+c, b+d]`. Openness propagates (the sum
     /// endpoint is attained only if both contributing endpoints are).
     pub fn add(&self, other: &Interval) -> Interval {
-        let (Interval::Range { lower: l1, upper: u1 }, Interval::Range { lower: l2, upper: u2 }) =
-            (self, other)
+        let (
+            Interval::Range {
+                lower: l1,
+                upper: u1,
+            },
+            Interval::Range {
+                lower: l2,
+                upper: u2,
+            },
+        ) = (self, other)
         else {
             return Interval::Empty;
         };
@@ -158,8 +166,16 @@ impl Interval {
     /// Product: the image `{ x*y : x∈a, y∈b }`, computed from the four endpoint
     /// products (the exact hull for intervals of rationals).
     pub fn mul(&self, other: &Interval) -> Interval {
-        let (Interval::Range { lower: l1, upper: u1 }, Interval::Range { lower: l2, upper: u2 }) =
-            (self, other)
+        let (
+            Interval::Range {
+                lower: l1,
+                upper: u1,
+            },
+            Interval::Range {
+                lower: l2,
+                upper: u2,
+            },
+        ) = (self, other)
         else {
             return Interval::Empty;
         };
@@ -184,15 +200,29 @@ impl Interval {
         let min = pts.first().unwrap().clone();
         let max = pts.last().unwrap().clone();
         Interval::new(
-            Bound::Finite { value: min.0, open: min.1 },
-            Bound::Finite { value: max.0, open: max.1 },
+            Bound::Finite {
+                value: min.0,
+                open: min.1,
+            },
+            Bound::Finite {
+                value: max.0,
+                open: max.1,
+            },
         )
     }
 
     /// Intersection: the largest interval contained in both.
     pub fn intersect(&self, other: &Interval) -> Interval {
-        let (Interval::Range { lower: l1, upper: u1 }, Interval::Range { lower: l2, upper: u2 }) =
-            (self, other)
+        let (
+            Interval::Range {
+                lower: l1,
+                upper: u1,
+            },
+            Interval::Range {
+                lower: l2,
+                upper: u2,
+            },
+        ) = (self, other)
         else {
             return Interval::Empty;
         };
