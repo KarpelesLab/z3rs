@@ -198,12 +198,86 @@ int main(void) {
         printf("quantified = %s\n", q);
         assert(strcmp(q, "sat") == 0);
 
+        /* ---- Structured value readback from the model ---- */
+        /* Z3_model_eval: pull the concrete value of `a` back as a numeral AST. */
+        Z3_ast a_val = NULL;
+        bool ok = Z3_model_eval(rc, mdl, a, true, &a_val);
+        assert(ok && a_val != NULL);
+        assert(Z3_get_ast_kind(rc, a_val) == 0);   /* Z3_NUMERAL_AST */
+        assert(Z3_is_numeral_ast(rc, a_val));
+        printf("model_eval(a) numeral string = %s\n",
+               Z3_get_numeral_string(rc, a_val));
+        assert(strcmp(Z3_get_numeral_string(rc, a_val), "6") == 0);
+        int a_int = -1;
+        assert(Z3_get_numeral_int(rc, a_val, &a_int) && a_int == 6); /* a == 6 */
+        long long a_i64 = 0;
+        assert(Z3_get_numeral_int64(rc, a_val, &a_i64) && a_i64 == 6);
+
+        /* Z3_model_get_const_interp over the model's parsed constant decls. */
+        unsigned nconsts = Z3_model_get_num_consts(rc, mdl);
+        printf("model has %u const(s)\n", nconsts);
+        assert(nconsts >= 1);
+        bool saw_a = false;
+        for (unsigned ci = 0; ci < nconsts; ci++) {
+            Z3_func_decl cd = Z3_model_get_const_decl(rc, mdl, ci);
+            const char *cn = Z3_get_symbol_string(rc, Z3_get_decl_name(rc, cd));
+            Z3_ast civ = Z3_model_get_const_interp(rc, mdl, cd);
+            printf("  %s = %s\n", cn, Z3_get_numeral_string(rc, civ));
+            if (strcmp(cn, "a") == 0) {
+                saw_a = true;
+                int cval = 0;
+                assert(Z3_get_numeral_int(rc, civ, &cval) && cval == 6);
+            }
+        }
+        assert(saw_a);
+
+        /* Bit-vector value readback: evaluate v (== 15 == 0x0f) under bvm. */
+        Z3_ast v_val = NULL;
+        assert(Z3_model_eval(rc, bvm, v, true, &v_val) && v_val != NULL);
+        assert(Z3_is_numeral_ast(rc, v_val));
+        unsigned v_uint = 0;
+        assert(Z3_get_numeral_uint(rc, v_val, &v_uint));
+        printf("model_eval(v) = %u (0x%02x)\n", v_uint, v_uint);
+        assert(v_uint == 0x0f); /* v == 0x0f */
+        assert(strcmp(Z3_get_numeral_string(rc, v_val), "15") == 0);
+
+        /* A non-numeral term is not a numeral AST. */
+        assert(!Z3_is_numeral_ast(rc, a_gt5));
+        assert(Z3_get_ast_kind(rc, a_gt5) == 1); /* Z3_APP_AST */
+
         Z3_model_dec_ref(rc, mdl);
         Z3_solver_dec_ref(rc, sol3);
         Z3_dec_ref(rc, a);
         Z3_dec_ref(rc, v);
         Z3_dec_ref(rc, m);
         Z3_del_context(rc);
+    }
+
+    /* ---- Unsat core via assert_and_track + Z3_solver_get_unsat_core ---- */
+    {
+        Z3_context uc = Z3_mk_context(NULL);
+        Z3_sort ints = Z3_mk_int_sort(uc);
+        Z3_sort bools = Z3_mk_bool_sort(uc);
+        Z3_ast x = Z3_mk_const(uc, Z3_mk_string_symbol(uc, "x"), ints);
+        /* Tracking literals p1, p2 for two contradictory constraints. */
+        Z3_ast p1 = Z3_mk_const(uc, Z3_mk_string_symbol(uc, "p1"), bools);
+        Z3_ast p2 = Z3_mk_const(uc, Z3_mk_string_symbol(uc, "p2"), bools);
+        Z3_solver s = Z3_mk_solver(uc);
+        Z3_solver_assert_and_track(uc, s, Z3_mk_gt(uc, x, Z3_mk_int(uc, 0, ints)), p1);
+        Z3_solver_assert_and_track(uc, s, Z3_mk_lt(uc, x, Z3_mk_int(uc, 0, ints)), p2);
+        assert(Z3_solver_check(uc, s) == -1); /* x>0 and x<0 -> unsat */
+        Z3_ast_vector core = Z3_solver_get_unsat_core(uc, s);
+        unsigned n = Z3_ast_vector_size(uc, core);
+        printf("unsat core size = %u: %s\n", n, Z3_ast_vector_to_string(uc, core));
+        assert(n == 2); /* both tracked assumptions are in the core */
+        bool saw_p1 = false, saw_p2 = false;
+        for (unsigned i = 0; i < n; i++) {
+            const char *nm = Z3_ast_to_string(uc, Z3_ast_vector_get(uc, core, i));
+            if (strcmp(nm, "p1") == 0) saw_p1 = true;
+            if (strcmp(nm, "p2") == 0) saw_p2 = true;
+        }
+        assert(saw_p1 && saw_p2);
+        Z3_del_context(uc);
     }
 
     puts("ffi_smoke: OK");
