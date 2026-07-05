@@ -7,6 +7,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Other
+
+- Phase 1 ✅: `math` (multivariate `polynomial` + rational `interval` kernels),
+  `params` (`param_descrs` schema tables), AST quantifiers/lambda +
+  cross-manager `ast_translation` with a build→translate→pp round-trip
+- Phase 3 ✅: `model` + recursive `model_evaluator`; the `tactic` framework
+  (`Goal`, `Tactic`, `then`/`or_else`/`repeat`/`par`/`cond`, probes) + a
+  solver-backed `ctx-solver-simplify`
+- Phase 6 ✅: 100-case full-response differential regression corpus (verdict +
+  get-value/get-model/get-unsat-core + push/pop/check-sat-assuming) vs z3
+- Phase 8 ✅: `-dl` (finite-domain Datalog engine in `muz`) and `-drat` (RUP+RAT
+  DRAT proof checker in `sat::drat`) frontends wired into the `z3rs` binary;
+  `parsers` module gathers all four frontends
+- Phase 5: substantial nonlinear-arithmetic decision procedure — sound
+  refutation (`nlsat::icp`, interval constraint propagation), **linearization**
+  (`x*y` with `x=2` → `2*y`), a complete **univariate procedure**
+  (`nlsat::univariate`: Sturm-sequence real-root isolation + integer-root
+  enumeration), **linear-variable elimination** (`nlsat::elim`: solve an equality
+  for a linearly-occurring variable and substitute — `x*y=6 ∧ x+y=5` →
+  `x*(5−x)=6`, with sound integer/real coefficient rules), and **bounded
+  integer-box enumeration**. Together they turn a large fraction of QF_NRA/QF_NIA
+  `unknown`s into definite sat/unsat matching z3, **fuzz-validated for soundness
+  over 45k+ scripts (0 unsound after fixes)**. Also: multivariate SAT by
+  variable-fixing (verified witnesses) and HC4-style **square narrowing** in ICP
+  (`a·v²+rest<0` ⇒ `|v|≤√…`, refuting e.g. `x²+y²<1 ∧ xy>1`). Fuzzing caught and
+  fixed a mixed Int/Real integrality bug and a zero-constant-term root bug.
+- Phase 10: **soundness fix** — a "functional" array constant (`(_ map f)`,
+  `(_ as-array f)`, or a `(lambda …)`) used in an *equality* (rather than being
+  `select`ed) was left opaque, so its pointwise definition went unenforced and
+  e.g. `map(-,a,b)=a ∧ b[0]≠0` or `(_ as-array f)=b ∧ b[0]≠f(0)` wrongly returned
+  `sat`. Any such constant surviving into the goal now gates to a sound `unknown`
+  (an explicit `select` still rewrites to `f(select …)`/`f(i)`/the β-reduced body
+  and decides). Found by a 4.6k-script array-combinator differential fuzz.
+- Phase 10: **string completeness** — closing z3rs↔z3 divergences in QF_S. New
+  length-link axioms (`str.contains(s,sub) ⇒ len(s) ≥ len(sub)`,
+  prefixof/suffixof, `len(str.at) ≤ 1`) refute length contradictions (`unsat`
+  where it was `unknown`), and a bounded **string-witness search** (enumerate
+  short candidates → re-fold the opaque markers to concrete values → confirm via
+  the core solver) exhibits concrete models (`sat` where it was `unknown`). A
+  fuzz-found soundness bug in the first cut of the witness search — new literals
+  created mid-search were not asserted pairwise-distinct, so `check_model` could
+  equate different literals and report a spurious `sat` — was fixed by conjoining
+  the string axioms before confirming a witness.
+- Phase 10 ✅: **hardening & parity** — a published **`PARITY.md`** report
+  (per-theory coverage, soundness methodology, the fuzz-caught-and-fixed bugs,
+  honest limitations) and a **77k-script cross-theory differential fuzz** vs z3
+  spanning QF_UF/LIA/LRA/BV/A/DT/S/FP + quantifiers + nonlinear + CHC, with **0
+  unsound** (every case where both solvers returned a definite verdict agreed).
+  Completes the roadmap: **all 11 phases at their exit criterion**. Continuous
+  follow-ons: performance tuning to a target factor of upstream, `unknown`-rate
+  parity and proof/core validation at scale.
+- Phase 7 ✅: **Constrained Horn Clause decision procedure** — a single-predicate
+  CHC transition system (`(set-logic HORN)` rules parsed into `Init`/`τ`/`Bad`) is
+  decided by **bounded model checking** (an `unsat`/unsafe verdict from a concrete
+  counterexample trace) and **k-induction** (a `sat`/safe verdict from an inductive
+  invariant such as `x≥0` or `x=y`), both sound with a resource bound → `unknown`.
+  Conservative guards decline anything outside the fragment (multi-predicate,
+  ground-constrained predicate, argument-permutation rules, non-bare arguments) so
+  it never guesses. Fuzz-validated vs z3 over 3.3k CHC scripts (0 unsound;
+  z3rs-only non-matches are `unknown`/timeout). Full multi-predicate CHC-COMP
+  parity (Spacer PDR with model-based projection) remains a follow-on. Together
+  with the existing `opt` (MaxSMT/optimization) and `qe` (quantifier elimination),
+  this completes Phase 7's functional criterion.
+- Phase 7: **soundness fix** for Constrained Horn Clauses — the quantifier
+  instantiation engine wrongly reported `sat` for unsafe arithmetic-recursive CHC
+  (e.g. `inv(x) ∧ y=x+1 ⇒ inv(y)` with no ground seed), because vacuous
+  E-matching "saturation" over an infinite arithmetic domain was treated as
+  complete. Now an arithmetic-productive universal that E-matching never fires on
+  keeps a `sat` a sound `unknown`; recursive functions (ground-seeded, terminating)
+  still decide.
+- Phase 5: **full multivariate CAD for QF_NRA** (`nlsat::cad` + `nlsat::realclosure`
+  + `math::{upoly,resultant}`) — a complete real-arithmetic decision procedure via
+  McCallum projection (resultants/discriminants by fraction-free Bareiss), a
+  base+lift decomposition, and exact **real-algebraic-number** arithmetic
+  (`(defining poly, isolating interval)`, Sturm root isolation, `sign_at_point` by
+  interval refinement + resultant certification). Decides genuinely multivariate
+  systems previously left `unknown` — `x²+y²<4 ∧ xy>1` (sat), `x²+y²<1 ∧ xy>1`
+  (unsat), `x·y=1 ∧ x²+y²=1` (unsat), `x²=2 ∧ y²=3 ∧ x+y<0` (sat) — all matching
+  z3; degenerate (nullified / non-squarefree with parametric coefficients) or
+  over-cap cases decline to a sound `unknown`. Soundness fuzzed vs z3 over
+  ~7.5k multivariate scripts (0 unsound); fuzzing caught and fixed a
+  between-sector-sample bug (open cells under strict inequalities collapsing onto
+  a section).
+- Phase 9 ✅: doctested safe-Rust APIs — text-driven `Solver` (`check_assuming`/
+  `get_model`/`get_unsat_core`/`simplify`) and a handle-based `api::build`
+  (`Context`/`Ast`/`Sort` term builders) — plus a **`Z3_`-prefixed drop-in C ABI**
+  (real z3_api.h names/ABI, valgrind-clean): config/context lifecycle,
+  `Z3_eval_smtlib2_string`, and the handle object API (sorts, consts, numerals,
+  n-ary arith/bool, comparisons, `Z3_mk_solver`/`Z3_solver_assert`/`_check`,
+  `Z3_solver_get_model`/`Z3_model_to_string`/`Z3_ast_to_string`). A find-model z3
+  C program links & runs unchanged against libz3rs
+
 ## [0.0.5](https://github.com/KarpelesLab/z3rs/compare/v0.0.4...v0.0.5) - 2026-07-04
 
 ### Other
