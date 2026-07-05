@@ -14,7 +14,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::ast::node::{
-    AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, SortData, VarData,
+    AppData, AstNode, DeclInfo, FuncDeclData, FuncDeclFlags, QuantifierData, QuantifierKind,
+    SortData, VarData,
 };
 use crate::ast::{AstId, AstKind, FamilyId, SortSize};
 use crate::util::hash::fnv_hash;
@@ -197,6 +198,56 @@ impl AstManager {
         self.intern(AstNode::Var(VarData { index, sort }))
     }
 
+    /// A quantifier / lambda. `var_sorts` and `var_names` list the bound
+    /// variables outermost-first; inside `body` the innermost binder is De Bruijn
+    /// index `0`. `patterns` are E-matching triggers. The node's sort is derived
+    /// (`Bool` for `forall`/`exists`; a (possibly nested) array sort for
+    /// `lambda`).
+    pub fn mk_quantifier(
+        &mut self,
+        kind: QuantifierKind,
+        var_sorts: &[AstId],
+        var_names: &[Symbol],
+        body: AstId,
+        patterns: &[AstId],
+        weight: i32,
+    ) -> AstId {
+        debug_assert_eq!(var_sorts.len(), var_names.len());
+        debug_assert!(!var_sorts.is_empty(), "quantifier needs at least one binder");
+        let sort = match kind {
+            QuantifierKind::Forall | QuantifierKind::Exists => self.mk_bool_sort(),
+            QuantifierKind::Lambda => {
+                // Nest array sorts innermost-first: (Array s_k ... (Array s_1 body)).
+                let mut s = self.get_sort(body);
+                for &vs in var_sorts.iter().rev() {
+                    s = self.mk_array_sort(vs, s);
+                }
+                s
+            }
+        };
+        self.intern(AstNode::Quantifier(QuantifierData {
+            kind,
+            var_sorts: var_sorts.to_vec(),
+            var_names: var_names.to_vec(),
+            body,
+            patterns: patterns.to_vec(),
+            weight,
+            sort,
+        }))
+    }
+
+    /// Convenience: a universal quantifier with fresh binder names `x0, x1, …`.
+    pub fn mk_forall(&mut self, var_sorts: &[AstId], body: AstId) -> AstId {
+        let names = default_binder_names(var_sorts.len());
+        self.mk_quantifier(QuantifierKind::Forall, var_sorts, &names, body, &[], 0)
+    }
+
+    /// Convenience: an existential quantifier with fresh binder names `x0, x1, …`.
+    pub fn mk_exists(&mut self, var_sorts: &[AstId], body: AstId) -> AstId {
+        let names = default_binder_names(var_sorts.len());
+        self.mk_quantifier(QuantifierKind::Exists, var_sorts, &names, body, &[], 0)
+    }
+
     // --- accessors --------------------------------------------------------
 
     /// The node content for `id`.
@@ -280,9 +331,31 @@ impl AstManager {
                     .range
             }
             AstNode::Var(v) => v.sort,
+            AstNode::Quantifier(q) => q.sort,
             _ => panic!("get_sort: node is not an expression"),
         }
     }
+
+    /// The quantifier content of `id`, if it is a quantifier/lambda.
+    pub fn quantifier(&self, id: AstId) -> Option<&QuantifierData> {
+        match self.node(id) {
+            AstNode::Quantifier(q) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// Is `id` a quantifier or lambda?
+    #[inline]
+    pub fn is_quantifier(&self, id: AstId) -> bool {
+        matches!(self.node(id), AstNode::Quantifier(_))
+    }
+}
+
+/// Default binder display names `x0, x1, …` for `n` bound variables.
+fn default_binder_names(n: usize) -> alloc::vec::Vec<Symbol> {
+    (0..n)
+        .map(|i| Symbol::new(&alloc::format!("x{i}")))
+        .collect()
 }
 
 #[cfg(test)]

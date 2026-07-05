@@ -4,8 +4,8 @@
 //! See [`ROADMAP.md`](../../ROADMAP.md) for the porting plan and status.
 //!
 //! ## Upstream C++ components to port
-//! - [ ] `z3/src/interval`
-//! - [ ] `z3/src/polynomial`
+//! - [x] `z3/src/math/polynomial` → [`polynomial`] (multivariate over `Rational`)
+//! - [x] `z3/src/math/interval` → [`interval`] (rational interval arithmetic)
 //! - [ ] `z3/src/simplex`
 //! - [ ] `z3/src/dd`
 //! - [ ] `z3/src/hilbert`
@@ -13,7 +13,14 @@
 //! - [ ] `z3/src/grobner`
 //! - [ ] `z3/src/lp`
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS — exact polynomial & interval kernels landed
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod interval;
+pub mod polynomial;
+pub mod resultant;
+pub mod upoly;
+
+pub use interval::{Bound, Interval};
+pub use polynomial::{Monomial, Polynomial};
+pub use resultant::{discriminant, resultant};
+pub use upoly::UPoly;

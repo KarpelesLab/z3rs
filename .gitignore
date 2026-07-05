@@ -1,6 +1,7 @@
 .*.swp
 /z3/
 /target/
+/.claude/
 
 # cargo-fuzz
 /fuzz/target/

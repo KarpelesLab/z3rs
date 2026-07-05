@@ -18,6 +18,9 @@ impl AstManager {
     fn expr_children(&self, id: AstId) -> &[AstId] {
         match self.node(id) {
             AstNode::App(a) => &a.args,
+            // A quantifier's single expression child is its body; bound-variable
+            // sorts and trigger patterns are not part of the expression DAG walk.
+            AstNode::Quantifier(q) => core::slice::from_ref(&q.body),
             _ => &[],
         }
     }

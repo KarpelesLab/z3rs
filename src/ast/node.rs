@@ -136,7 +136,43 @@ pub struct VarData {
     pub sort: AstId,
 }
 
-/// The content of an AST node (one variant per [`AstKind`], quantifiers TBD).
+/// The flavour of a quantifier (`quantifier_kind` in Z3).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum QuantifierKind {
+    /// Universal `forall`.
+    Forall,
+    /// Existential `exists`.
+    Exists,
+    /// A `lambda` (its "body" is the mapped value; the node's sort is an array).
+    Lambda,
+}
+
+/// A quantified formula / lambda, `quantifier` in Z3. Bound variables are
+/// referenced inside `body` by De Bruijn [`VarData`] indices: index `0` is the
+/// **last** declared variable (innermost binder), matching Z3's convention.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct QuantifierData {
+    /// `forall` / `exists` / `lambda`.
+    pub kind: QuantifierKind,
+    /// The sorts of the bound variables, outermost binder first. Bound var of
+    /// De Bruijn index `i` (as seen inside `body`) has sort
+    /// `var_sorts[var_sorts.len() - 1 - i]`.
+    pub var_sorts: Vec<AstId>,
+    /// Display names for the bound variables, parallel to `var_sorts`.
+    pub var_names: Vec<Symbol>,
+    /// The quantified body (an expression).
+    pub body: AstId,
+    /// Trigger patterns for E-matching (each a multi-pattern expression list,
+    /// here flattened to single pattern terms).
+    pub patterns: Vec<AstId>,
+    /// Instantiation weight (Z3's `qid`/weight annotation; 0 by default).
+    pub weight: i32,
+    /// The sort of the whole quantifier: `Bool` for `forall`/`exists`, an array
+    /// sort for `lambda`. Stored so `get_sort` needs no interning.
+    pub sort: AstId,
+}
+
+/// The content of an AST node (one variant per [`AstKind`]).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum AstNode {
     /// A sort.
@@ -147,6 +183,8 @@ pub enum AstNode {
     App(AppData),
     /// A bound variable.
     Var(VarData),
+    /// A quantifier or lambda.
+    Quantifier(QuantifierData),
 }
 
 impl AstNode {
@@ -157,6 +195,7 @@ impl AstNode {
             AstNode::Var(_) => AstKind::Var,
             AstNode::Sort(_) => AstKind::Sort,
             AstNode::FuncDecl(_) => AstKind::FuncDecl,
+            AstNode::Quantifier(_) => AstKind::Quantifier,
         }
     }
 }

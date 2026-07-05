@@ -54,6 +54,25 @@ impl AstManager {
             AstNode::Var(v) => {
                 let _ = write!(out, "(:var {})", v.index);
             }
+            AstNode::Quantifier(q) => {
+                let kw = match q.kind {
+                    crate::ast::node::QuantifierKind::Forall => "forall",
+                    crate::ast::node::QuantifierKind::Exists => "exists",
+                    crate::ast::node::QuantifierKind::Lambda => "lambda",
+                };
+                let _ = write!(out, "({kw} (");
+                for (i, (&sort, name)) in q.var_sorts.iter().zip(&q.var_names).enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    let _ = write!(out, "({name} ");
+                    self.pp_into(sort, out);
+                    out.push(')');
+                }
+                out.push_str(") ");
+                self.pp_into(q.body, out);
+                out.push(')');
+            }
         }
     }
 }

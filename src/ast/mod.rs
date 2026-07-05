@@ -21,6 +21,7 @@ pub mod node;
 pub mod parameter;
 pub mod pp;
 pub mod query;
+pub mod translation;
 
 pub use arith::{ArithOp, ArithSortKind};
 pub use basic::{BasicOp, BasicSortKind};

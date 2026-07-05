@@ -51,6 +51,11 @@ impl Params {
         self.entries.get(&norm(key))
     }
 
+    /// The bound parameter names (normalised, without a leading `:`), sorted.
+    pub fn keys(&self) -> impl Iterator<Item = &str> {
+        self.entries.keys().map(String::as_str)
+    }
+
     /// A boolean parameter, or `default` if unset or another type.
     pub fn get_bool(&self, key: &str, default: bool) -> bool {
         match self.get(key) {
