@@ -73,6 +73,10 @@ struct BitBlaster<'a> {
     bools: BTreeMap<AstId, Lit>,
     /// A literal fixed to true (its negation is false).
     true_lit: Lit,
+    /// Structural hash of binary gates `(tag, a, b) → out` (a ≤ b for the
+    /// commutative ops), so an identical gate reuses one literal instead of
+    /// re-emitting clauses — a large shrink for repetitive circuits (FP rounders).
+    gate_cache: BTreeMap<(u8, Lit, Lit), Lit>,
 }
 
 impl<'a> BitBlaster<'a> {
@@ -86,7 +90,15 @@ impl<'a> BitBlaster<'a> {
             bits: BTreeMap::new(),
             bools: BTreeMap::new(),
             true_lit: t,
+            gate_cache: BTreeMap::new(),
         }
+    }
+
+    /// Look up (or record) a commutative binary gate `tag(a,b)` in the structural
+    /// hash. Returns the cached output literal if the identical gate was already
+    /// built. Callers pass the freshly-built `out` to memoize on a miss.
+    fn gate_key(a: Lit, b: Lit) -> (Lit, Lit) {
+        if a <= b { (a, b) } else { (b, a) }
     }
 
     fn fresh(&mut self) -> Lit {
@@ -107,10 +119,15 @@ impl<'a> BitBlaster<'a> {
         if a == f || b == f || a == !b {
             return f;
         }
+        let (k0, k1) = Self::gate_key(a, b);
+        if let Some(&c) = self.gate_cache.get(&(0, k0, k1)) {
+            return c;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[!c, a]);
         self.sat.add_clause(&[!c, b]);
         self.sat.add_clause(&[c, !a, !b]);
+        self.gate_cache.insert((0, k0, k1), c);
         c
     }
 
@@ -125,10 +142,15 @@ impl<'a> BitBlaster<'a> {
         if a == self.true_lit || b == self.true_lit || a == !b {
             return self.true_lit;
         }
+        let (k0, k1) = Self::gate_key(a, b);
+        if let Some(&c) = self.gate_cache.get(&(1, k0, k1)) {
+            return c;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[c, !a]);
         self.sat.add_clause(&[c, !b]);
         self.sat.add_clause(&[!c, a, b]);
+        self.gate_cache.insert((1, k0, k1), c);
         c
     }
 
@@ -152,11 +174,16 @@ impl<'a> BitBlaster<'a> {
         if a == !b {
             return self.true_lit;
         }
+        let (k0, k1) = Self::gate_key(a, b);
+        if let Some(&c) = self.gate_cache.get(&(2, k0, k1)) {
+            return c;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[!c, a, b]);
         self.sat.add_clause(&[!c, !a, !b]);
         self.sat.add_clause(&[c, !a, b]);
         self.sat.add_clause(&[c, a, !b]);
+        self.gate_cache.insert((2, k0, k1), c);
         c
     }
 
