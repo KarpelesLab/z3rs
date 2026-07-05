@@ -1932,30 +1932,44 @@ impl Context {
                 // Division by the literal 0 is unconstrained in SMT-LIB: q, r free.
             }
             None => {
-                self.symbolic_divisors.insert(b);
-                self.symbolic_divmod.push((a, b, q, r));
-                // Symbolic divisor: the Euclidean identity holds only for b ≠ 0
-                // (div/mod by 0 are unconstrained). `|b| = ite(b≥0, b, −b)`. Push
-                // the three facts as *separate* guarded implications rather than
-                // one bundled body, so the linear engine can use the range
-                // `0 ≤ r < |b|` even when the nonlinear identity `a = b·q + r` is
-                // opaque to it (e.g. refuting `mod(x,y) ≥ y ∧ y > 0`).
-                let beq0 = self.m.mk_eq(b, zero);
+                // For a *compound* divisor expression, alias it to a fresh
+                // variable `dv` (`dv = b`) and reason about `dv`. Then the
+                // single-variable divisor-witness / complete-UNSAT decision also
+                // covers `div a (+ x y)`, `div a (* 2 y)`, … — substituting a
+                // value for `dv` linearises both the Euclidean `dv·q` and the
+                // `dv = b` link.
+                let divv = if self.m.is_uninterp_const(b) {
+                    b
+                } else {
+                    let dv = self.fresh_const(int);
+                    let link = self.m.mk_eq(dv, b);
+                    ctx.defs.push(link);
+                    dv
+                };
+                self.symbolic_divisors.insert(divv);
+                self.symbolic_divmod.push((a, divv, q, r));
+                // Symbolic divisor: the Euclidean identity holds only for dv ≠ 0
+                // (div/mod by 0 are unconstrained). `|dv| = ite(dv≥0, dv, −dv)`.
+                // Push the three facts as *separate* guarded implications rather
+                // than one bundled body, so the linear engine can use the range
+                // `0 ≤ r < |dv|` even when the nonlinear identity `a = dv·q + r`
+                // is opaque to it (e.g. refuting `mod(x,y) ≥ y ∧ y > 0`).
+                let beq0 = self.m.mk_eq(divv, zero);
                 let bne0 = self.m.mk_not(beq0);
-                let nq = self.m.mk_mul(&[b, q]);
+                let nq = self.m.mk_mul(&[divv, q]);
                 let sum = self.m.mk_add(&[nq, r]);
                 let eq = self.m.mk_eq(a, sum);
                 ctx.defs.push(self.m.mk_implies(bne0, eq));
                 let ge = self.m.mk_ge(r, zero);
                 ctx.defs.push(self.m.mk_implies(bne0, ge));
-                // `r < |b|`, split by the sign of `b` to avoid an `ite` the linear
-                // engine won't resolve: `b>0 ⇒ r<b` and `b<0 ⇒ r<−b`.
-                let bgt0 = self.m.mk_gt(b, zero);
-                let ltb = self.m.mk_lt(r, b);
+                // `r < |dv|`, split by the sign of `dv` to avoid an `ite` the
+                // linear engine won't resolve: `dv>0 ⇒ r<dv` and `dv<0 ⇒ r<−dv`.
+                let bgt0 = self.m.mk_gt(divv, zero);
+                let ltb = self.m.mk_lt(r, divv);
                 ctx.defs.push(self.m.mk_implies(bgt0, ltb));
-                let blt0 = self.m.mk_lt(b, zero);
+                let blt0 = self.m.mk_lt(divv, zero);
                 let neg1 = self.m.mk_int(-1);
-                let negb = self.m.mk_mul(&[neg1, b]);
+                let negb = self.m.mk_mul(&[neg1, divv]);
                 let ltnegb = self.m.mk_lt(r, negb);
                 ctx.defs.push(self.m.mk_implies(blt0, ltnegb));
             }
