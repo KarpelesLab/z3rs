@@ -236,6 +236,8 @@ pub struct Z3rsZ3Context {
     symbols: alloc::vec::Vec<CString>,
     func_decls: alloc::vec::Vec<alloc::boxed::Box<FuncDecl>>,
     solvers: alloc::vec::Vec<alloc::boxed::Box<Z3rsSolver>>,
+    models: alloc::vec::Vec<alloc::boxed::Box<Z3rsModel>>,
+    ast_vectors: alloc::vec::Vec<alloc::boxed::Box<Z3rsAstVector>>,
     /// Context-owned string outputs (models, `ast_to_string`), stable until
     /// context deletion.
     strings: alloc::vec::Vec<CString>,
@@ -261,6 +263,18 @@ impl Z3rsZ3Context {
         self.func_decls.push(boxed);
         ptr
     }
+    fn intern_model(&mut self, m: Z3rsModel) -> *const Z3rsModel {
+        let boxed = alloc::boxed::Box::new(m);
+        let ptr: *const Z3rsModel = &*boxed;
+        self.models.push(boxed);
+        ptr
+    }
+    fn intern_ast_vector(&mut self, v: Z3rsAstVector) -> *const Z3rsAstVector {
+        let boxed = alloc::boxed::Box::new(v);
+        let ptr: *const Z3rsAstVector = &*boxed;
+        self.ast_vectors.push(boxed);
+        ptr
+    }
 }
 
 /// `Z3_solver` — an independent solver: its own [`Session`] (assertions and
@@ -272,6 +286,10 @@ pub struct Z3rsSolver {
     scopes: u32,
     /// How many of the context's declaration commands have been replayed.
     decl_watermark: usize,
+    /// Assumptions asserted with [`Z3_solver_assert_and_track`], keyed by their
+    /// `:named` label, so [`Z3_solver_get_unsat_core`] can map the printed core
+    /// labels back to the tracking `Z3_ast`s.
+    tracked: alloc::vec::Vec<(String, *const Ast)>,
 }
 
 impl Z3rsSolver {
@@ -280,6 +298,7 @@ impl Z3rsSolver {
             session: Session::new(),
             scopes: 0,
             decl_watermark: 0,
+            tracked: alloc::vec::Vec::new(),
         }
     }
     /// Replay any context declarations this solver has not yet seen.
@@ -321,6 +340,8 @@ pub unsafe extern "C" fn Z3_mk_context(_cfg: *mut Z3rsZ3Config) -> *mut Z3rsZ3Co
         symbols: alloc::vec::Vec::new(),
         func_decls: alloc::vec::Vec::new(),
         solvers: alloc::vec::Vec::new(),
+        models: alloc::vec::Vec::new(),
+        ast_vectors: alloc::vec::Vec::new(),
         strings: alloc::vec::Vec::new(),
         last: None,
     }))
@@ -787,11 +808,12 @@ pub unsafe extern "C" fn Z3_solver_assert_and_track(
     };
     sol.sync(&decls);
     let src = unsafe { &*a }.to_smt();
-    let name = unsafe { &*p }.to_smt();
+    let name = unsafe { &*p }.to_smt().to_string();
     let _ = sol.session.eval("(set-option :produce-unsat-cores true)");
     let _ = sol
         .session
         .eval(&alloc::format!("(assert (! {src} :named {name}))"));
+    sol.tracked.push((name, p));
 }
 
 /// `Z3_solver_check(c, s)` — decide solver `s`'s assertions, returning a
@@ -905,12 +927,20 @@ pub unsafe extern "C" fn Z3_solver_reset(c: *mut Z3rsZ3Context, s: *const Z3rsSo
     sol.session = Session::new();
     sol.scopes = 0;
     sol.decl_watermark = 0;
+    sol.tracked.clear();
 }
 
-/// `Z3_model` — an opaque handle. Internally it is the stable pointer to the
-/// context-owned model text (a `CString` buffer), so [`Z3_model_to_string`] is
-/// the identity.
-pub type Z3rsModel = c_char;
+/// `Z3_model` — the model of a satisfiable check. It keeps the printed
+/// `(get-model)` text (for [`Z3_model_to_string`]), the parsed 0-ary constant
+/// `(name, sort)` entries (for [`Z3_model_get_num_consts`] /
+/// [`Z3_model_get_const_decl`]), and a pointer to the [`Z3rsSolver`] that
+/// produced it so [`Z3_model_eval`] / [`Z3_model_get_const_interp`] can re-query
+/// values with `(get-value …)`.
+pub struct Z3rsModel {
+    text: CString,
+    consts: alloc::vec::Vec<(String, Sort)>,
+    solver: *const Z3rsSolver,
+}
 
 /// Intern a string in the context arena, returning a stable pointer to its
 /// buffer. The buffer address is fixed for the context's lifetime even as the
@@ -947,12 +977,64 @@ pub unsafe extern "C" fn Z3_solver_get_model(
             .unwrap_or_default(),
         None => String::new(),
     };
-    let ctx = unsafe { &mut *c };
-    intern_string(ctx, text)
+    let consts = parse_model_consts(&text);
+    let model = Z3rsModel {
+        text: CString::new(text).unwrap_or_default(),
+        consts,
+        solver: s,
+    };
+    unsafe { &mut *c }.intern_model(model)
 }
 
-/// `Z3_model_to_string(c, m)` — the SMT-LIB rendering of a model (context-owned;
-/// do not free). The handle already points at the rendered text.
+/// Parse the `(define-fun name () Sort value)` lines of a printed model into
+/// `(name, sort)` pairs for the 0-ary constants, in order.
+fn parse_model_consts(text: &str) -> alloc::vec::Vec<(String, Sort)> {
+    let mut out = alloc::vec::Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.starts_with("(define-fun ") {
+            continue;
+        }
+        // Peel exactly one outer paren pair, then split respecting nesting:
+        // ["define-fun", name, "()", <sort tokens...>, value].
+        let Some(inner) = line.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+            continue;
+        };
+        let parts = crate::api::build::top_level_parts(inner);
+        // parts[0] = "define-fun", [1] = name, [2] = "()", then sort..., value.
+        if parts.len() < 5 || parts[2] != "()" {
+            continue; // not a 0-ary constant we can render
+        }
+        let name = parts[1];
+        let sort_toks = &parts[3..parts.len() - 1];
+        let sort = parse_sort_tokens(sort_toks);
+        out.push((name.to_string(), sort));
+    }
+    out
+}
+
+/// Reconstruct a [`Sort`] from its printed tokens (`Int`, `Bool`, `Real`,
+/// `(_ BitVec 8)`, `(Array …)`, or an uninterpreted name).
+fn parse_sort_tokens(toks: &[&str]) -> Sort {
+    let joined = toks.join(" ");
+    let s = joined.trim();
+    match s {
+        "Int" => Sort::Int,
+        "Bool" => Sort::Bool,
+        "Real" => Sort::Real,
+        _ => {
+            if let Some(inner) = s.strip_prefix("(_ BitVec ").and_then(|r| r.strip_suffix(')'))
+                && let Ok(w) = inner.trim().parse::<u32>()
+            {
+                return Sort::BitVec(w);
+            }
+            Sort::Uninterpreted(s.to_string())
+        }
+    }
+}
+
+/// `Z3_model_to_string(c, m)` — the SMT-LIB rendering of a model (owned by the
+/// model, valid until [`Z3_del_context`]; do not free).
 ///
 /// # Safety
 /// `c` valid context; `m` a `Z3_model` from [`Z3_solver_get_model`].
@@ -961,7 +1043,170 @@ pub unsafe extern "C" fn Z3_model_to_string(
     _c: *mut Z3rsZ3Context,
     m: *const Z3rsModel,
 ) -> *const c_char {
-    m
+    if m.is_null() {
+        return ptr::null();
+    }
+    unsafe { &*m }.text.as_ptr()
+}
+
+/// Peel a `(get-value ((term value)))` response line down to `value`, matching
+/// [`Z3rsSolver`]'s printed `((term value))` shape.
+fn peel_get_value(line: &str, term: &str) -> Option<String> {
+    let inner = line.trim().strip_prefix('(')?.strip_suffix(')')?.trim();
+    let inner = inner.strip_prefix('(')?.strip_suffix(')')?.trim();
+    Some(
+        inner
+            .strip_prefix(term)
+            .map(str::trim)
+            .unwrap_or(inner)
+            .to_string(),
+    )
+}
+
+/// Query `(get-value (term))` against a solver's current model, returning the
+/// printed value string.
+///
+/// # Safety
+/// `s` must be NULL or a valid solver handle.
+unsafe fn solver_get_value(s: *const Z3rsSolver, term: &str) -> Option<String> {
+    let sol = unsafe { solver_mut(s) }?;
+    let out = sol
+        .session
+        .eval(&alloc::format!("(get-value ({term}))"))
+        .ok()?;
+    peel_get_value(out.first()?, term)
+}
+
+/// Sniff a [`Sort`] from a printed value literal (used when no declared sort is
+/// available for the queried term).
+fn sniff_value_sort(v: &str) -> Sort {
+    let v = v.trim();
+    if v == "true" || v == "false" {
+        return Sort::Bool;
+    }
+    if let Some(hex) = v.strip_prefix("#x") {
+        return Sort::BitVec((hex.len() as u32) * 4);
+    }
+    if let Some(bin) = v.strip_prefix("#b") {
+        return Sort::BitVec(bin.len() as u32);
+    }
+    if let Some(rest) = v.strip_prefix("(_ bv")
+        && let Some(w) = rest
+            .split_whitespace()
+            .nth(1)
+            .and_then(|t| t.trim_end_matches(')').parse::<u32>().ok())
+    {
+        return Sort::BitVec(w);
+    }
+    if v.contains('/') || v.contains('.') {
+        return Sort::Real;
+    }
+    Sort::Int
+}
+
+/// `Z3_model_eval(c, m, t, model_completion, out)` — evaluate term `t` under
+/// model `m`, writing the resulting value AST to `*out`. Returns `true` on
+/// success. Implemented by re-querying `(get-value (t))` against the solver that
+/// produced the model and wrapping the printed value as a fresh numeral/bool/bv
+/// AST. `model_completion` is accepted; the engine always yields a total model.
+///
+/// # Safety
+/// `c` valid context; `m` a model handle; `t` a valid `Z3_ast`; `out` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_model_eval(
+    c: *mut Z3rsZ3Context,
+    m: *const Z3rsModel,
+    t: *const Z3rsAst,
+    _model_completion: bool,
+    out: *mut *const Z3rsAst,
+) -> bool {
+    if c.is_null() || m.is_null() || t.is_null() {
+        return false;
+    }
+    let (solver, term, sort) = {
+        let model = unsafe { &*m };
+        let ast = unsafe { &*t };
+        (model.solver, ast.to_smt().to_string(), ast.sort().clone())
+    };
+    let Some(value) = (unsafe { solver_get_value(solver, &term) }) else {
+        return false;
+    };
+    let ast = Ast::new(value, sort);
+    let ptr = unsafe { &mut *c }.intern_ast(ast);
+    if !out.is_null() {
+        unsafe { *out = ptr };
+    }
+    true
+}
+
+/// `Z3_model_get_const_interp(c, m, decl)` — the value of the 0-ary declaration
+/// `decl` in model `m` (via `(get-value (name))`), or NULL if unavailable.
+///
+/// # Safety
+/// `c` valid context; `m` a model handle; `decl` a valid `Z3_func_decl`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_model_get_const_interp(
+    c: *mut Z3rsZ3Context,
+    m: *const Z3rsModel,
+    decl: *const Z3rsFuncDecl,
+) -> *const Z3rsAst {
+    if c.is_null() || m.is_null() || decl.is_null() {
+        return ptr::null();
+    }
+    let (solver, name, sort) = {
+        let model = unsafe { &*m };
+        let fd = unsafe { &*decl };
+        let name = fd.name().to_string();
+        // Prefer the sort recorded in the model; fall back to the decl's range.
+        let sort = model
+            .consts
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, s)| s.clone())
+            .unwrap_or_else(|| fd.range().clone());
+        (model.solver, name, sort)
+    };
+    let Some(value) = (unsafe { solver_get_value(solver, &name) }) else {
+        return ptr::null();
+    };
+    unsafe { &mut *c }.intern_ast(Ast::new(value, sort))
+}
+
+/// `Z3_model_get_num_consts(c, m)` — the number of 0-ary constants interpreted
+/// by the model.
+///
+/// # Safety
+/// `m` must be NULL or a valid model handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_model_get_num_consts(_c: *mut Z3rsZ3Context, m: *const Z3rsModel) -> u32 {
+    if m.is_null() {
+        return 0;
+    }
+    unsafe { &*m }.consts.len() as u32
+}
+
+/// `Z3_model_get_const_decl(c, m, i)` — the declaration of the `i`-th 0-ary
+/// constant of the model (a synthesised `Z3_func_decl` with name and range sort).
+///
+/// # Safety
+/// `c` valid context; `m` a model handle; `i < Z3_model_get_num_consts(c, m)`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_model_get_const_decl(
+    c: *mut Z3rsZ3Context,
+    m: *const Z3rsModel,
+    i: u32,
+) -> *const Z3rsFuncDecl {
+    if c.is_null() || m.is_null() {
+        return ptr::null();
+    }
+    let entry = {
+        let model = unsafe { &*m };
+        model.consts.get(i as usize).cloned()
+    };
+    let Some((name, sort)) = entry else {
+        return ptr::null();
+    };
+    unsafe { &mut *c }.intern_func_decl(FuncDecl::new(name, sort))
 }
 
 /// `Z3_ast_to_string(c, a)` — the SMT-LIB 2 rendering of a term (context-owned;
@@ -1812,4 +2057,409 @@ pub unsafe extern "C" fn Z3_get_symbol_string(
     s: *const Z3rsSymbol,
 ) -> *const c_char {
     s
+}
+
+// --- AST kind & numeral readback -------------------------------------------
+
+/// `Z3_get_ast_kind(c, a)` — the `Z3_ast_kind` tag: `Z3_NUMERAL_AST` (0) for a
+/// numeral literal, `Z3_APP_AST` (1) for everything else (constants and
+/// applications), or `Z3_UNKNOWN_AST` (1000) for NULL. z3rs terms are text, so
+/// bound variables / quantifiers are not distinguished — they read as `APP`.
+///
+/// # Safety
+/// `a` must be NULL or a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_ast_kind(_c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> u32 {
+    if a.is_null() {
+        return 1000; // Z3_UNKNOWN_AST
+    }
+    if unsafe { &*a }.is_numeral() {
+        0 // Z3_NUMERAL_AST
+    } else {
+        1 // Z3_APP_AST
+    }
+}
+
+/// `Z3_is_numeral_ast(c, a)` — whether `a` is a numeral literal.
+///
+/// # Safety
+/// `a` must be NULL or a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_is_numeral_ast(_c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> bool {
+    !a.is_null() && unsafe { &*a }.is_numeral()
+}
+
+/// `Z3_get_numeral_string(c, a)` — the decimal (integer) or `p/q` (rational)
+/// string of a numeral AST (context-owned; do not free). Returns `"0"` if `a`
+/// is not a numeral literal.
+///
+/// # Safety
+/// `c` valid context; `a` a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_numeral_string(
+    c: *mut Z3rsZ3Context,
+    a: *const Z3rsAst,
+) -> *const c_char {
+    if c.is_null() || a.is_null() {
+        return ptr::null();
+    }
+    let s = unsafe { &*a }.numeral_string().unwrap_or_else(|| "0".to_string());
+    let ctx = unsafe { &mut *c };
+    intern_string(ctx, s)
+}
+
+/// The numeral of `a` as an integer, if it is an integer literal that fits.
+///
+/// # Safety
+/// `a` must be NULL or a valid `Z3_ast`.
+unsafe fn numeral_i128(a: *const Z3rsAst) -> Option<i128> {
+    if a.is_null() {
+        None
+    } else {
+        unsafe { &*a }.as_int()
+    }
+}
+
+/// `Z3_get_numeral_int(c, v, i)` — write `v`'s value as an `int`, returning
+/// `false` if it is not an integer numeral or does not fit.
+///
+/// # Safety
+/// `v` a valid `Z3_ast`; `i` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_numeral_int(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAst,
+    i: *mut i32,
+) -> bool {
+    match unsafe { numeral_i128(v) }.and_then(|n| i32::try_from(n).ok()) {
+        Some(n) if !i.is_null() => {
+            unsafe { *i = n };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `Z3_get_numeral_uint(c, v, u)` — as `unsigned`.
+///
+/// # Safety
+/// `v` a valid `Z3_ast`; `u` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_numeral_uint(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAst,
+    u: *mut u32,
+) -> bool {
+    match unsafe { numeral_i128(v) }.and_then(|n| u32::try_from(n).ok()) {
+        Some(n) if !u.is_null() => {
+            unsafe { *u = n };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `Z3_get_numeral_int64(c, v, i)` — as `int64_t`.
+///
+/// # Safety
+/// `v` a valid `Z3_ast`; `i` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_numeral_int64(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAst,
+    i: *mut i64,
+) -> bool {
+    match unsafe { numeral_i128(v) }.and_then(|n| i64::try_from(n).ok()) {
+        Some(n) if !i.is_null() => {
+            unsafe { *i = n };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `Z3_get_numeral_uint64(c, v, u)` — as `uint64_t`.
+///
+/// # Safety
+/// `v` a valid `Z3_ast`; `u` writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_numeral_uint64(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAst,
+    u: *mut u64,
+) -> bool {
+    match unsafe { numeral_i128(v) }.and_then(|n| u64::try_from(n).ok()) {
+        Some(n) if !u.is_null() => {
+            unsafe { *u = n };
+            true
+        }
+        _ => false,
+    }
+}
+
+// --- Application accessors (minimum viable) ---------------------------------
+
+/// Split an application term's source into `[head, arg1, arg2, …]`, or `None`
+/// if it is a bare atom (a constant or literal, i.e. a 0-argument application).
+fn app_parts(src: &str) -> Option<Vec<&str>> {
+    let s = src.trim();
+    let inner = s.strip_prefix('(').and_then(|r| r.strip_suffix(')'))?;
+    let parts = crate::api::build::top_level_parts(inner);
+    if parts.is_empty() { None } else { Some(parts) }
+}
+
+/// `Z3_to_app(c, a)` — reinterpret an AST as an application. z3rs uses one term
+/// representation, so this is the identity.
+///
+/// # Safety
+/// `a` must be NULL or a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_to_app(_c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> *const Z3rsAst {
+    a
+}
+
+/// `Z3_get_app_num_args(c, a)` — the number of arguments of an application (0
+/// for a constant or literal).
+///
+/// # Safety
+/// `a` must be NULL or a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_app_num_args(_c: *mut Z3rsZ3Context, a: *const Z3rsAst) -> u32 {
+    if a.is_null() {
+        return 0;
+    }
+    match app_parts(unsafe { &*a }.to_smt()) {
+        Some(parts) => (parts.len() as u32).saturating_sub(1),
+        None => 0,
+    }
+}
+
+/// `Z3_get_app_arg(c, a, i)` — the `i`-th argument of an application, as a fresh
+/// AST (its sort is sniffed from the text, best-effort). NULL if out of range.
+///
+/// # Safety
+/// `c` valid context; `a` a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_app_arg(
+    c: *mut Z3rsZ3Context,
+    a: *const Z3rsAst,
+    i: u32,
+) -> *const Z3rsAst {
+    if c.is_null() || a.is_null() {
+        return ptr::null();
+    }
+    let arg = {
+        let parts = app_parts(unsafe { &*a }.to_smt());
+        parts.and_then(|p| p.get(i as usize + 1).map(|s| s.to_string()))
+    };
+    match arg {
+        Some(src) => {
+            let sort = sniff_value_sort(&src);
+            unsafe { &mut *c }.intern_ast(Ast::new(src, sort))
+        }
+        None => ptr::null(),
+    }
+}
+
+/// `Z3_get_app_decl(c, a)` — the declaration (operator) of an application: a
+/// synthesised `Z3_func_decl` whose name is the head symbol and whose range is
+/// the term's sort. For a bare constant the name is the constant itself.
+///
+/// # Safety
+/// `c` valid context; `a` a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_app_decl(
+    c: *mut Z3rsZ3Context,
+    a: *const Z3rsAst,
+) -> *const Z3rsFuncDecl {
+    if c.is_null() || a.is_null() {
+        return ptr::null();
+    }
+    let (name, sort) = {
+        let ast = unsafe { &*a };
+        let name = match app_parts(ast.to_smt()) {
+            Some(parts) => parts[0].to_string(),
+            None => ast.to_smt().to_string(),
+        };
+        (name, ast.sort().clone())
+    };
+    unsafe { &mut *c }.intern_func_decl(FuncDecl::new(name, sort))
+}
+
+/// `Z3_get_decl_name(c, d)` — the name symbol of a declaration.
+///
+/// # Safety
+/// `c` valid context; `d` a valid `Z3_func_decl`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_get_decl_name(
+    c: *mut Z3rsZ3Context,
+    d: *const Z3rsFuncDecl,
+) -> *const Z3rsSymbol {
+    if c.is_null() || d.is_null() {
+        return ptr::null();
+    }
+    let name = unsafe { &*d }.name().to_string();
+    let ctx = unsafe { &mut *c };
+    let cstr = match CString::new(name) {
+        Ok(cs) => cs,
+        Err(_) => return ptr::null(),
+    };
+    let ptr = cstr.as_ptr();
+    ctx.symbols.push(cstr);
+    ptr
+}
+
+// --- AST vectors (z3_ast_containers.h) --------------------------------------
+
+/// `Z3_ast_vector` — a growable list of `Z3_ast` handles (owned by the context
+/// arena, freed at [`Z3_del_context`]). Element pointers reference context ASTs
+/// that outlive the vector.
+pub struct Z3rsAstVector {
+    items: alloc::vec::Vec<*const Ast>,
+}
+
+/// `Z3_mk_ast_vector(c)` — a fresh, empty AST vector.
+///
+/// # Safety
+/// `c` must be a valid context handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_ast_vector(c: *mut Z3rsZ3Context) -> *const Z3rsAstVector {
+    if c.is_null() {
+        return ptr::null();
+    }
+    unsafe { &mut *c }.intern_ast_vector(Z3rsAstVector {
+        items: alloc::vec::Vec::new(),
+    })
+}
+
+/// `Z3_ast_vector_inc_ref(c, v)` — no-op (arena-owned).
+#[unsafe(no_mangle)]
+pub extern "C" fn Z3_ast_vector_inc_ref(_c: *mut Z3rsZ3Context, _v: *const Z3rsAstVector) {}
+/// `Z3_ast_vector_dec_ref(c, v)` — no-op (arena-owned).
+#[unsafe(no_mangle)]
+pub extern "C" fn Z3_ast_vector_dec_ref(_c: *mut Z3rsZ3Context, _v: *const Z3rsAstVector) {}
+
+/// `Z3_ast_vector_size(c, v)` — the number of elements.
+///
+/// # Safety
+/// `v` must be NULL or a valid AST vector handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_ast_vector_size(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAstVector,
+) -> u32 {
+    if v.is_null() {
+        return 0;
+    }
+    unsafe { &*v }.items.len() as u32
+}
+
+/// `Z3_ast_vector_get(c, v, i)` — the `i`-th element (NULL if out of range).
+///
+/// # Safety
+/// `v` must be NULL or a valid AST vector handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_ast_vector_get(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAstVector,
+    i: u32,
+) -> *const Z3rsAst {
+    if v.is_null() {
+        return ptr::null();
+    }
+    unsafe { &*v }
+        .items
+        .get(i as usize)
+        .copied()
+        .unwrap_or(ptr::null())
+}
+
+/// `Z3_ast_vector_push(c, v, a)` — append an AST to the vector.
+///
+/// # Safety
+/// `v` a valid AST vector handle; `a` a valid `Z3_ast`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_ast_vector_push(
+    _c: *mut Z3rsZ3Context,
+    v: *const Z3rsAstVector,
+    a: *const Z3rsAst,
+) {
+    if v.is_null() || a.is_null() {
+        return;
+    }
+    let vec = unsafe { &mut *(v as *mut Z3rsAstVector) };
+    vec.items.push(a);
+}
+
+/// `Z3_ast_vector_to_string(c, v)` — the elements rendered as SMT-LIB terms, one
+/// per line, wrapped in parentheses (context-owned; do not free).
+///
+/// # Safety
+/// `c` valid context; `v` a valid AST vector handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_ast_vector_to_string(
+    c: *mut Z3rsZ3Context,
+    v: *const Z3rsAstVector,
+) -> *const c_char {
+    if c.is_null() || v.is_null() {
+        return ptr::null();
+    }
+    let text = {
+        let vec = unsafe { &*v };
+        let mut s = String::from("(ast-vector");
+        for &p in &vec.items {
+            if !p.is_null() {
+                s.push_str("\n  ");
+                s.push_str(unsafe { &*p }.to_smt());
+            }
+        }
+        s.push(')');
+        s
+    };
+    let ctx = unsafe { &mut *c };
+    intern_string(ctx, text)
+}
+
+/// `Z3_solver_get_unsat_core(c, s)` — the unsat core of the most recent
+/// unsatisfiable check, as a `Z3_ast_vector` of the tracking assumption ASTs
+/// registered via [`Z3_solver_assert_and_track`]. Parses `(get-unsat-core)` and
+/// maps each printed `:named` label back to its tracking `Z3_ast`.
+///
+/// # Safety
+/// `c` valid context; `s` a solver from this context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_solver_get_unsat_core(
+    c: *mut Z3rsZ3Context,
+    s: *const Z3rsSolver,
+) -> *const Z3rsAstVector {
+    if c.is_null() {
+        return ptr::null();
+    }
+    let items = {
+        let Some(sol) = (unsafe { solver_mut(s) }) else {
+            return ptr::null();
+        };
+        let names: alloc::vec::Vec<String> = match sol.session.eval("(get-unsat-core)") {
+            Ok(lines) => lines
+                .first()
+                .map(|line| {
+                    line.trim()
+                        .trim_start_matches('(')
+                        .trim_end_matches(')')
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => alloc::vec::Vec::new(),
+        };
+        let mut items: alloc::vec::Vec<*const Ast> = alloc::vec::Vec::new();
+        for name in &names {
+            if let Some((_, ast)) = sol.tracked.iter().find(|(n, _)| n == name) {
+                items.push(*ast);
+            }
+        }
+        items
+    };
+    unsafe { &mut *c }.intern_ast_vector(Z3rsAstVector { items })
 }

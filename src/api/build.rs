@@ -363,6 +363,173 @@ impl Ast {
             sort: self.sort.clone(),
         }
     }
+
+    // --- numeral readback (the C ABI's `Z3_get_numeral_*`) ----------------
+
+    /// Whether this term is a numeral *literal* — an integer, rational, or
+    /// bit-vector constant — by its syntactic form (matching `Z3_NUMERAL_AST`).
+    pub fn is_numeral(&self) -> bool {
+        parse_numeral(&self.src).is_some()
+    }
+
+    /// The numeral as a reduced rational `(numerator, denominator)` (denominator
+    /// positive), if this term is a numeral literal.
+    pub fn as_rational(&self) -> Option<(i128, i128)> {
+        parse_numeral(&self.src)
+    }
+
+    /// The numeral as an integer, if it is one (rejects genuine rationals).
+    pub fn as_int(&self) -> Option<i128> {
+        match parse_numeral(&self.src)? {
+            (n, 1) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// The numeral's decimal (integer) or `p/q` (rational) string, matching
+    /// `Z3_get_numeral_string`. `None` if this term is not a numeral literal.
+    pub fn numeral_string(&self) -> Option<String> {
+        let (n, d) = parse_numeral(&self.src)?;
+        Some(if d == 1 {
+            n.to_string()
+        } else {
+            alloc::format!("{n}/{d}")
+        })
+    }
+}
+
+/// Split `s` into its top-level whitespace/parenthesis-delimited parts (atoms
+/// and `(...)` groups). ASCII-indexed, which is sound for SMT-LIB text.
+pub(crate) fn top_level_parts(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'(' => {
+                if depth == 0 && start.is_none() {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 && let Some(st) = start.take() {
+                    parts.push(&s[st..=i]);
+                }
+            }
+            c if c.is_ascii_whitespace() => {
+                if depth == 0 && let Some(st) = start.take() {
+                    parts.push(&s[st..i]);
+                }
+            }
+            _ => {
+                if depth == 0 && start.is_none() {
+                    start = Some(i);
+                }
+            }
+        }
+    }
+    if let Some(st) = start {
+        parts.push(&s[st..]);
+    }
+    parts
+}
+
+fn gcd(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Reduce `n/d` to lowest terms with a positive denominator.
+fn reduce(mut n: i128, mut d: i128) -> Option<(i128, i128)> {
+    if d == 0 {
+        return None;
+    }
+    if d < 0 {
+        n = -n;
+        d = -d;
+    }
+    let g = gcd(n.unsigned_abs(), d.unsigned_abs());
+    if g > 1 {
+        n /= g as i128;
+        d /= g as i128;
+    }
+    Some((n, d))
+}
+
+/// Parse an SMT-LIB numeral *literal* into a reduced rational `(num, den)`.
+/// Handles decimals (`6`, `-3`), `(- n)`, `(/ p q)`, hex/binary bit-vector
+/// constants (`#x0f`, `#b1010`), `(_ bvN W)`, and simple decimals (`1.5`).
+/// Returns `None` for anything that is not a self-contained numeral literal.
+fn parse_numeral(s: &str) -> Option<(i128, i128)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Hex / binary bit-vector constants.
+    if let Some(hex) = s.strip_prefix("#x") {
+        if !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return i128::from_str_radix(hex, 16).ok().map(|n| (n, 1));
+        }
+        return None;
+    }
+    if let Some(bin) = s.strip_prefix("#b") {
+        if !bin.is_empty() && bin.bytes().all(|b| b == b'0' || b == b'1') {
+            return i128::from_str_radix(bin, 2).ok().map(|n| (n, 1));
+        }
+        return None;
+    }
+    // `(_ bvN W)` bit-vector value.
+    if let Some(rest) = s.strip_prefix("(_ bv") {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits.parse::<i128>().ok().map(|n| (n, 1));
+        }
+        return None;
+    }
+    // Parenthesised `(- x)` or `(/ p q)`.
+    if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+        let parts = top_level_parts(inner);
+        match parts.as_slice() {
+            ["-", x] => {
+                let (n, d) = parse_numeral(x)?;
+                return Some((-n, d));
+            }
+            ["/", p, q] => {
+                let (pn, pd) = parse_numeral(p)?;
+                let (qn, qd) = parse_numeral(q)?;
+                return reduce(pn.checked_mul(qd)?, pd.checked_mul(qn)?);
+            }
+            _ => return None,
+        }
+    }
+    // Simple decimal `123.456`.
+    if let Some(dot) = s.find('.') {
+        let (int_part, frac_part) = (&s[..dot], &s[dot + 1..]);
+        let neg = int_part.starts_with('-');
+        let int_digits = int_part.strip_prefix('-').unwrap_or(int_part);
+        if (int_digits.is_empty() || int_digits.bytes().all(|b| b.is_ascii_digit()))
+            && frac_part.bytes().all(|b| b.is_ascii_digit())
+            && frac_part.len() <= 30
+        {
+            let combined = alloc::format!("{int_digits}{frac_part}");
+            let num = combined.parse::<i128>().ok()?;
+            let mut den: i128 = 1;
+            for _ in 0..frac_part.len() {
+                den = den.checked_mul(10)?;
+            }
+            return reduce(if neg { -num } else { num }, den);
+        }
+        return None;
+    }
+    // Plain integer.
+    s.parse::<i128>().ok().map(|n| (n, 1))
 }
 
 /// An uninterpreted function declaration (Z3's `Z3_func_decl`). Apply it to
@@ -374,9 +541,20 @@ pub struct FuncDecl {
 }
 
 impl FuncDecl {
+    /// Construct a declaration handle from a name and range sort. Used by the C
+    /// ABI to synthesise `Z3_func_decl`s for model constants and `Z3_get_app_decl`.
+    pub fn new(name: String, range: Sort) -> FuncDecl {
+        FuncDecl { name, range }
+    }
+
     /// The declaration's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The declaration's range (result) sort.
+    pub fn range(&self) -> &Sort {
+        &self.range
     }
 
     /// Apply the function to `args` — `(name a₁ … aₙ)`, or just `name` when
@@ -688,6 +866,34 @@ mod tests {
         ctx.assert(&b.bvsub(&Context::bv_val(1, 8)).eq(&Context::bv_val(14, 8)));
         assert_eq!(ctx.check(), SatResult::Sat);
         assert_eq!(ctx.eval_value(&b).as_deref(), Some("#x0f"));
+    }
+
+    #[test]
+    fn numeral_readback() {
+        let bv = |s: &str| Ast::new(s.to_string(), Sort::BitVec(8));
+        let int = |s: &str| Ast::new(s.to_string(), Sort::Int);
+        let real = |s: &str| Ast::new(s.to_string(), Sort::Real);
+
+        assert_eq!(int("6").numeral_string().as_deref(), Some("6"));
+        assert_eq!(int("6").as_int(), Some(6));
+        assert_eq!(int("(- 6)").numeral_string().as_deref(), Some("-6"));
+        assert_eq!(int("(- 6)").as_int(), Some(-6));
+        assert_eq!(bv("#x0f").numeral_string().as_deref(), Some("15"));
+        assert_eq!(bv("#x0f").as_int(), Some(15));
+        assert_eq!(bv("#b1010").as_int(), Some(10));
+        assert_eq!(bv("(_ bv15 8)").as_int(), Some(15));
+        assert_eq!(real("(/ 1 2)").numeral_string().as_deref(), Some("1/2"));
+        assert_eq!(real("(/ 1 2)").as_int(), None);
+        assert_eq!(real("(/ (- 3) 6)").numeral_string().as_deref(), Some("-1/2"));
+        assert_eq!(real("1.5").numeral_string().as_deref(), Some("3/2"));
+        assert_eq!(real("2.0").as_int(), Some(2));
+
+        // Non-numerals.
+        assert!(!Ast::new("x".to_string(), Sort::Int).is_numeral());
+        assert!(!Ast::new("(+ x 1)".to_string(), Sort::Int).is_numeral());
+        assert!(!Ast::new("(- x 1)".to_string(), Sort::Int).is_numeral());
+        assert!(!Ast::new("true".to_string(), Sort::Bool).is_numeral());
+        assert!(int("6").is_numeral());
     }
 
     #[test]

@@ -230,6 +230,51 @@ Z3_model Z3_solver_get_model(Z3_context c, Z3_solver s);
 const char *Z3_model_to_string(Z3_context c, Z3_model m);
 const char *Z3_ast_to_string(Z3_context c, Z3_ast a);
 
+/* ---- AST kind & numeral readback ----
+ * Z3_ast_kind: NUMERAL=0, APP=1, VAR=2, QUANTIFIER=3, SORT=4, FUNC_DECL=5,
+ * UNKNOWN=1000. z3rs terms are text, so only NUMERAL vs APP is distinguished. */
+unsigned Z3_get_ast_kind(Z3_context c, Z3_ast a);
+bool Z3_is_numeral_ast(Z3_context c, Z3_ast a);
+/* Decimal ("6") or rational ("1/2") string of a numeral (context-owned). */
+const char *Z3_get_numeral_string(Z3_context c, Z3_ast a);
+/* Write the numeral's value; return false if not an integer numeral / no fit. */
+bool Z3_get_numeral_int(Z3_context c, Z3_ast v, int *i);
+bool Z3_get_numeral_uint(Z3_context c, Z3_ast v, unsigned *u);
+bool Z3_get_numeral_int64(Z3_context c, Z3_ast v, long long *i);
+bool Z3_get_numeral_uint64(Z3_context c, Z3_ast v, unsigned long long *u);
+
+/* ---- Application accessors (minimum viable) ----
+ * Z3_app is an alias of Z3_ast (z3rs has one term representation). */
+typedef Z3_ast Z3_app;
+Z3_app Z3_to_app(Z3_context c, Z3_ast a);
+Z3_func_decl Z3_get_app_decl(Z3_context c, Z3_app a);
+unsigned Z3_get_app_num_args(Z3_context c, Z3_app a);
+Z3_ast Z3_get_app_arg(Z3_context c, Z3_app a, unsigned i);
+Z3_symbol Z3_get_decl_name(Z3_context c, Z3_func_decl d);
+
+/* ---- Model value readback ----
+ * Evaluate t under model m; write the value AST to *v; return true on success. */
+bool Z3_model_eval(Z3_context c, Z3_model m, Z3_ast t, bool model_completion,
+                   Z3_ast *v);
+/* Value of a 0-ary declaration in the model (NULL if unavailable). */
+Z3_ast Z3_model_get_const_interp(Z3_context c, Z3_model m, Z3_func_decl a);
+unsigned Z3_model_get_num_consts(Z3_context c, Z3_model m);
+Z3_func_decl Z3_model_get_const_decl(Z3_context c, Z3_model m, unsigned i);
+
+/* ---- AST vectors (z3_ast_containers.h) ----
+ * Owned by the context arena, freed at Z3_del_context; inc/dec_ref are no-ops. */
+typedef struct Z3rsAstVector *Z3_ast_vector;
+Z3_ast_vector Z3_mk_ast_vector(Z3_context c);
+void Z3_ast_vector_inc_ref(Z3_context c, Z3_ast_vector v);
+void Z3_ast_vector_dec_ref(Z3_context c, Z3_ast_vector v);
+unsigned Z3_ast_vector_size(Z3_context c, Z3_ast_vector v);
+Z3_ast Z3_ast_vector_get(Z3_context c, Z3_ast_vector v, unsigned i);
+void Z3_ast_vector_push(Z3_context c, Z3_ast_vector v, Z3_ast a);
+const char *Z3_ast_vector_to_string(Z3_context c, Z3_ast_vector v);
+
+/* Unsat core of the last unsatisfiable check as tracking assumption ASTs. */
+Z3_ast_vector Z3_solver_get_unsat_core(Z3_context c, Z3_solver s);
+
 #ifdef __cplusplus
 }
 #endif
