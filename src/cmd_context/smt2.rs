@@ -1064,6 +1064,10 @@ struct Context {
     /// Canonical empty sequence per sequence sort, so all `(as seq.empty S)`
     /// share one constant and `seq.len(s)=0 ⇒ s=empty` is enforceable.
     seq_empty: BTreeMap<AstId, AstId>,
+    /// Symbolic divisor terms from `div`/`mod` (the non-numeral `b` in
+    /// `div(a,b)`), collected during lifting so the SAT direction can witness by
+    /// enumerating small divisor values.
+    symbolic_divisors: BTreeSet<AstId>,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -1228,6 +1232,7 @@ impl Context {
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
             seq_empty: BTreeMap::new(),
+            symbolic_divisors: BTreeSet::new(),
             seq_len_decls: BTreeSet::new(),
         }
     }
@@ -1921,6 +1926,7 @@ impl Context {
                 // Division by the literal 0 is unconstrained in SMT-LIB: q, r free.
             }
             None => {
+                self.symbolic_divisors.insert(b);
                 // Symbolic divisor: the Euclidean identity holds only for b ≠ 0
                 // (div/mod by 0 are unconstrained). `|b| = ite(b≥0, b, −b)`. Push
                 // the three facts as *separate* guarded implications rather than
@@ -2491,6 +2497,63 @@ impl Context {
         };
         memo.insert(t, out);
         out
+    }
+
+    /// Bounded, sound SAT witness for a goal with symbolic `div`/`mod` divisors:
+    /// try a small concrete value for each divisor variable; substituting it makes
+    /// the Euclidean product `b·q` linear, so a confirmed (non-nonlinear) `sat` is
+    /// a real model. Returns `None` if no small divisor works.
+    fn try_divmod_witness(&mut self, goal: AstId) -> Option<Model> {
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let divs: Vec<AstId> = self
+            .symbolic_divisors
+            .iter()
+            .copied()
+            .filter(|&d| {
+                present.contains(&d)
+                    && self.m.is_uninterp_const(d)
+                    && self.m.is_int_sort(self.m.get_sort(d))
+            })
+            .collect();
+        if divs.is_empty() || divs.len() > 2 {
+            return None;
+        }
+        let vals: [i64; 12] = [1, 2, 3, 4, 5, 6, 7, 8, -1, -2, -3, -4];
+        const MAX_TRIES: usize = 300;
+        let mut idx = alloc::vec![0usize; divs.len()];
+        let mut tries = 0;
+        loop {
+            if tries >= MAX_TRIES {
+                return None;
+            }
+            tries += 1;
+            let subst: Vec<(AstId, AstId)> = divs
+                .iter()
+                .enumerate()
+                .map(|(k, &d)| (d, self.m.mk_int(vals[idx[k]])))
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            // Only trust the verdict once the concretised goal is linear (the
+            // nonlinear `b·q` is now `value·q`); then a `sat` is a genuine model.
+            if !self.arith_nonlinear(g)
+                && let (SmtResult::Sat, m) = check_model(&self.m, g)
+            {
+                return m;
+            }
+            let mut k = 0;
+            loop {
+                if k == divs.len() {
+                    return None;
+                }
+                idx[k] += 1;
+                if idx[k] < vals.len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
     }
 
     /// Bounded, sound search for a concrete satisfying assignment to a goal with
@@ -5605,6 +5668,22 @@ impl Context {
             return (SmtResult::Unknown, None);
         }
         let (res, model) = check_model(&self.m, goal);
+        // SAT witness for symbolic-divisor div/mod goals: a small concrete divisor
+        // often makes the goal linear and satisfiable (e.g. `mod(35,y)≥1 ∧ y<6`
+        // at y=2). A confirmed linear model is a real `sat` — and `check_model`'s
+        // own `sat` on the still-nonlinear `y·q` is not trustworthy, so try the
+        // witness whenever the verdict is not a sound `unsat`.
+        if res != SmtResult::Unsat
+            && !self.symbolic_divisors.is_empty()
+            && self
+                .m
+                .postorder(goal)
+                .iter()
+                .any(|t| self.symbolic_divisors.contains(t))
+            && let Some(m) = self.try_divmod_witness(goal)
+        {
+            return (SmtResult::Sat, Some(m));
+        }
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
             // First, try to *linearize*: a variable pinned by an equality
             // `x = c` (constant) can be substituted throughout, which often
@@ -7952,6 +8031,17 @@ mod tests {
                  (assert (< (mod x y) 0))(assert (not (= y 0)))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+        // SAT witness by enumerating a small divisor: `mod(35,y)≥1 ∧ y<6` at y=2.
+        assert_eq!(
+            run("(declare-const y Int)(assert (>= (mod 35 y) 1))(assert (< y 6))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (mod 26 y) 1))(assert (> y 0))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
