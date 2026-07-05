@@ -5266,34 +5266,50 @@ impl Context {
     /// otherwise-opaque `div`/`mod` variables to `a`, so e.g. `x mod 2 = 0 ∧
     /// (x+1) mod 2 = 0` is refuted.
     fn divmod_axioms(&mut self, goal: AstId) -> Vec<AstId> {
-        let mut targets: Vec<(AstId, Int)> = Vec::new();
+        // Distinct (dividend, divisor) pairs of `div`/`mod` applications.
+        let mut pairs: Vec<(AstId, AstId)> = Vec::new();
         for t in self.m.postorder(goal) {
             if matches!(self.m.arith_op(t), Some(ArithOp::Mod | ArithOp::Idiv)) {
                 let args = self.m.app_args(t);
-                if let Some(n) = self.m.as_numeral(args[1]).and_then(|r| r.to_integer())
-                    && !n.is_zero()
-                {
-                    targets.push((args[0], n));
-                }
+                pairs.push((args[0], args[1]));
             }
         }
-        targets.sort();
-        targets.dedup();
-        if targets.len() > 12 {
-            targets.truncate(12);
+        pairs.sort();
+        pairs.dedup();
+        if pairs.len() > 12 {
+            pairs.truncate(12);
         }
         let mut axioms = Vec::new();
-        for (a, n) in targets {
-            let n_num = self.m.mk_numeral(Rational::from_integer(n.clone()), true);
-            let divt = self.m.mk_idiv(a, n_num);
-            let modt = self.m.mk_mod(a, n_num);
-            let prod = self.m.mk_mul(&[n_num, divt]);
+        let zero = self.m.mk_int(0);
+        for (a, b) in pairs {
+            let divt = self.m.mk_idiv(a, b);
+            let modt = self.m.mk_mod(a, b);
+            let prod = self.m.mk_mul(&[b, divt]);
             let sum = self.m.mk_add(&[prod, modt]);
-            axioms.push(self.m.mk_eq(a, sum)); // a = n·div + mod
-            let zero = self.m.mk_int(0);
-            axioms.push(self.m.mk_ge(modt, zero)); // 0 ≤ mod
-            let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
-            axioms.push(self.m.mk_lt(modt, abs_n)); // mod < |n|
+            let euclid = self.m.mk_eq(a, sum); // a = b·div + mod
+            let mod_ge0 = self.m.mk_ge(modt, zero);
+            if let Some(n) = self.m.as_numeral(b).and_then(|r| r.to_integer()) {
+                if n.is_zero() {
+                    continue; // div/mod by literal 0 is unconstrained in SMT-LIB
+                }
+                // Constant nonzero divisor: unconditional Euclidean axioms.
+                axioms.push(euclid);
+                axioms.push(mod_ge0);
+                let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
+                axioms.push(self.m.mk_lt(modt, abs_n)); // mod < |n|
+            } else {
+                // Symbolic divisor: the Euclidean identity holds only when b ≠ 0
+                // (div/mod by 0 are unconstrained). `|b| = ite(b≥0, b, −b)`.
+                let bge0 = self.m.mk_ge(b, zero);
+                let neg1 = self.m.mk_int(-1);
+                let negb = self.m.mk_mul(&[neg1, b]);
+                let absb = self.m.mk_ite(bge0, b, negb);
+                let mod_lt = self.m.mk_lt(modt, absb); // mod < |b|
+                let body = self.m.mk_and(&[euclid, mod_ge0, mod_lt]);
+                let beq0 = self.m.mk_eq(b, zero);
+                let bne0 = self.m.mk_not(beq0);
+                axioms.push(self.m.mk_implies(bne0, body));
+            }
         }
         axioms
     }
@@ -7877,6 +7893,20 @@ mod tests {
             )
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+        // Symbolic divisor: the Euclidean identity `a = b·div(a,b) + mod(a,b)`
+        // holds (guarded by b≠0), so `b·div(a,b)+mod(a,b)=5` forces `a=5`.
+        assert_eq!(
+            run("(declare-const a Int)(declare-const b Int)(assert (> b 0))\
+                 (assert (= (+ (* b (div a b))(mod a b)) 5))(assert (not (= a 5)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // div/mod by literal 0 is unconstrained ⇒ satisfiable.
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (mod 5 y) 3))(assert (= y 0))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
