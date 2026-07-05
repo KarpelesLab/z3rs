@@ -3230,6 +3230,55 @@ impl Context {
         })
     }
 
+    /// Symbolic `fp.min`/`fp.max` as a bit-vector `ite` circuit: the smaller
+    /// (resp. larger) value, with NaN yielding the other operand and a ±0 clash
+    /// resolving to `-0` for min / `+0` for max (z3's convention). Returns a fresh
+    /// FP term whose bit-vector is the result.
+    fn fp_min_max_bv(&mut self, op: &str, a: AstId, b: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(a))?;
+        let w = eb + sb;
+        let bva = self.fp_to_bv(a)?;
+        let bvb = self.fp_to_bv(b)?;
+        let nan_a = self.fp_classify_bv("fp.isNaN", a)?;
+        let nan_b = self.fp_classify_bv("fp.isNaN", b)?;
+        let zero_a = self.fp_classify_bv("fp.isZero", a)?;
+        let zero_b = self.fp_classify_bv("fp.isZero", b)?;
+        let both_zero = self.m.mk_and(&[zero_a, zero_b]);
+        let one1 = self.m.mk_bv(1, 1);
+        let sa = self.m.mk_bv_extract(w - 1, w - 1, bva);
+        let sbb = self.m.mk_bv_extract(w - 1, w - 1, bvb);
+        let sa1 = self.m.mk_eq(sa, one1);
+        let sb1 = self.m.mk_eq(sbb, one1);
+        let zeros = self.m.mk_bv(0, w - 1);
+        let neg_zero = self.m.mk_bv_concat(one1, zeros);
+        let pos_zero = self.m.mk_bv(0, w);
+        let lt_ab = self.fp_real_lt(bva, bvb, w);
+        let lt_ba = self.fp_real_lt(bvb, bva, w);
+        let is_min = op == "fp.min";
+        // ±0 clash → the signed zero z3 prefers.
+        let zero_res = if is_min {
+            let either_neg = self.m.mk_or(&[sa1, sb1]);
+            self.m.mk_ite(either_neg, neg_zero, pos_zero)
+        } else {
+            let nsa1 = self.m.mk_not(sa1);
+            let nsb1 = self.m.mk_not(sb1);
+            let either_pos = self.m.mk_or(&[nsa1, nsb1]);
+            self.m.mk_ite(either_pos, pos_zero, neg_zero)
+        };
+        let eq_case = self.m.mk_ite(both_zero, zero_res, bva);
+        // min: a<b→a, b<a→b; max: a>b→a, b>a→b.
+        let (first, second) = if is_min { (lt_ab, lt_ba) } else { (lt_ba, lt_ab) };
+        let inner = self.m.mk_ite(second, bvb, eq_case);
+        let core = self.m.mk_ite(first, bva, inner);
+        // NaN operand ⇒ the other operand.
+        let r1 = self.m.mk_ite(nan_b, bva, core);
+        let result_bv = self.m.mk_ite(nan_a, bvb, r1);
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// `value(a) < value(b)` for the width-`w` bit-vectors of two **non-NaN**
     /// floats (±0 tie handled by the caller): compare by sign, then by magnitude
     /// (`exp:significand`) — ascending for positives, descending for negatives.
@@ -3383,6 +3432,9 @@ impl Context {
                 if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
                     let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
                     return Ok(self.mk_fp(f64_bits(r), 11, 53));
+                }
+                if let Some(t) = self.fp_min_max_bv(op, args[0], args[1]) {
+                    return Ok(t);
                 }
                 self.symbolic_fp(op, args)
             }
@@ -8385,6 +8437,26 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn symbolic_fp_min_max() {
+        // fp.min/max via the BV ite circuit (uses the ordered comparison).
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)\
+                 (assert (fp.gt (fp.min x y) x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)\
+                 (assert (fp.lt (fp.max x y) y))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)\
+                 (assert (fp.lt (fp.min x y) (fp.max x y)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
