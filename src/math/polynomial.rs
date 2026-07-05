@@ -338,19 +338,19 @@ impl Polynomial {
         p
     }
 
-    /// Exact quotient `self / divisor`, assuming `divisor` divides `self`
-    /// exactly (multivariate long division by leading terms in graded-lex order;
-    /// used by the fraction-free Bareiss determinant, which guarantees
-    /// exactness). Panics if a leading-term division is not possible.
-    pub fn div_exact(&self, divisor: &Polynomial) -> Polynomial {
+    /// Exact quotient `self / divisor` when `divisor` divides `self` exactly
+    /// (multivariate long division by leading terms in graded-lex order; used by
+    /// the fraction-free Bareiss determinant). Returns `None` if a leading-term
+    /// division is not possible — i.e. the division is not exact — so callers can
+    /// decline rather than crash (the Bareiss exactness invariant can be broken by
+    /// a degenerate/pivoted matrix).
+    pub fn div_exact(&self, divisor: &Polynomial) -> Option<Polynomial> {
         debug_assert!(!divisor.is_zero());
         let (dc, dm) = divisor.terms[0].clone(); // graded-lex leading term
         let mut rem = self.clone();
         let mut quot = Polynomial::zero();
         while let Some((rc, rm)) = rem.terms.first().cloned() {
-            let qm = rm
-                .checked_div(&dm)
-                .expect("div_exact: leading term not divisible (inexact division)");
+            let qm = rm.checked_div(&dm)?; // not divisible ⇒ inexact ⇒ decline
             let qc = rc.div(&dc);
             let qterm = Polynomial {
                 terms: vec![(qc, qm)],
@@ -358,7 +358,7 @@ impl Polynomial {
             quot = quot.add(&qterm);
             rem = rem.sub(&divisor.mul(&qterm));
         }
-        quot
+        Some(quot)
     }
 
     /// Multiply by a scalar rational.

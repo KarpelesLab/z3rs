@@ -23,18 +23,18 @@ use crate::math::polynomial::{Polynomial, Var};
 /// `Res_v(p, q)`: the resultant of `p` and `q` with respect to variable `v`, a
 /// polynomial in the remaining variables. `Res(p, q) = 0` iff `p` and `q` have a
 /// common root in `v` or both leading coefficients (in `v`) vanish.
-pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Polynomial {
+pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Option<Polynomial> {
     if p.is_zero() || q.is_zero() {
-        return Polynomial::zero();
+        return Some(Polynomial::zero());
     }
     let m = p.degree_of(v) as usize;
     let n = q.degree_of(v) as usize;
     // Degenerate cases: a constant (in v) c has Res(c, q) = c^n and Res(p, c)=c^m.
     if m == 0 {
-        return p.coeff_of_var(v, 0).pow(n as u32);
+        return Some(p.coeff_of_var(v, 0).pow(n as u32));
     }
     if n == 0 {
-        return q.coeff_of_var(v, 0).pow(m as u32);
+        return Some(q.coeff_of_var(v, 0).pow(m as u32));
     }
     // Sylvester matrix: (m+n)×(m+n). Coefficients highest-degree first.
     let p_co: Vec<Polynomial> = (0..=m).rev().map(|i| p.coeff_of_var(v, i as u32)).collect();
@@ -73,9 +73,13 @@ pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Polynomial {
 ///
 /// Constant/scalar factors and overall sign are irrelevant: CAD uses these
 /// polynomials only for their real zero sets to delineate cells.
-pub fn principal_subresultant_coeffs(p: &Polynomial, q: &Polynomial, v: Var) -> Vec<Polynomial> {
+pub fn principal_subresultant_coeffs(
+    p: &Polynomial,
+    q: &Polynomial,
+    v: Var,
+) -> Option<Vec<Polynomial>> {
     if p.is_zero() || q.is_zero() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     // Order so that deg_v P ≥ deg_v Q (subresultants are symmetric up to sign).
     let (p, q) = if p.degree_of(v) >= q.degree_of(v) {
@@ -87,7 +91,7 @@ pub fn principal_subresultant_coeffs(p: &Polynomial, q: &Polynomial, v: Var) -> 
     let n = q.degree_of(v) as usize;
     if n == 0 {
         // q is a constant c in v: the only subresultant coefficient is s₀ = Res = c^m.
-        return alloc::vec![q.coeff_of_var(v, 0).pow(m as u32)];
+        return Some(alloc::vec![q.coeff_of_var(v, 0).pow(m as u32)]);
     }
     // Sylvester matrix Syl(P,Q): n rows of P-shifts then m rows of Q-shifts, size m+n.
     // Column c (0-indexed) corresponds to the power v^{m+n-1-c}.
@@ -132,15 +136,15 @@ pub fn principal_subresultant_coeffs(p: &Polynomial, q: &Polynomial, v: Var) -> 
             .iter()
             .map(|&ri| cols.iter().map(|&ci| syl[ri][ci].clone()).collect())
             .collect();
-        out.push(determinant(&sub));
+        out.push(determinant(&sub)?);
     }
-    out
+    Some(out)
 }
 
 /// `Res_v(p, ∂p/∂v)`: vanishes exactly where `p` has a repeated root in `v`. This
 /// equals the classical discriminant up to a nonzero factor (`±1/lc_v(p)`), so it
 /// has the same vanishing set — which is all CAD's projection requires.
-pub fn discriminant(p: &Polynomial, v: Var) -> Polynomial {
+pub fn discriminant(p: &Polynomial, v: Var) -> Option<Polynomial> {
     resultant(p, &p.deriv_var(v), v)
 }
 
@@ -148,10 +152,10 @@ pub fn discriminant(p: &Polynomial, v: Var) -> Polynomial {
 /// **Bareiss algorithm** — `O(n³)` ring operations with exact divisions
 /// (valid over the integral domain of polynomials), rather than the `O(n!)`
 /// cofactor expansion, which is essential to keep resultants tractable.
-fn determinant(mat: &[Vec<Polynomial>]) -> Polynomial {
+fn determinant(mat: &[Vec<Polynomial>]) -> Option<Polynomial> {
     let n = mat.len();
     if n == 0 {
-        return Polynomial::constant(1.into());
+        return Some(Polynomial::constant(1.into()));
     }
     let mut m: Vec<Vec<Polynomial>> = mat.to_vec();
     let mut sign = 1i32;
@@ -164,7 +168,7 @@ fn determinant(mat: &[Vec<Polynomial>]) -> Polynomial {
                     m.swap(k, piv);
                     sign = -sign;
                 }
-                None => return Polynomial::zero(), // singular column ⇒ det 0
+                None => return Some(Polynomial::zero()), // singular column ⇒ det 0
             }
         }
         let pivot = m[k][k].clone();
@@ -174,14 +178,16 @@ fn determinant(mat: &[Vec<Polynomial>]) -> Polynomial {
                 m[i][j] = if prev.as_constant() == Some(1.into()) {
                     num
                 } else {
-                    num.div_exact(&prev)
+                    // Exact division should hold; if a degenerate/pivoted matrix
+                    // breaks the Bareiss invariant, decline rather than crash.
+                    num.div_exact(&prev)?
                 };
             }
         }
         prev = pivot;
     }
     let det = m[n - 1][n - 1].clone();
-    if sign < 0 { det.neg() } else { det }
+    Some(if sign < 0 { det.neg() } else { det })
 }
 
 #[cfg(test)]
@@ -206,7 +212,7 @@ mod tests {
     fn resultant_coprime_linear_nonzero() {
         let a = uni(&[(-1, 0), (1, 1)]); // x - 1
         let b = uni(&[(-2, 0), (1, 1)]); // x - 2
-        let res = resultant(&a, &b, 0);
+        let res = resultant(&a, &b, 0).unwrap();
         assert!(res.as_constant().is_some());
         assert!(!res.as_constant().unwrap().is_zero()); // no common root
     }
@@ -216,7 +222,7 @@ mod tests {
     fn resultant_common_root_is_zero() {
         let a = uni(&[(-1, 0), (1, 1)]); // x - 1
         let b = uni(&[(-1, 0), (0, 1), (1, 2)]); // x^2 - 1
-        let res = resultant(&a, &b, 0);
+        let res = resultant(&a, &b, 0).unwrap();
         assert_eq!(res.as_constant(), Some(r(0)));
     }
 
@@ -229,7 +235,7 @@ mod tests {
             (r(1), mono(&[(0, 1), (1, 1)])),
             (r(1), mono(&[(2, 1)])),
         ]);
-        let disc = discriminant(&p, 0);
+        let disc = discriminant(&p, 0).unwrap();
         // The classical discriminant is b^2 - 4c; Res(p, p') equals it up to a
         // nonzero factor (here −1), so match up to sign.
         let expect = Polynomial::from_terms(alloc::vec![
@@ -244,7 +250,7 @@ mod tests {
     fn psc_coprime() {
         let a = uni(&[(-1, 0), (1, 1)]); // x - 1
         let b = uni(&[(-2, 0), (1, 1)]); // x - 2
-        let s = principal_subresultant_coeffs(&a, &b, 0);
+        let s = principal_subresultant_coeffs(&a, &b, 0).unwrap();
         // min degree = 1 ⇒ [s0, s1]; s0 = Res(x-1,x-2) = ±1 (nonzero).
         assert_eq!(s.len(), 2);
         assert!(!s[0].is_zero());
@@ -256,7 +262,7 @@ mod tests {
         // P = (x-1)(x-2) = x^2 - 3x + 2 ; Q = (x-1)(x-3) = x^2 - 4x + 3.
         let p = uni(&[(2, 0), (-3, 1), (1, 2)]);
         let q = uni(&[(3, 0), (-4, 1), (1, 2)]);
-        let s = principal_subresultant_coeffs(&p, &q, 0);
+        let s = principal_subresultant_coeffs(&p, &q, 0).unwrap();
         assert_eq!(s.len(), 3); // [s0, s1, s2]
         assert!(s[0].is_zero(), "s0 (resultant) should vanish: {:?}", s[0]);
         assert!(!s[1].is_zero(), "s1 should be nonzero for gcd deg 1");
@@ -267,7 +273,7 @@ mod tests {
     fn psc_proportional() {
         let p = uni(&[(-1, 0), (0, 1), (1, 2)]); // x^2 - 1
         let q = uni(&[(-2, 0), (0, 1), (2, 2)]); // 2x^2 - 2
-        let s = principal_subresultant_coeffs(&p, &q, 0);
+        let s = principal_subresultant_coeffs(&p, &q, 0).unwrap();
         assert!(
             s[0].is_zero() && s[1].is_zero(),
             "proportional ⇒ s0=s1=0: {s:?}"
@@ -285,8 +291,8 @@ mod tests {
             (r(1), mono(&[(1, 2)])), // y^2
             (r(-2), Monomial::one()),
         ]);
-        let res = resultant(&a, &b, 1);
-        let s = principal_subresultant_coeffs(&a, &b, 1);
+        let res = resultant(&a, &b, 1).unwrap();
+        let s = principal_subresultant_coeffs(&a, &b, 1).unwrap();
         assert!(
             s[0] == res || s[0] == res.neg(),
             "s0 vs Res: {:?} {:?}",
@@ -308,7 +314,7 @@ mod tests {
             (r(1), mono(&[(1, 2)])), // y^2
             (r(-2), Monomial::one()),
         ]);
-        let res = resultant(&a, &b, 1); // eliminate y
+        let res = resultant(&a, &b, 1).unwrap(); // eliminate y
         // x^2 - 2 (up to sign).
         let expect = Polynomial::from_terms(alloc::vec![
             (r(1), mono(&[(0, 2)])),

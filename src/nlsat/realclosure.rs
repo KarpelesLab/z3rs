@@ -61,7 +61,7 @@ pub(crate) fn poly_to_upoly(p: &Polynomial, var: Var) -> UPoly {
 /// eliminating every coordinate: `R(z) = Res(z − p, q_1, …, q_k)` where `q_i` is
 /// the defining polynomial of `point[i]` (rational coordinates are substituted
 /// directly). See the CAD spec §3.3 / realclosure spec §2.5.
-fn eliminate_to_univariate(p: &Polynomial, point: &[Alg]) -> UPoly {
+fn eliminate_to_univariate(p: &Polynomial, point: &[Alg]) -> Option<UPoly> {
     let n = point.len();
     let z = n as Var; // fresh variable index, above all coordinates
     // f = z - p
@@ -73,11 +73,11 @@ fn eliminate_to_univariate(p: &Polynomial, point: &[Alg]) -> UPoly {
             }
             Alg::Irrational { poly, .. } => {
                 let qi = upoly_to_poly(poly, i as Var);
-                f = resultant(&f, &qi, i as Var);
+                f = resultant(&f, &qi, i as Var)?; // inexact Bareiss ⇒ decline
             }
         }
     }
-    poly_to_upoly(&f, z)
+    Some(poly_to_upoly(&f, z))
 }
 
 /// A rational `L > 0` such that every **nonzero** root `ρ` of `r` has `|ρ| ≥ L`
@@ -153,7 +153,7 @@ fn boxes_of(point: &[Alg]) -> Vec<Interval> {
 /// coordinates are algebraic numbers (`point[i]` is the value of variable `i`).
 /// Interval arithmetic decides the easy cases; a resultant certification decides
 /// a suspected zero exactly. Sound and terminating (CAD spec §3.3).
-pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> i32 {
+pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> Option<i32> {
     // Indices whose coordinate is irrational (refinable).
     let refinable: Vec<usize> = (0..point.len())
         .filter(|&i| matches!(point[i], Alg::Irrational { .. }))
@@ -165,37 +165,38 @@ pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> i32 {
         let boxes = boxes_of(&pt);
         let val = eval_interval(p, &boxes);
         if let Some(s) = strict_interval_sign(&val) {
-            return s;
+            return Some(s);
         }
         if refinable.is_empty() {
             // Fully rational: the value is exact; read it off directly.
-            return exact_rational_sign(p, &pt);
+            return Some(exact_rational_sign(p, &pt));
         }
         for &i in &refinable {
             pt[i].refine();
         }
     }
 
-    // Phase 2: certify a suspected zero via the resultant lower bound.
-    let r = eliminate_to_univariate(p, &pt);
+    // Phase 2: certify a suspected zero via the resultant lower bound. If the
+    // elimination resultant cannot be formed (inexact Bareiss division), decline.
+    let r = eliminate_to_univariate(p, &pt)?;
     if r.is_zero() {
-        return 0; // p is identically zero along this fiber
+        return Some(0); // p is identically zero along this fiber
     }
     let l = nonzero_root_lower_bound(&r);
     for _ in 0..400 {
         let boxes = boxes_of(&pt);
         let val = eval_interval(p, &boxes);
         if let Some(s) = strict_interval_sign(&val) {
-            return s;
+            return Some(s);
         }
         if interval_within(&val, &l) {
-            return 0; // |value| < L but value is a root of R ⇒ value = 0
+            return Some(0); // |value| < L but value is a root of R ⇒ value = 0
         }
         for &i in &refinable {
             pt[i].refine();
         }
     }
-    0
+    Some(0)
 }
 
 /// Exact sign of `p` at an all-rational point.
@@ -493,14 +494,20 @@ mod tests {
             (r(1), Monomial::from_powers(&[(1, 2)])),
             (r(-3), Monomial::one()),
         ]);
-        assert_eq!(sign_at_point(&g, &[Alg::Rational(r(1)), sqrt2.clone()]), 0);
+        assert_eq!(
+            sign_at_point(&g, &[Alg::Rational(r(1)), sqrt2.clone()]).unwrap(),
+            0
+        );
         // At (x=1, y=√2): x^2+y^2-2 = 1 ⇒ +1.
         let g2 = Polynomial::from_terms(alloc::vec![
             (r(1), Monomial::from_powers(&[(0, 2)])),
             (r(1), Monomial::from_powers(&[(1, 2)])),
             (r(-2), Monomial::one()),
         ]);
-        assert_eq!(sign_at_point(&g2, &[Alg::Rational(r(1)), sqrt2.clone()]), 1);
+        assert_eq!(
+            sign_at_point(&g2, &[Alg::Rational(r(1)), sqrt2.clone()]).unwrap(),
+            1
+        );
         // At (x=1, y=√2): x^2+y^2-4 = -1 ⇒ -1.
         let g3 = Polynomial::from_terms(alloc::vec![
             (r(1), Monomial::from_powers(&[(0, 2)])),
@@ -508,7 +515,7 @@ mod tests {
             (r(-4), Monomial::one()),
         ]);
         assert_eq!(
-            sign_at_point(&g3, &[Alg::Rational(r(1)), sqrt2.clone()]),
+            sign_at_point(&g3, &[Alg::Rational(r(1)), sqrt2.clone()]).unwrap(),
             -1
         );
         // Two algebraic coords: x=√2, y=√2 ; x*y - 2 = 2 - 2 = 0.
@@ -516,12 +523,15 @@ mod tests {
             (r(1), Monomial::from_powers(&[(0, 1), (1, 1)])),
             (r(-2), Monomial::one()),
         ]);
-        assert_eq!(sign_at_point(&g4, &[sqrt2.clone(), sqrt2.clone()]), 0);
+        assert_eq!(
+            sign_at_point(&g4, &[sqrt2.clone(), sqrt2.clone()]).unwrap(),
+            0
+        );
         // x*y - 1 at (√2,√2) = 2 - 1 = 1 ⇒ +1.
         let g5 = Polynomial::from_terms(alloc::vec![
             (r(1), Monomial::from_powers(&[(0, 1), (1, 1)])),
             (r(-1), Monomial::one()),
         ]);
-        assert_eq!(sign_at_point(&g5, &[sqrt2.clone(), sqrt2]), 1);
+        assert_eq!(sign_at_point(&g5, &[sqrt2.clone(), sqrt2]).unwrap(), 1);
     }
 }

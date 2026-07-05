@@ -106,12 +106,18 @@ pub fn cad_sat(constraints: &[(Polynomial, Rel)], num_vars: usize) -> Option<boo
         samples = next;
     }
 
-    // Decision: some cell's sample satisfies every constraint ⇒ SAT.
+    // Decision: some cell's sample satisfies every constraint ⇒ SAT. A sample
+    // whose sign cannot be determined (inexact Bareiss resultant) makes the whole
+    // decision decline to `unknown`.
     for s in &samples {
-        if constraints
-            .iter()
-            .all(|(p, rel)| rel_holds(sign_at_point(p, s), *rel))
-        {
+        let mut all = true;
+        for (p, rel) in constraints {
+            if !rel_holds(sign_at_point(p, s)?, *rel) {
+                all = false;
+                break;
+            }
+        }
+        if all {
             return Some(true);
         }
     }
@@ -166,7 +172,9 @@ fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>> {
             proj.push(g.coeff_of_var(var, d)); // leading coefficient
             let gd = g.deriv_var(var);
             if gd.degree_of(var) >= 1 {
-                proj.extend(principal_subresultant_coeffs(g, &gd, var));
+                // Decline (→ `unknown`) if the subresultant determinant hits an
+                // inexact Bareiss division rather than returning a wrong factor.
+                proj.extend(principal_subresultant_coeffs(g, &gd, var)?);
             }
             // (If `g` is linear in `var`, `g'` is a nonzero constant in `var`; the
             // pair has no repeated root and the leading coefficient above suffices.)
@@ -177,7 +185,7 @@ fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>> {
         for j in (i + 1)..reducta_lists.len() {
             for g in &reducta_lists[i] {
                 for h in &reducta_lists[j] {
-                    proj.extend(principal_subresultant_coeffs(g, h, var));
+                    proj.extend(principal_subresultant_coeffs(g, h, var)?);
                 }
             }
         }
@@ -377,7 +385,7 @@ fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
                 g = crate::nlsat::elim::subst_var(&g, i as Var, &Polynomial::constant(r.clone()));
             }
             Alg::Irrational { poly, .. } => {
-                g = resultant(&g, &upoly_to_poly(poly, i as Var), i as Var);
+                g = resultant(&g, &upoly_to_poly(poly, i as Var), i as Var)?;
             }
         }
     }
@@ -394,7 +402,13 @@ fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
         // identically-zero `f` is benign. Otherwise the resultant elimination
         // degenerated spuriously and we must decline soundly.
         let d = f.degree_of(var);
-        let nullified = (0..=d).all(|k| sign_at_point(&f.coeff_of_var(var, k), sample) == 0);
+        let mut nullified = true;
+        for k in 0..=d {
+            if sign_at_point(&f.coeff_of_var(var, k), sample)? != 0 {
+                nullified = false;
+                break;
+            }
+        }
         if nullified {
             return Some(Vec::new());
         }
@@ -405,7 +419,7 @@ fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
     for beta in candidates {
         let mut point = sample.to_vec();
         point.push(beta.clone());
-        if sign_at_point(f, &point) == 0 {
+        if sign_at_point(f, &point)? == 0 {
             out.push(beta);
         }
     }
