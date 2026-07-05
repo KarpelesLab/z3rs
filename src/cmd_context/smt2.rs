@@ -3805,6 +3805,89 @@ impl Context {
         (sgn, sig, exp)
     }
 
+    /// Round a real (rational) constant to the `(eb, sb)` floating-point format
+    /// under rounding mode `rm` (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ), returning the
+    /// packed bit pattern. Handles zero, normals, subnormals, and overflow→inf/
+    /// max-finite. `None` for out-of-range magnitudes (huge exponent).
+    fn real_to_fp_bits(r: &Rational, eb: u32, sb: u32, rm: u32) -> Option<u64> {
+        let w = eb + sb;
+        let neg = r.is_negative();
+        let sign_bit = if neg { 1u64 << (w - 1) } else { 0 };
+        if r.is_zero() {
+            return Some(sign_bit);
+        }
+        let a = r.abs();
+        let bias = (1i64 << (eb - 1)) - 1;
+        let emin = 1 - bias;
+        let two = Rational::from_integer(puremp::Int::from(2));
+        let one = Rational::from_integer(puremp::Int::from(1));
+        // E = floor(log2 |a|).
+        let mut e = 0i64;
+        let mut x = a.clone();
+        let mut guard = 0u32;
+        while x >= two {
+            x = x.div(&two);
+            e += 1;
+            guard += 1;
+            if guard > 100_000 {
+                return None;
+            }
+        }
+        while x < one {
+            x = x.mul(&two);
+            e -= 1;
+            guard += 1;
+            if guard > 100_000 {
+                return None;
+            }
+        }
+        let eff_e = e.max(emin);
+        let shift = (sb as i64 - 1) - eff_e;
+        if shift.unsigned_abs() > 100_000 {
+            return None;
+        }
+        let m_exact = a.mul(&Rational::power_of_two(shift as i32));
+        let m_floor = m_exact.floor();
+        let m_floor_r = Rational::from_integer(m_floor.clone());
+        let frac = m_exact.sub(&m_floor_r); // [0, 1)
+        let half = Rational::power_of_two(-1);
+        let frac_zero = frac.is_zero();
+        let m_floor_u = m_floor.to_i64()? as u64;
+        let round_up = match rm {
+            0 => frac > half || (frac == half && (m_floor_u & 1 == 1)), // RNE
+            1 => frac >= half,                                          // RNA
+            2 => !neg && !frac_zero,                                    // RTP
+            3 => neg && !frac_zero,                                     // RTN
+            4 => false,                                                 // RTZ
+            _ => return None,
+        };
+        let m_u = if round_up { m_floor_u + 1 } else { m_floor_u };
+        let exp_field_max = (1u64 << eb) - 1; // all-ones ⇒ inf/nan
+        if e >= emin {
+            let mut biased_e = e + bias;
+            let mut mant = m_u;
+            if mant == (1u64 << sb) {
+                mant = 1u64 << (sb - 1); // rounding carried into the exponent
+                biased_e += 1;
+            }
+            if biased_e as u64 >= exp_field_max {
+                // Overflow → inf (nearest/RNA, or the "toward" direction) else max.
+                let to_inf = matches!(rm, 0 | 1) || (rm == 2 && !neg) || (rm == 3 && neg);
+                return Some(if to_inf {
+                    sign_bit | (exp_field_max << (sb - 1))
+                } else {
+                    sign_bit | ((exp_field_max - 1) << (sb - 1)) | ((1u64 << (sb - 1)) - 1)
+                });
+            }
+            let frac_bits = mant - (1u64 << (sb - 1));
+            Some(sign_bit | ((biased_e as u64) << (sb - 1)) | frac_bits)
+        } else if m_u == (1u64 << (sb - 1)) {
+            Some(sign_bit | (1u64 << (sb - 1))) // rounded up to the smallest normal
+        } else {
+            Some(sign_bit | m_u) // subnormal (biased exp 0)
+        }
+    }
+
     /// `unpack(normalize=true)` (z3): like [`fp_unpack_add`] but the significand
     /// is left-normalised (leading zeros of a subnormal shifted out) and the
     /// leading-zero count `lz` is returned so the caller adjusts the exponent.
@@ -7389,18 +7472,12 @@ impl Context {
                         let x = self.term(&l[if has_rm { 2 } else { 1 }])?;
                         if has_rm {
                             let rm = self.term(&l[1])?;
-                            if (eb, sb) == (11, 53)
-                                && self
-                                    .rm_name(rm)
-                                    .as_deref()
-                                    .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
-                                && let Some(r) = self.m.as_numeral(x)
+                            // Round a constant real/int to the target format under a
+                            // constant rounding mode — bit-exact for any (eb,sb).
+                            if let (Some(rmc), Some(r)) = (self.rm_code(rm), self.m.as_numeral(x))
+                                && let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc)
                             {
-                                let num = r.numerator().to_i64();
-                                let den = r.denominator().to_i64();
-                                if let (Some(n), Some(d)) = (num, den) {
-                                    return Ok(self.mk_fp((n as f64 / d as f64).to_bits(), 11, 53));
-                                }
+                                return Ok(self.mk_fp(bits, eb, sb));
                             }
                         } else if self.m.bv_sort_width(self.m.get_sort(x)) == Some(eb + sb)
                             && let Some(v) = self.m.bv_numeral_value(x)
