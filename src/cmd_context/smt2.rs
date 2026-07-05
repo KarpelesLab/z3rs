@@ -4465,6 +4465,234 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.fma` (fused `x·y + z` with a single rounding) — port of
+    /// z3's `mk_fma`. `None` for unsupported format/rm or unavailable bits.
+    fn fp_fma_bv(&mut self, rm: AstId, x: AstId, y: AstId, z: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb < 2 || sb < 5 || eb > sb {
+            return None; // sb ≥ 5 ⇒ z3's `too_short` padding is 0
+        }
+        let rm_c = self.rm_code(rm)?;
+        let rm_is_to_neg = rm_c == 3;
+        let w = eb + sb;
+        let bvx = self.fp_to_bv(x)?;
+        let bvy = self.fp_to_bv(y)?;
+        let bvz = self.fp_to_bv(z)?;
+        let mant = sb - 1;
+        let exp_ones_v = ((1u64 << eb) - 1) << mant;
+        let sgnbit = 1u64 << (w - 1);
+        let nan = self.fp_lit(exp_ones_v | (1u64 << (mant - 1)), w);
+        let pzero = self.fp_lit(0, w);
+        let nzero = self.fp_lit(sgnbit, w);
+        let pinf = self.fp_lit(exp_ones_v, w);
+        let ninf = self.fp_lit(exp_ones_v | sgnbit, w);
+
+        let clas = |ctx: &mut Self, bv: AstId| -> (AstId, AstId, AstId, AstId) {
+            let exp = ctx.m.mk_bv_extract(w - 2, sb - 1, bv);
+            let sigf = ctx.m.mk_bv_extract(sb - 2, 0, bv);
+            let sbit = ctx.m.mk_bv_extract(w - 1, w - 1, bv);
+            let ez = ctx.m.mk_bv(0, eb);
+            let eo = ctx.m.mk_bvnot(ez);
+            let sz = ctx.m.mk_bv(0, sb - 1);
+            let exp_ones = ctx.m.mk_eq(exp, eo);
+            let exp_zero = ctx.m.mk_eq(exp, ez);
+            let sig_zero = ctx.m.mk_eq(sigf, sz);
+            let sig_nz = ctx.m.mk_not(sig_zero);
+            let is_nan = ctx.m.mk_and(&[exp_ones, sig_nz]);
+            let is_inf = ctx.m.mk_and(&[exp_ones, sig_zero]);
+            let is_zero = ctx.m.mk_and(&[exp_zero, sig_zero]);
+            let one1 = ctx.m.mk_bv(1, 1);
+            let is_neg = ctx.m.mk_eq(sbit, one1);
+            (is_nan, is_inf, is_zero, is_neg)
+        };
+        let (x_nan, x_inf, x_zero, x_neg) = clas(self, bvx);
+        let (y_nan, y_inf, y_zero, y_neg) = clas(self, bvy);
+        let (z_nan, z_inf, z_zero, z_neg) = clas(self, bvz);
+        let x_pos = self.m.mk_not(x_neg);
+        let y_pos = self.m.mk_not(y_neg);
+        let z_pos = self.m.mk_not(z_neg);
+
+        // inf_cond = z=∞ ∧ (x.sgn ⊕ y.sgn ⊕ z.sgn).
+        let xor1a = self.m.mk_and(&[x_neg, y_pos]);
+        let xor1b = self.m.mk_and(&[x_pos, y_neg]);
+        let inf_xor1 = self.m.mk_or(&[xor1a, xor1b]);
+        let n_ix = self.m.mk_not(inf_xor1);
+        let ix2a = self.m.mk_and(&[inf_xor1, z_pos]);
+        let ix2b = self.m.mk_and(&[n_ix, z_neg]);
+        let inf_xor = self.m.mk_or(&[ix2a, ix2b]);
+        let inf_cond = self.m.mk_and(&[z_inf, inf_xor]);
+
+        // c1: any NaN.
+        let c1 = self.m.mk_or(&[x_nan, y_nan, z_nan]);
+        let v1 = nan;
+        // c2: x=+∞.
+        let c2 = self.m.mk_and(&[x_inf, x_pos]);
+        let y_sgn_inf = self.m.mk_ite(y_pos, pinf, ninf);
+        let inf_or2 = self.m.mk_or(&[y_zero, inf_cond]);
+        let v2 = self.m.mk_ite(inf_or2, nan, y_sgn_inf);
+        // c3: y=+∞.
+        let c3 = self.m.mk_and(&[y_inf, y_pos]);
+        let x_sgn_inf = self.m.mk_ite(x_pos, pinf, ninf);
+        let inf_or3 = self.m.mk_or(&[x_zero, inf_cond]);
+        let v3 = self.m.mk_ite(inf_or3, nan, x_sgn_inf);
+        // c4: x=-∞.
+        let c4 = self.m.mk_and(&[x_inf, x_neg]);
+        let neg_y_sgn_inf = self.m.mk_ite(y_pos, ninf, pinf);
+        let inf_or4 = self.m.mk_or(&[y_zero, inf_cond]);
+        let v4 = self.m.mk_ite(inf_or4, nan, neg_y_sgn_inf);
+        // c5: y=-∞.
+        let c5 = self.m.mk_and(&[y_inf, y_neg]);
+        let neg_x_sgn_inf = self.m.mk_ite(x_pos, ninf, pinf);
+        let inf_or5 = self.m.mk_or(&[x_zero, inf_cond]);
+        let v5 = self.m.mk_ite(inf_or5, nan, neg_x_sgn_inf);
+        // c6: z=±∞ → z.
+        let c6 = z_inf;
+        let v6 = bvz;
+        // c7: x=0 ∨ y=0 → z (with the c71 sign-cancel special case).
+        let c7 = self.m.mk_or(&[x_zero, y_zero]);
+        let xy_sgn_a = self.m.mk_and(&[x_neg, y_pos]);
+        let xy_sgn_b = self.m.mk_and(&[x_pos, y_neg]);
+        let xy_sgn = self.m.mk_or(&[xy_sgn_a, xy_sgn_b]);
+        let n_xy = self.m.mk_not(xy_sgn);
+        let xyz_a = self.m.mk_and(&[xy_sgn, z_pos]);
+        let xyz_b = self.m.mk_and(&[n_xy, z_neg]);
+        let xyz_sgn = self.m.mk_or(&[xyz_a, xyz_b]);
+        let c71 = self.m.mk_and(&[z_zero, xyz_sgn]);
+        let zero_cond = if rm_is_to_neg { nzero } else { pzero };
+        let v7 = self.m.mk_ite(c71, zero_cond, bvz);
+
+        // === fused core ===
+        let (a_sgn, a_sig, a_exp, a_lz) = self.fp_unpack_norm(bvx, eb, sb);
+        let (b_sgn, b_sig, b_exp, b_lz) = self.fp_unpack_norm(bvy, eb, sb);
+        let (c_sgn, c_sig, c_exp, c_lz) = self.fp_unpack_norm(bvz, eb, sb);
+        let a_lz_e = self.m.mk_bv_zero_extend(2, a_lz);
+        let b_lz_e = self.m.mk_bv_zero_extend(2, b_lz);
+        let c_lz_e = self.m.mk_bv_zero_extend(2, c_lz);
+        let a_sig_e = self.m.mk_bv_zero_extend(sb, a_sig); // 2sb
+        let b_sig_e = self.m.mk_bv_zero_extend(sb, b_sig);
+        let a_exp_e = self.m.mk_bv_sign_extend(2, a_exp); // eb+2
+        let b_exp_e = self.m.mk_bv_sign_extend(2, b_exp);
+        let c_exp_e0 = self.m.mk_bv_sign_extend(2, c_exp);
+        let mul_sgn = self.m.mk_bvxor(a_sgn, b_sgn);
+        let ta = self.m.mk_bvsub(a_exp_e, a_lz_e);
+        let tb = self.m.mk_bvsub(b_exp_e, b_lz_e);
+        let mul_exp = self.m.mk_bvadd(ta, tb); // eb+2
+        let mul_sig0 = self.m.mk_bvmul(a_sig_e, b_sig_e); // 2sb
+        let z_sb2 = self.m.mk_bv(0, sb + 2);
+        let c_cat = self.m.mk_bv_concat(c_sig, z_sb2); // 2sb+1
+        let c_sig_ext = self.m.mk_bv_zero_extend(1, c_cat); // 2sb+2
+        let c_exp_ext = self.m.mk_bvsub(c_exp_e0, c_lz_e); // eb+2
+        let z3b = self.m.mk_bv(0, 3);
+        let mul_sig = self.m.mk_bv_concat(mul_sig0, z3b); // 2sb+3
+        let swap_cond = self.m.mk_bvsle(mul_exp, c_exp_ext);
+        let e_sgn = self.m.mk_ite(swap_cond, c_sgn, mul_sgn);
+        let e_sig = self.m.mk_ite(swap_cond, c_sig_ext, mul_sig); // 2sb+3
+        let e_exp = self.m.mk_ite(swap_cond, c_exp_ext, mul_exp); // eb+2
+        let f_sgn = self.m.mk_ite(swap_cond, mul_sgn, c_sgn);
+        let f_sig = self.m.mk_ite(swap_cond, mul_sig, c_sig_ext); // 2sb+3
+        let f_exp = self.m.mk_ite(swap_cond, mul_exp, c_exp_ext); // eb+2
+        let exp_delta0 = self.m.mk_bvsub(e_exp, f_exp);
+        let cap = self.m.mk_bv((2 * sb + 3) as i64, eb + 2);
+        let cap_le = self.m.mk_bvule(cap, exp_delta0);
+        let exp_delta = self.m.mk_ite(cap_le, cap, exp_delta0); // eb+2
+        let z_sb = self.m.mk_bv(0, sb);
+        let f_cat = self.m.mk_bv_concat(f_sig, z_sb); // 3sb+3
+        let delta_ext = self.m.mk_bv_zero_extend((3 * sb + 3) - (eb + 2), exp_delta); // 3sb+3
+        let shifted_big = self.m.mk_bvlshr(f_cat, delta_ext); // 3sb+3
+        let shifted_f_sig = self.m.mk_bv_extract(3 * sb + 2, sb, shifted_big); // 2sb+3
+        let align_raw = self.m.mk_bv_extract(sb - 1, 0, shifted_big); // sb
+        let araw_z = self.m.mk_bv(0, sb);
+        let araw_zero = self.m.mk_eq(align_raw, araw_z);
+        let zero1 = self.m.mk_bv(0, 1);
+        let one1 = self.m.mk_bv(1, 1);
+        let align_sticky = self.m.mk_ite(araw_zero, zero1, one1); // 1
+        let e_sig5 = self.m.mk_bv_zero_extend(2, e_sig); // 2sb+5
+        let sf_sig5 = self.m.mk_bv_zero_extend(2, shifted_f_sig); // 2sb+5
+        let eq_sgn = self.m.mk_eq(e_sgn, f_sgn);
+        let sticky_wide = self.m.mk_bv_zero_extend(2 * sb + 4, align_sticky); // 2sb+5
+        let epf0 = self.m.mk_bvadd(e_sig5, sf_sig5);
+        let epf_lsb = self.m.mk_bv_extract(0, 0, epf0);
+        let epf_lsb0 = self.m.mk_eq(epf_lsb, zero1);
+        let epf_add = self.m.mk_bvadd(epf0, sticky_wide);
+        let e_plus_f = self.m.mk_ite(epf_lsb0, epf_add, epf0);
+        let emf0 = self.m.mk_bvsub(e_sig5, sf_sig5);
+        let emf_lsb = self.m.mk_bv_extract(0, 0, emf0);
+        let emf_lsb0 = self.m.mk_eq(emf_lsb, zero1);
+        let emf_sub = self.m.mk_bvsub(emf0, sticky_wide);
+        let e_minus_f = self.m.mk_ite(emf_lsb0, emf_sub, emf0);
+        let sum = self.m.mk_ite(eq_sgn, e_plus_f, e_minus_f); // 2sb+5
+        let sign_bv = self.m.mk_bv_extract(2 * sb + 4, 2 * sb + 4, sum);
+        let n_sum = self.m.mk_bvneg(sum);
+        let sign_eq1 = self.m.mk_eq(sign_bv, one1);
+        let sig_abs = self.m.mk_ite(sign_eq1, n_sum, sum); // 2sb+5, ≥ 0
+        let not_e = self.m.mk_bvnot(e_sgn);
+        let not_f = self.m.mk_bvnot(f_sgn);
+        let not_sb = self.m.mk_bvnot(sign_bv);
+        let rc1 = self.m.mk_bvand(not_e, f_sgn);
+        let rc1 = self.m.mk_bvand(rc1, sign_bv);
+        let rc2 = self.m.mk_bvand(e_sgn, not_f);
+        let rc2 = self.m.mk_bvand(rc2, not_sb);
+        let rc3 = self.m.mk_bvand(e_sgn, f_sgn);
+        let res_sgn = self.m.mk_bvor(rc1, rc2);
+        let res_sgn = self.m.mk_bvor(res_sgn, rc3);
+        let extra = self.m.mk_bv_extract(2 * sb + 4, 2 * sb + 3, sig_abs); // 2
+        let extra_z = self.m.mk_bv(0, 2);
+        let extra_is_zero = self.m.mk_eq(extra, extra_z);
+        let one_e2 = self.m.mk_bv(1, eb + 2);
+        let e_exp_p1 = self.m.mk_bvadd(e_exp, one_e2);
+        let res_exp = self.m.mk_ite(extra_is_zero, e_exp, e_exp_p1); // eb+2
+        let min_exp = self.fp_ilit(2 - (1i64 << (eb - 1)), eb);
+        let min_exp = self.m.mk_bv_sign_extend(2, min_exp); // eb+2
+        let sig_lz0 = self.fp_leading_zeros(sig_abs, eb + 2);
+        let two_e2 = self.m.mk_bv(2, eb + 2);
+        let sig_lz = self.m.mk_bvsub(sig_lz0, two_e2);
+        let max_delta = self.m.mk_bvsub(res_exp, min_exp);
+        let lz_le = self.m.mk_bvsle(sig_lz, max_delta);
+        let sig_lz_capped = self.m.mk_ite(lz_le, sig_lz, max_delta);
+        let zero_e2 = self.m.mk_bv(0, eb + 2);
+        let ge0 = self.m.mk_bvsle(zero_e2, sig_lz_capped);
+        let renorm = self.m.mk_ite(ge0, sig_lz_capped, zero_e2);
+        let res_exp = self.m.mk_bvsub(res_exp, renorm);
+        let renorm_ext = self.m.mk_bv_zero_extend(2 * sb + 3 - eb, renorm); // 2sb+5
+        let sig_abs = self.m.mk_bvshl(sig_abs, renorm_ext); // 2sb+5
+        // Round-significand assembly (too_short = 0).
+        let sticky_h1 = self.m.mk_bv_extract(sb - 2, 0, sig_abs); // sb-1
+        let sig_abs_h1 = self.m.mk_bv_extract(2 * sb + 4, sb - 1, sig_abs); // sb+6
+        let sh1z = self.m.mk_bv(0, sb - 1);
+        let sh1_eq = self.m.mk_eq(sticky_h1, sh1z);
+        let sh1_nz = self.m.mk_not(sh1_eq);
+        let sh1_bit = self.m.mk_ite(sh1_nz, one1, zero1);
+        let sh1_red = self.m.mk_bv_zero_extend(sb + 5, sh1_bit); // sb+6
+        let h1_f = self.m.mk_bvor(sig_abs_h1, sh1_red); // sb+6
+        let res_sig_1 = self.m.mk_bv_extract(sb + 3, 0, h1_f); // sb+4
+        let sig_abs_h2 = self.m.mk_bv_extract(2 * sb + 4, sb, sig_abs); // sb+5
+        let sh2_red = self.m.mk_bv_zero_extend(sb + 4, sh1_bit); // sb+5 (z3 uses sticky_h1)
+        let h2_or = self.m.mk_bvor(sig_abs_h2, sh2_red); // sb+5
+        let h2_f = self.m.mk_bv_zero_extend(1, h2_or); // sb+6
+        let res_sig_2 = self.m.mk_bv_extract(sb + 3, 0, h2_f); // sb+4
+        let res_sig = self.m.mk_ite(extra_is_zero, res_sig_1, res_sig_2); // sb+4
+        let nil_s4 = self.m.mk_bv(0, sb + 4);
+        let is_zero_sig = self.m.mk_eq(res_sig, nil_s4);
+        let zero_case = if rm_is_to_neg { nzero } else { pzero };
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rounded = self.fp_round(rm3, res_sgn, res_sig, res_exp, eb, sb);
+        let v8 = self.m.mk_ite(is_zero_sig, zero_case, rounded);
+
+        // Tie together (lower index wins).
+        let r = self.m.mk_ite(c7, v7, v8);
+        let r = self.m.mk_ite(c6, v6, r);
+        let r = self.m.mk_ite(c5, v5, r);
+        let r = self.m.mk_ite(c4, v4, r);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Bit-blast `fp.roundToIntegral` on a symbolic operand (port of z3's
     /// `mk_round_to_integral`). The rounding mode is a constant, so its many
     /// per-mode branches collapse at build time. `None` for unsupported bits.
@@ -4706,6 +4934,12 @@ impl Context {
             }
             "fp.roundToIntegral" if args.len() == 2 => {
                 if let Some(t) = self.fp_r2i_bv(args[0], args[1]) {
+                    return Ok(t);
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.fma" if args.len() == 4 => {
+                if let Some(t) = self.fp_fma_bv(args[0], args[1], args[2], args[3]) {
                     return Ok(t);
                 }
                 self.symbolic_fp(op, args)
