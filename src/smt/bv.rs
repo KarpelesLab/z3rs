@@ -208,9 +208,18 @@ impl<'a> BitBlaster<'a> {
 
     /// Per-bit multiplexer: `sel ? then : els`.
     fn mux(&mut self, sel: Lit, then: &[Lit], els: &[Lit]) -> Vec<Lit> {
+        if sel == self.true_lit {
+            return then.to_vec();
+        }
+        if sel == !self.true_lit {
+            return els.to_vec();
+        }
         then.iter()
             .zip(els)
             .map(|(&t, &e)| {
+                if t == e {
+                    return t; // both branches agree on this bit
+                }
                 let a = self.and2(sel, t);
                 let b = self.and2(!sel, e);
                 self.or2(a, b)
