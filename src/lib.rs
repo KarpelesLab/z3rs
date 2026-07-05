@@ -42,7 +42,8 @@
 //! | [`parsers`]     | 8     | `parsers`                                             |
 //! | [`api`]         | 9     | `api` (C ABI + safe Rust surface)                     |
 //!
-//! Nothing below is functional yet — every module is a documented scaffold.
+//! Most modules are functional (see [`ROADMAP.md`](../ROADMAP.md) for live
+//! phase status); a few upper-layer components remain documented scaffolds.
 
 // `no_std` by default; `alloc` is always required. `std` (feature) or `test`
 // builds pull in the standard library.

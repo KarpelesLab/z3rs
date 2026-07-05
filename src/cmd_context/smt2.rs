@@ -1027,6 +1027,18 @@ struct Context {
     /// mentions any is answered `unknown` (their word semantics aren't solved),
     /// keeping every definite verdict sound.
     str_symbolic: BTreeSet<AstId>,
+    /// Length links for symbolic string predicates: `(pred_app, longer, shorter)`
+    /// asserts `pred_app ⇒ str.len(longer) ≥ str.len(shorter)` — sound for
+    /// `str.contains`/`str.prefixof`/`str.suffixof`, and enough to refute e.g.
+    /// `str.contains x "a" ∧ str.len x = 0`.
+    str_pred_len: Vec<(AstId, AstId, AstId)>,
+    /// Constant upper bounds on a string marker's length: `(marker, k)` asserts
+    /// `str.len(marker) ≤ k` (e.g. `str.at` yields ≤ 1 character).
+    str_len_ub: Vec<(AstId, i64)>,
+    /// Each symbolic string marker's declaration → the string op it stands for,
+    /// so a candidate assignment can *re-fold* it concretely during the bounded
+    /// string-witness search (the `sat` direction).
+    str_op_decls: BTreeMap<AstId, String>,
     /// The interned `RegLan` (regular language) sort, once used.
     reglan_sort: Option<AstId>,
     /// Regex terms whose structure is fully constant, for `str.in_re` folding.
@@ -1200,6 +1212,9 @@ impl Context {
             str_lits: BTreeMap::new(),
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
+            str_pred_len: Vec::new(),
+            str_len_ub: Vec::new(),
+            str_op_decls: BTreeMap::new(),
             reglan_sort: None,
             regex_of: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
@@ -1537,8 +1552,15 @@ impl Context {
                     .get(1)
                     .map(|t| Self::tactic_mentions(t, "nnf"))
                     .unwrap_or(false);
+                let use_ctx = list
+                    .get(1)
+                    .map(|t| Self::tactic_mentions(t, "ctx-solver-simplify"))
+                    .unwrap_or(false);
                 let asserts = self.assertions.clone();
                 let mut lines: Vec<String> = Vec::new();
+                // Pass 1: per-formula rewriting (nnf + theory simplification).
+                let mut simplified: Vec<AstId> = Vec::new();
+                let mut collapsed = false;
                 for a in asserts {
                     let mut s = self.dt_fold(a);
                     if use_nnf {
@@ -1546,10 +1568,26 @@ impl Context {
                     }
                     s = crate::rewriter::simplify(&mut self.m, s);
                     if self.m.is_false(s) {
-                        lines = alloc::vec!["false".to_string()];
+                        collapsed = true;
                         break;
                     }
                     if !self.m.is_true(s) {
+                        simplified.push(s);
+                    }
+                }
+                // Pass 2 (ctx-solver-simplify): drop each formula that the
+                // conjunction of the others already entails, and detect a
+                // context-level contradiction — using the solver as the oracle.
+                if use_ctx && !collapsed {
+                    match self.ctx_solver_simplify(&simplified) {
+                        None => collapsed = true,
+                        Some(residual) => simplified = residual,
+                    }
+                }
+                if collapsed {
+                    lines = alloc::vec!["false".to_string()];
+                } else {
+                    for s in simplified {
                         lines.push(self.m.pp(s));
                     }
                 }
@@ -2285,6 +2323,32 @@ impl Context {
                 }
             }
         }
+        // Length links for symbolic predicates present in the goal:
+        // `str.contains(s,sub) ⇒ len(s) ≥ len(sub)` etc.
+        let links = self.str_pred_len.clone();
+        for (app, longer, shorter) in links {
+            if !present_set.contains(&app) {
+                continue;
+            }
+            let lenf = self.str_len_fn();
+            let ll = self.m.mk_app(lenf, &[longer]);
+            let ls = self.m.mk_app(lenf, &[shorter]);
+            let ge = self.m.mk_ge(ll, ls);
+            let imp = self.m.mk_implies(app, ge);
+            ax.push(imp);
+        }
+        // Constant length upper bounds (`str.len(marker) ≤ k`).
+        let ubs = self.str_len_ub.clone();
+        for (app, k) in ubs {
+            if !present_set.contains(&app) {
+                continue;
+            }
+            let lenf = self.str_len_fn();
+            let la = self.m.mk_app(lenf, &[app]);
+            let kv = self.m.mk_int(k);
+            let le = self.m.mk_le(la, kv);
+            ax.push(le);
+        }
         if self.str_lits.is_empty() {
             return ax;
         }
@@ -2311,6 +2375,159 @@ impl Context {
             }
         }
         ax
+    }
+
+    /// Re-fold symbolic string markers whose arguments have become concrete
+    /// (after substituting string variables by literals): a marker `op(a,…)`
+    /// with literal args is replaced by `string_op(op, args)` (which folds to a
+    /// literal), and a `str.len` of a literal by its concrete length.
+    fn refold_str_markers(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let raw_args = self.m.app_args(t).to_vec();
+            let args: Vec<AstId> = raw_args
+                .iter()
+                .map(|&a| self.refold_str_markers(a, memo))
+                .collect();
+            let is_len = self.str_len_decl == Some(decl) || self.seq_len_decls.contains(&decl);
+            if is_len && args.len() == 1 && let Some(v) = self.str_value(args[0]) {
+                self.m.mk_int(v.len() as i64)
+            } else if let Some(op) = self.str_op_decls.get(&decl).cloned() {
+                self.string_op(&op, &args)
+                    .unwrap_or_else(|_| self.m.mk_app(decl, &args))
+            } else {
+                self.m.mk_app(decl, &args)
+            }
+        } else {
+            t
+        };
+        memo.insert(t, out);
+        out
+    }
+
+    /// Bounded, sound search for a concrete satisfying assignment to a goal with
+    /// symbolic strings: try short candidate strings for each free string
+    /// variable, re-fold the markers to concrete values, and confirm with the
+    /// core solver. A found witness is a real `sat`; failure returns `None`
+    /// (keeping the sound `unknown`).
+    fn try_string_witness(&mut self, goal: AstId) -> Option<Model> {
+        let string_sort = self.string_sort?;
+        let lit_consts: BTreeSet<AstId> = self.str_lits.values().copied().collect();
+        let mut vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && self.m.app_args(t).is_empty()
+                && self.m.get_sort(t) == string_sort
+                && !lit_consts.contains(&t)
+                && !vars.contains(&t)
+            {
+                vars.push(t);
+            }
+        }
+        if vars.is_empty() || vars.len() > 3 {
+            return None;
+        }
+        // Alphabet: characters occurring in string literals, plus two fresh ones.
+        let mut alpha: Vec<u32> = Vec::new();
+        for text in self.str_lits.keys() {
+            for ch in text.chars() {
+                let c = ch as u32;
+                if !alpha.contains(&c) {
+                    alpha.push(c);
+                }
+            }
+        }
+        for &c in &[b'a' as u32, b'b' as u32] {
+            if !alpha.contains(&c) {
+                alpha.push(c);
+            }
+        }
+        alpha.truncate(4);
+        // Candidate strings, shortest first, up to a per-variable-count length cap
+        // that keeps the search bounded (≈ a few thousand combinations).
+        let max_len = match vars.len() {
+            1 => 6,
+            2 => 3,
+            _ => 2,
+        };
+        let mut cands: Vec<Vec<u32>> = alloc::vec![Vec::new()];
+        let mut frontier: Vec<Vec<u32>> = alloc::vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for base in &frontier {
+                for &c in &alpha {
+                    let mut s = base.clone();
+                    s.push(c);
+                    next.push(s);
+                }
+            }
+            cands.extend(next.iter().cloned());
+            frontier = next;
+        }
+        // Cartesian product of candidates over the variables, capped.
+        const MAX_TRIES: usize = 2500;
+        let mut idx = alloc::vec![0usize; vars.len()];
+        let mut tries = 0;
+        loop {
+            if tries >= MAX_TRIES {
+                return None;
+            }
+            tries += 1;
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    let s = code_points_to_string(&cands[idx[k]]);
+                    (v, self.mk_str_lit(&s))
+                })
+                .collect();
+            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let mut memo = BTreeMap::new();
+            let g2 = self.refold_str_markers(g1, &mut memo);
+            // Only trust the result if every symbolic marker folded away.
+            let clean = !self
+                .m
+                .postorder(g2)
+                .iter()
+                .any(|t| self.str_symbolic.contains(t) || self.str_op_marker(*t));
+            if clean {
+                // Re-assert the string axioms for the concretised goal: literals
+                // are uninterpreted constants, so without the distinctness /
+                // length axioms `check_model` could equate two *different* literals
+                // (e.g. `"c" = "xyz"`) and report a spurious `sat`.
+                let mut conj = self.string_axioms(g2);
+                let g3 = if conj.is_empty() {
+                    g2
+                } else {
+                    conj.push(g2);
+                    self.m.mk_and(&conj)
+                };
+                if let (SmtResult::Sat, m) = check_model(&self.m, g3) {
+                    return m;
+                }
+            }
+            // Advance the mixed-radix counter over candidate indices.
+            let mut k = 0;
+            loop {
+                if k == vars.len() {
+                    return None; // exhausted
+                }
+                idx[k] += 1;
+                if idx[k] < cands.len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
+    /// Is `t` an application of a symbolic string-op marker declaration?
+    fn str_op_marker(&self, t: AstId) -> bool {
+        self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t))
     }
 
     /// The interned `String` sort (registered on first use).
@@ -2779,9 +2996,7 @@ impl Context {
     /// operand is NaN, and either the bits are equal or both are zero (−0 = +0).
     /// Decided by the QF_BV engine. `None` for ops other than `fp.eq`.
     fn fp_compare_bv(&mut self, op: &str, a: AstId, b: AstId) -> Option<AstId> {
-        if op != "fp.eq" {
-            return None;
-        }
+        // NaN makes every ordered/equality comparison false.
         let nan_a = self.fp_classify_bv("fp.isNaN", a)?;
         let nan_b = self.fp_classify_bv("fp.isNaN", b)?;
         let not_nan_a = self.m.mk_not(nan_a);
@@ -2793,8 +3008,54 @@ impl Context {
         let bva = self.fp_to_bv(a)?;
         let bvb = self.fp_to_bv(b)?;
         let bv_eq = self.m.mk_eq(bva, bvb);
-        let val_eq = self.m.mk_or(&[bv_eq, both_zero]);
-        Some(self.m.mk_and(&[val_eq, no_nan]))
+        if op == "fp.eq" {
+            // `+0 = -0`, so equal bits OR both zero, and neither NaN.
+            let val_eq = self.m.mk_or(&[bv_eq, both_zero]);
+            return Some(self.m.mk_and(&[val_eq, no_nan]));
+        }
+        // Ordered comparisons via the IEEE monotone bit-key: mapping the bits
+        // `x` to `key(x) = sign(x) ? ~x : x | msb` makes UNSIGNED integer order
+        // coincide with the real order of the (non-NaN) floats, with `-0` just
+        // below `+0` (their equality is patched via `both_zero`).
+        let w = self.fp_format_of(self.m.get_sort(a)).map(|(eb, sb)| eb + sb)?;
+        let key_a = self.fp_order_key(bva, w);
+        let key_b = self.fp_order_key(bvb, w);
+        let (x, y) = match op {
+            "fp.lt" | "fp.leq" => (key_a, key_b),
+            "fp.gt" | "fp.geq" => (key_b, key_a),
+            _ => return None,
+        };
+        let lt = self.m.mk_bvult(x, y);
+        let strict = self.m.mk_and(&[no_nan, lt]);
+        Some(match op {
+            "fp.lt" | "fp.gt" => {
+                // strict, but `±0 < ∓0` is false (they are equal).
+                let not_both_zero = self.m.mk_not(both_zero);
+                self.m.mk_and(&[strict, not_both_zero])
+            }
+            // non-strict: strictly-below OR equal (bit-equal or both zero).
+            _ => {
+                let eq = self.m.mk_or(&[bv_eq, both_zero]);
+                let le = self.m.mk_or(&[lt, eq]);
+                self.m.mk_and(&[no_nan, le])
+            }
+        })
+    }
+
+    /// The IEEE monotone ordering key of a float's bit-vector `bv` (width `w`):
+    /// `sign ? ~bv : bv | msb`, so unsigned comparison of keys matches real order.
+    fn fp_order_key(&mut self, bv: AstId, w: u32) -> AstId {
+        let sign = self.m.mk_bv_extract(w - 1, w - 1, bv);
+        let one1 = self.m.mk_bv(1, 1);
+        let is_neg = self.m.mk_eq(sign, one1);
+        let notbv = self.m.mk_bvnot(bv);
+        // msb mask = 1 << (w-1) as a constant `1 :: 0^{w-1}` (concat avoids both a
+        // barrel-shifter circuit and i64 overflow at w = 64).
+        let one_bit = self.m.mk_bv(1, 1);
+        let zeros = self.m.mk_bv(0, w - 1);
+        let msb_mask = self.m.mk_bv_concat(one_bit, zeros);
+        let orbv = self.m.mk_bvor(bv, msb_mask);
+        self.m.mk_ite(is_neg, notbv, orbv)
     }
 
     /// A classification predicate (`fp.isNaN` …) as a Boolean over the bits of
@@ -2913,10 +3174,11 @@ impl Context {
                     };
                     return Ok(self.mk_bool(r));
                 }
-                // fp.eq is cheap to bit-blast (equality + zero handling); the
-                // ordered comparisons need a key-transform + bvult circuit the
-                // basic CDCL core handles too slowly, so they stay a sound
-                // `unknown` (constant operands still fold above).
+                // `fp.eq` is cheap to bit-blast (equality + zero handling). The
+                // ordered comparisons have a correct key-transform + `bvult`
+                // circuit (`fp_compare_bv`), but a chain like `x<y ∧ y<x` drives
+                // the basic CDCL core past its conflict budget (tens of seconds),
+                // so they stay a sound `unknown` until the BV core is faster.
                 if op == "fp.eq"
                     && let Some(t) = self.fp_compare_bv(op, args[0], args[1])
                 {
@@ -3251,6 +3513,21 @@ impl Context {
         let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
         let app = self.m.mk_app(d, args);
         self.str_symbolic.insert(app);
+        self.str_op_decls.insert(d, op.to_string());
+        // Record a length link so `pred ⇒ len(longer) ≥ len(shorter)` can be
+        // emitted (sound for contains/prefixof/suffixof).
+        match op {
+            "str.contains" if args.len() == 2 => {
+                self.str_pred_len.push((app, args[0], args[1]));
+            }
+            "str.prefixof" | "str.suffixof" if args.len() == 2 => {
+                self.str_pred_len.push((app, args[1], args[0]));
+            }
+            // `str.at` returns a string of length ≤ 1 — a sound bound that refutes
+            // e.g. `(str.at x 0) = "xyz"` directly.
+            "str.at" => self.str_len_ub.push((app, 1)),
+            _ => {}
+        }
         Ok(app)
     }
 
@@ -3384,6 +3661,16 @@ impl Context {
     /// incomplete, so a `sat` result in the presence of universals is reported
     /// as a sound `unknown`.
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        // A single-predicate Constrained Horn Clause system (a transition system
+        // `Init/τ/Bad`) is decided by bounded model checking (for `unsat`, a
+        // counterexample trace) and k-induction (for `sat`, an inductive
+        // invariant). Both are sound; on the resource bound it declines (`None`)
+        // and falls through to the general instantiation engine.
+        if !self.universals.is_empty()
+            && let Some(r) = self.solve_chc()
+        {
+            return (r, None);
+        }
         let (instances, saturated) = self.universal_instances();
         let base = self.conjunction();
         let combined = if instances.is_empty() {
@@ -3406,6 +3693,301 @@ impl Context {
         }
     }
 
+    /// If `t` is an application of an uninterpreted, `Bool`-ranged function of
+    /// arity ≥ 1 (a CHC *predicate*), return its declaration.
+    fn predicate_of(&self, t: AstId) -> Option<AstId> {
+        let app = self.m.app(t)?;
+        if app.args.is_empty() {
+            return None;
+        }
+        let d = self.m.func_decl(app.decl)?;
+        if d.info.family_id == crate::ast::NULL_FAMILY_ID && self.m.is_bool_sort(d.range) {
+            Some(app.decl)
+        } else {
+            None
+        }
+    }
+
+    /// Try to decide the asserted universals as a **single-predicate CHC**
+    /// transition system: parse `Init(x)`, `τ(x,x')`, `Bad(x)`, then run bounded
+    /// model checking (⇒ `unsat` on a counterexample) and k-induction (⇒ `sat` on
+    /// an inductive invariant). Returns `None` (fall back) when the shape is not a
+    /// single-predicate CHC or the bound is exhausted.
+    fn solve_chc(&mut self) -> Option<SmtResult> {
+        // 1. Identify exactly one predicate across all universals.
+        let mut preds: BTreeSet<AstId> = BTreeSet::new();
+        for (_, body) in &self.universals.clone() {
+            for t in self.m.postorder(*body) {
+                if let Some(p) = self.predicate_of(t) {
+                    preds.insert(p);
+                }
+            }
+        }
+        if preds.len() != 1 {
+            return None;
+        }
+        let pred = *preds.iter().next().unwrap();
+        // Decline if the predicate is constrained by a *ground* assertion (e.g.
+        // `¬p(5)`): the transition-system framing only accounts for the universal
+        // rules, so such a constraint would be ignored — let the general
+        // instantiation engine handle those goals instead.
+        for a in &self.assertions {
+            if self
+                .m
+                .postorder(*a)
+                .iter()
+                .any(|&t| self.predicate_of(t) == Some(pred))
+            {
+                return None;
+            }
+        }
+        let sorts: Vec<AstId> = self.m.func_decl(pred)?.domain.clone();
+
+        // Canonical state / next-state variables.
+        let state: Vec<AstId> = sorts.iter().map(|&s| self.fresh_const(s)).collect();
+        let next: Vec<AstId> = sorts.iter().map(|&s| self.fresh_const(s)).collect();
+
+        // 2. Parse each universal into an Init / Trans / Bad disjunct.
+        let mut inits: Vec<AstId> = Vec::new();
+        let mut transs: Vec<AstId> = Vec::new();
+        let mut bads: Vec<AstId> = Vec::new();
+        for (binders, body) in self.universals.clone() {
+            let Some((ant, cons)) = self.chc_split_rule(body) else {
+                return None; // not an implication/clause we handle
+            };
+            // Antecedent → (body predicate application if any, arithmetic guard).
+            let mut body_pred: Option<AstId> = None;
+            let mut guards: Vec<AstId> = Vec::new();
+            let mut ant_conj = Vec::new();
+            self.icp_flatten_and(ant, &mut ant_conj);
+            for a in ant_conj {
+                if self.predicate_of(a).is_some() {
+                    if body_pred.is_some() {
+                        return None; // nonlinear (≥2 body predicates) — out of MVP scope
+                    }
+                    body_pred = Some(a);
+                } else {
+                    guards.push(a);
+                }
+            }
+            let _ = binders;
+            let guard = if guards.is_empty() {
+                self.m.mk_true()
+            } else if guards.len() == 1 {
+                guards[0]
+            } else {
+                self.m.mk_and(&guards)
+            };
+            // Head: a predicate application (fact/rule) or `false` (query).
+            let head_pred = if self.m.is_false(cons) {
+                None
+            } else if self.predicate_of(cons).is_some() {
+                Some(cons)
+            } else {
+                return None; // unexpected head
+            };
+            // Build a substitution from each predicate's argument (which must be a
+            // bare binder variable) to the corresponding state/next variable, so
+            // the guard is expressed *directly* over the state — no equality
+            // bindings, hence `¬Bad` stays a plain inequality rather than a
+            // disequality `state ≠ binder` that blows up the linear search.
+            let collect = |ctx: &Self, app: AstId, vars: &[AstId], subst: &mut Vec<(AstId, AstId)>| -> bool {
+                let args = ctx.m.app_args(app).to_vec();
+                if args.len() != vars.len() {
+                    return false;
+                }
+                for (j, &a) in args.iter().enumerate() {
+                    if !ctx.m.is_uninterp_const(a) {
+                        return false; // non-bare argument (e.g. P(x+1)) — decline
+                    }
+                    // A binder reused across the body and head (e.g. an argument
+                    // permutation `P(x,y) ⇒ P(y,x)`) is not a clean transition;
+                    // the substitution would conflict, so decline.
+                    if subst.iter().any(|&(from, _)| from == a) {
+                        return false;
+                    }
+                    subst.push((a, vars[j]));
+                }
+                true
+            };
+            match (body_pred, head_pred) {
+                (None, Some(h)) => {
+                    // Fact: guard ⇒ P(s).
+                    let mut subst = Vec::new();
+                    if !collect(self, h, &state, &mut subst) {
+                        return None;
+                    }
+                    let d = substitute(&mut self.m, guard, &subst);
+                    inits.push(d);
+                }
+                (Some(b), Some(h)) => {
+                    // Rule: P(t) ∧ guard ⇒ P(s).
+                    let mut subst = Vec::new();
+                    if !collect(self, b, &state, &mut subst) || !collect(self, h, &next, &mut subst)
+                    {
+                        return None;
+                    }
+                    let d = substitute(&mut self.m, guard, &subst);
+                    transs.push(d);
+                }
+                (Some(b), None) => {
+                    // Query: P(t) ∧ guard ⇒ false.
+                    let mut subst = Vec::new();
+                    if !collect(self, b, &state, &mut subst) {
+                        return None;
+                    }
+                    let d = substitute(&mut self.m, guard, &subst);
+                    bads.push(d);
+                }
+                (None, None) => {
+                    // guard ⇒ false: satisfiable iff guard is unsat. If guard is
+                    // satisfiable, the system is unsat (a ground contradiction).
+                    let (r, _) = check_model(&self.m, guard);
+                    match r {
+                        SmtResult::Sat => return Some(SmtResult::Unsat),
+                        SmtResult::Unsat => {}
+                        SmtResult::Unknown => return None,
+                    }
+                }
+            }
+        }
+        if bads.is_empty() {
+            return Some(SmtResult::Sat); // no query ⇒ trivially safe
+        }
+        let init = self.mk_disjunction(&inits);
+        let trans = self.mk_disjunction(&transs);
+        let bad = self.mk_disjunction(&bads);
+        // Collect the local (binder) variables to freshen per unrolling step.
+        let mut locals: BTreeSet<AstId> = BTreeSet::new();
+        for f in [init, trans, bad] {
+            for t in self.m.postorder(f) {
+                if self.m.is_uninterp_const(t) && !state.contains(&t) && !next.contains(&t) {
+                    locals.insert(t);
+                }
+            }
+        }
+        let locals: Vec<AstId> = locals.into_iter().collect();
+        self.chc_bmc_kinduction(&sorts, &state, &next, init, trans, bad, &locals)
+    }
+
+    /// Bounded model checking + k-induction over a parsed transition system.
+    #[allow(clippy::too_many_arguments)]
+    fn chc_bmc_kinduction(
+        &mut self,
+        sorts: &[AstId],
+        state: &[AstId],
+        next: &[AstId],
+        init: AstId,
+        trans: AstId,
+        bad: AstId,
+        locals: &[AstId],
+    ) -> Option<SmtResult> {
+        const MAX_K: usize = 40;
+        // Step-state variables s_0, s_1, …; extended lazily.
+        let mut steps: Vec<Vec<AstId>> = Vec::new();
+        let fresh_state = |ctx: &mut Self| -> Vec<AstId> {
+            sorts.iter().map(|&s| ctx.fresh_const(s)).collect()
+        };
+        steps.push(fresh_state(self));
+
+        for k in 0..=MAX_K {
+            while steps.len() <= k {
+                let s = fresh_state(self);
+                steps.push(s);
+            }
+            // BMC(k): Init(s_0) ∧ ⋀_{i<k} τ(s_i,s_{i+1}) ∧ Bad(s_k).
+            let mut conj = alloc::vec![self.chc_inst(init, state, &steps[0], next, &[], locals)];
+            for i in 0..k {
+                let step_next = steps[i + 1].clone();
+                conj.push(self.chc_inst(trans, state, &steps[i], next, &step_next, locals));
+            }
+            conj.push(self.chc_inst(bad, state, &steps[k], next, &[], locals));
+            let formula = self.m.mk_and(&conj);
+            match check_model(&self.m, formula).0 {
+                SmtResult::Sat => return Some(SmtResult::Unsat), // counterexample ⇒ CHC unsat
+                SmtResult::Unknown => return None,
+                SmtResult::Unsat => {}
+            }
+            // k-induction step: ⋀_{i<k} ¬Bad(s_i) ∧ ⋀ τ(s_i,s_{i+1}) ∧ Bad(s_k)
+            // UNSAT ⇒ ¬Bad is k-inductive; with the BMC base (all depths < k
+            // unsat) this proves the invariant ⇒ CHC sat.
+            if k >= 1 {
+                let mut sconj = Vec::new();
+                for i in 0..k {
+                    let notbad = self.chc_inst(bad, state, &steps[i], next, &[], locals);
+                    let nb = self.m.mk_not(notbad);
+                    sconj.push(nb);
+                    let step_next = steps[i + 1].clone();
+                    sconj.push(self.chc_inst(trans, state, &steps[i], next, &step_next, locals));
+                }
+                sconj.push(self.chc_inst(bad, state, &steps[k], next, &[], locals));
+                let sformula = self.m.mk_and(&sconj);
+                // `unsat` ⇒ ¬Bad is k-inductive ⇒ safe. A `sat`/`unknown` step is
+                // inconclusive; keep unrolling (BMC may find a counterexample).
+                if check_model(&self.m, sformula).0 == SmtResult::Unsat {
+                    return Some(SmtResult::Sat);
+                }
+            }
+        }
+        None // bound reached: sound `unknown`
+    }
+
+    /// Instantiate a transition-system formula for one unrolling step: substitute
+    /// the canonical `state`/`next` vectors by the step vectors `cur`/`nxt`, and
+    /// rename every local (binder) variable to a fresh copy (so different steps'
+    /// auxiliary variables are independent).
+    fn chc_inst(
+        &mut self,
+        formula: AstId,
+        state: &[AstId],
+        cur: &[AstId],
+        next: &[AstId],
+        nxt: &[AstId],
+        locals: &[AstId],
+    ) -> AstId {
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for (j, &s) in state.iter().enumerate() {
+            subst.push((s, cur[j]));
+        }
+        for (j, &s) in next.iter().enumerate() {
+            if j < nxt.len() {
+                subst.push((s, nxt[j]));
+            }
+        }
+        for &l in locals {
+            let s = self.m.get_sort(l);
+            let f = self.fresh_const(s);
+            subst.push((l, f));
+        }
+        substitute(&mut self.m, formula, &subst)
+    }
+
+    /// Split a Horn rule body into `(antecedent, consequent)`. Handles the
+    /// `(=> A B)` form and the clausal `(or ¬A₁ … ¬Aₙ H)` form.
+    fn chc_split_rule(&mut self, body: AstId) -> Option<(AstId, AstId)> {
+        if self.m.is_implies(body) {
+            let args = self.m.app_args(body).to_vec();
+            if args.len() == 2 {
+                return Some((args[0], args[1]));
+            }
+        }
+        // A bare head predicate `P(..)` is a fact with a `true` antecedent.
+        if self.predicate_of(body).is_some() {
+            let t = self.m.mk_true();
+            return Some((t, body));
+        }
+        None
+    }
+
+    /// Disjoin formulas (`false` if empty).
+    fn mk_disjunction(&mut self, fs: &[AstId]) -> AstId {
+        match fs {
+            [] => self.m.mk_false(),
+            [f] => *f,
+            _ => self.m.mk_or(fs),
+        }
+    }
+
     /// Decide the assertions together with `extra` temporary constraints,
     /// without permanently adding them.
     fn check_with(&mut self, extra: &[AstId]) -> (SmtResult, Option<Model>) {
@@ -3414,6 +3996,50 @@ impl Context {
         let r = self.check_sat();
         self.assertions.truncate(n);
         r
+    }
+
+    /// Decide an arbitrary formula set in isolation (the current assertions are
+    /// swapped out and restored), returning only the verdict.
+    fn solve_set(&mut self, set: &[AstId]) -> SmtResult {
+        let saved = core::mem::replace(&mut self.assertions, set.to_vec());
+        let (res, _) = self.check_sat();
+        self.assertions = saved;
+        res
+    }
+
+    /// Solver-backed `ctx-solver-simplify`: return an equisatisfiable residual
+    /// where each formula that the conjunction of the *others* already entails is
+    /// dropped, or `None` if the set is unsatisfiable. Redundancy/contradiction
+    /// are proved with the SMT engine; a non-`unsat` (incl. `unknown`) check
+    /// conservatively keeps the formula, so the result is always sound.
+    fn ctx_solver_simplify(&mut self, formulas: &[AstId]) -> Option<Vec<AstId>> {
+        let mut kept: Vec<AstId> = Vec::new();
+        for (i, &fi) in formulas.iter().enumerate() {
+            if self.m.is_true(fi) {
+                continue;
+            }
+            if self.m.is_false(fi) {
+                return None;
+            }
+            // Context = already-kept formulas + not-yet-processed ones.
+            let mut ctx = kept.clone();
+            ctx.extend_from_slice(&formulas[i + 1..]);
+            // If ctx ∧ ¬fi is unsat, ctx entails fi ⇒ fi is redundant.
+            let nfi = self.m.mk_not(fi);
+            let mut probe_redundant = ctx.clone();
+            probe_redundant.push(nfi);
+            if self.solve_set(&probe_redundant) == SmtResult::Unsat {
+                continue;
+            }
+            // If ctx ∧ fi is unsat, the whole goal is unsat.
+            let mut probe_conflict = ctx.clone();
+            probe_conflict.push(fi);
+            if self.solve_set(&probe_conflict) == SmtResult::Unsat {
+                return None;
+            }
+            kept.push(fi);
+        }
+        Some(kept)
     }
 
     /// Optimize the recorded objectives (integer, lexicographic in declaration
@@ -4225,6 +4851,19 @@ impl Context {
         // `sat` stays a sound `unknown`. (A recursive *function* over a datatype
         // is handled by E-matching instead and can still saturate.)
         let mut dt_enumerated = false;
+        // Set when a universal enumerated in Phase 2 has an infinite arithmetic
+        // (Int/Real) binder that occurs inside an arithmetic operation, e.g. the
+        // CHC transition `inv(x) ∧ y = x+1 ⇒ inv(y)`. Enumerating only the present
+        // ground terms cannot materialise `x+1`, so the fixpoint is *not* captured
+        // and a `sat` over the finite instantiation would be unsound — the run is
+        // then never "saturated" (a `sat` stays a sound `unknown`). Purely
+        // relational finite Datalog (binders only inside predicate applications)
+        // is unaffected and still saturates. A recursive *function* over Int
+        // (e.g. `fact`) is arithmetic-productive too, but it is seeded by a ground
+        // application (`fact(3)`) and E-matching unfolds it to a *terminating*
+        // fixpoint — so it is NOT gated here; only universals E-matching never
+        // fires on (`ematch_counts == 0`, no ground seed — the CHC case) are.
+        let mut arith_enumerated = false;
 
         // User-function declarations (targets for E-matching triggers) and, per
         // universal, a trigger that covers all its binders (if one exists).
@@ -4316,6 +4955,16 @@ impl Context {
                 break; // E-matching fixpoint reached
             }
         }
+        // An arithmetic-productive universal that E-matching never fired on (no
+        // ground seed) is not genuinely instantiated; enumeration cannot saturate
+        // its infinite arithmetic domain, so a `sat` over it would be unsound.
+        // This is exactly the CHC-transition case (`inv(x) ∧ y=x+1 ⇒ inv(y)` with
+        // no ground `inv` application to seed the chain).
+        for (ui, (vars, body)) in universals.iter().enumerate() {
+            if ematch_counts[ui] == 0 && self.universal_arith_productive(vars, *body) {
+                arith_enumerated = true;
+            }
+        }
         // Phase 2 — enumerative instantiation over all ground terms: provides the
         // saturation guarantee that makes a `sat` result complete for finite
         // domains / Datalog. Universals that HAVE a covering trigger are left to
@@ -4342,6 +4991,9 @@ impl Context {
                 }
                 if dt_binder {
                     dt_enumerated = true; // infinite domain → cannot claim saturation
+                }
+                if self.universal_arith_productive(vars, *body) {
+                    arith_enumerated = true; // arithmetic recursion → cannot saturate
                 }
                 let cands: Vec<Vec<AstId>> = vars
                     .iter()
@@ -4403,10 +5055,48 @@ impl Context {
                 // Enumeration fixpoint; overall completeness also needs the
                 // E-matching phase to have reached its own fixpoint AND no
                 // infinite-domain (datatype) binder to have been enumerated.
-                return (instances, ematch_saturated && !dt_enumerated);
+                return (
+                    instances,
+                    ematch_saturated && !dt_enumerated && !arith_enumerated,
+                );
             }
         }
         (instances, false) // ran out of rounds: not saturated
+    }
+
+    /// Does `body` have an infinite arithmetic (Int/Real) binder occurring inside
+    /// an arithmetic operator (`+`, `-`, `*`, `div`, `mod`, `^`)? Such a binder
+    /// can be constrained to values (`x+1`) that enumeration over present ground
+    /// terms never materialises, so the enumeration cannot prove saturation.
+    fn universal_arith_productive(&self, vars: &[AstId], body: AstId) -> bool {
+        let binders: BTreeSet<AstId> = vars
+            .iter()
+            .copied()
+            .filter(|&v| self.m.is_arith_sort(self.m.get_sort(v)))
+            .collect();
+        if binders.is_empty() {
+            return false;
+        }
+        for t in self.m.postorder(body) {
+            let is_arith_op = matches!(
+                self.m.arith_op(t),
+                Some(
+                    ArithOp::Add
+                        | ArithOp::Sub
+                        | ArithOp::Mul
+                        | ArithOp::Uminus
+                        | ArithOp::Div
+                        | ArithOp::Idiv
+                        | ArithOp::Mod
+                        | ArithOp::Rem
+                        | ArithOp::Power
+                )
+            );
+            if is_arith_op && self.m.postorder(t).iter().any(|s| binders.contains(s)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Instantiate the array + enum axioms for `lifted` and conjoin them.
@@ -4692,16 +5382,60 @@ impl Context {
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
-        // Quantified formulas and symbolic string operations are not fully
-        // decided: if the goal mentions either kind of sentinel, answer a sound
-        // `unknown`.
-        if (!self.quant_atoms.is_empty() || !self.str_symbolic.is_empty())
+        // Quantified formulas are not decided here (the instantiation engine ran
+        // upstream); a residual quantifier sentinel ⇒ sound `unknown`.
+        if !self.quant_atoms.is_empty()
             && self
                 .m
                 .postorder(goal)
                 .iter()
-                .any(|t| self.quant_atoms.contains(t) || self.str_symbolic.contains(t))
+                .any(|t| self.quant_atoms.contains(t))
         {
+            return (SmtResult::Unknown, None);
+        }
+        // Symbolic string operations are opaque uninterpreted markers: a `sat`
+        // over them may be spurious (the marker can take a value inconsistent with
+        // string semantics), so a `sat` stays `unknown` — but an `unsat` derived
+        // together with the sound string axioms (length links, literal lengths) is
+        // a real `unsat`. So don't gate up front; check, then gate only `sat`.
+        // A "functional" array constant — `(_ map f)`, `(_ as-array f)`, or a
+        // `(lambda …)` — is only given semantics for *explicit* `select`s of it
+        // (rewritten to `f(select …)` / `f(i)` / the beta-reduced body). If such a
+        // constant survives into the goal — e.g. used in an array equality
+        // `(_ as-array f) = b`, inside a `store`, or as an array-of-arrays element —
+        // its pointwise definition is not enforced, so a `sat` could be wrong;
+        // gate to a sound `unknown`.
+        if !self.maps.is_empty() || !self.as_arrays.is_empty() || !self.lambdas.is_empty() {
+            let functional: BTreeSet<AstId> = self
+                .maps
+                .keys()
+                .chain(self.as_arrays.keys())
+                .chain(self.lambdas.keys())
+                .copied()
+                .collect();
+            if self
+                .m
+                .postorder(goal)
+                .iter()
+                .any(|t| functional.contains(t))
+            {
+                return (SmtResult::Unknown, None);
+            }
+        }
+        let has_symbolic_str = !self.str_symbolic.is_empty()
+            && self
+                .m
+                .postorder(goal)
+                .iter()
+                .any(|t| self.str_symbolic.contains(t));
+        if has_symbolic_str {
+            if check_model(&self.m, goal).0 == SmtResult::Unsat {
+                return (SmtResult::Unsat, None);
+            }
+            // Not refuted: try to exhibit a concrete satisfying string assignment.
+            if let Some(m) = self.try_string_witness(goal) {
+                return (SmtResult::Sat, Some(m));
+            }
             return (SmtResult::Unknown, None);
         }
         // Bit-vector formulas are decided by bit-blasting (no model produced yet).
@@ -4723,10 +5457,335 @@ impl Context {
         }
         let (res, model) = check_model(&self.m, goal);
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
-            (SmtResult::Unknown, None)
+            // First, try to *linearize*: a variable pinned by an equality
+            // `x = c` (constant) can be substituted throughout, which often
+            // turns a nonlinear product like `x*y` into the linear `c*y`. If the
+            // residual is fully linear the ordinary engine decides it soundly,
+            // producing a real verdict (and model) instead of `unknown`.
+            let lin = self.linearize_fixed_vars(goal);
+            if lin != goal && !self.arith_nonlinear(lin) {
+                return check_model(&self.m, lin);
+            }
+            // A genuinely nonlinear residual in a *single* variable is decided
+            // exactly by the univariate procedure (real-root isolation over the
+            // reals; integer-root enumeration over the integers) — this is a
+            // complete decision for that fragment, matching z3.
+            // Polynomial-level decision: eliminate linearly-determined variables,
+            // then decide the residual exactly (univariate CAD, or exhaustive
+            // search over a bounded integer box). Complete for those fragments.
+            if let Some(r) = self.decide_nonlinear_definite(lin) {
+                return (r, None);
+            }
+            // Otherwise, interval constraint propagation over the *actual*
+            // polynomials may still prove the (multivariate) system
+            // unsatisfiable; that refutation is sound.
+            if self.nonlinear_icp_refutes(lin) {
+                (SmtResult::Unsat, None)
+            } else {
+                (SmtResult::Unknown, None)
+            }
         } else {
             (res, model)
         }
+    }
+
+    /// Repeatedly substitute every variable that a top-level equality pins to a
+    /// numeral constant (`x = c` / `c = x`) and re-simplify, to a fixpoint. This
+    /// linearizes nonlinear terms whose non-constant factors become constant
+    /// (e.g. `x*y` with `x = 2` → `2*y`). Sound: each substitution is entailed
+    /// by the goal, so the result is equisatisfiable.
+    fn linearize_fixed_vars(&mut self, goal: AstId) -> AstId {
+        let mut g = goal;
+        for _ in 0..16 {
+            let mut conjuncts = Vec::new();
+            self.icp_flatten_and(g, &mut conjuncts);
+            let mut subst: Option<(AstId, AstId)> = None;
+            'find: for &c in &conjuncts {
+                if !self.m.is_eq(c) {
+                    continue;
+                }
+                let args = self.m.app_args(c);
+                if args.len() != 2 {
+                    continue;
+                }
+                for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
+                    // Substitute a variable `a` determined by `a = b`, provided
+                    // `a` is a free uninterpreted constant that does not itself
+                    // occur in `b` (occurs-check, so the substitution terminates
+                    // and stays equisatisfiable). This linearizes `x*y` under
+                    // `y = x+1` just as it does under `x = 2`.
+                    //
+                    // Soundness for **integers**: substituting an `Int` variable
+                    // by a general expression can drop its integrality (e.g.
+                    // `y = x − 6` with `x` Real forces `x − 6 ∈ ℤ`, lost if `y`
+                    // is eliminated). So an `Int` variable is only substituted by
+                    // a numeral here; the general integer/real case is handled
+                    // soundly by the polynomial-level elimination downstream.
+                    let a_is_int = self.m.is_int_sort(self.m.get_sort(a));
+                    let safe = self.m.as_numeral(b).is_some() || !a_is_int;
+                    if a != b
+                        && self.m.is_uninterp_const(a)
+                        && self.m.is_arith_sort(self.m.get_sort(a))
+                        && safe
+                        && !self.term_contains(b, a)
+                    {
+                        subst = Some((a, b));
+                        break 'find;
+                    }
+                }
+            }
+            let Some((from, to)) = subst else { break };
+            let ng = substitute(&mut self.m, g, &[(from, to)]);
+            let ng = crate::rewriter::simplify(&mut self.m, ng);
+            if ng == g {
+                break;
+            }
+            g = ng;
+        }
+        g
+    }
+
+    /// Does `sub` occur anywhere within `term`?
+    fn term_contains(&self, term: AstId, sub: AstId) -> bool {
+        self.m.postorder(term).contains(&sub)
+    }
+
+    /// Try to decide a nonlinear goal definitely (sat **or** unsat). Extracts the
+    /// polynomial constraints, eliminates linearly-determined variables
+    /// (soundly, per the integer/real rule), then decides the residual: a single
+    /// variable by the univariate real/integer procedure, or an all-integer
+    /// finitely-bounded system by exhaustive search. Returns `None` (fall back to
+    /// the refutation-only ICP path) when the goal is not of a decidable shape.
+    ///
+    /// Every variable must be a genuine *free* uninterpreted constant: an opaque
+    /// compound term (`(^ 2.0 0.5)` = √2, `(f x)`) has a determined value, so
+    /// treating it as free would make a `sat` claim unsound.
+    fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
+        use crate::nlsat::{Constraint, Rel};
+        let mut conjuncts = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut constraints: Vec<(crate::math::polynomial::Polynomial, Rel)> = Vec::new();
+        for atom in conjuncts {
+            let (negated, a) = if self.m.is_not(atom) {
+                (true, self.m.app_args(atom)[0])
+            } else {
+                (false, atom)
+            };
+            if let Some(c) = self.icp_atom(a, negated, &mut var_map) {
+                constraints.push((c.poly, c.rel));
+            }
+        }
+        if var_map.is_empty() || constraints.is_empty() {
+            return None;
+        }
+        // `int_of[idx]` = is this variable integer-sorted? All must be free consts.
+        let mut int_of: BTreeMap<u32, bool> = BTreeMap::new();
+        for (&ast, &idx) in &var_map {
+            if !self.m.is_uninterp_const(ast) {
+                return None;
+            }
+            int_of.insert(idx, self.m.is_int_sort(self.m.get_sort(ast)));
+        }
+        let all_int = int_of.values().all(|&b| b);
+
+        // Eliminate linearly-determined variables. Integer variables are only
+        // eliminated in a pure-integer system with a unit coefficient, so the
+        // substituted value stays integral (soundness).
+        let reduced0 = crate::nlsat::elim::eliminate_linear(constraints, |v, c| {
+            if *int_of.get(&v).unwrap_or(&false) {
+                all_int && (c.is_one() || c.is_minus_one())
+            } else {
+                true
+            }
+        });
+        let (reduced, orig_vars) = crate::nlsat::elim::remap_vars(&reduced0);
+        let k = orig_vars.len();
+        let remaining_int: Vec<bool> = orig_vars
+            .iter()
+            .map(|v| *int_of.get(v).unwrap_or(&false))
+            .collect();
+
+        let verdict = if k <= 1 {
+            let is_int = remaining_int.first().copied().unwrap_or(true);
+            if is_int {
+                crate::nlsat::univariate::decide_int(&reduced, 0)
+            } else {
+                crate::nlsat::univariate::decide(&reduced, 0)
+            }
+        } else if remaining_int.iter().all(|&b| b) {
+            let cons: Vec<Constraint> =
+                reduced.iter().map(|(p, r)| Constraint::new(p.clone(), *r)).collect();
+            crate::nlsat::icp::decide_bounded_int(&cons, k)
+        } else {
+            None
+        };
+        if let Some(b) = verdict {
+            return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
+        }
+        // Multivariate residual not otherwise decided. If it is over the reals
+        // (no integer variables — CAD decides ℝ, not ℤ), invoke the complete CAD
+        // decision procedure; it returns a definite verdict or declines soundly.
+        if k >= 2 && remaining_int.iter().all(|&b| !b) {
+            match crate::nlsat::cad::cad_sat(&reduced, k) {
+                Some(true) => return Some(SmtResult::Sat),
+                Some(false) => return Some(SmtResult::Unsat),
+                None => {}
+            }
+        }
+        // Otherwise, try to *prove sat* by fixing all-but-one variable to
+        // candidate values and deciding the last univariately (a verified
+        // witness — sound).
+        if k >= 2 && crate::nlsat::elim::sat_by_fixing(&reduced, &remaining_int) {
+            return Some(SmtResult::Sat);
+        }
+        None
+    }
+
+    /// Try to refute a (nonlinear) goal by interval constraint propagation over
+    /// its top-level conjunctive arithmetic atoms. Sound: returns `true` only on
+    /// a genuine interval proof of unsatisfiability, so it may only strengthen an
+    /// `unknown` into `unsat`.
+    fn nonlinear_icp_refutes(&self, goal: AstId) -> bool {
+        let mut conjuncts = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut constraints: Vec<crate::nlsat::Constraint> = Vec::new();
+        for atom in conjuncts {
+            let (negated, a) = if self.m.is_not(atom) {
+                (true, self.m.app_args(atom)[0])
+            } else {
+                (false, atom)
+            };
+            if let Some(c) = self.icp_atom(a, negated, &mut var_map) {
+                constraints.push(c);
+            }
+        }
+        if constraints.is_empty() {
+            return false;
+        }
+        crate::nlsat::refute(&constraints, var_map.len())
+    }
+
+    /// Flatten a nest of top-level `(and …)` into its conjuncts.
+    fn icp_flatten_and(&self, f: AstId, out: &mut Vec<AstId>) {
+        if self.m.is_and(f) {
+            for &c in self.m.app_args(f) {
+                self.icp_flatten_and(c, out);
+            }
+        } else {
+            out.push(f);
+        }
+    }
+
+    /// Convert one (possibly negated) arithmetic atom into an ICP constraint
+    /// `poly REL 0`, or `None` if it is not an arithmetic comparison/equality.
+    fn icp_atom(
+        &self,
+        atom: AstId,
+        negated: bool,
+        var_map: &mut BTreeMap<AstId, u32>,
+    ) -> Option<crate::nlsat::Constraint> {
+        use crate::nlsat::Rel as NRel;
+        let args = self.m.app(atom)?.args.clone();
+        if args.len() != 2 {
+            return None;
+        }
+        let rel = if let Some(op) = self.m.arith_op(atom) {
+            match op {
+                ArithOp::Lt => NRel::Lt,
+                ArithOp::Le => NRel::Le,
+                ArithOp::Gt => NRel::Gt,
+                ArithOp::Ge => NRel::Ge,
+                _ => return None,
+            }
+        } else if self.m.is_eq(atom) && self.m.is_arith_sort(self.m.get_sort(args[0])) {
+            NRel::Eq
+        } else {
+            return None;
+        };
+        let lhs = self.icp_to_poly(args[0], var_map);
+        let rhs = self.icp_to_poly(args[1], var_map);
+        let poly = lhs.sub(&rhs);
+        let rel = if negated {
+            match rel {
+                NRel::Lt => NRel::Ge,
+                NRel::Le => NRel::Gt,
+                NRel::Gt => NRel::Le,
+                NRel::Ge => NRel::Lt,
+                NRel::Eq => NRel::Ne,
+                NRel::Ne => NRel::Eq,
+            }
+        } else {
+            rel
+        };
+        Some(crate::nlsat::Constraint::new(poly, rel))
+    }
+
+    /// Convert an arithmetic term to a [`Polynomial`], mapping each opaque
+    /// arith-sorted subterm to a fresh variable keyed by its `AstId`. Any term we
+    /// cannot decompose becomes a free variable — sound for refutation, since it
+    /// only *enlarges* the value set ICP reasons over.
+    fn icp_to_poly(
+        &self,
+        t: AstId,
+        var_map: &mut BTreeMap<AstId, u32>,
+    ) -> crate::math::polynomial::Polynomial {
+        use crate::math::polynomial::Polynomial;
+        if let Some(n) = self.m.as_numeral(t) {
+            return Polynomial::constant(n);
+        }
+        if let Some(op) = self.m.arith_op(t) {
+            let args = self.m.app_args(t);
+            match op {
+                ArithOp::Add => {
+                    let mut acc = Polynomial::zero();
+                    for &a in args {
+                        acc = acc.add(&self.icp_to_poly(a, var_map));
+                    }
+                    return acc;
+                }
+                ArithOp::Sub if !args.is_empty() => {
+                    let mut acc = self.icp_to_poly(args[0], var_map);
+                    if args.len() == 1 {
+                        return acc.neg();
+                    }
+                    for &a in &args[1..] {
+                        acc = acc.sub(&self.icp_to_poly(a, var_map));
+                    }
+                    return acc;
+                }
+                ArithOp::Uminus if args.len() == 1 => {
+                    return self.icp_to_poly(args[0], var_map).neg();
+                }
+                ArithOp::Mul => {
+                    let mut acc = Polynomial::constant(Rational::from_integer(1.into()));
+                    for &a in args {
+                        acc = acc.mul(&self.icp_to_poly(a, var_map));
+                    }
+                    return acc;
+                }
+                ArithOp::Power if args.len() == 2 => {
+                    if let Some(e) = self.m.as_numeral(args[1])
+                        && e.is_integer()
+                        && !e.is_negative()
+                        && let Some(ei) = e.to_i64()
+                        && ei <= 8
+                    {
+                        return self.icp_to_poly(args[0], var_map).pow(ei as u32);
+                    }
+                    // Non-constant / large exponent: fall through to a fresh var.
+                }
+                ArithOp::ToReal if args.len() == 1 => {
+                    return self.icp_to_poly(args[0], var_map);
+                }
+                _ => {} // Div / Mod / Idiv / Abs / … → opaque variable below.
+            }
+        }
+        // Opaque arith-sorted term → a fresh variable (consistent per AstId).
+        let idx = var_map.len() as u32;
+        let v = *var_map.entry(t).or_insert(idx);
+        Polynomial::var(v)
     }
 
     /// Does `goal` contain a `select`/`store` over an array whose index sort is
@@ -6730,17 +7789,55 @@ mod tests {
     }
 
     #[test]
-    fn nonlinear_is_unknown_not_wrong() {
-        // The linear core over-approximates x*y, so a sat verdict would be
-        // unsound; report unknown instead. Linear multiplication still decides.
+    fn chc_transition_system_decided() {
+        // An **unsafe** CHC transition system: `inv(0)`, `inv(x) ⇒ inv(x+1)`,
+        // query `inv(x) ∧ x=2 ⇒ false`. Bounded model checking reaches `inv(2)`,
+        // deriving the counterexample ⇒ the CHC system is unsat (matches z3).
+        assert_eq!(
+            run("(declare-fun inv (Int) Bool)\
+                 (assert (forall ((x Int)) (=> (= x 0) (inv x))))\
+                 (assert (forall ((x Int)(y Int)) (=> (and (inv x) (= y (+ x 1))) (inv y))))\
+                 (assert (forall ((x Int)) (=> (and (inv x) (= x 2)) false)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A **safe** system: `inv(x) ∧ x<0 ⇒ false` — `x ≥ 0` is 1-inductive, so
+        // k-induction proves it satisfiable (safe).
+        assert_eq!(
+            run("(declare-fun inv (Int) Bool)\
+                 (assert (forall ((x Int)) (=> (= x 0) (inv x))))\
+                 (assert (forall ((x Int)(y Int)) (=> (and (inv x) (= y (+ x 1))) (inv y))))\
+                 (assert (forall ((x Int)) (=> (and (inv x) (< x 0)) false)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // A recursive *function* seeded by a ground application still decides sat.
+        assert_eq!(
+            run("(define-fun-rec f ((n Int)) Int (ite (<= n 0) 1 (* n (f (- n 1)))))\
+                 (assert (= (f 3) 6))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn nonlinear_now_decided_matches_z3() {
+        // Substituting a variable pinned by an equality linearizes the product:
+        // `x*y = 6 ∧ x = 2` ⇒ `2*y = 6`, decided sat (matches z3).
         assert_eq!(
             run("(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= x 2))(check-sat)")
                 .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["sat"]
         );
+        // The univariate integer procedure: `x*x = 2` has no integer root ⇒ unsat.
         assert_eq!(
             run("(declare-const x Int)(assert (= (* x x) 2))(check-sat)").unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["unsat"]
+        );
+        // Over the reals `x*x = 2` is satisfiable (x = ±√2) via real-root isolation.
+        assert_eq!(
+            run("(declare-const x Real)(assert (= (* x x) 2))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
         // Constant coefficient is linear — still decided.
         assert_eq!(
@@ -7322,6 +8419,57 @@ mod tests {
     }
 
     #[test]
+    fn string_predicate_length_links() {
+        // `str.contains(s, sub) ⇒ len(s) ≥ len(sub)` etc. refute length
+        // contradictions even with a symbolic string (was `unknown`).
+        assert_eq!(
+            run("(declare-const x String)(assert (str.contains x \"a\"))\
+                 (assert (= (str.len x) 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x String)(assert (str.prefixof \"abc\" x))\
+                 (assert (< (str.len x) 2))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x String)(assert (str.suffixof \"ab\" x))\
+                 (assert (= (str.len x) 1))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn string_witness_search_decides_sat() {
+        // A concrete satisfying string is exhibited for symbolic-string goals
+        // that were previously `unknown` (bounded witness search + re-fold).
+        for s in [
+            "(declare-const x String)(assert (= (str.at x 0) \"a\"))(check-sat)",
+            "(declare-const x String)(assert (str.contains x \"ab\"))(assert (str.contains x \"cd\"))(check-sat)",
+            "(declare-const x String)(assert (str.prefixof \"a\" x))(assert (str.suffixof \"b\" x))(assert (= (str.len x) 3))(check-sat)",
+            "(declare-const x String)(assert (not (str.contains x \"a\")))(assert (= (str.len x) 2))(check-sat)",
+            "(declare-const x String)(assert (str.contains x \"a\"))(assert (= (str.len x) 5))(check-sat)",
+        ] {
+            assert_eq!(run(s).unwrap(), alloc::vec!["sat"], "script: {s}");
+        }
+        // The witness search must NOT report a spurious `sat`: `str.at` yields a
+        // ≤1-char string (can't equal "xyz"), and a variable pinned to "cd" does
+        // not contain "z". These must not be `sat` (they stay sound: unknown or
+        // unsat, never a wrong sat). Regression for a fuzz-found soundness bug
+        // where new literals created during the search were not asserted distinct.
+        for s in [
+            "(declare-const x String)(assert (= (str.at x 0) \"xyz\"))(check-sat)",
+            "(declare-const x String)(assert (= x \"cd\"))(assert (str.contains x \"z\"))(check-sat)",
+            "(declare-const x String)(assert (= x \"cd\"))(assert (str.suffixof \"b\" x))(check-sat)",
+        ] {
+            assert_ne!(run(s).unwrap(), alloc::vec!["sat"], "spurious sat: {s}");
+        }
+    }
+
+    #[test]
     fn string_fragment_decides() {
         // Constant folding of string operations.
         assert_eq!(
@@ -7893,6 +9041,25 @@ mod tests {
     }
 
     #[test]
+    fn apply_ctx_solver_simplify() {
+        // A context-implied conjunct (`x > 0`, entailed by `x > 5`) is dropped.
+        let out = run(
+            "(declare-const x Int)(assert (> x 5))(assert (> x 0))\
+             (apply ctx-solver-simplify)",
+        )
+        .unwrap();
+        assert!(out[0].contains("x 5"), "output: {}", out[0]);
+        assert!(!out[0].contains("x 0"), "redundant conjunct kept: {}", out[0]);
+        // A contradictory context collapses the goal to `false`.
+        let unsat = run(
+            "(declare-const p Bool)(assert p)(assert (not p))\
+             (apply ctx-solver-simplify)",
+        )
+        .unwrap();
+        assert!(unsat[0].contains("false"), "output: {}", unsat[0]);
+    }
+
+    #[test]
     fn singular_datatype_eval_simplify() {
         // (declare-datatype …) — the single-datatype form, incl. recursive.
         assert_eq!(
@@ -7950,6 +9117,44 @@ mod tests {
                  (assert (not (select ((_ map not) a) 3)))(check-sat)")
             .unwrap(),
             alloc::vec!["sat"]
+        );
+        // Soundness: a map array used in an *equality* (not selected) is not given
+        // its element-wise semantics, so `sat` would be wrong — must stay sound.
+        // `map(-,a,b)=a` forces `b=0`, contradicting `b[0]≠0` (z3: unsat).
+        assert_ne!(
+            run("(declare-const a (Array Int Int))(declare-const b (Array Int Int))\
+                 (assert (= ((_ map (- (Int Int) Int)) a b) a))\
+                 (assert (not (= (select b 0) 0)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn functional_array_equality_is_sound() {
+        // `(_ as-array f)` and `(lambda …)` arrays used in an EQUALITY (not
+        // selected) must not be treated as free variables — a `sat` would be
+        // wrong (both are unsat in z3). Regression for a fuzz-found soundness bug.
+        assert_ne!(
+            run("(declare-fun f (Int) Int)(declare-const b (Array Int Int))\
+                 (assert (= (_ as-array f) b))\
+                 (assert (not (= (select b 0) (f 0))))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_ne!(
+            run("(declare-const b (Array Int Int))\
+                 (assert (= (lambda ((x Int)) (+ x 1)) b))\
+                 (assert (not (= (select b 0) 1)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+        // …but a direct `select` of each still decides.
+        assert_eq!(
+            run("(declare-fun f (Int) Int)(assert (= (f 0) 7))\
+                 (assert (not (= (select (_ as-array f) 0) 7)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 

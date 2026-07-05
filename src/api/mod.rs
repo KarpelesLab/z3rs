@@ -21,6 +21,8 @@ use alloc::vec::Vec;
 
 use crate::cmd_context::Session;
 
+pub mod build;
+
 /// A satisfiability verdict.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SatResult {
@@ -112,6 +114,98 @@ impl Solver {
     /// Drop all assertions and declarations (`(reset)`).
     pub fn reset(&mut self) -> Result<(), String> {
         self.assert("(reset)")
+    }
+
+    /// Decide the current assertions together with a set of literal
+    /// `assumptions` (`(check-sat-assuming (a₁ … aₙ))`), without adding them
+    /// permanently — the basis for assumption-based unsat cores.
+    ///
+    /// ```
+    /// use z3rs::api::{SatResult, Solver};
+    /// let mut s = Solver::new();
+    /// s.assert("(declare-const p Bool)(declare-const q Bool)(assert (=> p q))").unwrap();
+    /// assert_eq!(s.check_assuming(&["p", "(not q)"]).unwrap(), SatResult::Unsat);
+    /// assert_eq!(s.check_assuming(&["p"]).unwrap(), SatResult::Sat);
+    /// ```
+    pub fn check_assuming(&mut self, assumptions: &[&str]) -> Result<SatResult, String> {
+        let joined = assumptions.join(" ");
+        let out = self.eval(&alloc::format!("(check-sat-assuming ({joined}))"))?;
+        match out.first().map(String::as_str) {
+            Some("sat") => Ok(SatResult::Sat),
+            Some("unsat") => Ok(SatResult::Unsat),
+            Some("unknown") => Ok(SatResult::Unknown),
+            other => Err(alloc::format!("unexpected response: {other:?}")),
+        }
+    }
+
+    /// The unsat core of the most recent unsatisfiable check, as the list of
+    /// `:named` assertion labels (`(get-unsat-core)`).
+    ///
+    /// ```
+    /// use z3rs::api::{SatResult, Solver};
+    /// let mut s = Solver::new();
+    /// s.eval("(set-option :produce-unsat-cores true)").unwrap();
+    /// s.assert("(declare-const x Int)(assert (! (> x 0) :named a))(assert (! (< x 0) :named b))").unwrap();
+    /// assert_eq!(s.check().unwrap(), SatResult::Unsat);
+    /// let core = s.get_unsat_core().unwrap();
+    /// assert!(core.contains(&"a".to_string()) && core.contains(&"b".to_string()));
+    /// ```
+    pub fn get_unsat_core(&mut self) -> Result<Vec<String>, String> {
+        let out = self.eval("(get-unsat-core)")?;
+        let line = out
+            .first()
+            .ok_or_else(|| "get-unsat-core produced no response".to_string())?;
+        let inner = line.trim().trim_start_matches('(').trim_end_matches(')');
+        Ok(inner.split_whitespace().map(str::to_string).collect())
+    }
+
+    /// The full model of the most recent satisfiable check as `(name, value)`
+    /// pairs, parsed from `(get-model)`.
+    ///
+    /// ```
+    /// use z3rs::api::Solver;
+    /// let mut s = Solver::new();
+    /// s.assert("(declare-const x Int)(assert (= x 42))").unwrap();
+    /// s.check().unwrap();
+    /// let model = s.get_model().unwrap();
+    /// assert!(model.iter().any(|(n, v)| n == "x" && v == "42"));
+    /// ```
+    pub fn get_model(&mut self) -> Result<Vec<(String, String)>, String> {
+        // `(get-model)` prints one `(define-fun name () Sort value)` per line.
+        let out = self.eval("(get-model)")?;
+        let text = out.join("\n");
+        let mut pairs = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            let Some(rest) = line.strip_prefix("(define-fun ") else {
+                continue;
+            };
+            let inner = rest.trim_end().trim_end_matches(')').trim();
+            // inner = "name () Sort... value"; name is the first token and the
+            // (scalar) value is the last.
+            let mut toks = inner.split_whitespace();
+            let Some(name) = toks.next() else { continue };
+            if let Some(value) = inner.split_whitespace().last() {
+                pairs.push((name.to_string(), value.to_string()));
+            }
+        }
+        Ok(pairs)
+    }
+
+    /// Simplify an SMT-LIB term with the theory rewriter (`(simplify term)`),
+    /// returning the simplified term's printed form.
+    ///
+    /// ```
+    /// use z3rs::api::Solver;
+    /// let mut s = Solver::new();
+    /// s.assert("(declare-const x Int)").unwrap();
+    /// assert_eq!(s.simplify("(+ x 0)").unwrap(), "x");
+    /// ```
+    pub fn simplify(&mut self, term: &str) -> Result<String, String> {
+        let out = self.eval(&alloc::format!("(simplify {term})"))?;
+        out.into_iter()
+            .next()
+            .ok_or_else(|| "simplify produced no response".to_string())
     }
 }
 

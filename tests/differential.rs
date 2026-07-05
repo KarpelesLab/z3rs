@@ -401,6 +401,285 @@ const CORPUS: &[Case] = &[
         name: "bv_ite_and_implies",
         script: "(declare-const c Bool)(assert c)(assert (=> c (not (= (ite c #x01 #x02) #x01))))(check-sat)",
     },
+    // --- datatypes (QF_DT) --------------------------------------------------
+    Case {
+        name: "dt_enum_exclusion_sat",
+        script: "(declare-datatypes ((Color 0)) (((red)(green)(blue))))(declare-const c Color)
+                 (assert (not (= c red)))(assert (not (= c green)))(check-sat)",
+    },
+    Case {
+        name: "dt_enum_all_excluded_unsat",
+        script: "(declare-datatypes ((Color 0)) (((red)(green)(blue))))(declare-const c Color)
+                 (assert (not (= c red)))(assert (not (= c green)))(assert (not (= c blue)))(check-sat)",
+    },
+    Case {
+        name: "dt_record_selector_unsat",
+        script: "(declare-datatypes ((P 0)) (((mk (fst Int)(snd Int)))))(declare-const p P)
+                 (assert (= p (mk 3 4)))(assert (not (= (fst p) 3)))(check-sat)",
+    },
+    Case {
+        name: "dt_list_recursive_unsat",
+        script: "(declare-datatype Lst ((nil)(cons (hd Int)(tl Lst))))(declare-const l Lst)
+                 (assert (= l (cons 5 nil)))(assert (not (= (hd l) 5)))(check-sat)",
+    },
+    Case {
+        name: "dt_tester_sat",
+        script: "(declare-datatype Lst ((nil)(cons (hd Int)(tl Lst))))(declare-const l Lst)
+                 (assert ((_ is cons) l))(check-sat)",
+    },
+    // --- quantifiers (UF / LIA) --------------------------------------------
+    Case {
+        name: "forall_instantiation_unsat",
+        script: "(declare-fun p (Int) Bool)(assert (forall ((x Int)) (=> (p x) (p (+ x 1)))))
+                 (assert (p 0))(assert (not (p 3)))(check-sat)",
+    },
+    Case {
+        name: "forall_uf_congruence_unsat",
+        script: "(declare-sort U 0)(declare-fun f (U) U)(declare-const a U)
+                 (assert (forall ((x U)) (= (f x) a)))(declare-const b U)(assert (not (= (f b) a)))(check-sat)",
+    },
+    Case {
+        name: "exists_witness_sat",
+        script: "(declare-const y Int)(assert (exists ((x Int)) (= (* 2 x) y)))(assert (= y 8))(check-sat)",
+    },
+    // --- floating point (QF_FP), concrete Float64 ---------------------------
+    Case {
+        name: "fp_add_fold_unsat",
+        script: "(assert (not (= (fp.add roundNearestTiesToEven (fp #b0 #b10000000000 #x0000000000000)
+                 (fp #b0 #b10000000000 #x0000000000000)) (fp #b0 #b10000000001 #x0000000000000))))(check-sat)",
+    },
+    Case {
+        name: "fp_nan_not_equal_sat",
+        script: "(declare-const x Float64)(assert (fp.isNaN x))(check-sat)",
+    },
+    // --- responses: get-value / get-model / get-unsat-core ------------------
+    Case {
+        name: "get_value_int",
+        script: "(declare-const x Int)(assert (= x 7))(check-sat)(get-value (x))",
+    },
+    Case {
+        name: "get_value_bv",
+        script: "(declare-const b (_ BitVec 8))(assert (= (bvadd b #x01) #x10))(check-sat)(get-value (b))",
+    },
+    Case {
+        name: "get_value_enum",
+        script: "(declare-datatypes ((Color 0)) (((red)(green)(blue))))(declare-const c Color)
+                 (assert (not (= c red)))(assert (not (= c green)))(check-sat)(get-value (c))",
+    },
+    Case {
+        name: "get_unsat_core_named",
+        script: "(set-option :produce-unsat-cores true)(declare-const x Int)
+                 (assert (! (> x 0) :named a))(assert (! (< x 0) :named b))(check-sat)(get-unsat-core)",
+    },
+    // --- incremental push/pop (multiple verdicts) ---------------------------
+    Case {
+        name: "push_pop_sequence",
+        script: "(declare-const p Bool)(declare-const q Bool)(assert (=> p q))
+                 (check-sat)(push 1)(assert p)(assert (not q))(check-sat)(pop 1)(check-sat)",
+    },
+    Case {
+        name: "check_sat_assuming",
+        script: "(declare-const p Bool)(declare-const q Bool)(assert (=> p q))
+                 (check-sat-assuming (p (not q)))(check-sat-assuming (p))",
+    },
+    // --- nonlinear refutation (interval constraint propagation) --------------
+    // z3rs answers these via ICP (sound `unsat`); satisfiable nonlinear cases
+    // stay `unknown` (sound), which the harness accepts.
+    Case {
+        name: "nl_square_negative_unsat",
+        script: "(declare-const x Real)(assert (< (* x x) 0))(check-sat)",
+    },
+    Case {
+        name: "nl_bound_vs_square_unsat",
+        script: "(declare-const x Real)(assert (> x 2))(assert (< (* x x) 4))(check-sat)",
+    },
+    Case {
+        name: "nl_sum_of_squares_unsat",
+        script: "(declare-const x Real)(declare-const y Real)
+                 (assert (< (+ (* x x) (* y y)) 1))(assert (> x 2))(check-sat)",
+    },
+    Case {
+        name: "nl_product_bound_unsat",
+        script: "(declare-const x Real)(assert (>= x 3))(assert (<= x 5))
+                 (assert (> (* x x) 30))(check-sat)",
+    },
+    Case {
+        name: "nl_satisfiable_stays_sound",
+        script: "(declare-const x Real)(assert (= (* x x) 4))(assert (> x 0))(check-sat)",
+    },
+    // --- nonlinear now decided (linearization + univariate CAD / int roots) --
+    Case {
+        name: "nl_fixed_var_linearizes_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= x 2))(check-sat)",
+    },
+    Case {
+        name: "nl_int_square_positive_sat",
+        script: "(declare-const x Int)(assert (= (* x x) 9))(assert (> x 0))(check-sat)",
+    },
+    Case {
+        name: "nl_int_square_nonsquare_unsat",
+        script: "(declare-const x Int)(assert (= (* x x) 2))(check-sat)",
+    },
+    Case {
+        name: "nl_int_bounded_square_sat",
+        script: "(declare-const x Int)(assert (and (>= x 1)(<= x 5)(= (* x x) 16)))(check-sat)",
+    },
+    Case {
+        name: "nl_real_square_irrational_sat",
+        script: "(declare-const x Real)(assert (= (* x x) 2))(check-sat)",
+    },
+    Case {
+        name: "nl_real_square_eq_positive_sat",
+        script: "(declare-const x Real)(assert (= (* x x) 4))(assert (> x 0))(check-sat)",
+    },
+    Case {
+        name: "nl_two_var_fixed_reduces_univariate_sat",
+        script: "(declare-const x Int)(declare-const y Int)
+                 (assert (= (+ (* x x)(* y y)) 25))(assert (= x 3))(check-sat)",
+    },
+    Case {
+        name: "nl_real_square_lt_sat",
+        script: "(declare-const x Real)(assert (< (* x x) 4))(assert (> x 1))(check-sat)",
+    },
+    Case {
+        name: "nl_cubic_root_forced_unsat",
+        script: "(declare-const x Real)(assert (= (- (* x (* x x)) x) 0))(assert (> x 0))(assert (< x 1))(check-sat)",
+    },
+    // Generalized substitution: a variable defined by a linear expression is
+    // substituted, reducing the product to a univariate polynomial.
+    Case {
+        name: "nl_subst_linear_expr_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= y (+ x 1)))(check-sat)",
+    },
+    Case {
+        name: "nl_subst_linear_expr_two_roots_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= y (+ x 5)))(check-sat)",
+    },
+    Case {
+        name: "nl_subst_real_quadratic_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 2))(assert (= y (- 4 x)))(check-sat)",
+    },
+    // Bounded multivariate integer search (exhaustive over a finite box).
+    Case {
+        name: "nl_bounded_int_product_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 12))
+                 (assert (and (>= x 1)(<= x 4)(>= y 1)(<= y 4)))(check-sat)",
+    },
+    Case {
+        name: "nl_bounded_int_product_prime_unsat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 7))
+                 (assert (and (>= x 1)(<= x 3)(>= y 1)(<= y 3)))(check-sat)",
+    },
+    Case {
+        name: "nl_bounded_int_pythagorean_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (+ (* x x)(* y y)) 25))
+                 (assert (and (>= x 0)(<= x 5)(>= y 0)(<= y 5)))(check-sat)",
+    },
+    // Linear-variable elimination reduces a polynomial system to univariate.
+    Case {
+        name: "nl_elim_system_int_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= (+ x y) 5))(check-sat)",
+    },
+    Case {
+        name: "nl_elim_system_int_unsat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (* x y) 6))(assert (= (+ x y) 100))(check-sat)",
+    },
+    Case {
+        name: "nl_elim_real_disc_negative_unsat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 6))(assert (= (+ x y) 1))(check-sat)",
+    },
+    Case {
+        name: "nl_elim_into_inequality_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (+ (* x x) y) 5))(assert (> y 0))(check-sat)",
+    },
+    // Fuzzer-found soundness regressions (all now fixed).
+    Case {
+        name: "nl_zero_constant_root_sat",
+        script: "(declare-const x Int)(declare-const y Int)(assert (= (+ x y) 7))(assert (= (* x y) 0))(assert (> y 0))(check-sat)",
+    },
+    Case {
+        name: "nl_mixed_int_real_drops_no_integrality_unsat",
+        script: "(declare-const x Real)(declare-const y Int)(assert (= y (- x 6)))(assert (= (* x y) (- 4)))(check-sat)",
+    },
+    Case {
+        name: "nl_mixed_nonunit_coeff_unsat",
+        script: "(declare-const x Real)(declare-const y Int)(assert (= y (+ (* 2 x) 4)))(assert (= (* x y) (- 1)))(check-sat)",
+    },
+    // Multivariate sat proved by variable-fixing + univariate.
+    Case {
+        name: "nl_multivar_fixing_negatives_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (> (* x y) 5))(assert (< (+ x y) 3))(check-sat)",
+    },
+    Case {
+        name: "nl_multivar_fixing_sign_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (> (* x y) 0))(assert (> x 0))(check-sat)",
+    },
+    // Full multivariate real CAD (project → base → lift → decide).
+    Case {
+        name: "cad_circle_hyperbola_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (< (+ (* x x)(* y y)) 4))(assert (> (* x y) 1))(check-sat)",
+    },
+    Case {
+        name: "cad_two_equalities_ineq_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x x) 2))(assert (= (* y y) 3))(assert (< (+ x y) 0))(check-sat)",
+    },
+    Case {
+        name: "cad_ineq_only_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (> (* x x) (* y y)))(assert (> y 10))(assert (< x 1))(check-sat)",
+    },
+    Case {
+        name: "cad_curve_intersection_unsat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 1))(assert (= (+ (* x x)(* y y)) 1))(check-sat)",
+    },
+    Case {
+        name: "cad_curve_intersection_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 1))(assert (= (+ (* x x)(* y y)) 4))(check-sat)",
+    },
+    // CAD fuzzer regressions: open cells under strict inequalities (the
+    // between-sector sample must land in the interior, not on a section).
+    Case {
+        name: "cad_strict_open_cell_1_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 2))(assert (< (* x x)(* y y)))(check-sat)",
+    },
+    Case {
+        name: "cad_strict_open_cell_2_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) (- 1)))(assert (< (- x y)(- 2)))(assert (> (+ x y) 2))(check-sat)",
+    },
+    Case {
+        name: "cad_strict_open_cell_3_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 1))(assert (> (+ x y) 8))(assert (< (- x y)(- 1)))(check-sat)",
+    },
+    Case {
+        name: "cad_strict_open_cell_4_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (not (>= (+ (* 2 (* x x))(* 5 (* y y))) 1)))(assert (< (- (* x (* x x)) x) 0))(check-sat)",
+    },
+    // Constrained Horn Clauses: single-predicate transition systems decided by
+    // bounded model checking (unsat/counterexample) and k-induction (sat/invariant).
+    Case {
+        name: "chc_safe_nonneg_invariant",
+        script: "(set-logic HORN)(declare-fun inv (Int) Bool)(assert (forall ((x Int)) (=> (= x 0) (inv x))))(assert (forall ((x Int)(y Int)) (=> (and (inv x)(= y (+ x 1))) (inv y))))(assert (forall ((x Int)) (=> (and (inv x)(< x 0)) false)))(check-sat)",
+    },
+    Case {
+        name: "chc_unsafe_reaches_target",
+        script: "(set-logic HORN)(declare-fun inv (Int) Bool)(assert (forall ((x Int)) (=> (= x 0) (inv x))))(assert (forall ((x Int)(y Int)) (=> (and (inv x)(= y (+ x 1))) (inv y))))(assert (forall ((x Int)) (=> (and (inv x)(= x 5)) false)))(check-sat)",
+    },
+    Case {
+        name: "chc_unsafe_init_hits_bad",
+        script: "(set-logic HORN)(declare-fun inv (Int) Bool)(assert (forall ((x Int)) (=> (= x 3) (inv x))))(assert (forall ((x Int)) (=> (and (inv x)(= x 3)) false)))(check-sat)",
+    },
+    // Square-bound interval narrowing refutes bounded-disc multivariate systems.
+    Case {
+        name: "nl_square_narrow_unsat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (< (+ (* x x)(* y y)) 1))(assert (> (* x y) 1))(check-sat)",
+    },
+    Case {
+        name: "nl_square_narrow_unsat_2",
+        script: "(declare-const x Real)(declare-const y Real)(assert (<= (+ (* x x)(* y y)) 2))(assert (> (* x y) 5))(check-sat)",
+    },
+    Case {
+        name: "nl_square_narrow_no_false_refute_sat",
+        script: "(declare-const x Real)(declare-const y Real)(assert (< (+ (* x x)(* y y)) 4))(assert (> (* x y) 1))(check-sat)",
+    },
 ];
 
 /// Run `z3` on a script, returning its `(check-sat)` verdict lines, or `None`
@@ -423,13 +702,16 @@ fn z3_verdicts(script: &str) -> Option<Vec<String>> {
         return None;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let verdicts: Vec<String> = text
+    // Capture every non-empty output line (verdicts *and* (get-value)/
+    // (get-unsat-core)/model responses), so the corpus can check that z3rs
+    // reproduces z3's full response stream, not just the sat/unsat verdict.
+    let lines: Vec<String> = text
         .lines()
         .map(str::trim)
-        .filter(|l| matches!(*l, "sat" | "unsat" | "unknown"))
+        .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
-    Some(verdicts)
+    Some(lines)
 }
 
 #[test]
