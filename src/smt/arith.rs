@@ -96,6 +96,11 @@ impl LinExpr {
         self.coeffs.get(&v).cloned().unwrap_or_else(zero)
     }
 
+    /// The coefficient of `v` (0 if absent) — public accessor.
+    pub fn coeff_of(&self, v: AstId) -> Rational {
+        self.coeff(v)
+    }
+
     /// Is this a constant (no variables)?
     pub fn is_constant(&self) -> bool {
         self.coeffs.is_empty()

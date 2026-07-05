@@ -580,20 +580,62 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
         }
     }
     let int_vars: Vec<AstId> = sys.int_set.iter().copied().collect();
+    // Free-variable disequalities: a disequality `e ≠ 0` containing a variable
+    // that appears in NO other constraint or disequality is *always* satisfiable
+    // (pick that variable to avoid the single forbidden value). Drop such
+    // disequalities from the feasibility search — otherwise branch-and-bound
+    // drains its budget branching on the unbounded free variable — and assign the
+    // free variables when completing the model. General QF_LIA completeness fix
+    // (e.g. `mod(x,2) ≤ 14 ∧ y ≠ 0` was a spurious `unknown`).
+    let con_vars: BTreeSet<AstId> = cons.iter().flat_map(|c| c.expr.vars()).collect();
+    let mut dq_count: BTreeMap<AstId, usize> = BTreeMap::new();
+    for d in &sys.diseqs {
+        for v in d.vars() {
+            *dq_count.entry(v).or_default() += 1;
+        }
+    }
+    let mut kept_diseqs: Vec<LinExpr> = Vec::new();
+    let mut free_diseqs: Vec<(LinExpr, AstId)> = Vec::new();
+    for d in &sys.diseqs {
+        let free = d
+            .vars()
+            .find(|&v| !con_vars.contains(&v) && dq_count[&v] == 1 && !d.coeff_of(v).is_zero());
+        match free {
+            Some(v) => free_diseqs.push((d.clone(), v)),
+            None => kept_diseqs.push(d.clone()),
+        }
+    }
+    // Complete an assignment by picking a value for each free-diseq variable that
+    // makes its disequality hold (`v = 0` unless that hits 0, then `v = 1`).
+    let finish = |mut a: Assignment| -> Assignment {
+        for (d, v) in &free_diseqs {
+            let rest = d.eval(&a); // `a` lacks `v`, so its term contributes 0
+            let val = if rest.is_zero() {
+                Rational::from_integer(Int::from(1))
+            } else {
+                Rational::from_integer(Int::from(0))
+            };
+            a.insert(*v, val);
+        }
+        a
+    };
     // Branch-and-bound cannot converge on an unbounded Diophantine system
     // (e.g. `6a+4b=2`). Try to construct an integer witness first — it uses no
     // budget and is *verified* against every constraint, so it only ever yields a
     // genuine `Sat` and cannot introduce unsoundness. Running it before B&B also
     // preserves the shared budget for the Nelson–Oppen interface phase.
-    if let Some(a) = dioph_witness(&cons, &sys.diseqs, &int_vars) {
-        return Feas::Sat(a);
+    if let Some(a) = dioph_witness(&cons, &kept_diseqs, &int_vars) {
+        return Feas::Sat(finish(a));
     }
     // Branch-and-bound runs on a *copy* of the budget: on an unbounded system it
     // can otherwise drain the shared budget the Nelson–Oppen interface phase
     // needs, turning an Omega-decided `sat` into a spurious `unknown`. Per-call
     // and per-round bounds still guarantee termination.
     let mut bb_budget = *budget;
-    let feas = integer_feasible(&cons, &sys.diseqs, &int_vars, &mut bb_budget, 0);
+    let feas = match integer_feasible(&cons, &kept_diseqs, &int_vars, &mut bb_budget, 0) {
+        Feas::Sat(a) => Feas::Sat(finish(a)),
+        other => other,
+    };
     // Omega-style last resort when B&B gave up on a pure-integer system:
     // eliminate every variable by Fourier–Motzkin, GCD-tightening the residual
     // constraints after each step. Because tightening preserves the integer
@@ -612,8 +654,8 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
             // Dark-shadow SAT: a verified witness upgrades unknown → sat for
             // unbounded feasible systems B&B cannot converge on.
             let mut dark_budget: u64 = 60_000;
-            if let Some(a) = omega_dark_witness(&cons, &sys.diseqs, &int_vars, &mut dark_budget) {
-                return Feas::Sat(a);
+            if let Some(a) = omega_dark_witness(&cons, &kept_diseqs, &int_vars, &mut dark_budget) {
+                return Feas::Sat(finish(a));
             }
         }
     }
