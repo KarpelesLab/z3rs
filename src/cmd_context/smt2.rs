@@ -6276,19 +6276,32 @@ impl Context {
                         let sb: u32 = Self::sym(&qid[3])?
                             .parse()
                             .map_err(|_| "bad sb".to_string())?;
-                        let rm = self.term(&l[1])?;
-                        let x = self.term(&l[2])?;
-                        if (eb, sb) == (11, 53)
-                            && self
-                                .rm_name(rm)
-                                .as_deref()
-                                .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
-                            && let Some(r) = self.m.as_numeral(x)
+                        // Two forms: `((_ to_fp eb sb) RM x)` (round a real/int/fp)
+                        // and `((_ to_fp eb sb) bv)` (reinterpret a width-(eb+sb)
+                        // bit-vector as FP — no rounding mode).
+                        let has_rm = l.len() > 2;
+                        let x = self.term(&l[if has_rm { 2 } else { 1 }])?;
+                        if has_rm {
+                            let rm = self.term(&l[1])?;
+                            if (eb, sb) == (11, 53)
+                                && self
+                                    .rm_name(rm)
+                                    .as_deref()
+                                    .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
+                                && let Some(r) = self.m.as_numeral(x)
+                            {
+                                let num = r.numerator().to_i64();
+                                let den = r.denominator().to_i64();
+                                if let (Some(n), Some(d)) = (num, den) {
+                                    return Ok(self.mk_fp((n as f64 / d as f64).to_bits(), 11, 53));
+                                }
+                            }
+                        } else if self.m.bv_sort_width(self.m.get_sort(x)) == Some(eb + sb)
+                            && let Some(v) = self.m.bv_numeral_value(x)
                         {
-                            let num = r.numerator().to_i64();
-                            let den = r.denominator().to_i64();
-                            if let (Some(n), Some(d)) = (num, den) {
-                                return Ok(self.mk_fp((n as f64 / d as f64).to_bits(), 11, 53));
+                            // Constant bit-vector reinterpreted as an FP bit pattern.
+                            if let Some(bits) = v.to_i64() {
+                                return Ok(self.mk_fp(bits as u64, eb, sb));
                             }
                         }
                         let s = self.fp_sort(eb, sb);
@@ -8501,6 +8514,24 @@ mod tests {
                  (assert (= (str.len x) 1))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn to_fp_from_bitvec_no_crash() {
+        // Regression: `((_ to_fp eb sb) bv)` (bit-vector reinterpret form, no
+        // rounding mode) indexed a missing argument and panicked. It must not
+        // crash; a constant bit pattern folds to the FP literal.
+        assert_eq!(
+            run("(assert (fp.isNaN ((_ to_fp 8 24) #x7fc00000)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // Symbolic bit-vector: no crash (sound unknown or decided).
+        assert_ne!(
+            run("(declare-const x (_ BitVec 32))\
+                 (assert (fp.isNaN ((_ to_fp 8 24) x)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["error"]
         );
     }
 
