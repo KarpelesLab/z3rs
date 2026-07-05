@@ -96,6 +96,17 @@ impl<'a> BitBlaster<'a> {
     // --- gates: define a fresh literal equal to a function of its inputs ------
 
     fn and2(&mut self, a: Lit, b: Lit) -> Lit {
+        // Constant-fold: a huge win for FP circuits full of constant masks.
+        let f = !self.true_lit;
+        if a == self.true_lit || a == b {
+            return b;
+        }
+        if b == self.true_lit {
+            return a;
+        }
+        if a == f || b == f || a == !b {
+            return f;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[!c, a]);
         self.sat.add_clause(&[!c, b]);
@@ -104,6 +115,16 @@ impl<'a> BitBlaster<'a> {
     }
 
     fn or2(&mut self, a: Lit, b: Lit) -> Lit {
+        let f = !self.true_lit;
+        if a == f || a == b {
+            return b;
+        }
+        if b == f {
+            return a;
+        }
+        if a == self.true_lit || b == self.true_lit || a == !b {
+            return self.true_lit;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[c, !a]);
         self.sat.add_clause(&[c, !b]);
@@ -112,6 +133,25 @@ impl<'a> BitBlaster<'a> {
     }
 
     fn xor2(&mut self, a: Lit, b: Lit) -> Lit {
+        let f = !self.true_lit;
+        if a == f {
+            return b;
+        }
+        if b == f {
+            return a;
+        }
+        if a == self.true_lit {
+            return !b;
+        }
+        if b == self.true_lit {
+            return !a;
+        }
+        if a == b {
+            return f;
+        }
+        if a == !b {
+            return self.true_lit;
+        }
         let c = self.fresh();
         self.sat.add_clause(&[!c, a, b]);
         self.sat.add_clause(&[!c, !a, !b]);
