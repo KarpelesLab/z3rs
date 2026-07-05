@@ -238,6 +238,9 @@ pub struct Z3rsZ3Context {
     solvers: alloc::vec::Vec<alloc::boxed::Box<Z3rsSolver>>,
     models: alloc::vec::Vec<alloc::boxed::Box<Z3rsModel>>,
     ast_vectors: alloc::vec::Vec<alloc::boxed::Box<Z3rsAstVector>>,
+    patterns: alloc::vec::Vec<alloc::boxed::Box<Z3rsPattern>>,
+    constructors: alloc::vec::Vec<alloc::boxed::Box<Z3rsConstructor>>,
+    constructor_lists: alloc::vec::Vec<alloc::boxed::Box<Z3rsConstructorList>>,
     /// Context-owned string outputs (models, `ast_to_string`), stable until
     /// context deletion.
     strings: alloc::vec::Vec<CString>,
@@ -273,6 +276,24 @@ impl Z3rsZ3Context {
         let boxed = alloc::boxed::Box::new(v);
         let ptr: *const Z3rsAstVector = &*boxed;
         self.ast_vectors.push(boxed);
+        ptr
+    }
+    fn intern_pattern(&mut self, p: Z3rsPattern) -> *const Z3rsPattern {
+        let boxed = alloc::boxed::Box::new(p);
+        let ptr: *const Z3rsPattern = &*boxed;
+        self.patterns.push(boxed);
+        ptr
+    }
+    fn intern_constructor(&mut self, k: Z3rsConstructor) -> *const Z3rsConstructor {
+        let boxed = alloc::boxed::Box::new(k);
+        let ptr: *const Z3rsConstructor = &*boxed;
+        self.constructors.push(boxed);
+        ptr
+    }
+    fn intern_constructor_list(&mut self, l: Z3rsConstructorList) -> *const Z3rsConstructorList {
+        let boxed = alloc::boxed::Box::new(l);
+        let ptr: *const Z3rsConstructorList = &*boxed;
+        self.constructor_lists.push(boxed);
         ptr
     }
 }
@@ -342,6 +363,9 @@ pub unsafe extern "C" fn Z3_mk_context(_cfg: *mut Z3rsZ3Config) -> *mut Z3rsZ3Co
         solvers: alloc::vec::Vec::new(),
         models: alloc::vec::Vec::new(),
         ast_vectors: alloc::vec::Vec::new(),
+        patterns: alloc::vec::Vec::new(),
+        constructors: alloc::vec::Vec::new(),
+        constructor_lists: alloc::vec::Vec::new(),
         strings: alloc::vec::Vec::new(),
         last: None,
     }))
@@ -2463,4 +2487,547 @@ pub unsafe extern "C" fn Z3_solver_get_unsat_core(
         items
     };
     unsafe { &mut *c }.intern_ast_vector(Z3rsAstVector { items })
+}
+
+// --- Quantifiers ------------------------------------------------------------
+//
+// The `_const` builder forms real clients use: bound variables are supplied as
+// constant `Z3_app`s (their name + sort), so no De-Bruijn bookkeeping is needed
+// — the text front end binds them by name in the rendered `(forall/exists …)`.
+
+/// `Z3_pattern` — a quantifier instantiation trigger, rendered as the group
+/// `(t₁ … tₙ)`. Owned by the context arena (freed at [`Z3_del_context`]).
+pub struct Z3rsPattern {
+    src: String,
+}
+
+/// `Z3_mk_pattern(c, num_patterns, terms)` — build a (multi-)pattern from its
+/// trigger terms, as a `Z3_pattern` usable in the `_const` quantifier builders.
+///
+/// # Safety
+/// `c` valid context; `terms` points to `num_patterns` valid `Z3_ast` handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_pattern(
+    c: *mut Z3rsZ3Context,
+    num_patterns: u32,
+    terms: *const *const Z3rsAst,
+) -> *const Z3rsPattern {
+    if c.is_null() {
+        return ptr::null();
+    }
+    let items = if num_patterns == 0 {
+        alloc::vec::Vec::new()
+    } else {
+        let Some(v) = (unsafe { read_args(num_patterns, terms) }) else {
+            return ptr::null();
+        };
+        v
+    };
+    let src = Ast::pattern(&items);
+    unsafe { &mut *c }.intern_pattern(Z3rsPattern { src })
+}
+
+/// Read `num` bound-variable `Z3_app` handles into `(name, sort)` pairs.
+///
+/// # Safety
+/// `bound` must point to `num` valid `Z3_ast` handles (each a constant whose
+/// `src` is the variable name and whose sort is the variable's sort).
+unsafe fn read_bound<'a>(
+    num: u32,
+    bound: *const *const Z3rsAst,
+) -> Option<alloc::vec::Vec<(&'a str, &'a Sort)>> {
+    if num == 0 {
+        return Some(alloc::vec::Vec::new());
+    }
+    if bound.is_null() {
+        return None;
+    }
+    let mut out = alloc::vec::Vec::with_capacity(num as usize);
+    for i in 0..num as isize {
+        let p = unsafe { *bound.offset(i) };
+        if p.is_null() {
+            return None;
+        }
+        let a = unsafe { &*p };
+        out.push((a.to_smt(), a.sort()));
+    }
+    Some(out)
+}
+
+/// Shared body of the `_const` quantifier builders: render
+/// `(forall/exists ((v S)…) [(! body :pattern … :weight w)])`.
+///
+/// # Safety
+/// `c` valid context; `bound`/`patterns` point to the given counts of valid
+/// handles; `body` a valid `Z3_ast`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn mk_quantifier_const(
+    c: *mut Z3rsZ3Context,
+    is_forall: bool,
+    weight: u32,
+    num_bound: u32,
+    bound: *const *const Z3rsAst,
+    num_patterns: u32,
+    patterns: *const *const Z3rsPattern,
+    body: *const Z3rsAst,
+) -> *const Z3rsAst {
+    if c.is_null() || body.is_null() {
+        return ptr::null();
+    }
+    let Some(vars) = (unsafe { read_bound(num_bound, bound) }) else {
+        return ptr::null();
+    };
+    let mut pats: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+    if num_patterns > 0 {
+        if patterns.is_null() {
+            return ptr::null();
+        }
+        for i in 0..num_patterns as isize {
+            let p = unsafe { *patterns.offset(i) };
+            if p.is_null() {
+                return ptr::null();
+            }
+            pats.push(unsafe { &*p }.src.as_str());
+        }
+    }
+    let body_ast = unsafe { &*body };
+    let q = BuildContext::quantifier(is_forall, weight, &vars, &pats, body_ast);
+    unsafe { &mut *c }.intern_ast(q)
+}
+
+/// `Z3_mk_forall_const(c, weight, num_bound, bound, num_patterns, patterns,
+/// body)` — a universally-quantified formula over the constant bound variables
+/// `bound`, with optional instantiation `patterns` and `weight` (→ Bool).
+///
+/// # Safety
+/// `c` valid context; `bound` points to `num_bound` valid `Z3_app` handles;
+/// `patterns` to `num_patterns` valid `Z3_pattern` handles; `body` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_forall_const(
+    c: *mut Z3rsZ3Context,
+    weight: u32,
+    num_bound: u32,
+    bound: *const *const Z3rsAst,
+    num_patterns: u32,
+    patterns: *const *const Z3rsPattern,
+    body: *const Z3rsAst,
+) -> *const Z3rsAst {
+    unsafe {
+        mk_quantifier_const(c, true, weight, num_bound, bound, num_patterns, patterns, body)
+    }
+}
+
+/// `Z3_mk_exists_const(...)` — the existential variant of [`Z3_mk_forall_const`].
+///
+/// # Safety
+/// See [`Z3_mk_forall_const`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_exists_const(
+    c: *mut Z3rsZ3Context,
+    weight: u32,
+    num_bound: u32,
+    bound: *const *const Z3rsAst,
+    num_patterns: u32,
+    patterns: *const *const Z3rsPattern,
+    body: *const Z3rsAst,
+) -> *const Z3rsAst {
+    unsafe {
+        mk_quantifier_const(c, false, weight, num_bound, bound, num_patterns, patterns, body)
+    }
+}
+
+/// `Z3_mk_quantifier_const(c, is_forall, …)` — dispatch to
+/// [`Z3_mk_forall_const`] / [`Z3_mk_exists_const`] on `is_forall`.
+///
+/// # Safety
+/// See [`Z3_mk_forall_const`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_quantifier_const(
+    c: *mut Z3rsZ3Context,
+    is_forall: bool,
+    weight: u32,
+    num_bound: u32,
+    bound: *const *const Z3rsAst,
+    num_patterns: u32,
+    patterns: *const *const Z3rsPattern,
+    body: *const Z3rsAst,
+) -> *const Z3rsAst {
+    unsafe {
+        mk_quantifier_const(
+            c,
+            is_forall,
+            weight,
+            num_bound,
+            bound,
+            num_patterns,
+            patterns,
+            body,
+        )
+    }
+}
+
+// --- Algebraic datatypes ----------------------------------------------------
+//
+// Datatypes are declared to the text front end with `(declare-datatype …)`; the
+// C-API `Z3_constructor` objects capture the spec (constructor name, fields and
+// their sorts, with a NULL field-sort meaning a recursive reference to the
+// datatype being defined) so `Z3_query_constructor` can later hand back the
+// constructor / tester / accessor function declarations.
+
+/// One field of a datatype constructor.
+#[derive(Clone)]
+struct ConstructorField {
+    name: String,
+    /// The field's sort, or `None` for a recursive reference to the datatype
+    /// being defined (`sort_ref` selects which, but z3rs defines one datatype at
+    /// a time, so any `None` refers to that datatype).
+    sort: Option<Sort>,
+    #[allow(dead_code)]
+    sort_ref: u32,
+}
+
+/// `Z3_constructor` — a captured datatype-constructor spec. Owned by the context
+/// arena; [`Z3_mk_datatype`] records the datatype sort into it for later
+/// [`Z3_query_constructor`] queries.
+pub struct Z3rsConstructor {
+    name: String,
+    fields: alloc::vec::Vec<ConstructorField>,
+    datatype: Option<Sort>,
+}
+
+/// `Z3_mk_constructor(c, name, recognizer, num_fields, field_names, sorts,
+/// sort_refs)` — capture a constructor spec. A `NULL` entry in `sorts` (with the
+/// paired `sort_refs` index) denotes a recursive reference to the datatype under
+/// construction. The `recognizer` name is accepted; z3rs's tester is always the
+/// standard `(_ is name)`, so it is not otherwise stored.
+///
+/// # Safety
+/// `c` valid context; `field_names`/`sorts`/`sort_refs` point to `num_fields`
+/// entries (any of the arrays may be NULL only when `num_fields == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_constructor(
+    c: *mut Z3rsZ3Context,
+    name: *const Z3rsSymbol,
+    _recognizer: *const Z3rsSymbol,
+    num_fields: u32,
+    field_names: *const *const Z3rsSymbol,
+    sorts: *const *const Z3rsSort,
+    sort_refs: *mut u32,
+) -> *const Z3rsConstructor {
+    if c.is_null() {
+        return ptr::null();
+    }
+    let name = unsafe { c_str(name) }.unwrap_or("").to_string();
+    let mut fields = alloc::vec::Vec::with_capacity(num_fields as usize);
+    for i in 0..num_fields as isize {
+        let fname = if field_names.is_null() {
+            String::new()
+        } else {
+            unsafe { c_str(*field_names.offset(i)) }
+                .unwrap_or("")
+                .to_string()
+        };
+        let sort = if sorts.is_null() {
+            None
+        } else {
+            let sp = unsafe { *sorts.offset(i) };
+            if sp.is_null() {
+                None
+            } else {
+                Some(unsafe { &*sp }.clone())
+            }
+        };
+        let sort_ref = if sort_refs.is_null() {
+            0
+        } else {
+            unsafe { *sort_refs.offset(i) }
+        };
+        fields.push(ConstructorField {
+            name: fname,
+            sort,
+            sort_ref,
+        });
+    }
+    unsafe { &mut *c }.intern_constructor(Z3rsConstructor {
+        name,
+        fields,
+        datatype: None,
+    })
+}
+
+/// `Z3_mk_datatype(c, name, num_constructors, constructors)` — declare an
+/// algebraic datatype from its constructor specs and return its `Z3_sort`. Emits
+/// `(declare-datatype name ((ctor (field sort)…)…))` into the session and
+/// records the resulting sort into each `Z3_constructor` for
+/// [`Z3_query_constructor`].
+///
+/// # Safety
+/// `c` valid context; `constructors` points to `num_constructors` valid
+/// `Z3_constructor` handles from this context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_datatype(
+    c: *mut Z3rsZ3Context,
+    name: *const Z3rsSymbol,
+    num_constructors: u32,
+    constructors: *mut *const Z3rsConstructor,
+) -> *const Z3rsSort {
+    if c.is_null() || constructors.is_null() || num_constructors == 0 {
+        return ptr::null();
+    }
+    let dt_name = unsafe { c_str(name) }.unwrap_or("").to_string();
+    // Render the constructor list, using the datatype name for recursive fields.
+    let mut body = String::new();
+    for i in 0..num_constructors as isize {
+        let kp = unsafe { *constructors.offset(i) };
+        if kp.is_null() {
+            return ptr::null();
+        }
+        let k = unsafe { &*kp };
+        if i > 0 {
+            body.push(' ');
+        }
+        body.push('(');
+        body.push_str(&k.name);
+        for f in &k.fields {
+            let sort_txt = match &f.sort {
+                Some(s) => s.smt(),
+                None => dt_name.clone(),
+            };
+            body.push_str(&alloc::format!(" ({} {})", f.name, sort_txt));
+        }
+        body.push(')');
+    }
+    let sort = unsafe { &mut *c }.build.declare_datatype(&dt_name, &body);
+    // Record the datatype sort into each constructor (arena-owned; safe to
+    // reborrow mutably through the raw pointer, as `Z3_ast_vector_push` does).
+    for i in 0..num_constructors as isize {
+        let kp = unsafe { *constructors.offset(i) } as *mut Z3rsConstructor;
+        unsafe { (*kp).datatype = Some(sort.clone()) };
+    }
+    unsafe { &mut *c }.intern_sort(sort)
+}
+
+/// `Z3_query_constructor(c, constr, num_fields, constructor, tester, accessors)`
+/// — hand back the constructor's function declarations: the constructor itself
+/// (range = the datatype sort), its `(_ is name)` tester (range = Bool), and one
+/// accessor per field (range = the field's sort). NULL out-pointers are skipped.
+///
+/// # Safety
+/// `c` valid context; `constr` a `Z3_constructor` already passed to
+/// [`Z3_mk_datatype`]; `accessors` (if non-NULL) writable for `num_fields`
+/// entries; `constructor`/`tester` writable if non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_query_constructor(
+    c: *mut Z3rsZ3Context,
+    constr: *const Z3rsConstructor,
+    num_fields: u32,
+    constructor: *mut *const Z3rsFuncDecl,
+    tester: *mut *const Z3rsFuncDecl,
+    accessors: *mut *const Z3rsFuncDecl,
+) {
+    if c.is_null() || constr.is_null() {
+        return;
+    }
+    let (ctor_name, dt, fields) = {
+        let k = unsafe { &*constr };
+        let dt = k
+            .datatype
+            .clone()
+            .unwrap_or_else(|| Sort::Datatype(String::new()));
+        (k.name.clone(), dt, k.fields.clone())
+    };
+    if !constructor.is_null() {
+        let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(ctor_name.clone(), dt.clone()));
+        unsafe { *constructor = fd };
+    }
+    if !tester.is_null() {
+        let tname = alloc::format!("(_ is {ctor_name})");
+        let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(tname, Sort::Bool));
+        unsafe { *tester = fd };
+    }
+    if !accessors.is_null() {
+        for (i, f) in fields.iter().enumerate().take(num_fields as usize) {
+            let range = f.sort.clone().unwrap_or_else(|| dt.clone());
+            let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(f.name.clone(), range));
+            unsafe { *accessors.add(i) = fd };
+        }
+    }
+}
+
+/// `Z3_constructor_list` — an arena wrapper around a list of `Z3_constructor`s
+/// (used by the mutually-recursive `Z3_mk_datatypes` surface; kept so clients
+/// that build one link and run).
+pub struct Z3rsConstructorList {
+    #[allow(dead_code)]
+    constructors: alloc::vec::Vec<*const Z3rsConstructor>,
+}
+
+/// `Z3_mk_constructor_list(c, num_constructors, constructors)` — wrap
+/// constructors into a `Z3_constructor_list`.
+///
+/// # Safety
+/// `c` valid context; `constructors` points to `num_constructors` valid handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_constructor_list(
+    c: *mut Z3rsZ3Context,
+    num_constructors: u32,
+    constructors: *const *const Z3rsConstructor,
+) -> *const Z3rsConstructorList {
+    if c.is_null() {
+        return ptr::null();
+    }
+    let mut items = alloc::vec::Vec::with_capacity(num_constructors as usize);
+    if num_constructors > 0 {
+        if constructors.is_null() {
+            return ptr::null();
+        }
+        for i in 0..num_constructors as isize {
+            items.push(unsafe { *constructors.offset(i) });
+        }
+    }
+    unsafe { &mut *c }.intern_constructor_list(Z3rsConstructorList { constructors: items })
+}
+
+/// `Z3_del_constructor(c, constr)` — no-op (arena-owned until
+/// [`Z3_del_context`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn Z3_del_constructor(_c: *mut Z3rsZ3Context, _constr: *const Z3rsConstructor) {}
+
+/// `Z3_del_constructor_list(c, clist)` — no-op (arena-owned).
+#[unsafe(no_mangle)]
+pub extern "C" fn Z3_del_constructor_list(
+    _c: *mut Z3rsZ3Context,
+    _clist: *const Z3rsConstructorList,
+) {
+}
+
+/// `Z3_mk_enumeration_sort(c, name, n, enum_names, enum_consts, enum_testers)` —
+/// a datatype of `n` nullary constructors. Fills `enum_consts[i]` with each
+/// value's constructor decl and `enum_testers[i]` with its `(_ is …)` tester.
+///
+/// # Safety
+/// `c` valid context; `enum_names` points to `n` valid symbols; `enum_consts` /
+/// `enum_testers` (if non-NULL) writable for `n` entries.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_enumeration_sort(
+    c: *mut Z3rsZ3Context,
+    name: *const Z3rsSymbol,
+    n: u32,
+    enum_names: *const *const Z3rsSymbol,
+    enum_consts: *mut *const Z3rsFuncDecl,
+    enum_testers: *mut *const Z3rsFuncDecl,
+) -> *const Z3rsSort {
+    if c.is_null() || enum_names.is_null() {
+        return ptr::null();
+    }
+    let dt_name = unsafe { c_str(name) }.unwrap_or("").to_string();
+    let mut names = alloc::vec::Vec::with_capacity(n as usize);
+    for i in 0..n as isize {
+        let np = unsafe { *enum_names.offset(i) };
+        names.push(unsafe { c_str(np) }.unwrap_or("").to_string());
+    }
+    let body = names
+        .iter()
+        .map(|nm| alloc::format!("({nm})"))
+        .collect::<alloc::vec::Vec<_>>()
+        .join(" ");
+    let sort = unsafe { &mut *c }.build.declare_datatype(&dt_name, &body);
+    for (i, nm) in names.iter().enumerate() {
+        if !enum_consts.is_null() {
+            let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(nm.clone(), sort.clone()));
+            unsafe { *enum_consts.add(i) = fd };
+        }
+        if !enum_testers.is_null() {
+            let tname = alloc::format!("(_ is {nm})");
+            let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(tname, Sort::Bool));
+            unsafe { *enum_testers.add(i) = fd };
+        }
+    }
+    unsafe { &mut *c }.intern_sort(sort)
+}
+
+/// `Z3_mk_tuple_sort(c, name, num_fields, field_names, field_sorts,
+/// mk_tuple_decl, proj_decl)` — a single-constructor datatype (a tuple). Writes
+/// the constructor decl to `*mk_tuple_decl` and the `num_fields` projection
+/// (accessor) decls to `proj_decl`.
+///
+/// # Safety
+/// `c` valid context; `field_names`/`field_sorts` point to `num_fields` entries;
+/// `mk_tuple_decl`/`proj_decl` (if non-NULL) writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_tuple_sort(
+    c: *mut Z3rsZ3Context,
+    name: *const Z3rsSymbol,
+    num_fields: u32,
+    field_names: *const *const Z3rsSymbol,
+    field_sorts: *const *const Z3rsSort,
+    mk_tuple_decl: *mut *const Z3rsFuncDecl,
+    proj_decl: *mut *const Z3rsFuncDecl,
+) -> *const Z3rsSort {
+    if c.is_null() {
+        return ptr::null();
+    }
+    let tuple_name = unsafe { c_str(name) }.unwrap_or("").to_string();
+    // Sort name: the tuple type; constructor name: `mk-<name>` to avoid clashing
+    // with the sort name in the front end's namespaces.
+    let ctor_name = alloc::format!("mk-{tuple_name}");
+    let mut fnames = alloc::vec::Vec::with_capacity(num_fields as usize);
+    let mut fsorts = alloc::vec::Vec::with_capacity(num_fields as usize);
+    for i in 0..num_fields as isize {
+        let fname = if field_names.is_null() {
+            String::new()
+        } else {
+            unsafe { c_str(*field_names.offset(i)) }
+                .unwrap_or("")
+                .to_string()
+        };
+        let fsort = if field_sorts.is_null() {
+            Sort::Int
+        } else {
+            let sp = unsafe { *field_sorts.offset(i) };
+            if sp.is_null() {
+                Sort::Int
+            } else {
+                unsafe { &*sp }.clone()
+            }
+        };
+        fnames.push(fname);
+        fsorts.push(fsort);
+    }
+    let mut body = alloc::format!("({ctor_name}");
+    for (fname, fsort) in fnames.iter().zip(fsorts.iter()) {
+        body.push_str(&alloc::format!(" ({} {})", fname, fsort.smt()));
+    }
+    body.push(')');
+    let sort = unsafe { &mut *c }.build.declare_datatype(&tuple_name, &body);
+    if !mk_tuple_decl.is_null() {
+        let fd = unsafe { &mut *c }.intern_func_decl(FuncDecl::new(ctor_name, sort.clone()));
+        unsafe { *mk_tuple_decl = fd };
+    }
+    if !proj_decl.is_null() {
+        for (i, (fname, fsort)) in fnames.iter().zip(fsorts.iter()).enumerate() {
+            let fd =
+                unsafe { &mut *c }.intern_func_decl(FuncDecl::new(fname.clone(), fsort.clone()));
+            unsafe { *proj_decl.add(i) = fd };
+        }
+    }
+    unsafe { &mut *c }.intern_sort(sort)
+}
+
+/// `Z3_mk_set_sort(c, elem)` — the set sort over `elem`, i.e. `(Array elem
+/// Bool)`.
+///
+/// # Safety
+/// `c` valid context; `elem` a valid sort handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn Z3_mk_set_sort(
+    c: *mut Z3rsZ3Context,
+    elem: *const Z3rsSort,
+) -> *const Z3rsSort {
+    if c.is_null() || elem.is_null() {
+        return ptr::null();
+    }
+    let d = unsafe { &*elem }.clone();
+    let s = Sort::Array(alloc::boxed::Box::new(d), alloc::boxed::Box::new(Sort::Bool));
+    unsafe { &mut *c }.intern_sort(s)
 }
