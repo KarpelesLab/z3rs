@@ -170,7 +170,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ exit criterion met.
 |------:|-----|:------:|-------|
 | A | SAT/BV core speed | ⬜ | enables C; BV correct but budget-bound |
 | B | symbolic `div`/`mod` | 🟨 | Euclidean lift-abstraction + divisor-witness search: unknown-gap **45%→~6%** (fuzz, 0 unsound); large/unbounded-divisor tail remains |
-| C | floating-point theory | 🟨 | non-arithmetic surface done & fuzz-clean: `fp.abs`/`neg`, exact `fp.to_real`, **fast** ordered `fp.lt`/`leq`/`gt`/`geq` (direct sign+magnitude circuit — replaced the key transform that hung), `fp.min`/`max`, `fp.eq` + classification. Remaining: arithmetic (add/sub/mul/div/fma/sqrt/rem, `roundToIntegral`, `to_fp`/`to_ubv`/`to_sbv`) — specced; large circuits still likely need Phase A |
+| C | floating-point theory | 🟨 | non-arithmetic surface done & fuzz-clean (`abs`/`neg`, exact `to_real`, **fast** ordered compares, `min`/`max`, `eq`+classification); **bit-exact `fp.add`/`fp.sub`** landed (all 5 rounding modes, ~3k fuzz 0 unsound) — decides **Float16 fast**, Float32 partially, fp64 declines. Confirmed: Float32/64 add is too large for the CDCL ⇒ **needs Phase A**. Remaining: mul/div/fma/sqrt/rem, `roundToIntegral`, conversions, + faster core |
 | D | strings & sequences | ⬜ | length/witness/predicate reasoning done; word equations remain |
 | E | nonlinear real (CAD) | 🟨 | full CAD for the non-degenerate capped fragment done; coupled 3-var declines on degenerate projection → needs **Hong fallback** (verified: not a cap issue) |
 | F | quantifiers (MBQI) | ⬜ | E-matching fixpoint done; MBQI/alternation remain |
