@@ -1938,7 +1938,7 @@ pub unsafe extern "C" fn Z3_get_sort(c: *mut Z3rsZ3Context, a: *const Z3rsAst) -
 }
 
 /// `Z3_get_sort_kind(c, s)` — the `Z3_sort_kind` tag (`UNINTERPRETED`=0,
-/// `BOOL`=1, `INT`=2, `REAL`=3, `BV`=4, `ARRAY`=5).
+/// `BOOL`=1, `INT`=2, `REAL`=3, `BV`=4, `ARRAY`=5, `DATATYPE`=6).
 ///
 /// # Safety
 /// `s` must be NULL or a valid sort handle.
@@ -1954,6 +1954,7 @@ pub unsafe extern "C" fn Z3_get_sort_kind(_c: *mut Z3rsZ3Context, s: *const Z3rs
         Sort::Real => 3,
         Sort::BitVec(_) => 4,
         Sort::Array(_, _) => 5,
+        Sort::Datatype(_) => 6, // Z3_DATATYPE_SORT
     }
 }
 
