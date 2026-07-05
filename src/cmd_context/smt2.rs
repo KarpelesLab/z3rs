@@ -1972,6 +1972,16 @@ impl Context {
                 let negb = self.m.mk_mul(&[neg1, divv]);
                 let ltnegb = self.m.mk_lt(r, negb);
                 ctx.defs.push(self.m.mk_implies(blt0, ltnegb));
+                // Same dividend and divisor: `div(t,t)=1 ∧ mod(t,t)=0` for `t≠0`
+                // (the nonlinear identity alone doesn't pin this for the linear
+                // engine). Decides e.g. `mod(x,x) > 9 ∧ x > 0` (unsat).
+                if a == b {
+                    let one = self.m.mk_int(1);
+                    let q1 = self.m.mk_eq(q, one);
+                    ctx.defs.push(self.m.mk_implies(bne0, q1));
+                    let r0 = self.m.mk_eq(r, zero);
+                    ctx.defs.push(self.m.mk_implies(bne0, r0));
+                }
             }
         }
         ctx.dm.insert((a, b), (q, r));
