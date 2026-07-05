@@ -3335,17 +3335,24 @@ impl Context {
                 self.symbolic_fp(op, args)
             }
             "fp.to_real" if args.len() == 1 => {
-                // Exact real value of a finite Float64 constant. Folded when the
-                // value is an integer; other finite values would need an exact
-                // dyadic rational, so they stay a gated `unknown`.
+                // Exact real value of a finite Float64 constant as a dyadic
+                // rational `mant · 2^p`, decomposed from the IEEE-754 bits.
                 if let Some(a) = self.fp64(args[0])
                     && a.is_finite()
-                    && a.abs() < 9.007e15
-                    && (a as i64) as f64 == a
                 {
-                    return Ok(self
-                        .m
-                        .mk_numeral(Rational::from_integer(puremp::Int::from(a as i64)), false));
+                    let bits = a.to_bits();
+                    let s = (bits >> 63) & 1;
+                    let e = ((bits >> 52) & 0x7ff) as i32;
+                    let m = (bits & 0x000f_ffff_ffff_ffff) as i64;
+                    let (mant, p) = if e == 0 {
+                        (m, -1074i32) // subnormal / zero
+                    } else {
+                        (m | (1i64 << 52), e - 1075) // normal (hidden bit)
+                    };
+                    let val = Rational::from_integer(puremp::Int::from(mant))
+                        .mul(&Rational::power_of_two(p));
+                    let val = if s == 1 { val.neg() } else { val };
+                    return Ok(self.m.mk_numeral(val, false));
                 }
                 self.symbolic_fp(op, args)
             }
