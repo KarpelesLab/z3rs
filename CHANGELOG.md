@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/z3rs/compare/v0.0.5...v0.0.6) - 2026-07-05
+
+### Other
+
+- Phase G (Horn/CHC) → done: single-pred + acyclic multi-pred decide both directions
+- Phase G: bound the multi-predicate BMC to decline cyclic systems fast
+- Phase G: decide acyclic multi-predicate CHC exactly (both directions)
+- roadmap Phase G — multi-predicate unsafe decides; safe needs MBP
+- Phase G: multi-predicate CHC (unsafe direction) via bounded reachability
+- roadmap Phase G — single-predicate CHC robust (property heads, non-bare args)
+- Phase G: single-predicate CHC — property heads + non-bare predicate args
+- Phase C (floating-point) → done: whole common QF_FP fragment decides
+- Phase C: bit-blast to_fp(fp→fp) format conversion (widening)
+- fp.fma/fp.sqrt now decide (were opaque); update the gate test
+- Phase C: bit-blast symbolic fp.fma (port of z3's mk_fma)
+- roadmap Phase C — symbolic Float16 arithmetic decides (bit-blaster wins)
+- roadmap Phase C — 6 FP ops bit-exact + concrete arithmetic decides all formats
+- Phase C: bit-blast symbolic fp.roundToIntegral (port of z3's mk_round_to_integral)
+- roadmap Phase C — add/sub/mul/div/sqrt + to_fp folding landed
+- Phase C: bit-blast symbolic fp.sqrt (port of z3's mk_sqrt)
+- Phase C: bit-blast symbolic fp.div (port of z3's mk_div)
+- Phase C: fold to_fp(real/int) to any format under any rounding mode
+- Phase C: bit-blast symbolic fp.mul (port of z3's mk_mul)
+- Phase B (div/mod) and Phase E (QF_NRA CAD) → done
+- cofactor-expansion fallback when Bareiss division is inexact
+- Fix CAD panic: make the Bareiss determinant / resultant chain fallible
+- roadmap Phase B — comprehensive div/mod (gap ~1.3%)
+- Phase B: pin div(t,t)=1, mod(t,t)=0 when dividend equals divisor
+- Phase B: handle compound divisor expressions via a fresh alias variable
+- roadmap Phase B — single-var divisor complete; compound divisors remain
+- Phase B: complete decision for constant-dividend symbolic-divisor div/mod
+- Phase B: div/mod witness — try zero divisor + goal-derived candidates
+- apply rustfmt and fix rustdoc intra-doc warnings
+- satisfy free-variable disequalities without draining branch-and-bound
+- roadmap Phase E — complete-projection CAD fallback landed (salvaged)
+- Phase A: structural hashing of bit-blaster gates
+- roadmap Phase C — fp.add/sub landed (Float16 fast, Float32 needs Phase A)
+- Bit-exact symbolic fp.add / fp.sub, bit-blasted to QF_BV
+- Phase H (full C ABI) → done: representative real-world C programs run unchanged
+- quantifier _const builders, datatypes, enum/tuple/set sorts + C program
+- add Datatype sort, quantifier + pattern + declare_datatype builders
+- read back model values and exercise unsat core
+- model/AST-inspection surface (numeral readback, model_eval, ast vectors)
+- roadmap tracker — Phase B/C/H progress this cycle
+- expand drop-in Z3_ C ABI (80% path)
+- Phase B: widen divisor-witness candidate range (gap ~8%→~6%)
+- Phase B: SAT witnesses for symbolic div/mod via divisor enumeration
+- Phase B: abstract symbolic div/mod as solver variables (Euclidean lift)
+- Reset roadmap: from "port complete" to "close the parity gaps"
+- record the divergence-closing campaign in Phase 10 (hardening & parity)
+- Euclidean axiom for div/mod by a symbolic divisor
+- changelog for sequence-theory soundness fixes
+- Fix unsound UNSAT: seq.contains/prefixof/suffixof over symbolic elements
+- Fix unsound SAT: propagate length of concrete sequences through equality
+- changelog for fuzz-mined divergence fixes
+- derive variable bounds from square equalities
+- Fix unsound SAT: acyclicity across mutually-recursive datatypes
+- Fix panic on ((_ to_fp eb sb) bv) bit-vector reinterpret form
+- Fix panic in str.indexof folding on needle longer than string
+- Fix unsound SAT: seq.len(s)=0 ⇔ s=empty (canonical empty sequence)
+- Fix unsound SAT: str.len(s)=0 must force s=""
+- roadmap all phases done, changelog, published parity report
+- wire CAD, add CHC (BMC + k-induction), string & array completeness
+- nlsat CAD/realclosure + ICP, DRAT checker, Datalog engine
+- math kernels + ast quantifiers/translation foundations
+
 ### Other
 
 - Divergence-closing vs z3 (fuzz-mined): fix wrong `sat` on string/sequence
