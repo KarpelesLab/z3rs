@@ -4363,6 +4363,108 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.sqrt` on a symbolic operand (port of `mk_sqrt`: the
+    /// restoring bit-by-bit square root, Handbook of FP Arithmetic alg. 10.2).
+    /// `None` for an unsupported format/rm or unavailable bits.
+    fn fp_sqrt_bv(&mut self, rm: AstId, x: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb < 2 || sb < 4 || eb > sb || sb + 3 >= 63 {
+            return None;
+        }
+        let rm_c = self.rm_code(rm)?;
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let w = eb + sb;
+        let bvx = self.fp_to_bv(x)?;
+        let mant = sb - 1;
+        let exp_ones_v = ((1u64 << eb) - 1) << mant;
+        let nan = self.fp_lit(exp_ones_v | (1u64 << (mant - 1)), w);
+
+        // Classification.
+        let exp = self.m.mk_bv_extract(w - 2, sb - 1, bvx);
+        let sigf = self.m.mk_bv_extract(sb - 2, 0, bvx);
+        let sbit = self.m.mk_bv_extract(w - 1, w - 1, bvx);
+        let ez = self.m.mk_bv(0, eb);
+        let eo = self.m.mk_bvnot(ez);
+        let sz = self.m.mk_bv(0, sb - 1);
+        let exp_ones = self.m.mk_eq(exp, eo);
+        let exp_zero = self.m.mk_eq(exp, ez);
+        let sig_zero = self.m.mk_eq(sigf, sz);
+        let sig_nz = self.m.mk_not(sig_zero);
+        let one1 = self.m.mk_bv(1, 1);
+        let x_nan = self.m.mk_and(&[exp_ones, sig_nz]);
+        let x_inf = self.m.mk_and(&[exp_ones, sig_zero]);
+        let x_zero = self.m.mk_and(&[exp_zero, sig_zero]);
+        let x_neg = self.m.mk_eq(sbit, one1);
+        let x_pos = self.m.mk_not(x_neg);
+
+        // c1 NaN→x, c2 +∞→x, c3 ±0→x, c4 x<0→NaN.
+        let c1 = x_nan;
+        let v1 = bvx;
+        let c2 = self.m.mk_and(&[x_inf, x_pos]);
+        let v2 = bvx;
+        let c3 = x_zero;
+        let v3 = bvx;
+        let c4 = x_neg;
+        let v4 = nan;
+
+        // Core square root.
+        let (_a_sgn, a_sig, a_exp, a_lz) = self.fp_unpack_norm(bvx, eb, sb);
+        let zero1 = self.m.mk_bv(0, 1);
+        let res_sgn = zero1;
+        let ae = self.m.mk_bv_sign_extend(1, a_exp);
+        let al = self.m.mk_bv_zero_extend(1, a_lz);
+        let real_exp = self.m.mk_bvsub(ae, al); // eb+1
+        let re_hi = self.m.mk_bv_extract(eb, 1, real_exp); // eb bits (exp/2)
+        let res_exp = self.m.mk_bv_sign_extend(2, re_hi); // eb+2
+        let re_lo = self.m.mk_bv_extract(0, 0, real_exp);
+        let e_is_odd = self.m.mk_eq(re_lo, one1);
+        let a_z = self.m.mk_bv_concat(a_sig, zero1); // sb+1
+        let z_a = self.m.mk_bv_concat(zero1, a_sig); // sb+1
+        let sig_prime = self.m.mk_ite(e_is_odd, a_z, z_a); // sb+1
+        let mut q = self.m.mk_bv(1i64 << (sb + 3), sb + 5); // 2^(sb+3)
+        let z4 = self.m.mk_bv(0, 4);
+        let sp4 = self.m.mk_bv_concat(sig_prime, z4); // sb+5
+        let mut r = self.m.mk_bvsub(sp4, q);
+        let mut s = q;
+        for _ in 0..(sb + 3) {
+            let s_hi = self.m.mk_bv_extract(sb + 4, 1, s); // sb+4
+            s = self.m.mk_bv_concat(zero1, s_hi); // sb+5
+            let qz = self.m.mk_bv_concat(q, zero1); // sb+6
+            let zs = self.m.mk_bv_concat(zero1, s); // sb+6
+            let two_q_plus_s = self.m.mk_bvadd(qz, zs);
+            let rz = self.m.mk_bv_concat(r, zero1); // sb+6
+            let t = self.m.mk_bvsub(rz, two_q_plus_s);
+            let t_top = self.m.mk_bv_extract(sb + 5, sb + 5, t);
+            let t_lt_0 = self.m.mk_eq(t_top, one1);
+            let q_or_s = self.m.mk_bvor(q, s);
+            q = self.m.mk_ite(t_lt_0, q, q_or_s);
+            let r_lo = self.m.mk_bv_extract(sb + 3, 0, r); // sb+4
+            let r_shftd = self.m.mk_bv_concat(r_lo, zero1); // sb+5
+            let t_lo = self.m.mk_bv_extract(sb + 4, 0, t); // sb+5
+            r = self.m.mk_ite(t_lt_0, r_shftd, t_lo);
+        }
+        let r_zero = self.m.mk_bv(0, sb + 5);
+        let is_exact = self.m.mk_eq(r, r_zero);
+        let last = self.m.mk_bv_extract(0, 0, q);
+        let rest = self.m.mk_bv_extract(sb + 3, 1, q); // sb+3
+        let rest_ext = self.m.mk_bv_zero_extend(1, rest); // sb+4
+        let last_ext = self.m.mk_bv_zero_extend(sb + 3, last); // sb+4
+        let one_sbits4 = self.m.mk_bv(1, sb + 4);
+        let sticky = self.m.mk_ite(is_exact, last_ext, one_sbits4);
+        let res_sig = self.m.mk_bvor(rest_ext, sticky); // sb+4
+        let v5 = self.fp_round(rm3, res_sgn, res_sig, res_exp, eb, sb);
+
+        let r = self.m.mk_ite(c4, v4, v5);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -4401,6 +4503,14 @@ impl Context {
                 if op == "fp.div"
                     && let Some(t) = self.fp_div_bv(args[0], args[1], args[2])
                 {
+                    return Ok(t);
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.sqrt" if args.len() == 2 => {
+                // No `f64::sqrt` under no_std; the bit-blast circuit decides
+                // concrete operands too (via the QF_BV engine).
+                if let Some(t) = self.fp_sqrt_bv(args[0], args[1]) {
                     return Ok(t);
                 }
                 self.symbolic_fp(op, args)
@@ -9661,23 +9771,24 @@ mod tests {
 
     #[test]
     fn opaque_fp_ops_gate_not_contradict() {
-        // fp.fma / fp.sqrt on constants have a determined value we can't fold
-        // in no_std; they must stay `unknown`, never a wrong verdict. (A bug once
-        // bit-blasted them to a free bit-vector, giving `sat` where z3 is unsat.)
+        // fp.fma is still opaque (not bit-blasted) → sound `unknown`, never a wrong
+        // verdict. (A bug once bit-blasted it to a free bit-vector, giving `sat`
+        // where z3 is unsat.)
         let t = "((_ to_fp 11 53) RNE";
         assert_eq!(
             run(&alloc::format!(
-                "(assert (not (= (fp.fma RNE {t} 2.0) {t} 3.0) {t} 1.0)) {t} 7.0))))(check-sat)"
+                "(assert (not (fp.isNaN (fp.fma RNE {t} 2.0) {t} 3.0) {t} 1.0)))))(check-sat)"
             ))
             .unwrap(),
             alloc::vec!["unknown"]
         );
+        // fp.sqrt is now bit-blasted and decides: √9 = 3, so `¬(√9 = 3)` is unsat.
         assert_eq!(
             run(&alloc::format!(
-                "(assert (not (= (fp.sqrt RNE {t} 9.0)) {t} 3.0))))(check-sat)"
+                "(assert (not (fp.eq (fp.sqrt RNE {t} 9.0)) {t} 3.0))))(check-sat)"
             ))
             .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["unsat"]
         );
     }
 
