@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Other
 
+- Divergence-closing vs z3 (fuzz-mined): fix wrong `sat` on string/sequence
+  emptiness (`str.len(s)=0 ⇔ s=""`, `seq.len(s)=0 ⇔ s=empty` with a canonical
+  empty sequence) and on acyclicity across **mutually-recursive datatypes**
+  (`x=nodeA(nodeB(x))`); fix panics in `str.indexof` (needle longer than string)
+  and `((_ to_fp eb sb) bv)` (bit-vector reinterpret form); and decide more
+  nonlinear-integer systems by deriving variable bounds from square equalities
+  (`x²+y²=3` unsat, `x²=2y² ∧ 0<x<5` unsat). Plus earlier this cycle: string
+  length-link axioms + bounded witness search, and the functional-array-equality
+  (`(_ map f)`/`(_ as-array f)`/`(lambda …)`) soundness gate.
 - Phase 1 ✅: `math` (multivariate `polynomial` + rational `interval` kernels),
   `params` (`param_descrs` schema tables), AST quantifiers/lambda +
   cross-manager `ast_translation` with a build→translate→pp round-trip
