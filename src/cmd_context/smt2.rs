@@ -1068,6 +1068,11 @@ struct Context {
     /// `div(a,b)`), collected during lifting so the SAT direction can witness by
     /// enumerating small divisor values.
     symbolic_divisors: BTreeSet<AstId>,
+    /// Per symbolic-divisor `div`/`mod` abstraction: `(dividend, divisor, q, r)`
+    /// where `q`/`r` are the fresh quotient/remainder. Lets the complete-UNSAT
+    /// check reason about the constant-dividend class after lifting has replaced
+    /// the div/mod terms with `q`/`r`.
+    symbolic_divmod: Vec<(AstId, AstId, AstId, AstId)>,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -1233,6 +1238,7 @@ impl Context {
             seq_of: BTreeMap::new(),
             seq_empty: BTreeMap::new(),
             symbolic_divisors: BTreeSet::new(),
+            symbolic_divmod: Vec::new(),
             seq_len_decls: BTreeSet::new(),
         }
     }
@@ -1927,6 +1933,7 @@ impl Context {
             }
             None => {
                 self.symbolic_divisors.insert(b);
+                self.symbolic_divmod.push((a, b, q, r));
                 // Symbolic divisor: the Euclidean identity holds only for b ≠ 0
                 // (div/mod by 0 are unconstrained). `|b| = ite(b≥0, b, −b)`. Push
                 // the three facts as *separate* guarded implications rather than
@@ -2530,12 +2537,15 @@ impl Context {
         // `mod(-26,y) ≥ 11` needs `y = ±37 = ±(26+11)`, `mod(12,y) ≥ 8 ∧ y<0`
         // needs `y = -13` (any `|y| > 12`). So take each constant with both
         // signs, ±1 around it, and all pairwise sums/differences.
-        let consts: Vec<i64> = present
+        let mut consts: Vec<i64> = present
             .iter()
             .filter_map(|t| self.m.as_numeral(*t).and_then(|r| r.to_integer()))
             .filter_map(|v| v.to_i64())
             .filter(|n| n.abs() <= 2000)
             .collect();
+        consts.sort_unstable();
+        consts.dedup();
+        consts.truncate(16); // bound the O(n²) pairwise blow-up
         let mut cand_set: Vec<i64> = Vec::new();
         for &a in &consts {
             for d in [a, a + 1, a - 1] {
@@ -2550,11 +2560,14 @@ impl Context {
             }
         }
         for cand in cand_set {
+            if vals.len() >= 220 {
+                break; // keep the search bounded
+            }
             if cand != 0 && cand.abs() <= 4000 && !vals.contains(&cand) {
                 vals.push(cand);
             }
         }
-        const MAX_TRIES: usize = 4000;
+        const MAX_TRIES: usize = 800;
         let mut idx = alloc::vec![0usize; divs.len()];
         let mut tries = 0;
         loop {
@@ -2589,6 +2602,108 @@ impl Context {
                 k += 1;
             }
         }
+    }
+
+    /// Prove **UNSAT** for a goal whose only symbolic divisor `d` occurs solely
+    /// inside `div`/`mod` terms with *constant* dividends. After lifting, each
+    /// such term became a quotient `q` / remainder `r` linked by the Euclidean
+    /// identity `a = d·q + r`. The quotient `q = div(a,d)` is **constant** for
+    /// every `|d| > M = max|dividend|` (`0` if `a ≥ 0`, else `∓1` for the ±∞
+    /// tail), so the value set over all `d` is finite: enumerating `|d| ≤ M+1`
+    /// concretely, plus the two symbolic tails `d > M` / `d < −M` with each `q`
+    /// pinned to its stable value (leaving `r` linearly determined), is a
+    /// *complete* decision. Returns `true` only when **every** case is definitely
+    /// (and linearly, hence trustworthily) unsatisfiable; otherwise it bails.
+    fn divmod_complete_unsat(&mut self, goal: AstId) -> bool {
+        // The single symbolic divisor present in the goal.
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let divisors: BTreeSet<AstId> = self
+            .symbolic_divmod
+            .iter()
+            .map(|&(_, b, _, _)| b)
+            .filter(|b| present.contains(b))
+            .collect();
+        if divisors.len() != 1 {
+            return false; // exactly one symbolic divisor handled
+        }
+        let d = *divisors.iter().next().unwrap();
+        if !self.m.is_uninterp_const(d) {
+            return false;
+        }
+        // The (dividend, quotient) pairs for this divisor; every dividend must be
+        // a concrete integer, and each quotient must actually occur in the goal.
+        let mut pairs: Vec<(i64, AstId)> = Vec::new(); // (dividend, quotient q)
+        for &(a, b, q, _r) in &self.symbolic_divmod {
+            if b != d || !present.contains(&q) {
+                continue;
+            }
+            let Some(av) = self
+                .m
+                .as_numeral(a)
+                .and_then(|r| r.to_integer())
+                .and_then(|v| v.to_i64())
+            else {
+                return false; // non-constant dividend
+            };
+            pairs.push((av, q));
+        }
+        if pairs.is_empty() {
+            return false;
+        }
+        let m_max = pairs.iter().map(|&(a, _)| a.abs()).max().unwrap_or(0);
+        if m_max > 128 {
+            return false; // enumeration would be too wide
+        }
+        let range = m_max + 1;
+        // 1. Finite enumeration of |d| ≤ M+1. Substituting a concrete `d` makes
+        //    the Euclidean `d·q` linear (`d = 0` leaves q,r free via the vacuous
+        //    guards) — every case must be linearly UNSAT.
+        for v in -range..=range {
+            let sub = alloc::vec![(d, self.m.mk_int(v))];
+            let g = crate::rewriter::substitute(&mut self.m, goal, &sub);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if self.arith_nonlinear(g) {
+                return false;
+            }
+            if check_model(&self.m, g).0 != SmtResult::Unsat {
+                return false;
+            }
+        }
+        // 2. The two symbolic tails: pin each quotient to its stable value and
+        //    require `d` beyond the stabilisation threshold `M`. The remainders
+        //    stay linearly determined by the (now-linear) Euclidean identity.
+        for positive in [true, false] {
+            let sub: Vec<(AstId, AstId)> = pairs
+                .iter()
+                .map(|&(a, q)| {
+                    let stable = if a >= 0 {
+                        0
+                    } else if positive {
+                        -1
+                    } else {
+                        1
+                    };
+                    (q, self.m.mk_int(stable))
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &sub);
+            let bound = if positive {
+                let mm = self.m.mk_int(m_max);
+                self.m.mk_gt(d, mm)
+            } else {
+                let mm = self.m.mk_int(-m_max);
+                self.m.mk_lt(d, mm)
+            };
+            let g = self.m.mk_and(&[g, bound]);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if self.arith_nonlinear(g) {
+                return false;
+            }
+            if check_model(&self.m, g).0 != SmtResult::Unsat {
+                return false;
+            }
+        }
+        true
     }
 
     /// Bounded, sound search for a concrete satisfying assignment to a goal with
@@ -6296,9 +6411,16 @@ impl Context {
                 .postorder(goal)
                 .iter()
                 .any(|t| self.symbolic_divisors.contains(t))
-            && let Some(m) = self.try_divmod_witness(goal)
         {
-            return (SmtResult::Sat, Some(m));
+            if let Some(m) = self.try_divmod_witness(goal) {
+                return (SmtResult::Sat, Some(m));
+            }
+            // No witness: for the constant-dividend single-divisor class the
+            // witness search is *complete*, so a proven-exhaustive failure is a
+            // sound `unsat` (e.g. `div(31,y) < −4 ∧ y > 2`).
+            if self.divmod_complete_unsat(goal) {
+                return (SmtResult::Unsat, None);
+            }
         }
         if res == SmtResult::Sat && self.arith_nonlinear(goal) {
             // First, try to *linearize*: a variable pinned by an equality
@@ -8955,6 +9077,27 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn divmod_symbolic_divisor_complete() {
+        // Constant-dividend div/mod by a symbolic divisor is now fully decided.
+        // SAT via a zero divisor (unspecified) or a witness:
+        assert_eq!(
+            run("(declare-const y Int)(assert (<= (mod (- 29) y) (- 8)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // UNSAT via the complete finite-enumeration + stable-tail decision:
+        assert_eq!(
+            run("(declare-const y Int)(assert (< (div 31 y) (- 4)))(assert (> y 2))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const y Int)(assert (> (div 27 y) 11))(assert (< y 0))(check-sat)")
+                .unwrap(),
+            alloc::vec!["unsat"]
+        );
     }
 
     #[test]
