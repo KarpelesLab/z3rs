@@ -3652,7 +3652,12 @@ impl Context {
                 if sub.is_empty() {
                     return Some(start as i64);
                 }
-                for i in start..=s.len().saturating_sub(sub.len()) {
+                // No room for `sub` at or after `start` ⇒ not found (guards the
+                // slice below against `s` shorter than `sub`).
+                if start + sub.len() > s.len() {
+                    return Some(-1);
+                }
+                for i in start..=s.len() - sub.len() {
                     if s[i..i + sub.len()] == sub[..] {
                         return Some(i as i64);
                     }
@@ -8496,6 +8501,27 @@ mod tests {
                  (assert (= (str.len x) 1))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn str_indexof_no_crash() {
+        // Regression: `str.indexof` folding sliced past the end when the string
+        // was shorter than the needle (hit via the witness search's empty
+        // candidate) — it must never panic.
+        assert_eq!(
+            run("(assert (= (str.indexof \"ab\" \"abc\" 0) (- 1)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(assert (= (str.indexof \"\" \"a\" 0) (- 1)))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // A symbolic indexof no longer panics (decides via the witness search).
+        assert_eq!(
+            run("(declare-const x String)(assert (= (str.indexof x \"a\" 0) 3))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
