@@ -4465,6 +4465,195 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.roundToIntegral` on a symbolic operand (port of z3's
+    /// `mk_round_to_integral`). The rounding mode is a constant, so its many
+    /// per-mode branches collapse at build time. `None` for unsupported bits.
+    fn fp_r2i_bv(&mut self, rm: AstId, x: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb < 2 || sb < 3 || eb > sb {
+            return None;
+        }
+        let rm_c = self.rm_code(rm)?;
+        let (rte, rta, rtp, rtn, rtz) = (rm_c == 0, rm_c == 1, rm_c == 2, rm_c == 3, rm_c == 4);
+        let w = eb + sb;
+        let bvx = self.fp_to_bv(x)?;
+        let mant = sb - 1;
+        let exp_ones_v = ((1u64 << eb) - 1) << mant;
+        let bias = (1u64 << (eb - 1)) - 1;
+        let nan = self.fp_lit(exp_ones_v | (1u64 << (mant - 1)), w);
+        let pzero = self.fp_lit(0, w);
+        let nzero = self.fp_lit(1u64 << (w - 1), w);
+        let pone = self.fp_lit(bias << mant, w); // +1.0
+        let none = self.fp_lit((1u64 << (w - 1)) | (bias << mant), w); // -1.0
+
+        // Classification.
+        let expf = self.m.mk_bv_extract(w - 2, sb - 1, bvx);
+        let sigf = self.m.mk_bv_extract(sb - 2, 0, bvx);
+        let sbit = self.m.mk_bv_extract(w - 1, w - 1, bvx);
+        let ez = self.m.mk_bv(0, eb);
+        let eo = self.m.mk_bvnot(ez);
+        let sz = self.m.mk_bv(0, sb - 1);
+        let one1 = self.m.mk_bv(1, 1);
+        let exp_ones = self.m.mk_eq(expf, eo);
+        let exp_zero = self.m.mk_eq(expf, ez);
+        let sig_zero = self.m.mk_eq(sigf, sz);
+        let sig_nz = self.m.mk_not(sig_zero);
+        let x_nan = self.m.mk_and(&[exp_ones, sig_nz]);
+        let x_inf = self.m.mk_and(&[exp_ones, sig_zero]);
+        let x_zero = self.m.mk_and(&[exp_zero, sig_zero]);
+        let x_denormal = self.m.mk_and(&[exp_zero, sig_nz]);
+        let x_neg = self.m.mk_eq(sbit, one1);
+
+        // c1 NaN→NaN, c2 ±∞→x, c3 ±0→x.
+        let c1 = x_nan;
+        let v1 = nan;
+        let c2 = x_inf;
+        let v2 = bvx;
+        let c3 = x_zero;
+        let v3 = bvx;
+
+        let (a_sgn, a_sig, a_exp, _a_lz) = self.fp_unpack_norm(bvx, eb, sb);
+        let sgn_eq_1 = self.m.mk_eq(a_sgn, one1);
+        let xzero = self.m.mk_ite(sgn_eq_1, nzero, pzero);
+        let xone = self.m.mk_ite(sgn_eq_1, none, pone);
+
+        // c4: |x| < 1 (exp < 0 or denormal).
+        let exp_h = self.m.mk_bv_extract(eb - 1, eb - 1, a_exp);
+        let exp_lt_zero = self.m.mk_eq(exp_h, one1);
+        let c4 = self.m.mk_or(&[exp_lt_zero, x_denormal]);
+        // tie: |x| == 0.5  (a_sig == 2^(sb-1) ∧ a_exp == -1).
+        let pow_sm1 = self.m.mk_bv(1i64 << (sb - 1), sb);
+        let t1 = self.m.mk_eq(a_sig, pow_sm1);
+        let neg1_e = self.fp_ilit(-1, eb);
+        let t2 = self.m.mk_eq(a_exp, neg1_e);
+        let tie = self.m.mk_and(&[t1, t2]);
+        let neg2_e = self.fp_ilit(-2, eb);
+        let c423 = self.m.mk_bvsle(a_exp, neg2_e); // |x| < 0.5
+        // v42 (round-to-nearest family): tie handling.
+        let v42 = if rte {
+            // tie → xzero (round half to even = 0); |x|<0.5 → xzero; else xone.
+            let below = self.m.mk_or(&[tie, c423]);
+            self.m.mk_ite(below, xzero, xone)
+        } else if rta {
+            // tie → xone (away); |x|<0.5 → xzero; else xone.
+            self.m.mk_ite(c423, xzero, xone)
+        } else {
+            // rtz path uses xzero below; this branch only reached for rte/rta.
+            xone
+        };
+        let v4 = if rtp {
+            self.m.mk_ite(x_neg, nzero, pone)
+        } else if rtn {
+            self.m.mk_ite(x_neg, none, pzero)
+        } else if rtz {
+            xzero
+        } else {
+            v42
+        };
+
+        // c5: exp ≥ sbits-1 ⇒ already integral ⇒ x.
+        let c5 = if (32 - (sb - 1).leading_zeros()) < eb {
+            let big = self.fp_ilit((sb - 1) as i64, eb);
+            self.m.mk_bvsle(big, a_exp)
+        } else {
+            self.m.mk_false()
+        };
+        let v5 = bvx;
+
+        // v6: general case 0 ≤ exp < sbits-1 — shift out the fractional bits,
+        // round the integer part per the (constant) mode, renormalise, pack.
+        let res_sgn = a_sgn;
+        let zero_s = self.m.mk_bv(0, sb);
+        let sm1 = self.m.mk_bv((sb - 1) as i64, sb);
+        let aexp_ext = self.m.mk_bv_sign_extend(sb - eb, a_exp); // sb bits
+        let shift = self.m.mk_bvsub(sm1, aexp_ext); // sb
+        let sig_cat = self.m.mk_bv_concat(a_sig, zero_s); // 2*sb
+        let shift_ext = self.m.mk_bv_concat(zero_s, shift); // 2*sb
+        let shifted_sig = self.m.mk_bvlshr(sig_cat, shift_ext); // 2*sb
+        let divp = self.m.mk_bv_extract(2 * sb - 1, sb, shifted_sig); // sb
+        let remp = self.m.mk_bv_extract(sb - 1, 0, shifted_sig); // sb
+        let one_s = self.m.mk_bv(1, sb);
+        let div_p1 = self.m.mk_bvadd(divp, one_s);
+        let zero1 = self.m.mk_bv(0, 1);
+        let res_sig = if rte || rta {
+            // half-way pattern 100..0.
+            let tie_z = self.m.mk_bv(0, sb - 1);
+            let tie_pat = self.m.mk_bv_concat(one1, tie_z); // sb
+            let tie2 = self.m.mk_eq(remp, tie_pat);
+            let div_last = self.m.mk_bv_extract(0, 0, divp);
+            let dl1 = self.m.mk_eq(div_last, one1);
+            let tie_up = if rta {
+                self.m.mk_true()
+            } else {
+                dl1 // rte: round half to even
+            };
+            let gt_half = self.m.mk_bvule(tie_pat, remp);
+            let cond = self.m.mk_ite(tie2, tie_up, gt_half);
+            self.m.mk_ite(cond, div_p1, divp)
+        } else if rtp {
+            let rem_z = self.m.mk_bv(0, sb);
+            let rem_eq0 = self.m.mk_eq(remp, rem_z);
+            let rem_nz = self.m.mk_not(rem_eq0);
+            let pos = self.m.mk_eq(res_sgn, zero1);
+            let up = self.m.mk_and(&[rem_nz, pos]);
+            self.m.mk_ite(up, div_p1, divp)
+        } else if rtn {
+            let rem_z = self.m.mk_bv(0, sb);
+            let rem_eq0 = self.m.mk_eq(remp, rem_z);
+            let rem_nz = self.m.mk_not(rem_eq0);
+            let negc = self.m.mk_eq(res_sgn, one1);
+            let up = self.m.mk_and(&[rem_nz, negc]);
+            self.m.mk_ite(up, div_p1, divp)
+        } else {
+            divp // rtz: truncate
+        };
+
+        // res_exp = zext(2, a_exp) + e_shift, then renormalise + bias.
+        let e_shift = if eb + 2 <= sb + 1 {
+            self.m.mk_bv_extract(eb + 1, 0, shift)
+        } else {
+            self.m.mk_bv_sign_extend((eb + 2) - sb, shift)
+        }; // eb+2
+        let res_exp0 = self.m.mk_bv_zero_extend(2, a_exp); // eb+2
+        let res_exp1 = self.m.mk_bvadd(res_exp0, e_shift); // eb+2
+        // Renormalise.
+        let min_exp = self.fp_ilit(2 - (1i64 << (eb - 1)), eb);
+        let min_exp = self.m.mk_bv_sign_extend(2, min_exp); // eb+2
+        let sig_lz = self.fp_leading_zeros(res_sig, eb + 2); // eb+2
+        let max_delta = self.m.mk_bvsub(res_exp1, min_exp);
+        let lz_le = self.m.mk_bvule(sig_lz, max_delta);
+        let sig_lz_capped = self.m.mk_ite(lz_le, sig_lz, max_delta);
+        let zero_e2 = self.m.mk_bv(0, eb + 2);
+        let ge0 = self.m.mk_bvule(zero_e2, sig_lz_capped);
+        let renorm = self.m.mk_ite(ge0, sig_lz_capped, zero_e2);
+        let res_exp2 = self.m.mk_bvsub(res_exp1, renorm);
+        let res_sig_shifted = if sb >= eb + 2 {
+            let rd = self.m.mk_bv_zero_extend(sb - eb - 2, renorm);
+            self.m.mk_bvshl(res_sig, rd)
+        } else {
+            let rs = self.m.mk_bv_zero_extend(eb + 2 - sb, res_sig);
+            let sh = self.m.mk_bvshl(rs, renorm);
+            self.m.mk_bv_extract(sb - 1, 0, sh)
+        };
+        let res_exp_eb = self.m.mk_bv_extract(eb - 1, 0, res_exp2); // eb
+        let res_exp_biased = self.fp_bias(res_exp_eb, eb);
+        let res_mant = self.m.mk_bv_extract(sb - 2, 0, res_sig_shifted); // sb-1
+        let hi = self.m.mk_bv_concat(res_sgn, res_exp_biased); // 1+eb
+        let v6 = self.m.mk_bv_concat(hi, res_mant); // w
+
+        // Tie together (lower index wins).
+        let r = self.m.mk_ite(c5, v5, v6);
+        let r = self.m.mk_ite(c4, v4, r);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(eb, sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -4511,6 +4700,12 @@ impl Context {
                 // No `f64::sqrt` under no_std; the bit-blast circuit decides
                 // concrete operands too (via the QF_BV engine).
                 if let Some(t) = self.fp_sqrt_bv(args[0], args[1]) {
+                    return Ok(t);
+                }
+                self.symbolic_fp(op, args)
+            }
+            "fp.roundToIntegral" if args.len() == 2 => {
+                if let Some(t) = self.fp_r2i_bv(args[0], args[1]) {
                     return Ok(t);
                 }
                 self.symbolic_fp(op, args)
