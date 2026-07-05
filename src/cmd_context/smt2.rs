@@ -5661,6 +5661,12 @@ impl Context {
             return None;
         }
         let d = self.m.func_decl(app.decl)?;
+        // Datatype testers `((_ is C) t)` are Bool-returning user decls too, but
+        // they are *interpreted* (fixed by the datatype axioms), not CHC
+        // predicates whose relation we solve for — exclude them.
+        if self.tester_of.values().any(|&td| td == app.decl) {
+            return None;
+        }
         if d.info.family_id == crate::ast::NULL_FAMILY_ID && self.m.is_bool_sort(d.range) {
             Some(app.decl)
         } else {
@@ -5731,78 +5737,98 @@ impl Context {
                 }
             }
             let _ = binders;
-            let guard = if guards.is_empty() {
-                self.m.mk_true()
-            } else if guards.len() == 1 {
-                guards[0]
-            } else {
-                self.m.mk_and(&guards)
-            };
-            // Head: a predicate application (fact/rule) or `false` (query).
+            // Head: a predicate application (fact/rule), `false` (query), or an
+            // arithmetic *property* `⇒ prop(x)`. A property head is exactly the
+            // query `P(x) ∧ guard ∧ ¬prop(x) ⇒ false`, so fold `¬prop` into the
+            // guard and treat it as a query — this handles the common
+            // safety-property CHC form `(=> (inv x) (>= x 0))`.
             let head_pred = if self.m.is_false(cons) {
                 None
             } else if self.predicate_of(cons).is_some() {
                 Some(cons)
             } else {
-                return None; // unexpected head
+                let neg = self.m.mk_not(cons);
+                guards.push(neg);
+                None
             };
-            // Build a substitution from each predicate's argument (which must be a
-            // bare binder variable) to the corresponding state/next variable, so
-            // the guard is expressed *directly* over the state — no equality
-            // bindings, hence `¬Bad` stays a plain inequality rather than a
-            // disequality `state ≠ binder` that blows up the linear search.
-            let collect =
-                |ctx: &Self, app: AstId, vars: &[AstId], subst: &mut Vec<(AstId, AstId)>| -> bool {
-                    let args = ctx.m.app_args(app).to_vec();
-                    if args.len() != vars.len() {
-                        return false;
-                    }
-                    for (j, &a) in args.iter().enumerate() {
-                        if !ctx.m.is_uninterp_const(a) {
-                            return false; // non-bare argument (e.g. P(x+1)) — decline
-                        }
-                        // A binder reused across the body and head (e.g. an argument
-                        // permutation `P(x,y) ⇒ P(y,x)`) is not a clean transition;
-                        // the substitution would conflict, so decline.
-                        if subst.iter().any(|&(from, _)| from == a) {
-                            return false;
-                        }
+            // Map each predicate argument to its state/next variable. A bare,
+            // not-yet-seen binder maps directly (`subst`); any other argument
+            // (a compound term `P(x+1)`, or a reused binder) instead contributes
+            // an equality `var = arg` — z3's own CHC normalisation — so
+            // transitions like `inv(x) ⇒ inv(x+1)` are handled.
+            let collect = |ctx: &Self,
+                           app: AstId,
+                           vars: &[AstId],
+                           subst: &mut Vec<(AstId, AstId)>,
+                           eqs: &mut Vec<(AstId, AstId)>|
+             -> bool {
+                let args = ctx.m.app_args(app).to_vec();
+                if args.len() != vars.len() {
+                    return false;
+                }
+                for (j, &a) in args.iter().enumerate() {
+                    if ctx.m.is_uninterp_const(a) && !subst.iter().any(|&(from, _)| from == a) {
                         subst.push((a, vars[j]));
+                    } else {
+                        eqs.push((vars[j], a));
                     }
-                    true
+                }
+                true
+            };
+            // Build the (substituted) guard for a rule from the shared `guards`
+            // plus the per-application equalities.
+            let build = |ctx: &mut Self,
+                         guards: &[AstId],
+                         eqs: &[(AstId, AstId)],
+                         subst: &[(AstId, AstId)]|
+             -> AstId {
+                let mut all: Vec<AstId> = guards.to_vec();
+                for &(v, a) in eqs {
+                    all.push(ctx.m.mk_eq(v, a));
+                }
+                let g = if all.is_empty() {
+                    ctx.m.mk_true()
+                } else if all.len() == 1 {
+                    all[0]
+                } else {
+                    ctx.m.mk_and(&all)
                 };
+                substitute(&mut ctx.m, g, subst)
+            };
             match (body_pred, head_pred) {
                 (None, Some(h)) => {
                     // Fact: guard ⇒ P(s).
-                    let mut subst = Vec::new();
-                    if !collect(self, h, &state, &mut subst) {
+                    let (mut subst, mut eqs) = (Vec::new(), Vec::new());
+                    if !collect(self, h, &state, &mut subst, &mut eqs) {
                         return None;
                     }
-                    let d = substitute(&mut self.m, guard, &subst);
+                    let d = build(self, &guards, &eqs, &subst);
                     inits.push(d);
                 }
                 (Some(b), Some(h)) => {
                     // Rule: P(t) ∧ guard ⇒ P(s).
-                    let mut subst = Vec::new();
-                    if !collect(self, b, &state, &mut subst) || !collect(self, h, &next, &mut subst)
+                    let (mut subst, mut eqs) = (Vec::new(), Vec::new());
+                    if !collect(self, b, &state, &mut subst, &mut eqs)
+                        || !collect(self, h, &next, &mut subst, &mut eqs)
                     {
                         return None;
                     }
-                    let d = substitute(&mut self.m, guard, &subst);
+                    let d = build(self, &guards, &eqs, &subst);
                     transs.push(d);
                 }
                 (Some(b), None) => {
                     // Query: P(t) ∧ guard ⇒ false.
-                    let mut subst = Vec::new();
-                    if !collect(self, b, &state, &mut subst) {
+                    let (mut subst, mut eqs) = (Vec::new(), Vec::new());
+                    if !collect(self, b, &state, &mut subst, &mut eqs) {
                         return None;
                     }
-                    let d = substitute(&mut self.m, guard, &subst);
+                    let d = build(self, &guards, &eqs, &subst);
                     bads.push(d);
                 }
                 (None, None) => {
                     // guard ⇒ false: satisfiable iff guard is unsat. If guard is
                     // satisfiable, the system is unsat (a ground contradiction).
+                    let guard = build(self, &guards, &[], &[]);
                     let (r, _) = check_model(&self.m, guard);
                     match r {
                         SmtResult::Sat => return Some(SmtResult::Unsat),
