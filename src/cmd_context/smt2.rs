@@ -4693,6 +4693,96 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `(_ to_fp to_eb to_sb) rm x` where `x` is a **float** (format
+    /// conversion; port of z3's `mk_to_fp_float`). Handles same-format (identity)
+    /// and the widening-exponent case (`from_eb < to_eb+2`, e.g. Float16→32,
+    /// Float32→64); the narrowing-exponent case is gated (`None`).
+    fn fp_to_fp_bv(&mut self, rm: AstId, x: AstId, to_eb: u32, to_sb: u32) -> Option<AstId> {
+        let (fe, fs) = self.fp_format_of(self.m.get_sort(x))?;
+        if (fe, fs) == (to_eb, to_sb) {
+            return Some(x); // identity
+        }
+        if fe < 2 || fs < 2 || to_eb < 2 || to_sb < 2 || to_eb > to_sb || fe >= to_eb + 2 {
+            return None; // narrowing exponent (or bad format) — gate
+        }
+        let rm_c = self.rm_code(rm)?;
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let fw = fe + fs;
+        let tw = to_eb + to_sb;
+        let bvx = self.fp_to_bv(x)?;
+        let tmant = to_sb - 1;
+        let t_exp_ones = ((1u64 << to_eb) - 1) << tmant;
+        let t_sign = 1u64 << (tw - 1);
+        let nan = self.fp_lit(t_exp_ones | (1u64 << (tmant - 1)), tw);
+        let pzero = self.fp_lit(0, tw);
+        let nzero = self.fp_lit(t_sign, tw);
+        let pinf = self.fp_lit(t_exp_ones, tw);
+        let ninf = self.fp_lit(t_exp_ones | t_sign, tw);
+
+        // Classification in the FROM format.
+        let expf = self.m.mk_bv_extract(fw - 2, fs - 1, bvx);
+        let sigf = self.m.mk_bv_extract(fs - 2, 0, bvx);
+        let sbit = self.m.mk_bv_extract(fw - 1, fw - 1, bvx);
+        let ez = self.m.mk_bv(0, fe);
+        let eo = self.m.mk_bvnot(ez);
+        let sz = self.m.mk_bv(0, fs - 1);
+        let one1 = self.m.mk_bv(1, 1);
+        let exp_ones = self.m.mk_eq(expf, eo);
+        let exp_zero = self.m.mk_eq(expf, ez);
+        let sig_zero = self.m.mk_eq(sigf, sz);
+        let sig_nz = self.m.mk_not(sig_zero);
+        let x_nan = self.m.mk_and(&[exp_ones, sig_nz]);
+        let x_inf = self.m.mk_and(&[exp_ones, sig_zero]);
+        let x_zero = self.m.mk_and(&[exp_zero, sig_zero]);
+        let x_neg = self.m.mk_eq(sbit, one1);
+        let x_pos = self.m.mk_not(x_neg);
+
+        let c1 = x_nan;
+        let v1 = nan;
+        let c2 = self.m.mk_and(&[x_zero, x_pos]);
+        let v2 = pzero;
+        let c3 = self.m.mk_and(&[x_zero, x_neg]);
+        let v3 = nzero;
+        let c4 = self.m.mk_and(&[x_inf, x_pos]);
+        let v4 = pinf;
+        let c5 = self.m.mk_and(&[x_inf, x_neg]);
+        let v5 = ninf;
+
+        // Core: unpack, resize significand to to_sb+4, exponent to to_eb+2, round.
+        let (sgn, sig, exp, lz) = self.fp_unpack_norm(bvx, fe, fs);
+        let res_sgn = sgn;
+        let res_sig3 = if fs < to_sb + 3 {
+            let pad = self.m.mk_bv(0, to_sb + 3 - fs);
+            self.m.mk_bv_concat(sig, pad) // to_sb+3
+        } else if fs > to_sb + 3 {
+            let high = self.m.mk_bv_extract(fs - 1, fs - to_sb - 2, sig); // to_sb+2
+            let low = self.m.mk_bv_extract(fs - to_sb - 3, 0, sig);
+            let low_z = self.m.mk_bv(0, fs - to_sb - 2);
+            let low_zero = self.m.mk_eq(low, low_z);
+            let z1 = self.m.mk_bv(0, 1);
+            let sticky = self.m.mk_ite(low_zero, z1, one1);
+            self.m.mk_bv_concat(high, sticky) // to_sb+3
+        } else {
+            sig // to_sb+3
+        };
+        let res_sig = self.m.mk_bv_zero_extend(1, res_sig3); // to_sb+4
+        let res_exp0 = self.m.mk_bv_sign_extend(to_eb - fe + 2, exp); // to_eb+2
+        let lz_ext = self.m.mk_bv_zero_extend(to_eb - fe + 2, lz);
+        let res_exp = self.m.mk_bvsub(res_exp0, lz_ext);
+        let v6 = self.fp_round(rm3, res_sgn, res_sig, res_exp, to_eb, to_sb);
+
+        let r = self.m.mk_ite(c5, v5, v6);
+        let r = self.m.mk_ite(c4, v4, r);
+        let r = self.m.mk_ite(c3, v3, r);
+        let r = self.m.mk_ite(c2, v2, r);
+        let result_bv = self.m.mk_ite(c1, v1, r);
+
+        let fps = self.fp_sort(to_eb, to_sb);
+        let result = self.fresh_const(fps);
+        self.fp_bv.insert(result, result_bv);
+        Some(result)
+    }
+
     /// Bit-blast `fp.roundToIntegral` on a symbolic operand (port of z3's
     /// `mk_round_to_integral`). The rounding mode is a constant, so its many
     /// per-mode branches collapse at build time. `None` for unsupported bits.
@@ -8158,6 +8248,12 @@ impl Context {
                                 && let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc)
                             {
                                 return Ok(self.mk_fp(bits, eb, sb));
+                            }
+                            // Float → float format conversion.
+                            if self.fp_format_of(self.m.get_sort(x)).is_some()
+                                && let Some(t) = self.fp_to_fp_bv(rm, x, eb, sb)
+                            {
+                                return Ok(t);
                             }
                         } else if self.m.bv_sort_width(self.m.get_sort(x)) == Some(eb + sb)
                             && let Some(v) = self.m.bv_numeral_value(x)
