@@ -4,10 +4,16 @@
 //! See [`ROADMAP.md`](../../ROADMAP.md) for the porting plan and status.
 //!
 //! ## Upstream C++ components to port
-//! - [ ] `z3/src/nlsat`
+//! - [~] `z3/src/nlsat` → [`icp`] (interval-propagation *refutation* half of nlsat)
 //! - [ ] `z3/src/realclosure`
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS — sound nonlinear refutation via interval propagation
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod cad;
+pub mod elim;
+pub mod icp;
+pub mod realclosure;
+pub mod univariate;
+
+pub use icp::{Constraint, Rel, refute};
+pub use univariate::decide as decide_univariate;

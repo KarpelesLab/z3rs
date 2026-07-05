@@ -15,7 +15,8 @@
 //! - [ ] `z3/src/dataflow`
 //! - [ ] `z3/src/fp`
 //!
-//! ## Status: SCAFFOLD (no functionality ported yet)
+//! ## Status: IN PROGRESS — finite-domain Datalog engine landed (`-dl` frontend)
 
-// Submodules will be declared here as components are ported, mirroring the
-// upstream file layout (e.g. `pub mod mpz;` for `z3/src/util/mpz.{h,cpp}`).
+pub mod datalog;
+
+pub use datalog::{Atom, Model, Program, Rule, Term, evaluate, parse};

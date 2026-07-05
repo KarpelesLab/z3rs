@@ -14,11 +14,13 @@
 //! ## Status: IN PROGRESS
 
 pub mod dimacs;
+pub mod drat;
 pub mod literal;
 pub mod solver;
 pub mod tseitin;
 
 pub use dimacs::{DimacsError, parse as parse_dimacs};
+pub use drat::{check as check_drat, check_text as check_drat_text};
 pub use literal::{Lit, Var};
 pub use solver::{SatResult, Solver};
 pub use tseitin::{check_skeleton, encode, encode_tracking};
