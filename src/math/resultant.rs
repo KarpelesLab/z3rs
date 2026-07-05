@@ -153,6 +153,52 @@ pub fn discriminant(p: &Polynomial, v: Var) -> Option<Polynomial> {
 /// (valid over the integral domain of polynomials), rather than the `O(n!)`
 /// cofactor expansion, which is essential to keep resultants tractable.
 fn determinant(mat: &[Vec<Polynomial>]) -> Option<Polynomial> {
+    // Bareiss is fast but its exact-division invariant can break on a
+    // degenerate/pivoted matrix; fall back to (division-free) cofactor expansion
+    // for small matrices so the CAD stays *complete*, not just sound, there.
+    bareiss_determinant(mat).or_else(|| cofactor_determinant(mat))
+}
+
+/// Laplace/cofactor expansion — division-free, hence always exact, but `O(n!)`;
+/// used only as a fallback for the small matrices where Bareiss declines.
+fn cofactor_determinant(mat: &[Vec<Polynomial>]) -> Option<Polynomial> {
+    let n = mat.len();
+    if n > 7 {
+        return None; // too expensive; caller declines
+    }
+    if n == 0 {
+        return Some(Polynomial::constant(1.into()));
+    }
+    if n == 1 {
+        return Some(mat[0][0].clone());
+    }
+    let mut det = Polynomial::zero();
+    for j in 0..n {
+        if mat[0][j].is_zero() {
+            continue;
+        }
+        let minor: Vec<Vec<Polynomial>> = mat[1..]
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|(c, _)| *c != j)
+                    .map(|(_, p)| p.clone())
+                    .collect()
+            })
+            .collect();
+        let sub = cofactor_determinant(&minor)?;
+        let term = mat[0][j].mul(&sub);
+        det = if j % 2 == 0 {
+            det.add(&term)
+        } else {
+            det.sub(&term)
+        };
+    }
+    Some(det)
+}
+
+fn bareiss_determinant(mat: &[Vec<Polynomial>]) -> Option<Polynomial> {
     let n = mat.len();
     if n == 0 {
         return Some(Polynomial::constant(1.into()));
