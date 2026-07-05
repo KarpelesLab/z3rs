@@ -1900,28 +1900,53 @@ impl Context {
         }
         let args = self.m.app_args(t).to_vec();
         let (a, b) = (args[0], args[1]);
-        let n = self.m.as_numeral(b)?.to_integer()?; // constant divisor only
-        if n.is_zero() {
-            return None;
-        }
         if let Some(&pair) = ctx.dm.get(&(a, b)) {
             return Some(pair);
         }
         let int = self.m.mk_int_sort();
         let q = self.fresh_const(int);
         let r = self.fresh_const(int);
-        // a = n·q + r
-        let nq = self.m.mk_mul(&[b, q]);
-        let sum = self.m.mk_add(&[nq, r]);
-        let eq = self.m.mk_eq(a, sum);
-        // 0 ≤ r < |n|
         let zero = self.m.mk_int(0);
-        let ge = self.m.mk_ge(r, zero);
-        let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
-        let lt = self.m.mk_lt(r, abs_n);
-        ctx.defs.push(eq);
-        ctx.defs.push(ge);
-        ctx.defs.push(lt);
+        match self.m.as_numeral(b).and_then(|v| v.to_integer()) {
+            Some(n) if !n.is_zero() => {
+                // Constant nonzero divisor: unconditional `a = n·q + r ∧ 0 ≤ r < |n|`.
+                let nq = self.m.mk_mul(&[b, q]);
+                let sum = self.m.mk_add(&[nq, r]);
+                ctx.defs.push(self.m.mk_eq(a, sum));
+                ctx.defs.push(self.m.mk_ge(r, zero));
+                let abs_n = self.m.mk_numeral(Rational::from_integer(n.abs()), true);
+                ctx.defs.push(self.m.mk_lt(r, abs_n));
+            }
+            Some(_) => {
+                // Division by the literal 0 is unconstrained in SMT-LIB: q, r free.
+            }
+            None => {
+                // Symbolic divisor: the Euclidean identity holds only for b ≠ 0
+                // (div/mod by 0 are unconstrained). `|b| = ite(b≥0, b, −b)`. Push
+                // the three facts as *separate* guarded implications rather than
+                // one bundled body, so the linear engine can use the range
+                // `0 ≤ r < |b|` even when the nonlinear identity `a = b·q + r` is
+                // opaque to it (e.g. refuting `mod(x,y) ≥ y ∧ y > 0`).
+                let beq0 = self.m.mk_eq(b, zero);
+                let bne0 = self.m.mk_not(beq0);
+                let nq = self.m.mk_mul(&[b, q]);
+                let sum = self.m.mk_add(&[nq, r]);
+                let eq = self.m.mk_eq(a, sum);
+                ctx.defs.push(self.m.mk_implies(bne0, eq));
+                let ge = self.m.mk_ge(r, zero);
+                ctx.defs.push(self.m.mk_implies(bne0, ge));
+                // `r < |b|`, split by the sign of `b` to avoid an `ite` the linear
+                // engine won't resolve: `b>0 ⇒ r<b` and `b<0 ⇒ r<−b`.
+                let bgt0 = self.m.mk_gt(b, zero);
+                let ltb = self.m.mk_lt(r, b);
+                ctx.defs.push(self.m.mk_implies(bgt0, ltb));
+                let blt0 = self.m.mk_lt(b, zero);
+                let neg1 = self.m.mk_int(-1);
+                let negb = self.m.mk_mul(&[neg1, b]);
+                let ltnegb = self.m.mk_lt(r, negb);
+                ctx.defs.push(self.m.mk_implies(blt0, ltnegb));
+            }
+        }
         ctx.dm.insert((a, b), (q, r));
         Some((q, r))
     }
@@ -7907,6 +7932,26 @@ mod tests {
             run("(declare-const y Int)(assert (= (mod 5 y) 3))(assert (= y 0))(check-sat)")
                 .unwrap(),
             alloc::vec!["sat"]
+        );
+        // Symbolic divisor abstracted with the Euclidean constraints: a pinned
+        // quotient linearizes the goal (`div(100,y)=7 ∧ y>0` ⇒ sat), and the
+        // range `0 ≤ mod < |divisor|` refutes out-of-range mods.
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (div 100 y) 7))(assert (> y 0))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (>= (mod x y) y))(assert (> y 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (< (mod x y) 0))(assert (not (= y 0)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
