@@ -368,9 +368,14 @@ fn interval_inf(iv: &Interval) -> Option<Rational> {
 /// (sound over-approximating) interval for `v`, `Empty` if the bound is
 /// infeasible, or `None` if the constraint is not of this shape.
 fn square_bound(c: &Constraint, v: Var, box_: &[Interval]) -> Option<Interval> {
-    if !matches!(c.rel, Rel::Lt | Rel::Le) {
-        return None;
-    }
+    // `a·v² + rest ⋈ 0` bounds `v²` when `⋈` implies `a·v²+rest ≤ 0`: a strict or
+    // non-strict `<`/`≤`, or an equality (`=0 ⇒ ≤0`). Equalities are the common
+    // shape `x²+y²=k`, letting us bound each variable.
+    let strict = match c.rel {
+        Rel::Lt => true,
+        Rel::Le | Rel::Eq => false,
+        _ => return None,
+    };
     let mut a = Rational::from_integer(0.into());
     let mut rest_terms = alloc::vec::Vec::new();
     for (coeff, mono) in c.poly.terms() {
@@ -380,10 +385,16 @@ fn square_bound(c: &Constraint, v: Var, box_: &[Interval]) -> Option<Interval> {
             _ => return None, // v¹, v³, or v² times another variable
         }
     }
+    let mut rest = Polynomial::from_terms(rest_terms);
+    // For an equality, `p = 0 ⇔ −p = 0`, so a negative `v²` coefficient can be
+    // flipped positive (e.g. `x² − 2y² = 0` bounds `y` via `2y² = x²`).
+    if a.is_negative() && c.rel == Rel::Eq {
+        a = a.neg();
+        rest = rest.neg();
+    }
     if !a.is_positive() {
         return None;
     }
-    let rest = Polynomial::from_terms(rest_terms);
     let c_iv = eval_interval(&rest, box_);
     let inf = interval_inf(&c_iv)?; // −∞ ⇒ no bound
     let b = inf.neg().div(&a); // v² ≤ b (strict for `<`)
@@ -391,7 +402,7 @@ fn square_bound(c: &Constraint, v: Var, box_: &[Interval]) -> Option<Interval> {
         return Some(Interval::Empty);
     }
     if b.is_zero() {
-        return Some(if c.rel == Rel::Lt {
+        return Some(if strict {
             Interval::Empty // v² < 0 impossible
         } else {
             Interval::point(Rational::from_integer(0.into())) // v² ≤ 0 ⇒ v = 0

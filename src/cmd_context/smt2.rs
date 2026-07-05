@@ -7894,6 +7894,33 @@ mod tests {
     }
 
     #[test]
+    fn nonlinear_integer_equality_bounds_decide() {
+        // Square bounds derived from a nonlinear EQUALITY box the integer
+        // variables, so exhaustive search refutes/decides (was `unknown`).
+        // `x²+y²=3` has no integer solution.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (= (+ (* x x)(* y y)) 3))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // `x²=2y² ∧ 0<x<5` — bound y via the negated orientation `2y²=x²`.
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (= (* x x)(* 2 (* y y))))(assert (> x 0))(assert (< x 5))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // …but a solvable one is sat: `x²+y²=25` with x,y>0 ⇒ (3,4).
+        assert_eq!(
+            run("(declare-const x Int)(declare-const y Int)\
+                 (assert (= (+ (* x x)(* y y)) 25))(assert (> x 0))(assert (> y 0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
     fn nonlinear_now_decided_matches_z3() {
         // Substituting a variable pinned by an equality linearizes the product:
         // `x*y = 6 ∧ x = 2` ⇒ `2*y = 6`, decided sat (matches z3).
