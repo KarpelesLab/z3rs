@@ -38,16 +38,30 @@ pub enum Sort {
     Real,
     /// A bit-vector of the given width.
     BitVec(u32),
+    /// An array sort `(Array domain range)`.
+    Array(alloc::boxed::Box<Sort>, alloc::boxed::Box<Sort>),
+    /// An uninterpreted sort, named.
+    Uninterpreted(String),
 }
 
 impl Sort {
     /// The SMT-LIB 2 rendering of the sort.
-    fn smt(&self) -> String {
+    pub fn smt(&self) -> String {
         match self {
             Sort::Bool => "Bool".to_string(),
             Sort::Int => "Int".to_string(),
             Sort::Real => "Real".to_string(),
             Sort::BitVec(n) => alloc::format!("(_ BitVec {n})"),
+            Sort::Array(d, r) => alloc::format!("(Array {} {})", d.smt(), r.smt()),
+            Sort::Uninterpreted(name) => name.clone(),
+        }
+    }
+
+    /// The width of a bit-vector sort, if this is one.
+    pub fn bv_width(&self) -> Option<u32> {
+        match self {
+            Sort::BitVec(n) => Some(*n),
+            _ => None,
         }
     }
 }
@@ -69,6 +83,24 @@ impl Ast {
     /// The term's SMT-LIB 2 rendering.
     pub fn to_smt(&self) -> &str {
         &self.src
+    }
+
+    /// Construct a term from its raw SMT-LIB 2 rendering and sort. The escape
+    /// hatch used by the C ABI for constructors that don't map onto the typed
+    /// combinators above.
+    pub fn new(src: String, sort: Sort) -> Ast {
+        Ast { src, sort }
+    }
+
+    /// `(distinct a₁ … aₙ)` — pairwise disequality (→ Bool).
+    pub fn distinct(args: &[&Ast]) -> Ast {
+        let mut src = String::from("(distinct");
+        for a in args {
+            src.push(' ');
+            src.push_str(&a.src);
+        }
+        src.push(')');
+        Ast { src, sort: Sort::Bool }
     }
 
     fn binop(&self, op: &str, rhs: &Ast, sort: Sort) -> Ast {
@@ -137,9 +169,68 @@ impl Ast {
         self.unop("not", Sort::Bool)
     }
 
-    // --- bit-vectors ------------------------------------------------------
+    pub fn iff(&self, rhs: &Ast) -> Ast {
+        self.binop("=", rhs, Sort::Bool)
+    }
+
+    /// `(ite self then els)` — `self` is the Boolean condition; result sort is
+    /// that of the branches.
+    pub fn ite(&self, then: &Ast, els: &Ast) -> Ast {
+        Ast {
+            src: alloc::format!("(ite {} {} {})", self.src, then.src, els.src),
+            sort: then.sort.clone(),
+        }
+    }
+
+    // --- more arithmetic --------------------------------------------------
+    pub fn div(&self, rhs: &Ast) -> Ast {
+        // Integer division renders as `div`; real division as `/`.
+        let op = if self.sort == Sort::Int { "div" } else { "/" };
+        self.binop(op, rhs, self.sort.clone())
+    }
+    pub fn rem_(&self, rhs: &Ast) -> Ast {
+        self.binop("rem", rhs, self.sort.clone())
+    }
+    pub fn modulo(&self, rhs: &Ast) -> Ast {
+        self.binop("mod", rhs, self.sort.clone())
+    }
+    pub fn power(&self, rhs: &Ast) -> Ast {
+        self.binop("^", rhs, self.sort.clone())
+    }
+    pub fn int2real(&self) -> Ast {
+        self.unop("to_real", Sort::Real)
+    }
+    pub fn real2int(&self) -> Ast {
+        self.unop("to_int", Sort::Int)
+    }
+    pub fn is_int(&self) -> Ast {
+        self.unop("is_int", Sort::Bool)
+    }
+
+    // --- bit-vectors: arithmetic / logical (result = operand sort) --------
     pub fn bvadd(&self, rhs: &Ast) -> Ast {
         self.binop("bvadd", rhs, self.sort.clone())
+    }
+    pub fn bvsub(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsub", rhs, self.sort.clone())
+    }
+    pub fn bvmul(&self, rhs: &Ast) -> Ast {
+        self.binop("bvmul", rhs, self.sort.clone())
+    }
+    pub fn bvudiv(&self, rhs: &Ast) -> Ast {
+        self.binop("bvudiv", rhs, self.sort.clone())
+    }
+    pub fn bvsdiv(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsdiv", rhs, self.sort.clone())
+    }
+    pub fn bvurem(&self, rhs: &Ast) -> Ast {
+        self.binop("bvurem", rhs, self.sort.clone())
+    }
+    pub fn bvsrem(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsrem", rhs, self.sort.clone())
+    }
+    pub fn bvsmod(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsmod", rhs, self.sort.clone())
     }
     pub fn bvand(&self, rhs: &Ast) -> Ast {
         self.binop("bvand", rhs, self.sort.clone())
@@ -147,8 +238,166 @@ impl Ast {
     pub fn bvor(&self, rhs: &Ast) -> Ast {
         self.binop("bvor", rhs, self.sort.clone())
     }
+    pub fn bvxor(&self, rhs: &Ast) -> Ast {
+        self.binop("bvxor", rhs, self.sort.clone())
+    }
+    pub fn bvnand(&self, rhs: &Ast) -> Ast {
+        self.binop("bvnand", rhs, self.sort.clone())
+    }
+    pub fn bvnor(&self, rhs: &Ast) -> Ast {
+        self.binop("bvnor", rhs, self.sort.clone())
+    }
+    pub fn bvxnor(&self, rhs: &Ast) -> Ast {
+        self.binop("bvxnor", rhs, self.sort.clone())
+    }
+    pub fn bvshl(&self, rhs: &Ast) -> Ast {
+        self.binop("bvshl", rhs, self.sort.clone())
+    }
+    pub fn bvlshr(&self, rhs: &Ast) -> Ast {
+        self.binop("bvlshr", rhs, self.sort.clone())
+    }
+    pub fn bvashr(&self, rhs: &Ast) -> Ast {
+        self.binop("bvashr", rhs, self.sort.clone())
+    }
+    pub fn bvnot(&self) -> Ast {
+        self.unop("bvnot", self.sort.clone())
+    }
+    pub fn bvneg(&self) -> Ast {
+        self.unop("bvneg", self.sort.clone())
+    }
+
+    // --- bit-vectors: comparisons (→ Bool) --------------------------------
     pub fn bvult(&self, rhs: &Ast) -> Ast {
         self.binop("bvult", rhs, Sort::Bool)
+    }
+    pub fn bvslt(&self, rhs: &Ast) -> Ast {
+        self.binop("bvslt", rhs, Sort::Bool)
+    }
+    pub fn bvule(&self, rhs: &Ast) -> Ast {
+        self.binop("bvule", rhs, Sort::Bool)
+    }
+    pub fn bvsle(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsle", rhs, Sort::Bool)
+    }
+    pub fn bvugt(&self, rhs: &Ast) -> Ast {
+        self.binop("bvugt", rhs, Sort::Bool)
+    }
+    pub fn bvsgt(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsgt", rhs, Sort::Bool)
+    }
+    pub fn bvuge(&self, rhs: &Ast) -> Ast {
+        self.binop("bvuge", rhs, Sort::Bool)
+    }
+    pub fn bvsge(&self, rhs: &Ast) -> Ast {
+        self.binop("bvsge", rhs, Sort::Bool)
+    }
+
+    // --- bit-vectors: shape-changing --------------------------------------
+    /// `(concat self rhs)` — widths add.
+    pub fn concat(&self, rhs: &Ast) -> Ast {
+        let w = self.sort.bv_width().unwrap_or(0) + rhs.sort.bv_width().unwrap_or(0);
+        self.binop("concat", rhs, Sort::BitVec(w))
+    }
+    /// `((_ extract high low) self)` — result width `high - low + 1`.
+    pub fn extract(&self, high: u32, low: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ extract {high} {low}) {})", self.src),
+            sort: Sort::BitVec(high.saturating_sub(low) + 1),
+        }
+    }
+    pub fn sign_ext(&self, i: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ sign_extend {i}) {})", self.src),
+            sort: Sort::BitVec(self.sort.bv_width().unwrap_or(0) + i),
+        }
+    }
+    pub fn zero_ext(&self, i: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ zero_extend {i}) {})", self.src),
+            sort: Sort::BitVec(self.sort.bv_width().unwrap_or(0) + i),
+        }
+    }
+    pub fn repeat(&self, i: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ repeat {i}) {})", self.src),
+            sort: Sort::BitVec(self.sort.bv_width().unwrap_or(0) * i),
+        }
+    }
+    pub fn rotate_left(&self, i: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ rotate_left {i}) {})", self.src),
+            sort: self.sort.clone(),
+        }
+    }
+    pub fn rotate_right(&self, i: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ rotate_right {i}) {})", self.src),
+            sort: self.sort.clone(),
+        }
+    }
+    /// `((_ int2bv n) self)` — an integer to a width-`n` bit-vector.
+    pub fn int2bv(&self, n: u32) -> Ast {
+        Ast {
+            src: alloc::format!("((_ int2bv {n}) {})", self.src),
+            sort: Sort::BitVec(n),
+        }
+    }
+    /// `(bv2int self)` — a bit-vector to a (non-negative, unsigned) integer.
+    pub fn bv2int(&self, _signed: bool) -> Ast {
+        self.unop("bv2int", Sort::Int)
+    }
+
+    // --- arrays -----------------------------------------------------------
+    /// `(select self index)` — result is the array's range sort.
+    pub fn select(&self, index: &Ast) -> Ast {
+        let range = match &self.sort {
+            Sort::Array(_, r) => (**r).clone(),
+            other => other.clone(),
+        };
+        self.binop("select", index, range)
+    }
+    /// `(store self index value)` — result is the (unchanged) array sort.
+    pub fn store(&self, index: &Ast, value: &Ast) -> Ast {
+        Ast {
+            src: alloc::format!("(store {} {} {})", self.src, index.src, value.src),
+            sort: self.sort.clone(),
+        }
+    }
+}
+
+/// An uninterpreted function declaration (Z3's `Z3_func_decl`). Apply it to
+/// arguments with [`FuncDecl::apply`].
+#[derive(Clone, Debug)]
+pub struct FuncDecl {
+    name: String,
+    range: Sort,
+}
+
+impl FuncDecl {
+    /// The declaration's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Apply the function to `args` — `(name a₁ … aₙ)`, or just `name` when
+    /// nullary. Result sort is the declared range.
+    pub fn apply(&self, args: &[&Ast]) -> Ast {
+        if args.is_empty() {
+            return Ast {
+                src: self.name.clone(),
+                sort: self.range.clone(),
+            };
+        }
+        let mut src = alloc::format!("({}", self.name);
+        for a in args {
+            src.push(' ');
+            src.push_str(&a.src);
+        }
+        src.push(')');
+        Ast {
+            src,
+            sort: self.range.clone(),
+        }
     }
 }
 
@@ -157,6 +406,11 @@ impl Ast {
 pub struct Context {
     session: Session,
     declared: BTreeSet<String>,
+    /// Every declaration command (`declare-const`/`declare-fun`/`declare-sort`)
+    /// issued, in order — used to seed independent per-solver sessions.
+    decls: Vec<String>,
+    /// Counter feeding [`Context::fresh_const`] unique names.
+    fresh: u64,
 }
 
 impl Default for Context {
@@ -171,19 +425,75 @@ impl Context {
         Context {
             session: Session::new(),
             declared: BTreeSet::new(),
+            decls: Vec::new(),
+            fresh: 0,
         }
+    }
+
+    /// The declaration commands issued so far (for seeding solver sessions).
+    pub fn declarations(&self) -> &[String] {
+        &self.decls
+    }
+
+    /// Record a declaration command: eval it against the context session and
+    /// remember it so freshly-created solvers can replay it.
+    fn declare(&mut self, cmd: String) {
+        let _ = self.session.eval(&cmd);
+        self.decls.push(cmd);
     }
 
     /// Declare (once) and return a constant of the given sort.
     pub fn const_(&mut self, name: &str, sort: Sort) -> Ast {
         if self.declared.insert(name.to_string()) {
-            let _ = self
-                .session
-                .eval(&alloc::format!("(declare-const {name} {})", sort.smt()));
+            self.declare(alloc::format!("(declare-const {name} {})", sort.smt()));
         }
         Ast {
             src: name.to_string(),
             sort,
+        }
+    }
+
+    /// Declare an uninterpreted function and return its [`FuncDecl`]. A 0-arity
+    /// declaration behaves like a constant.
+    pub fn declare_func(&mut self, name: &str, domain: Vec<Sort>, range: Sort) -> FuncDecl {
+        if self.declared.insert(name.to_string()) {
+            let doms: Vec<String> = domain.iter().map(Sort::smt).collect();
+            self.declare(alloc::format!(
+                "(declare-fun {name} ({}) {})",
+                doms.join(" "),
+                range.smt()
+            ));
+        }
+        FuncDecl {
+            name: name.to_string(),
+            range,
+        }
+    }
+
+    /// Declare an uninterpreted sort of arity 0 and return it.
+    pub fn declare_sort(&mut self, name: &str) -> Sort {
+        if self.declared.insert(alloc::format!("sort:{name}")) {
+            self.declare(alloc::format!("(declare-sort {name} 0)"));
+        }
+        Sort::Uninterpreted(name.to_string())
+    }
+
+    /// A freshly-named constant of the given sort (`prefix!N`).
+    pub fn fresh_const(&mut self, prefix: &str, sort: Sort) -> Ast {
+        self.fresh += 1;
+        let name = alloc::format!("{prefix}!{}", self.fresh);
+        self.const_(&name, sort)
+    }
+
+    /// A constant array `((as const (Array dom range)) value)`.
+    pub fn const_array(domain: Sort, value: &Ast) -> Ast {
+        let arr = Sort::Array(
+            alloc::boxed::Box::new(domain),
+            alloc::boxed::Box::new(value.sort.clone()),
+        );
+        Ast {
+            src: alloc::format!("((as const {}) {})", arr.smt(), value.src),
+            sort: arr,
         }
     }
 
@@ -326,6 +636,56 @@ mod tests {
         let b = ctx.const_("b", Sort::BitVec(8));
         // b + 1 = 16  ⇒  b = 15
         ctx.assert(&b.bvadd(&Context::bv_val(1, 8)).eq(&Context::bv_val(16, 8)));
+        assert_eq!(ctx.check(), SatResult::Sat);
+        assert_eq!(ctx.eval_value(&b).as_deref(), Some("#x0f"));
+    }
+
+    #[test]
+    fn array_select_store() {
+        let mut ctx = Context::new();
+        let idx = Sort::Int;
+        let arr = Sort::Array(
+            alloc::boxed::Box::new(idx.clone()),
+            alloc::boxed::Box::new(Sort::Int),
+        );
+        let m = ctx.const_("m", arr);
+        // (select (store m 3 7) 3) = 7 is valid, so its negation is unsat.
+        let stored = m.store(&Context::int(3), &Context::int(7));
+        let sel = stored.select(&Context::int(3));
+        ctx.assert(&sel.ne(&Context::int(7)));
+        assert_eq!(ctx.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn ite_and_distinct() {
+        let mut ctx = Context::new();
+        let x = ctx.const_("x", Sort::Int);
+        let y = ctx.const_("y", Sort::Int);
+        // distinct x y, and z = ite (x < y) x y = min; assert z = x and z = y -> unsat.
+        ctx.assert(&Ast::distinct(&[&x, &y]));
+        let z = x.lt(&y).ite(&x, &y);
+        ctx.assert(&z.eq(&x));
+        ctx.assert(&z.eq(&y));
+        assert_eq!(ctx.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn uf_apply_congruence() {
+        let mut ctx = Context::new();
+        let f = ctx.declare_func("f", alloc::vec![Sort::Int], Sort::Int);
+        let x = ctx.const_("x", Sort::Int);
+        let y = ctx.const_("y", Sort::Int);
+        ctx.assert(&x.eq(&y));
+        ctx.assert(&f.apply(&[&x]).ne(&f.apply(&[&y])));
+        assert_eq!(ctx.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn bitvector_extended_ops() {
+        let mut ctx = Context::new();
+        let b = ctx.const_("b", Sort::BitVec(8));
+        // (bvsub b 1) = 14  ⇒  b = 15
+        ctx.assert(&b.bvsub(&Context::bv_val(1, 8)).eq(&Context::bv_val(14, 8)));
         assert_eq!(ctx.check(), SatResult::Sat);
         assert_eq!(ctx.eval_value(&b).as_deref(), Some("#x0f"));
     }
