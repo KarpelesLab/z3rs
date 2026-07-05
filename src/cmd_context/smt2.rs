@@ -2316,10 +2316,21 @@ impl Context {
             .collect();
         if !len_decls.is_empty() {
             let zero = self.m.mk_int(0);
+            // Emptiness: `str.len(s) = 0 ⇒ s = ""` — without it a symbolic `s`
+            // with `len(s)=0 ∧ s≠""` looks sat (unsound).
+            let str_len = self.str_len_decl;
+            let empty = self.mk_str_lit("");
             for &t in &present {
                 if self.m.is_app(t) && len_decls.contains(&self.m.app_decl(t)) {
                     let ge = self.m.mk_ge(t, zero);
                     ax.push(ge);
+                    if str_len == Some(self.m.app_decl(t)) {
+                        let s = self.m.app_args(t)[0];
+                        let len_zero = self.m.mk_eq(t, zero);
+                        let is_empty = self.m.mk_eq(s, empty);
+                        let imp = self.m.mk_implies(len_zero, is_empty);
+                        ax.push(imp);
+                    }
                 }
             }
         }
@@ -8415,6 +8426,14 @@ mod tests {
         assert_eq!(
             run("(declare-const s String)(assert (= (str.len s) 0))(check-sat)").unwrap(),
             alloc::vec!["sat"]
+        );
+        // Emptiness: `len(s)=0 ⇒ s=""`, so `len(s)=0 ∧ s≠""` is unsat (was a
+        // fuzz-found spurious sat).
+        assert_eq!(
+            run("(declare-const s String)(assert (= (str.len s) 0))\
+                 (assert (not (= s \"\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
