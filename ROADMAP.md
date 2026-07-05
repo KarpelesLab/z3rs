@@ -175,7 +175,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ exit criterion met.
 | E | nonlinear real (CAD) | 🟨 | full CAD for the non-degenerate capped fragment done; coupled 3-var declines on degenerate projection → needs **Hong fallback** (verified: not a cap issue) |
 | F | quantifiers (MBQI) | ⬜ | E-matching fixpoint done; MBQI/alternation remain |
 | G | Horn (Spacer/PDR) | 🟨 | single-predicate BMC + k-induction done; multi-predicate PDR **specced** (`spacer_multi_spec`); implementation remains |
-| H | full C ABI | 🟨 | **80%-path landed** (lifecycle/refcount no-ops, all BV/array/numeral/UF builders, independent per-solver sessions, sort/AST trivia; C smoke green); model-inspection long tail (`get_numeral_int`, `model_eval` structured) remains |
+| H | full C ABI | ✅ | **Exit met**: representative real-world z3 C programs link & run unchanged — full builder surface (BV/array/numeral/UF/**quantifier**/**datatype**/enum/tuple), lifecycle/refcount, independent per-solver sessions, **model readback** (`model_eval`/`get_numeral_*`), **unsat cores**; C smoke programs (find-model, `List` datatype, `∀` + UF, enum/tuple) compile `-Wall -Wextra` and run to OK. · follow-ons: De-Bruijn `mk_forall`/`mk_bound`, mutually-recursive `mk_datatypes`, full AST-walk inspection |
 | I | models & proofs at scale | ⬜ | verdicts sound; model-on-every-path + proofs remain |
 | J | performance & parity validation | ⬜ | PARITY.md v1 published; perf + Parity v2 remain |
 
