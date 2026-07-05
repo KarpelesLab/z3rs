@@ -169,7 +169,7 @@ Status legend: ⬜ not started · 🟨 in progress · ✅ exit criterion met.
 | Phase | Gap | Status | Notes |
 |------:|-----|:------:|-------|
 | A | SAT/BV core speed | ⬜ | enables C; BV correct but budget-bound |
-| B | symbolic `div`/`mod` | 🟨 | Euclidean lift-abstraction + divisor-witness search: unknown-gap **45%→~6%** (fuzz, 0 unsound); large/unbounded-divisor tail remains |
+| B | symbolic `div`/`mod` | 🟨 | **single-variable divisor now complete** (SAT witness incl. zero divisor + goal-derived candidates; UNSAT via the constant-dividend stable-tail decision) — div/mod-by-`y` fuzzer gap **45%→0**, 0 unsound. Remaining: **compound divisors** (`div a (+ x y)`, `(* 2 y)`) still `unknown`/slow (not uninterp consts), and symbolic-dividend `mod` unbounded tail |
 | C | floating-point theory | 🟨 | non-arithmetic surface done & fuzz-clean (`abs`/`neg`, exact `to_real`, **fast** ordered compares, `min`/`max`, `eq`+classification); **bit-exact `fp.add`/`fp.sub`** landed (all 5 rounding modes, ~3k fuzz 0 unsound) — decides **Float16 fast**, Float32 partially, fp64 declines. Confirmed: Float32/64 add is too large for the CDCL ⇒ **needs Phase A**. Remaining: mul/div/fma/sqrt/rem, `roundToIntegral`, conversions, + faster core |
 | D | strings & sequences | ⬜ | length/witness/predicate reasoning done; word equations remain |
 | E | nonlinear real (CAD) | 🟨 | **complete-projection fallback landed** (Faddeev-LeVerrier determinant + full projection): coupled 3-var degenerate systems now decide (`x²+y²+z²=1 ∧ x+y+z>2` unsat, `xy=z ∧ yz=x ∧ zx=y ∧ …` unsat), fuzz-clean (340 QF_NRA, 0 unsound). Remaining: ∀/∃ over NRA (real QE), higher degree/dimension over-cap tail |
