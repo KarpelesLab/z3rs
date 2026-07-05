@@ -17,7 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nonlinear-integer systems by deriving variable bounds from square equalities
   (`x²+y²=3` unsat, `x²=2y² ∧ 0<x<5` unsat). Plus earlier this cycle: string
   length-link axioms + bounded witness search, and the functional-array-equality
-  (`(_ map f)`/`(_ as-array f)`/`(lambda …)`) soundness gate.
+  (`(_ map f)`/`(_ as-array f)`/`(lambda …)`) soundness gate. Sequence theory:
+  propagate a concrete sequence's length through equality (`s=(seq.unit 1)` forces
+  `seq.len(s)=1`, transitively) and decide `seq.contains`/`prefixof`/`suffixof`
+  over symbolic elements by the exact element-equality constraint (`a=b`) rather
+  than a syntactic AstId comparison (was a wrong `unsat`).
 - Phase 1 ✅: `math` (multivariate `polynomial` + rational `interval` kernels),
   `params` (`param_descrs` schema tables), AST quantifiers/lambda +
   cross-manager `ast_translation` with a build→translate→pp round-trip
