@@ -2368,6 +2368,21 @@ impl Context {
                 }
             }
         }
+        // Concrete sequence lengths: `seq.len(u) = |elements|` for every
+        // known-element sequence term `u` in the goal, so a variable bound to it
+        // (`s = (seq.unit 1)`) inherits the length by congruence (else a
+        // conflicting `seq.len(s)` looked sat).
+        let seq_terms: Vec<(AstId, usize)> = present
+            .iter()
+            .filter_map(|&t| self.seq_of.get(&t).map(|l| (t, l.len())))
+            .collect();
+        for (u, n) in seq_terms {
+            let d = self.seq_len_decl_for(self.m.get_sort(u));
+            let lenu = self.m.mk_app(d, &[u]);
+            let nv = self.m.mk_int(n as i64);
+            let eq = self.m.mk_eq(lenu, nv);
+            ax.push(eq);
+        }
         // Length links for symbolic predicates present in the goal:
         // `str.contains(s,sub) ⇒ len(s) ≥ len(sub)` etc.
         let links = self.str_pred_len.clone();
@@ -2573,6 +2588,15 @@ impl Context {
     /// Is `t` an application of a symbolic string-op marker declaration?
     fn str_op_marker(&self, t: AstId) -> bool {
         self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t))
+    }
+
+    /// The `seq.len : (Seq E) → Int` declaration for a sequence sort (interned by
+    /// signature, so all length applications on that sort are congruent).
+    fn seq_len_decl_for(&mut self, seq_sort: AstId) -> AstId {
+        let int = self.m.mk_int_sort();
+        let d = self.m.mk_func_decl(Symbol::new("seq.len"), &[seq_sort], int);
+        self.seq_len_decls.insert(d);
+        d
     }
 
     /// The canonical empty sequence of sort `s` (interned, with an empty element
@@ -3347,10 +3371,7 @@ impl Context {
                 }
                 // Symbolic sequence length: a genuine Int-valued function (like
                 // str.len), carrying a non-negativity axiom (see string_axioms).
-                let s = self.m.get_sort(args[0]);
-                let int = self.m.mk_int_sort();
-                let d = self.m.mk_func_decl(Symbol::new("seq.len"), &[s], int);
-                self.seq_len_decls.insert(d);
+                let d = self.seq_len_decl_for(self.m.get_sort(args[0]));
                 Ok(self.m.mk_app(d, &[args[0]]))
             }
             "seq.nth" => {
@@ -8502,6 +8523,22 @@ mod tests {
         assert_eq!(
             run("(declare-const s (Seq Int))(assert (= (seq.len s) 0))\
                  (assert (not (= s (as seq.empty (Seq Int)))))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A variable bound to a concrete sequence inherits its length by
+        // congruence — `s=(seq.unit 1)` forces `seq.len(s)=1` (fuzz-found: a
+        // conflicting length was spuriously sat), transitively through `t=s`.
+        assert_eq!(
+            run("(declare-const s (Seq Int))(assert (= s (seq.unit 1)))\
+                 (assert (= (seq.len s) 5))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const s (Seq Int))(declare-const t (Seq Int))\
+                 (assert (= s (seq.++ (seq.unit 1)(seq.unit 2))))(assert (= t s))\
+                 (assert (= (seq.len t) 0))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
