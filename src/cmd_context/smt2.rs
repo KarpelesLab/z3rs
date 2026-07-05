@@ -2518,10 +2518,25 @@ impl Context {
         if divs.is_empty() || divs.len() > 2 {
             return None;
         }
-        let vals: [i64; 24] = [
+        let mut vals: Vec<i64> = alloc::vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, -1, -2, -3, -4, -5, -6, -7, -8,
         ];
-        const MAX_TRIES: usize = 400;
+        // Also try nonzero integer constants that appear in the goal (and ±1
+        // around them): a satisfying divisor is often near a goal literal (e.g.
+        // `mod(x,y)=5 ∧ y<20` is sat at y just above 5 or just below 20).
+        for t in &present {
+            if let Some(v) = self.m.as_numeral(*t).and_then(|r| r.to_integer())
+                && let Some(n) = v.to_i64()
+                && n.abs() <= 1000
+            {
+                for cand in [n - 1, n, n + 1] {
+                    if cand != 0 && !vals.contains(&cand) {
+                        vals.push(cand);
+                    }
+                }
+            }
+        }
+        const MAX_TRIES: usize = 600;
         let mut idx = alloc::vec![0usize; divs.len()];
         let mut tries = 0;
         loop {
