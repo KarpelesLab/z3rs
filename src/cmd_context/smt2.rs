@@ -5627,7 +5627,10 @@ impl Context {
         // invariant). Both are sound; on the resource bound it declines (`None`)
         // and falls through to the general instantiation engine.
         if !self.universals.is_empty()
-            && let Some(r) = self.solve_chc().or_else(|| self.solve_chc_multi())
+            && let Some(r) = self
+                .solve_chc()
+                .or_else(|| self.solve_chc_acyclic())
+                .or_else(|| self.solve_chc_multi())
         {
             return (r, None);
         }
@@ -5926,7 +5929,18 @@ impl Context {
     /// is unsafe). Sound in that direction; the safe direction (a fixpoint of the
     /// reach sets) needs model-based projection, so on bound exhaustion it
     /// declines (`None`) and the goal stays a sound `unknown`.
-    fn solve_chc_multi(&mut self) -> Option<SmtResult> {
+    /// Parse the asserted universals as a **linear multi-predicate** CHC system:
+    /// the predicates, their canonical state variables, and each rule as
+    /// `(binders, body_app, guards, head_app)` (`head_app = None` ⇒ a query,
+    /// property heads already folded into the guards). `None` if not such a system.
+    #[allow(clippy::type_complexity)]
+    fn chc_parse_multi(
+        &mut self,
+    ) -> Option<(
+        BTreeSet<AstId>,
+        BTreeMap<AstId, Vec<AstId>>,
+        Vec<(Vec<AstId>, Option<AstId>, Vec<AstId>, Option<AstId>)>,
+    )> {
         let mut preds: BTreeSet<AstId> = BTreeSet::new();
         for (_, body) in &self.universals.clone() {
             for t in self.m.postorder(*body) {
@@ -5948,16 +5962,13 @@ impl Context {
                 return None;
             }
         }
-        // Canonical state variables for each predicate.
         let mut state: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
         for &p in &preds {
             let sorts = self.m.func_decl(p)?.domain.clone();
             let vars: Vec<AstId> = sorts.iter().map(|&s| self.fresh_const(s)).collect();
             state.insert(p, vars);
         }
-        // Parse each universal into (binders, body_app, guards, head_app).
-        type MRule = (Vec<AstId>, Option<AstId>, Vec<AstId>, Option<AstId>);
-        let mut rules: Vec<MRule> = Vec::new();
+        let mut rules = Vec::new();
         for (binders, body) in self.universals.clone() {
             let (ant, cons) = self.chc_split_rule(body)?;
             let mut conj = Vec::new();
@@ -5985,6 +5996,80 @@ impl Context {
             };
             rules.push((binders, body_app, guards, head_app));
         }
+        Some((preds, state, rules))
+    }
+
+    /// Multi-predicate CHC with an **acyclic** predicate-dependency graph: inline
+    /// each predicate's reachable set in topological order. With no recursion the
+    /// reach sets are *exact* and finite, so a satisfiable query is a genuine
+    /// counterexample (**unsat**) and no satisfiable query proves the system safe
+    /// (**sat**) — both sound. `None` on a dependency cycle (needs the PDR engine)
+    /// or when a query can't be decided.
+    fn solve_chc_acyclic(&mut self) -> Option<SmtResult> {
+        let (preds, state, rules) = self.chc_parse_multi()?;
+        // Dependency edges: a head predicate depends on its rule's body predicate.
+        let mut deps: BTreeMap<AstId, BTreeSet<AstId>> =
+            preds.iter().map(|&p| (p, BTreeSet::new())).collect();
+        for (_, body_app, _, head_app) in &rules {
+            if let (Some(happ), Some(bapp)) = (head_app, body_app) {
+                let hp = self.predicate_of(*happ)?;
+                let bp = self.predicate_of(*bapp)?;
+                deps.get_mut(&hp)?.insert(bp);
+            }
+        }
+        // Topological order (Kahn) — bail on any cycle (recursion).
+        let mut order: Vec<AstId> = Vec::new();
+        let mut remaining: BTreeSet<AstId> = preds.clone();
+        while !remaining.is_empty() {
+            let ready: Vec<AstId> = remaining
+                .iter()
+                .copied()
+                .filter(|p| deps[p].iter().all(|q| !remaining.contains(q)))
+                .collect();
+            if ready.is_empty() {
+                return None; // cycle
+            }
+            for p in ready {
+                order.push(p);
+                remaining.remove(&p);
+            }
+        }
+        // Exact reach per predicate, in topological order.
+        let mut reach: BTreeMap<AstId, AstId> =
+            preds.iter().map(|&p| (p, self.m.mk_false())).collect();
+        for &p in &order {
+            let mut acc = self.m.mk_false();
+            for (bs, body_app, guards, head_app) in &rules.clone() {
+                let Some(happ) = *head_app else { continue };
+                if self.predicate_of(happ)? != p {
+                    continue;
+                }
+                let img = self.chc_rule_image(bs, *body_app, guards, Some(happ), &reach, &state)?;
+                acc = self.m.mk_or(&[acc, img]);
+            }
+            acc = crate::rewriter::simplify(&mut self.m, acc);
+            if self.m.postorder(acc).len() > 4000 {
+                return None; // inlined reach blew up
+            }
+            reach.insert(p, acc);
+        }
+        // Check every query against the exact reach.
+        for (bs, body_app, guards, head_app) in &rules.clone() {
+            if head_app.is_some() {
+                continue;
+            }
+            let q = self.chc_rule_image(bs, *body_app, guards, None, &reach, &state)?;
+            match check_model(&self.m, q).0 {
+                SmtResult::Sat => return Some(SmtResult::Unsat),
+                SmtResult::Unknown => return None,
+                SmtResult::Unsat => {}
+            }
+        }
+        Some(SmtResult::Sat)
+    }
+
+    fn solve_chc_multi(&mut self) -> Option<SmtResult> {
+        let (preds, state, rules) = self.chc_parse_multi()?;
         // Bounded forward reachability. Without model-based projection the reach
         // sets never converge to a quantifier-free fixpoint (each rule firing adds
         // fresh existential path variables), so the bound is kept small: deep
@@ -5992,7 +6077,7 @@ impl Context {
         // case declines quickly rather than churning on ever-growing formulas.
         let mut reach: BTreeMap<AstId, AstId> =
             preds.iter().map(|&p| (p, self.m.mk_false())).collect();
-        const BOUND: usize = 4;
+        const BOUND: usize = 3;
         for _ in 0..BOUND {
             let mut new_reach = reach.clone();
             for (bs, body_app, guards, head_app) in &rules.clone() {
