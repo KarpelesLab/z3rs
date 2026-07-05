@@ -42,6 +42,10 @@ pub enum Sort {
     Array(alloc::boxed::Box<Sort>, alloc::boxed::Box<Sort>),
     /// An uninterpreted sort, named.
     Uninterpreted(String),
+    /// An algebraic datatype sort, named. Rendered as its bare name (the
+    /// `(declare-datatype …)` that introduces it is emitted into the session
+    /// separately, exactly like [`Sort::Uninterpreted`]).
+    Datatype(String),
 }
 
 impl Sort {
@@ -54,6 +58,7 @@ impl Sort {
             Sort::BitVec(n) => alloc::format!("(_ BitVec {n})"),
             Sort::Array(d, r) => alloc::format!("(Array {} {})", d.smt(), r.smt()),
             Sort::Uninterpreted(name) => name.clone(),
+            Sort::Datatype(name) => name.clone(),
         }
     }
 
@@ -90,6 +95,20 @@ impl Ast {
     /// combinators above.
     pub fn new(src: String, sort: Sort) -> Ast {
         Ast { src, sort }
+    }
+
+    /// Render a quantifier instantiation pattern `(t₁ … tₙ)` from its trigger
+    /// terms — the group form consumed by [`Context::quantifier`]'s `:pattern`.
+    pub fn pattern(terms: &[&Ast]) -> String {
+        let mut src = String::from("(");
+        for (i, t) in terms.iter().enumerate() {
+            if i > 0 {
+                src.push(' ');
+            }
+            src.push_str(&t.src);
+        }
+        src.push(')');
+        src
     }
 
     /// `(distinct a₁ … aₙ)` — pairwise disequality (→ Bool).
@@ -656,6 +675,17 @@ impl Context {
         Sort::Uninterpreted(name.to_string())
     }
 
+    /// Declare (once) an algebraic datatype and return its [`Sort`]. `ctors_body`
+    /// is the space-separated list of constructor S-expressions — e.g.
+    /// `"(nil) (cons (hd Int) (tl List))"` — which is wrapped into a
+    /// `(declare-datatype Name (…))` command and evaluated against the session.
+    pub fn declare_datatype(&mut self, name: &str, ctors_body: &str) -> Sort {
+        if self.declared.insert(alloc::format!("sort:{name}")) {
+            self.declare(alloc::format!("(declare-datatype {name} ({ctors_body}))"));
+        }
+        Sort::Datatype(name.to_string())
+    }
+
     /// A freshly-named constant of the given sort (`prefix!N`).
     pub fn fresh_const(&mut self, prefix: &str, sort: Sort) -> Ast {
         self.fresh += 1;
@@ -672,6 +702,52 @@ impl Context {
         Ast {
             src: alloc::format!("((as const {}) {})", arr.smt(), value.src),
             sort: arr,
+        }
+    }
+
+    /// Build a quantified formula (→ Bool). `bound` lists the bound variables as
+    /// `(name, sort)` pairs (rendered `((name Sort) …)`); `patterns` are the
+    /// already-rendered instantiation patterns (each the `(t₁ … tₙ)` form from
+    /// [`Ast::pattern`]); `weight` annotates the quantifier when non-zero. When
+    /// there are patterns (or a weight), the body is wrapped as
+    /// `(! body :pattern … :weight w)`.
+    ///
+    /// ```
+    /// use z3rs::api::build::{Ast, Context, Sort};
+    /// let body = Ast::new("(>= (f x) 0)".to_string(), Sort::Bool);
+    /// let q = Context::quantifier(true, 0, &[("x", &Sort::Int)], &[], &body);
+    /// assert_eq!(q.to_smt(), "(forall ((x Int)) (>= (f x) 0))");
+    /// ```
+    pub fn quantifier(
+        is_forall: bool,
+        weight: u32,
+        bound: &[(&str, &Sort)],
+        patterns: &[&str],
+        body: &Ast,
+    ) -> Ast {
+        let kw = if is_forall { "forall" } else { "exists" };
+        let mut vars = String::new();
+        for (name, sort) in bound {
+            vars.push_str(&alloc::format!("({name} {})", sort.smt()));
+        }
+        // Body, optionally annotated with patterns / weight.
+        let inner = if patterns.is_empty() && weight == 0 {
+            body.src.clone()
+        } else {
+            let mut ann = alloc::format!("(! {}", body.src);
+            for p in patterns {
+                ann.push_str(" :pattern ");
+                ann.push_str(p);
+            }
+            if weight != 0 {
+                ann.push_str(&alloc::format!(" :weight {weight}"));
+            }
+            ann.push(')');
+            ann
+        };
+        Ast {
+            src: alloc::format!("({kw} ({vars}) {inner})"),
+            sort: Sort::Bool,
         }
     }
 
@@ -894,6 +970,49 @@ mod tests {
         assert!(!Ast::new("(- x 1)".to_string(), Sort::Int).is_numeral());
         assert!(!Ast::new("true".to_string(), Sort::Bool).is_numeral());
         assert!(int("6").is_numeral());
+    }
+
+    #[test]
+    fn forall_uf_unsat() {
+        // forall x. f(x) >= 0, and f(3) < 0  ⇒  unsat.
+        let mut ctx = Context::new();
+        let f = ctx.declare_func("f", alloc::vec![Sort::Int], Sort::Int);
+        let x = Ast::new("x".to_string(), Sort::Int);
+        let body = f.apply(&[&x]).ge(&Context::int(0));
+        let q = Context::quantifier(true, 0, &[("x", &Sort::Int)], &[], &body);
+        ctx.assert(&q);
+        ctx.assert(&f.apply(&[&Context::int(3)]).lt(&Context::int(0)));
+        assert_eq!(ctx.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn forall_with_pattern() {
+        let mut ctx = Context::new();
+        let f = ctx.declare_func("f", alloc::vec![Sort::Int], Sort::Int);
+        let x = Ast::new("x".to_string(), Sort::Int);
+        let fx = f.apply(&[&x]);
+        let pat = Ast::pattern(&[&fx]);
+        let body = fx.ge(&Context::int(0));
+        let q = Context::quantifier(true, 1, &[("x", &Sort::Int)], &[&pat], &body);
+        assert!(q.to_smt().contains(":pattern"));
+        assert!(q.to_smt().contains(":weight 1"));
+        ctx.assert(&q);
+        ctx.assert(&f.apply(&[&Context::int(3)]).lt(&Context::int(0)));
+        assert_eq!(ctx.check(), SatResult::Unsat);
+    }
+
+    #[test]
+    fn datatype_list_sat() {
+        // List = nil | cons(hd: Int, tl: List); assert l = cons(1, nil).
+        let mut ctx = Context::new();
+        let lst = ctx.declare_datatype("Lst", "(nil) (cons (hd Int) (tl Lst))");
+        assert_eq!(lst, Sort::Datatype("Lst".to_string()));
+        let l = ctx.const_("l", lst);
+        let cons1 = Ast::new("(cons 1 nil)".to_string(), Sort::Datatype("Lst".to_string()));
+        ctx.assert(&l.eq(&cons1));
+        let hd_l = Ast::new("(hd l)".to_string(), Sort::Int);
+        ctx.assert(&hd_l.eq(&Context::int(1)));
+        assert_eq!(ctx.check(), SatResult::Sat);
     }
 
     #[test]

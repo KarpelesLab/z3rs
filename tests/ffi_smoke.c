@@ -280,6 +280,180 @@ int main(void) {
         Z3_del_context(uc);
     }
 
+    /* ---- Representative real-world program: an algebraic List datatype ----
+     * List = nil | cons(head: Int, tail: List). Build cons(1, cons(2, nil)),
+     * assert head(l) == 1 and l != nil, solve, and read the model back. */
+    {
+        Z3_context dc = Z3_mk_context(NULL);
+        Z3_sort intsort = Z3_mk_int_sort(dc);
+
+        /* cons(head: Int, tail: List): a NULL field sort with sort_ref = 0 means
+         * "the datatype being defined" (the recursive tail). */
+        Z3_symbol head_name = Z3_mk_string_symbol(dc, "head");
+        Z3_symbol tail_name = Z3_mk_string_symbol(dc, "tail");
+        Z3_symbol cons_fields[2] = { head_name, tail_name };
+        Z3_sort_opt cons_field_sorts[2] = { intsort, NULL }; /* NULL = List */
+        unsigned cons_field_refs[2] = { 0, 0 };
+        Z3_constructor cons_ctor = Z3_mk_constructor(
+            dc, Z3_mk_string_symbol(dc, "cons"), Z3_mk_string_symbol(dc, "is_cons"),
+            2, cons_fields, cons_field_sorts, cons_field_refs);
+        /* nil: a nullary constructor. */
+        Z3_constructor nil_ctor = Z3_mk_constructor(
+            dc, Z3_mk_string_symbol(dc, "nil"), Z3_mk_string_symbol(dc, "is_nil"),
+            0, NULL, NULL, NULL);
+
+        Z3_constructor ctors[2] = { nil_ctor, cons_ctor };
+        Z3_sort list_sort = Z3_mk_datatype(dc, Z3_mk_string_symbol(dc, "List"),
+                                           2, ctors);
+        assert(Z3_get_sort_kind(dc, list_sort) == 6); /* Z3_DATATYPE_SORT */
+        printf("List sort = %s\n", Z3_sort_to_string(dc, list_sort));
+
+        /* Pull back the constructor / tester / accessor decls. */
+        Z3_func_decl cons_decl, cons_tester, cons_accessors[2];
+        Z3_query_constructor(dc, cons_ctor, 2, &cons_decl, &cons_tester,
+                             cons_accessors);
+        Z3_func_decl head_decl = cons_accessors[0];
+        Z3_func_decl nil_decl, nil_tester;
+        Z3_query_constructor(dc, nil_ctor, 0, &nil_decl, &nil_tester, NULL);
+
+        /* nil, cons(2, nil), cons(1, cons(2, nil)). */
+        Z3_ast nil = Z3_mk_app(dc, nil_decl, 0, NULL);
+        Z3_ast two = Z3_mk_numeral(dc, "2", intsort);
+        Z3_ast one = Z3_mk_numeral(dc, "1", intsort);
+        Z3_ast inner_args[2] = { two, nil };
+        Z3_ast inner = Z3_mk_app(dc, cons_decl, 2, inner_args); /* cons(2,nil) */
+        Z3_ast outer_args[2] = { one, inner };
+        Z3_ast lst = Z3_mk_app(dc, cons_decl, 2, outer_args); /* cons(1,..) */
+        printf("term = %s\n", Z3_ast_to_string(dc, lst));
+
+        /* l is a List constant; assert l = cons(1, cons(2, nil)). */
+        Z3_ast l = Z3_mk_const(dc, Z3_mk_string_symbol(dc, "l"), list_sort);
+        Z3_solver ds = Z3_mk_solver(dc);
+        Z3_solver_assert(dc, ds, Z3_mk_eq(dc, l, lst));
+        /* Property: head(l) == 1 and l is a cons (not nil). */
+        Z3_ast head_l = Z3_mk_app(dc, head_decl, 1, &l);
+        Z3_solver_assert(dc, ds, Z3_mk_eq(dc, head_l, one));
+        Z3_ast is_cons_l = Z3_mk_app(dc, cons_tester, 1, &l);
+        Z3_solver_assert(dc, ds, is_cons_l);
+        assert(Z3_solver_check(dc, ds) == 1); /* sat */
+
+        /* Read head(l) back from the model: it must be 1. */
+        Z3_model dm = Z3_solver_get_model(dc, ds);
+        Z3_ast hv = NULL;
+        assert(Z3_model_eval(dc, dm, head_l, true, &hv) && hv != NULL);
+        int hval = -1;
+        assert(Z3_get_numeral_int(dc, hv, &hval));
+        printf("model: head(l) = %d\n", hval);
+        assert(hval == 1);
+
+        /* Contradiction: additionally assert l is nil -> unsat. */
+        Z3_solver_push(dc, ds);
+        Z3_ast is_nil_l = Z3_mk_app(dc, nil_tester, 1, &l);
+        Z3_solver_assert(dc, ds, is_nil_l);
+        assert(Z3_solver_check(dc, ds) == -1); /* cons and nil -> unsat */
+        Z3_solver_pop(dc, ds, 1);
+
+        Z3_del_constructor(dc, cons_ctor);
+        Z3_del_constructor(dc, nil_ctor);
+        Z3_del_context(dc);
+        puts("datatype program: OK");
+    }
+
+    /* ---- Representative real-world program: a quantified assertion ----
+     * Assert  forall x:Int. f(x) >= 0  and  f(3) < 0  -> unsat. */
+    {
+        Z3_context qc = Z3_mk_context(NULL);
+        Z3_sort intsort = Z3_mk_int_sort(qc);
+
+        /* f : Int -> Int */
+        Z3_sort fdom[1] = { intsort };
+        Z3_func_decl f = Z3_mk_func_decl(qc, Z3_mk_string_symbol(qc, "f"), 1,
+                                         fdom, intsort);
+
+        /* Bound variable x:Int as a constant Z3_app. */
+        Z3_ast x = Z3_mk_const(qc, Z3_mk_string_symbol(qc, "x"), intsort);
+        Z3_ast fx = Z3_mk_app(qc, f, 1, &x);
+        Z3_ast zero = Z3_mk_numeral(qc, "0", intsort);
+        Z3_ast body = Z3_mk_ge(qc, fx, zero); /* f(x) >= 0 */
+
+        /* Pattern { f(x) } to trigger instantiation. */
+        Z3_pattern pat = Z3_mk_pattern(qc, 1, &fx);
+        Z3_app bound[1] = { x };
+        Z3_pattern pats[1] = { pat };
+        Z3_ast forall = Z3_mk_forall_const(qc, 0, 1, bound, 1, pats, body);
+        printf("quantifier = %s\n", Z3_ast_to_string(qc, forall));
+
+        Z3_ast three = Z3_mk_numeral(qc, "3", intsort);
+        Z3_ast f3 = Z3_mk_app(qc, f, 1, &three);
+        Z3_ast f3_lt0 = Z3_mk_lt(qc, f3, zero); /* f(3) < 0 */
+
+        Z3_solver qs = Z3_mk_solver(qc);
+        Z3_solver_assert(qc, qs, forall);
+        Z3_solver_assert(qc, qs, f3_lt0);
+        int qr = Z3_solver_check(qc, qs);
+        printf("forall f(x)>=0 and f(3)<0 => %d (expect -1/unsat)\n", qr);
+        assert(qr == -1);
+
+        /* The existential dual is satisfiable on its own: exists x. f(x) < 0. */
+        Z3_context ec = Z3_mk_context(NULL);
+        Z3_sort eint = Z3_mk_int_sort(ec);
+        Z3_sort efdom[1] = { eint };
+        Z3_func_decl ef = Z3_mk_func_decl(ec, Z3_mk_string_symbol(ec, "g"), 1,
+                                          efdom, eint);
+        Z3_ast ex = Z3_mk_const(ec, Z3_mk_string_symbol(ec, "y"), eint);
+        Z3_ast egx = Z3_mk_app(ec, ef, 1, &ex);
+        Z3_ast ezero = Z3_mk_numeral(ec, "0", eint);
+        Z3_ast ebody = Z3_mk_lt(ec, egx, ezero);
+        Z3_app ebound[1] = { ex };
+        Z3_ast exists = Z3_mk_exists_const(ec, 0, 1, ebound, 0, NULL, ebody);
+        Z3_solver es = Z3_mk_solver(ec);
+        Z3_solver_assert(ec, es, exists);
+        assert(Z3_solver_check(ec, es) == 1); /* sat */
+        Z3_del_context(ec);
+
+        Z3_del_context(qc);
+        puts("quantifier program: OK");
+    }
+
+    /* ---- Enumeration + tuple sorts ---- */
+    {
+        Z3_context nc = Z3_mk_context(NULL);
+        /* enum Color { Red, Green, Blue } */
+        Z3_symbol cnames[3] = { Z3_mk_string_symbol(nc, "Red"),
+                                Z3_mk_string_symbol(nc, "Green"),
+                                Z3_mk_string_symbol(nc, "Blue") };
+        Z3_func_decl cconsts[3], ctesters[3];
+        Z3_sort color = Z3_mk_enumeration_sort(
+            nc, Z3_mk_string_symbol(nc, "Color"), 3, cnames, cconsts, ctesters);
+        assert(Z3_get_sort_kind(nc, color) == 6);
+        Z3_ast red = Z3_mk_app(nc, cconsts[0], 0, NULL);
+        Z3_ast green = Z3_mk_app(nc, cconsts[1], 0, NULL);
+        Z3_ast col = Z3_mk_const(nc, Z3_mk_string_symbol(nc, "col"), color);
+        Z3_solver ns = Z3_mk_solver(nc);
+        Z3_solver_assert(nc, ns, Z3_mk_eq(nc, col, red));
+        Z3_solver_assert(nc, ns, Z3_mk_eq(nc, col, green)); /* Red != Green */
+        assert(Z3_solver_check(nc, ns) == -1); /* unsat: distinct enum values */
+
+        /* tuple Pair(first: Int, second: Int) */
+        Z3_sort intsort = Z3_mk_int_sort(nc);
+        Z3_symbol pfields[2] = { Z3_mk_string_symbol(nc, "first"),
+                                 Z3_mk_string_symbol(nc, "second") };
+        Z3_sort psorts[2] = { intsort, intsort };
+        Z3_func_decl mk_pair, projs[2];
+        Z3_sort pair = Z3_mk_tuple_sort(nc, Z3_mk_string_symbol(nc, "Pair"), 2,
+                                        pfields, psorts, &mk_pair, projs);
+        assert(Z3_get_sort_kind(nc, pair) == 6);
+        Z3_ast pa[2] = { Z3_mk_numeral(nc, "3", intsort),
+                         Z3_mk_numeral(nc, "4", intsort) };
+        Z3_ast p = Z3_mk_app(nc, mk_pair, 2, pa); /* mk-Pair(3,4) */
+        Z3_ast first_p = Z3_mk_app(nc, projs[0], 1, &p); /* first(p) == 3 */
+        Z3_solver ps = Z3_mk_solver(nc);
+        Z3_solver_assert(nc, ps, Z3_mk_eq(nc, first_p, Z3_mk_numeral(nc, "4", intsort)));
+        assert(Z3_solver_check(nc, ps) == -1); /* first(mk-Pair(3,4)) != 4 */
+        Z3_del_context(nc);
+        puts("enum+tuple program: OK");
+    }
+
     puts("ffi_smoke: OK");
     return 0;
 }

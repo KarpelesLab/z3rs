@@ -275,6 +275,70 @@ const char *Z3_ast_vector_to_string(Z3_context c, Z3_ast_vector v);
 /* Unsat core of the last unsatisfiable check as tracking assumption ASTs. */
 Z3_ast_vector Z3_solver_get_unsat_core(Z3_context c, Z3_solver s);
 
+/* ---- Quantifiers (the _const forms; no De-Bruijn bookkeeping needed) ----
+ * Bound variables are supplied as constant Z3_app handles (name + sort); the
+ * text front end binds them by name in the rendered (forall/exists ...). */
+typedef struct Z3rsPattern *Z3_pattern;
+
+/* Build a (multi-)pattern trigger (t1 ... tn) from term handles. */
+Z3_pattern Z3_mk_pattern(Z3_context c, unsigned num_patterns,
+                         Z3_ast const terms[]);
+/* forall/exists over the constant bound variables, with optional patterns and
+ * weight. Result sort is Bool. */
+Z3_ast Z3_mk_forall_const(Z3_context c, unsigned weight, unsigned num_bound,
+                          Z3_app const bound[], unsigned num_patterns,
+                          Z3_pattern const patterns[], Z3_ast body);
+Z3_ast Z3_mk_exists_const(Z3_context c, unsigned weight, unsigned num_bound,
+                          Z3_app const bound[], unsigned num_patterns,
+                          Z3_pattern const patterns[], Z3_ast body);
+Z3_ast Z3_mk_quantifier_const(Z3_context c, bool is_forall, unsigned weight,
+                              unsigned num_bound, Z3_app const bound[],
+                              unsigned num_patterns,
+                              Z3_pattern const patterns[], Z3_ast body);
+
+/* ---- Algebraic datatypes ----
+ * Declared to the front end with (declare-datatype ...). A Z3_constructor
+ * captures a constructor spec; a NULL field sort (with its sort_refs index)
+ * denotes a recursive reference to the datatype being defined. */
+typedef Z3_sort Z3_sort_opt;
+typedef struct Z3rsConstructor *Z3_constructor;
+typedef struct Z3rsConstructorList *Z3_constructor_list;
+
+Z3_constructor Z3_mk_constructor(Z3_context c, Z3_symbol name,
+                                 Z3_symbol recognizer, unsigned num_fields,
+                                 Z3_symbol const field_names[],
+                                 Z3_sort_opt const sorts[],
+                                 unsigned sort_refs[]);
+Z3_sort Z3_mk_datatype(Z3_context c, Z3_symbol name,
+                       unsigned num_constructors,
+                       Z3_constructor constructors[]);
+/* Hand back the constructor, its (_ is name) tester, and one accessor per
+ * field, as Z3_func_decl handles. NULL out-pointers are skipped. */
+void Z3_query_constructor(Z3_context c, Z3_constructor constr,
+                          unsigned num_fields, Z3_func_decl *constructor,
+                          Z3_func_decl *tester, Z3_func_decl accessors[]);
+Z3_constructor_list Z3_mk_constructor_list(Z3_context c,
+                                           unsigned num_constructors,
+                                           Z3_constructor const constructors[]);
+void Z3_del_constructor(Z3_context c, Z3_constructor constr);
+void Z3_del_constructor_list(Z3_context c, Z3_constructor_list clist);
+
+/* Enumeration sort: a datatype of nullary constructors. Fills enum_consts[i]
+ * with each value's constructor decl and enum_testers[i] with its tester. */
+Z3_sort Z3_mk_enumeration_sort(Z3_context c, Z3_symbol name, unsigned n,
+                               Z3_symbol const enum_names[],
+                               Z3_func_decl enum_consts[],
+                               Z3_func_decl enum_testers[]);
+/* Tuple sort: a single-constructor datatype. Writes the constructor decl to
+ * *mk_tuple_decl and the projection (accessor) decls to proj_decl. */
+Z3_sort Z3_mk_tuple_sort(Z3_context c, Z3_symbol mk_tuple_name,
+                         unsigned num_fields, Z3_symbol const field_names[],
+                         Z3_sort const field_sorts[],
+                         Z3_func_decl *mk_tuple_decl, Z3_func_decl proj_decl[]);
+
+/* Set sort over `elem`, i.e. (Array elem Bool). */
+Z3_sort Z3_mk_set_sort(Z3_context c, Z3_sort elem);
+
 #ifdef __cplusplus
 }
 #endif
