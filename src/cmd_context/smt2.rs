@@ -3199,49 +3199,57 @@ impl Context {
             let val_eq = self.m.mk_or(&[bv_eq, both_zero]);
             return Some(self.m.mk_and(&[val_eq, no_nan]));
         }
-        // Ordered comparisons via the IEEE monotone bit-key: mapping the bits
-        // `x` to `key(x) = sign(x) ? ~x : x | msb` makes UNSIGNED integer order
-        // coincide with the real order of the (non-NaN) floats, with `-0` just
-        // below `+0` (their equality is patched via `both_zero`).
+        // Ordered comparisons via a DIRECT field comparison — sign bit plus the
+        // magnitude (`exp:significand` = the low `w-1` bits, a plain extract).
+        // Unlike the monotone-key transform, the magnitude is a near-free
+        // variable, so the SAT core refutes e.g. `x<y ∧ y<x` quickly.
         let w = self.fp_format_of(self.m.get_sort(a)).map(|(eb, sb)| eb + sb)?;
-        let key_a = self.fp_order_key(bva, w);
-        let key_b = self.fp_order_key(bvb, w);
-        let (x, y) = match op {
-            "fp.lt" | "fp.leq" => (key_a, key_b),
-            "fp.gt" | "fp.geq" => (key_b, key_a),
-            _ => return None,
-        };
-        let lt = self.m.mk_bvult(x, y);
-        let strict = self.m.mk_and(&[no_nan, lt]);
+        let lt_ab = self.fp_real_lt(bva, bvb, w); // value(a) < value(b), non-NaN
         Some(match op {
-            "fp.lt" | "fp.gt" => {
-                // strict, but `±0 < ∓0` is false (they are equal).
+            "fp.lt" => {
                 let not_both_zero = self.m.mk_not(both_zero);
-                self.m.mk_and(&[strict, not_both_zero])
+                self.m.mk_and(&[no_nan, not_both_zero, lt_ab])
             }
-            // non-strict: strictly-below OR equal (bit-equal or both zero).
-            _ => {
+            "fp.gt" => {
+                let lt_ba = self.fp_real_lt(bvb, bva, w);
+                let not_both_zero = self.m.mk_not(both_zero);
+                self.m.mk_and(&[no_nan, not_both_zero, lt_ba])
+            }
+            "fp.leq" => {
                 let eq = self.m.mk_or(&[bv_eq, both_zero]);
-                let le = self.m.mk_or(&[lt, eq]);
+                let le = self.m.mk_or(&[lt_ab, eq]);
                 self.m.mk_and(&[no_nan, le])
+            }
+            _ => {
+                // fp.geq
+                let lt_ba = self.fp_real_lt(bvb, bva, w);
+                let eq = self.m.mk_or(&[bv_eq, both_zero]);
+                let ge = self.m.mk_or(&[lt_ba, eq]);
+                self.m.mk_and(&[no_nan, ge])
             }
         })
     }
 
-    /// The IEEE monotone ordering key of a float's bit-vector `bv` (width `w`):
-    /// `sign ? ~bv : bv | msb`, so unsigned comparison of keys matches real order.
-    fn fp_order_key(&mut self, bv: AstId, w: u32) -> AstId {
-        let sign = self.m.mk_bv_extract(w - 1, w - 1, bv);
+    /// `value(a) < value(b)` for the width-`w` bit-vectors of two **non-NaN**
+    /// floats (±0 tie handled by the caller): compare by sign, then by magnitude
+    /// (`exp:significand`) — ascending for positives, descending for negatives.
+    fn fp_real_lt(&mut self, bva: AstId, bvb: AstId, w: u32) -> AstId {
         let one1 = self.m.mk_bv(1, 1);
-        let is_neg = self.m.mk_eq(sign, one1);
-        let notbv = self.m.mk_bvnot(bv);
-        // msb mask = 1 << (w-1) as a constant `1 :: 0^{w-1}` (concat avoids both a
-        // barrel-shifter circuit and i64 overflow at w = 64).
-        let one_bit = self.m.mk_bv(1, 1);
-        let zeros = self.m.mk_bv(0, w - 1);
-        let msb_mask = self.m.mk_bv_concat(one_bit, zeros);
-        let orbv = self.m.mk_bvor(bv, msb_mask);
-        self.m.mk_ite(is_neg, notbv, orbv)
+        let sa = self.m.mk_bv_extract(w - 1, w - 1, bva);
+        let sb = self.m.mk_bv_extract(w - 1, w - 1, bvb);
+        let sa1 = self.m.mk_eq(sa, one1); // a is negative
+        let sb1 = self.m.mk_eq(sb, one1); // b is negative
+        let nsa1 = self.m.mk_not(sa1);
+        let nsb1 = self.m.mk_not(sb1);
+        let both_neg = self.m.mk_and(&[sa1, sb1]);
+        let both_pos = self.m.mk_and(&[nsa1, nsb1]);
+        let mag_a = self.m.mk_bv_extract(w - 2, 0, bva);
+        let mag_b = self.m.mk_bv_extract(w - 2, 0, bvb);
+        let pos_lt = self.m.mk_bvult(mag_a, mag_b); // both ≥ 0: a<b iff |a|<|b|
+        let neg_lt = self.m.mk_bvult(mag_b, mag_a); // both < 0: a<b iff |a|>|b|
+        // signs differ ⇒ a<b iff a is the negative one (= sa1)
+        let inner = self.m.mk_ite(both_pos, pos_lt, sa1);
+        self.m.mk_ite(both_neg, neg_lt, inner)
     }
 
     /// A classification predicate (`fp.isNaN` …) as a Boolean over the bits of
@@ -3389,14 +3397,10 @@ impl Context {
                     };
                     return Ok(self.mk_bool(r));
                 }
-                // `fp.eq` is cheap to bit-blast (equality + zero handling). The
-                // ordered comparisons have a correct key-transform + `bvult`
-                // circuit (`fp_compare_bv`), but a chain like `x<y ∧ y<x` drives
-                // the basic CDCL core past its conflict budget (tens of seconds),
-                // so they stay a sound `unknown` until the BV core is faster.
-                if op == "fp.eq"
-                    && let Some(t) = self.fp_compare_bv(op, args[0], args[1])
-                {
+                // Bit-blast the comparison: `fp.eq` via equality + zero handling,
+                // the ordered comparisons via the direct sign+magnitude circuit
+                // (`fp_compare_bv`) — all decided by the QF_BV engine.
+                if let Some(t) = self.fp_compare_bv(op, args[0], args[1]) {
                     return Ok(t);
                 }
                 self.symbolic_fp(op, args)
@@ -8381,6 +8385,32 @@ mod tests {
             alloc::vec!["unsat"]
         );
         assert_eq!(s.eval("(pop)(check-sat)").unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn symbolic_fp_ordered_compare() {
+        // Ordered fp comparisons via the direct sign+magnitude circuit — the
+        // transitivity contradiction is decided fast (was a hang with the
+        // monotone-key encoding).
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)\
+                 (assert (fp.lt x y))(assert (fp.lt y x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(assert (fp.lt x x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)\
+                 (assert (fp.geq x y))(assert (fp.gt y x))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const x Float32)(declare-const y Float32)(assert (fp.lt x y))(check-sat)")
+                .unwrap(),
+            alloc::vec!["sat"]
+        );
     }
 
     #[test]
