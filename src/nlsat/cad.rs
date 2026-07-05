@@ -1,6 +1,6 @@
 //! Cylindrical Algebraic Decomposition (CAD) — a complete decision procedure for
 //! the satisfiability of a conjunction of polynomial constraints over the reals
-//! (QF_NRA), following the McCallum projection.
+//! (QF_NRA), following Collins' complete projection.
 //!
 //! Ported from Z3's `nlsat` / `math/polynomial` (Z3 4.17.0, MIT), implemented as
 //! textbook CAD (project → base → lift → decide) on top of the exact
@@ -9,18 +9,20 @@
 //!
 //! **Soundness is unconditional.** Whenever this procedure returns `Some(sat)` or
 //! `Some(unsat)` the answer is correct: signs are computed exactly at each cell's
-//! sample point, and the cells are genuinely sign-invariant. Where the cheap
-//! McCallum projection could be invalid (a discriminant or resultant that
-//! vanishes identically ⇒ non-squarefree/again basis, or a *nullified*
-//! polynomial during lifting) — or a resource cap is hit — it returns `None`
-//! (the caller falls back to a sound `unknown`). It never guesses.
+//! sample point, and the cells are genuinely sign-invariant. The projection is
+//! Collins' complete operator (reducta + the full principal-subresultant-coefficient
+//! chains), which — unlike the cheaper McCallum projection — never nullifies on
+//! proportional or common-factor inputs, so the degenerate cases McCallum
+//! declines are decided here. It returns `None` only on a resource cap or a
+//! genuinely undecidable degeneracy during lifting (the caller then falls back to
+//! a sound `unknown`). It never guesses.
 
 use alloc::vec::Vec;
 
 use puremp::Rational;
 
 use crate::math::polynomial::{Polynomial, Var};
-use crate::math::resultant::{discriminant, resultant};
+use crate::math::resultant::{principal_subresultant_coeffs, resultant};
 use crate::math::upoly::UPoly;
 use crate::nlsat::icp::Rel;
 use crate::nlsat::realclosure::{Alg, poly_to_upoly, sign_at_point, upoly_to_poly};
@@ -116,45 +118,98 @@ pub fn cad_sat(constraints: &[(Polynomial, Rel)], num_vars: usize) -> Option<boo
     Some(false)
 }
 
-/// McCallum projection eliminating `var`: leading/positive coefficients,
-/// discriminants, and pairwise resultants. Returns `None` if a discriminant or
-/// resultant vanishes identically (non-squarefree/coprime input — McCallum
-/// invalid), so the caller declines soundly.
+/// Collins' **complete** projection eliminating `var` (the sound fallback that
+/// subsumes McCallum). For every main polynomial `F` and its chain of *reducta*
+/// `red⁰(F), red¹(F), …` (successively dropping the leading `var`-term, needed
+/// wherever a leading coefficient can vanish and the degree drop):
+///
+/// * **PROJ1** — leading coefficient of each reductum, and the full chain of
+///   *principal subresultant coefficients* of each reductum with its derivative
+///   (the sub-discriminants), which delineate repeated roots.
+/// * **PROJ2** — the full chain of principal subresultant coefficients of every
+///   pair of reducta drawn from two distinct main polynomials, which delineates
+///   common roots.
+///
+/// Using the whole subresultant chain (rather than only the resultant /
+/// discriminant, which McCallum uses) is what makes this projection never
+/// nullify: where a resultant or discriminant vanishes identically — proportional
+/// or common-factor polynomials — the higher subresultant coefficients still
+/// carry the delineating information, and a proportional pair (same variety)
+/// correctly contributes nothing. The resulting decomposition is
+/// sign-invariant unconditionally (Collins 1975, corrected by Hong). Adding these
+/// extra polynomials only refines cells, so soundness is preserved; this returns
+/// `None` only on the resource cap (`MAX_PROJ`, checked by the caller).
 fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>> {
     let mut proj: Vec<Polynomial> = Vec::new();
-    // Make each polynomial squarefree in the main variable (McCallum requires it,
-    // e.g. the trivially-true axiom `y² ≥ 0` must become `y` — otherwise its
-    // discriminant vanishes identically). Then keep those with positive degree.
+    // Make each polynomial squarefree in the main variable when it is univariate
+    // in `var` (cheap reduction, e.g. the trivially-true axiom `y² ≥ 0` becomes
+    // `y`). Multivariate-coefficient polynomials keep their form — the
+    // subresultant chain below handles any non-squarefreeness soundly.
     let conditioned: Vec<Polynomial> = polys.iter().map(|p| squarefree_main(p, var)).collect();
-    let mains: Vec<&Polynomial> = conditioned.iter().filter(|p| p.degree_of(var) >= 1).collect();
     // Polynomials free of `var` are carried down unchanged (still constrain lower
     // levels and matter for the decision).
     for p in conditioned.iter().filter(|p| p.degree_of(var) == 0) {
         proj.push(p.clone());
     }
-    for f in &mains {
-        let d = f.degree_of(var);
-        for j in 1..=d {
-            proj.push(f.coeff_of_var(var, j));
-        }
-        if d >= 2 {
-            let disc = discriminant(f, var);
-            if disc.is_zero() {
-                return None; // repeated factor with non-constant coefficients
+    // Reducta chains of the main polynomials.
+    let reducta_lists: Vec<Vec<Polynomial>> = conditioned
+        .iter()
+        .filter(|p| p.degree_of(var) >= 1)
+        .map(|f| reducta(f, var))
+        .collect();
+
+    // PROJ1: per-reductum leading coefficient + sub-discriminant chain.
+    for rl in &reducta_lists {
+        for g in rl {
+            let d = g.degree_of(var);
+            debug_assert!(d >= 1);
+            proj.push(g.coeff_of_var(var, d)); // leading coefficient
+            let gd = g.deriv_var(var);
+            if gd.degree_of(var) >= 1 {
+                proj.extend(principal_subresultant_coeffs(g, &gd, var));
             }
-            proj.push(disc);
+            // (If `g` is linear in `var`, `g'` is a nonzero constant in `var`; the
+            // pair has no repeated root and the leading coefficient above suffices.)
         }
     }
-    for i in 0..mains.len() {
-        for j in (i + 1)..mains.len() {
-            let res = resultant(mains[i], mains[j], var);
-            if res.is_zero() {
-                return None; // the two share a factor in the main variable
+    // PROJ2: sub-resultant chain of every reducta pair across distinct mains.
+    for i in 0..reducta_lists.len() {
+        for j in (i + 1)..reducta_lists.len() {
+            for g in &reducta_lists[i] {
+                for h in &reducta_lists[j] {
+                    proj.extend(principal_subresultant_coeffs(g, h, var));
+                }
             }
-            proj.push(res);
         }
     }
     Some(clean(proj))
+}
+
+/// The chain of *reducta* of `f` in `var`: `f`, then `f` with its leading
+/// `var`-term removed, and so on, stopping once the leading coefficient is a
+/// nonzero constant (the degree can no longer drop) or the polynomial becomes
+/// constant in `var`. Every returned polynomial has positive degree in `var`.
+fn reducta(f: &Polynomial, var: Var) -> Vec<Polynomial> {
+    let mut out = Vec::new();
+    let mut g = f.clone();
+    loop {
+        let d = g.degree_of(var);
+        if d < 1 {
+            break;
+        }
+        let lc = g.coeff_of_var(var, d);
+        out.push(g.clone());
+        if lc.as_constant().is_some() {
+            break; // leading coefficient never vanishes ⇒ no further degree drop
+        }
+        // red(g) = g − lc·var^d (strip every term of degree `d` in `var`).
+        let lead = lc.mul(&Polynomial::var(var).pow(d));
+        g = g.sub(&lead);
+        if g.is_zero() {
+            break;
+        }
+    }
+    out
 }
 
 /// The squarefree part of `f` in the main variable `var`, when `f` is univariate
@@ -276,7 +331,8 @@ fn rational_between(rs: &mut [Alg], i: usize) -> Rational {
 /// Lift a sample point by one coordinate: isolate the fiber roots of every
 /// polynomial (main variable `var`) at the sample, merge them, and extend the
 /// sample by each root (section) and a rational between/around them (sectors).
-/// Returns `None` on a nullification (McCallum invalid at a positive-dim cell).
+/// Returns `None` only if a fiber polynomial's root elimination degenerates
+/// without being a genuine nullification (see [`roots_at`]) — a sound decline.
 fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec<Vec<Alg>>> {
     let mut roots: Vec<Alg> = Vec::new();
     for f in polys {
@@ -325,7 +381,21 @@ fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
     // `g` is now univariate in `var`.
     let u = poly_to_upoly(&g, var);
     if u.is_zero() {
-        return None; // nullification
+        // The elimination collapsed to the zero polynomial. Treating `f` as
+        // contributing no section over this fiber is sound *only* if `f` is
+        // genuinely identically zero along it — then `f`'s sign is uniformly `0`
+        // there (which the decision reads off correctly at the sample) and it
+        // delineates nothing. Verify exactly: every `var`-coefficient of `f`
+        // vanishes at the sample. Under the complete projection the surrounding
+        // cell is already sign-invariant for the other polynomials, so an
+        // identically-zero `f` is benign. Otherwise the resultant elimination
+        // degenerated spuriously and we must decline soundly.
+        let d = f.degree_of(var);
+        let nullified = (0..=d).all(|k| sign_at_point(&f.coeff_of_var(var, k), sample) == 0);
+        if nullified {
+            return Some(Vec::new());
+        }
+        return None;
     }
     let candidates = Alg::roots_of(&u);
     let mut out = Vec::new();
@@ -425,6 +495,36 @@ mod tests {
             (poly(&[(1, &[(0, 2)]), (-1, &[(1, 2)])]), Rel::Lt),
         ];
         assert_eq!(cad_sat(&c, 2), Some(true));
+    }
+
+    // Reproduced degenerate case: x²+y²+z²=1 ∧ x+y+z>2 : UNSAT. McCallum's
+    // projection nullifies here (the sphere's discriminant and the plane
+    // resultant become proportional after the trivial `·²≥0` facts); the complete
+    // projection decides it.
+    #[test]
+    fn sphere_vs_plane_unsat() {
+        let c = alloc::vec![
+            (poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[(2, 2)]), (-1, &[])]), Rel::Eq),
+            (poly(&[(1, &[(0, 1)]), (1, &[(1, 1)]), (1, &[(2, 1)]), (-2, &[])]), Rel::Gt),
+        ];
+        assert_eq!(cad_sat(&c, 3), Some(false));
+    }
+
+    // Reproduced degenerate case: xy=z ∧ yz=x ∧ zx=y ∧ x,y,z>0 ∧ x≠1 : UNSAT.
+    // After eliminating z=xy the residual has common-factor pairs (e.g. y(x²−1)
+    // and y) that nullify McCallum's resultant; the subresultant chain decides it.
+    #[test]
+    fn coupled_products_unsat() {
+        let c = alloc::vec![
+            (poly(&[(1, &[(0, 1), (1, 1)]), (-1, &[(2, 1)])]), Rel::Eq),
+            (poly(&[(1, &[(1, 1), (2, 1)]), (-1, &[(0, 1)])]), Rel::Eq),
+            (poly(&[(1, &[(2, 1), (0, 1)]), (-1, &[(1, 1)])]), Rel::Eq),
+            (poly(&[(1, &[(0, 1)])]), Rel::Gt),
+            (poly(&[(1, &[(1, 1)])]), Rel::Gt),
+            (poly(&[(1, &[(2, 1)])]), Rel::Gt),
+            (poly(&[(1, &[(0, 1)]), (-1, &[])]), Rel::Ne),
+        ];
+        assert_eq!(cad_sat(&c, 3), Some(false));
     }
 
     // Empty real variety: x^2 + y^2 + 1 = 0 : UNSAT.
