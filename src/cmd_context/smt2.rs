@@ -9558,6 +9558,13 @@ impl Context {
                     .m
                     .array_sort_params(self.m.get_sort(self.m.app_args(t)[0]))
                     .is_some_and(|(idx, _)| self.m.is_bool_sort(idx))
+                && {
+                    // A *symbolic* Bool index needs 2-valuedness reasoning (which
+                    // the core solver does not do soundly for the resulting ites);
+                    // a constant `true`/`false` index is a plain congruence read.
+                    let index = self.m.app_args(t)[1];
+                    !(self.m.is_true(index) || self.m.is_false(index))
+                }
         })
     }
 
