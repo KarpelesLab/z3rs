@@ -3622,6 +3622,31 @@ impl Context {
                 }
             }
         }
+        // Disjoint contains: two literal substrings with no shared character can't
+        // overlap, so `contains x t1 ∧ contains x t2 ⇒ len x ≥ len t1 + len t2`.
+        for i in 0..contains_m.len() {
+            for j in (i + 1)..contains_m.len() {
+                let (cm1, x1, t1) = contains_m[i];
+                let (cm2, x2, t2) = contains_m[j];
+                if x1 != x2 {
+                    continue;
+                }
+                if let (Some(v1), Some(v2)) = (self.str_value(t1), self.str_value(t2))
+                    && !v1.is_empty()
+                    && !v2.is_empty()
+                {
+                    let s1: BTreeSet<u32> = v1.iter().copied().collect();
+                    if v2.iter().all(|c| !s1.contains(c)) {
+                        let lenf = self.str_len_fn();
+                        let lx = self.m.mk_app(lenf, &[x1]);
+                        let sum = self.m.mk_int((v1.len() + v2.len()) as i64);
+                        let ge = self.m.mk_ge(lx, sum);
+                        let and = self.m.mk_and(&[cm1, cm2]);
+                        ax.push(self.m.mk_implies(and, ge));
+                    }
+                }
+            }
+        }
         // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
         // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
         let lts: Vec<(AstId, AstId, AstId)> = present
@@ -4513,6 +4538,18 @@ impl Context {
                         cat.extend_from_slice(b);
                         if !lit_subs.contains(&cat) {
                             lit_subs.push(cat);
+                        }
+                    }
+                    // Overlap merge: a suffix of `a` that is a prefix of `b`
+                    // (`"abc"+"cde"` sharing "c" ⇒ "abcde").
+                    let max_o = a.len().min(b.len());
+                    for o in 1..max_o {
+                        if a[a.len() - o..] == b[..o] {
+                            let mut merged = a.clone();
+                            merged.extend_from_slice(&b[o..]);
+                            if merged.len() <= 12 && !lit_subs.contains(&merged) {
+                                lit_subs.push(merged);
+                            }
                         }
                     }
                 }
