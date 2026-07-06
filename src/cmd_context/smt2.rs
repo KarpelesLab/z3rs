@@ -3647,6 +3647,44 @@ impl Context {
                 }
             }
         }
+        // `str.to_int x = n` (n ≥ 0): `x` is a non-empty digit string whose value is
+        // `n`, so `len x ≥ #digits(n)` — refutes `to_int x = 42 ∧ len x = 1`.
+        for &t in &present {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_app(l)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(l))
+                            .map(String::as_str),
+                        Some("str.to_int") | Some("str.to-int")
+                    )
+                    && !self.m.app_args(l).is_empty()
+                    && let Some(n) = self
+                        .m
+                        .as_numeral(r)
+                        .and_then(|q| q.to_integer())
+                        .and_then(|i| i.to_i64())
+                    && n >= 0
+                {
+                    let digits = alloc::format!("{n}").len() as i64;
+                    let x = self.m.app_args(l)[0];
+                    let lenf = self.str_len_fn();
+                    let lx = self.m.mk_app(lenf, &[x]);
+                    let d = self.m.mk_int(digits);
+                    let ge = self.m.mk_ge(lx, d);
+                    // Conditional on the equality actually holding (it may be
+                    // negated or under a disjunction).
+                    ax.push(self.m.mk_implies(t, ge));
+                }
+            }
+        }
         // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
         // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
         let lts: Vec<(AstId, AstId, AstId)> = present
@@ -4550,6 +4588,43 @@ impl Context {
                             if merged.len() <= 12 && !lit_subs.contains(&merged) {
                                 lit_subs.push(merged);
                             }
+                        }
+                    }
+                }
+            }
+        }
+        // `str.to_int x = n` (n ≥ 0): x is the decimal string of n, possibly with
+        // leading zeros — the digits are outside the literal alphabet, so add them
+        // as explicit candidates.
+        for t in self.m.postorder(goal) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_app(l)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(l))
+                            .map(String::as_str),
+                        Some("str.to_int") | Some("str.to-int")
+                    )
+                    && let Some(n) = self
+                        .m
+                        .as_numeral(r)
+                        .and_then(|q| q.to_integer())
+                        .and_then(|i| i.to_i64())
+                    && n >= 0
+                {
+                    let base: Vec<u32> = alloc::format!("{n}").chars().map(|c| c as u32).collect();
+                    for pad in 0..=8usize.saturating_sub(base.len()) {
+                        let mut cand: Vec<u32> = alloc::vec!['0' as u32; pad];
+                        cand.extend_from_slice(&base);
+                        if !lit_subs.contains(&cand) {
+                            lit_subs.push(cand);
                         }
                     }
                 }
