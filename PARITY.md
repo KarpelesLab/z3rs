@@ -21,7 +21,7 @@ multi-predicate CHC).*
 | Roadmap decision phases at exit | **all** — B (div/mod), C (floating-point), E (QF_NRA CAD), G (Horn/CHC), H (C ABI) met this cycle, joining the earlier fragments |
 | Tests | 390 unit/integration `#[test]`s + doctests, all green; CI green on Linux/macOS/Windows, MSRV 1.88, no_std, C-ABI |
 | Differential fuzzing | continuous vs `/usr/bin/z3`; a broad cross-theory sweep over **15 fragments** (LIA/LRA/BV/arrays/Bool-arrays/arrays-of-BV/datatypes/strings/sequences/regex/FP/NRA/NIA/quantifiers+∀∃/CHC/pseudo-boolean) is **0 gap, 0 unsound** on both-definite cases |
-| Cumulative fuzzing | ~90k+ random scripts vs z3 across all fragments, **0 unsound** at final state |
+| Cumulative fuzzing | ~90k+ random scripts vs z3 across all fragments, **0 unsound** at final state; recent randomized cross-theory stress runs (16 theories, randomized operators) hold **598/598 both-definite agreement, 0 unsound** |
 | Dependencies | `z3rs → puremp` only (enforced by a guard test) |
 
 ## Per-theory coverage
