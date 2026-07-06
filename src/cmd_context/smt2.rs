@@ -5561,6 +5561,51 @@ impl Context {
                 ax.push(self.m.mk_implies(t, d));
             }
         }
+        // `seq.prefixof s u ⇒ (i < len s ⇒ nth(s,i) = nth(u,i))`. Refutes
+        // `prefixof s u ∧ len s = 2 ∧ nth u 0 = 5 ∧ nth s 0 ≠ 5`.
+        let seq_prefs: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.prefixof")
+                    && self.m.app_args(t).len() == 2
+            })
+            .collect();
+        // Concrete indices `i` occurring in any `seq.nth(_, i)` marker.
+        let nth_idxs: BTreeSet<i64> = present
+            .iter()
+            .filter_map(|&t| {
+                (self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.nth")
+                    && self.m.app_args(t).len() == 2)
+                    .then(|| self.int_arg(self.m.app_args(t)[1]))
+                    .flatten()
+            })
+            .filter(|&i| (0..=64).contains(&i))
+            .collect();
+        for t in seq_prefs {
+            let a = self.m.app_args(t).to_vec();
+            let (s, u) = (a[0], a[1]);
+            let Ok(len_s) = self.seq_op("seq.len", &[s]) else {
+                continue;
+            };
+            for &i in &nth_idxs {
+                let iv = self.m.mk_int(i);
+                let (Ok(ns), Ok(nu)) = (
+                    self.seq_op("seq.nth", &[s, iv]),
+                    self.seq_op("seq.nth", &[u, iv]),
+                ) else {
+                    continue;
+                };
+                let guard = self.m.mk_lt(iv, len_s);
+                let hyp = self.m.mk_and(&[t, guard]);
+                let eq = self.m.mk_eq(ns, nu);
+                ax.push(self.m.mk_implies(hyp, eq));
+            }
+        }
         // `seq.at s i = seq.unit(seq.nth s i)` when `0 ≤ i < len s`. Refutes
         // `seq.at s 2 = seq.unit 5 ∧ seq.nth s 2 = 9`.
         let seq_ats: Vec<AstId> = present
