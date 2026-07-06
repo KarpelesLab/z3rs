@@ -1384,6 +1384,32 @@ impl Regex {
         }
     }
 
+    /// The longest literal every matching word must end with (mirror of
+    /// `mandatory_prefix`). `re.++ (a-z) "xyz"` ⇒ `"xyz"`.
+    fn mandatory_suffix(&self) -> Vec<u32> {
+        match self {
+            Regex::Lit(l) => l.clone(),
+            Regex::Range(lo, hi) if lo == hi => alloc::vec![*lo],
+            Regex::Concat(a, b) => {
+                let mut s = b.mandatory_suffix();
+                // Extend backwards past `b` only if `b` is a fixed literal.
+                if let Regex::Lit(lb) = b.as_ref()
+                    && *lb == s
+                {
+                    let mut p = a.mandatory_suffix();
+                    p.extend(s);
+                    s = p;
+                }
+                s
+            }
+            Regex::Inter(a, b) => {
+                let (sa, sb) = (a.mandatory_suffix(), b.mandatory_suffix());
+                if sa.len() >= sb.len() { sa } else { sb }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// The complete finite set of words in the language, or `None` if it is
     /// infinite or exceeds `budget` words. `("yes" | "no")` ⇒ `{yes, no}`.
     fn all_words(&self, budget: usize) -> Option<Vec<Vec<u32>>> {
@@ -3486,6 +3512,7 @@ impl Context {
         let mut last_char: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut contains: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
         let mut neg_prefixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
+        let mut neg_suffixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
         let mut neg_eq: BTreeMap<AstId, BTreeSet<Vec<u32>>> = BTreeMap::new();
         for &c in &conj {
             // `x ≠ "lit"` (distinct/¬=): the literal words x is excluded from.
@@ -3516,6 +3543,23 @@ impl Context {
                 && let Some(q) = self.str_value(self.m.app_args(inner)[0])
             {
                 neg_prefixof
+                    .entry(self.m.app_args(inner)[1])
+                    .or_default()
+                    .push(q);
+            }
+            // `¬suffixof(Q, x)` with Q concrete: x must NOT end with Q.
+            if self.m.is_not(c)
+                && let inner = self.m.app_args(c)[0]
+                && self.m.is_app(inner)
+                && self
+                    .str_op_decls
+                    .get(&self.m.app_decl(inner))
+                    .map(String::as_str)
+                    == Some("str.suffixof")
+                && self.m.app_args(inner).len() == 2
+                && let Some(q) = self.str_value(self.m.app_args(inner)[0])
+            {
+                neg_suffixof
                     .entry(self.m.app_args(inner)[1])
                     .or_default()
                     .push(q);
@@ -3685,6 +3729,16 @@ impl Context {
                     .iter()
                     .any(|q| !q.is_empty() && q.len() <= p.len() && p[..q.len()] == q[..])
                 {
+                    return true;
+                }
+            }
+            // Mirror for the mandatory suffix vs a `¬suffixof(Q, x)`
+            // (`x ∈ (a-z)·"xyz" ∧ ¬suffixof "xyz" x`).
+            if let Some(qs) = neg_suffixof.get(&x) {
+                let sfx = r.mandatory_suffix();
+                if qs.iter().any(|q| {
+                    !q.is_empty() && q.len() <= sfx.len() && sfx[sfx.len() - q.len()..] == q[..]
+                }) {
                     return true;
                 }
             }
