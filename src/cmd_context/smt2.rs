@@ -7823,8 +7823,72 @@ impl Context {
                 self.m.mk_false()
             });
         }
+        // Nonlinear `∀xs. ∃y. c·y² + Q(xs) ⋈ 0`: the inner `∃y` reduces to a sign
+        // condition on `Q` (a real `y` with `y² = −Q/c` exists iff `−Q/c ≥ 0`),
+        // and the resulting `∀xs. sign(Q)` is a quantifier-free CAD query.
+        if let Some(verdict) = self.try_nonlinear_forall_exists(&xvars, &yvars, phi) {
+            return Some(if verdict {
+                self.m.mk_true()
+            } else {
+                self.m.mk_false()
+            });
+        }
         let psi = self.qe_exists(&yvars, phi)?;
         self.qe_forall(&xvars, psi)
+    }
+
+    /// Decide `∀xs. ∃y. c·y² + Q(xs) ⋈ 0` (a single existential appearing only as
+    /// `y²`, single atom body) by reducing the inner `∃y` to a sign condition on
+    /// the `y`-free part `Q` and checking the universal over `xs` with `cad_sat`.
+    /// `None` if the body is not of this shape.
+    fn try_nonlinear_forall_exists(
+        &self,
+        _xvars: &[AstId],
+        yvars: &[AstId],
+        phi: AstId,
+    ) -> Option<bool> {
+        use crate::nlsat::{Rel as NRel, cad::cad_sat};
+        if yvars.len() != 1 {
+            return None;
+        }
+        let y = yvars[0];
+        let mut var_map = BTreeMap::new();
+        let con = self.icp_atom(phi, false, &mut var_map)?;
+        let yi = *var_map.get(&y)?;
+        let poly = &con.poly;
+        // `y` must occur only as `y²` with a nonzero constant leading coefficient.
+        if poly.degree_of(yi) != 2 || !poly.coeff_of_var(yi, 1).is_zero() {
+            return None;
+        }
+        let c = poly.coeff_of_var(yi, 2).as_constant()?;
+        if c.is_zero() {
+            return None;
+        }
+        let q = poly.coeff_of_var(yi, 0); // the `y`-free part Q(xs)
+        // `∃y. c·y² + Q ⋈ 0` as a condition on `Q` (with `c·y²` ranging over
+        // `[0,∞)` when `c>0`, `(−∞,0]` when `c<0`):
+        //   `=`  : solvable iff `−Q/c ≥ 0`  → `c>0 ⇒ Q ≤ 0`, `c<0 ⇒ Q ≥ 0`
+        //   `≤`  : same threshold as `=` for `c>0` / `c<0`
+        //   `≥`  : `c>0` always solvable (large `y`); `c<0 ⇒ Q ≥ 0`
+        // The universal `∀xs. cond` holds iff its negation is UNSAT over `xs`.
+        let cpos = c.signum() > 0;
+        // `neg_cond`: the `(poly, rel)` whose satisfiability refutes the universal.
+        let neg_cond = match (con.rel, cpos) {
+            // Q ≤ 0 required → refute with Q > 0.
+            (NRel::Eq | NRel::Le, true) => (q, NRel::Gt),
+            // Q ≥ 0 required → refute with Q < 0.
+            (NRel::Eq | NRel::Ge, false) => (q, NRel::Lt),
+            // Q < 0 required (strict, `c·y²` reaches its min 0 at y=0) → refute Q ≥ 0.
+            (NRel::Lt, true) => (q, NRel::Ge),
+            // Q > 0 required (`c·y²` reaches its max 0 at y=0) → refute Q ≤ 0.
+            (NRel::Gt, false) => (q, NRel::Le),
+            // `c·y²` is unbounded in the required direction → always solvable.
+            (NRel::Ge | NRel::Gt, true) | (NRel::Le | NRel::Lt, false) => return Some(true),
+            _ => return None,
+        };
+        let nvars = var_map.len();
+        let sat = cad_sat(&[neg_cond], nvars)?;
+        Some(!sat)
     }
 
     /// Decide `∀xs. ∃ys. φ` over linear-integer arithmetic by Cooper's QE:
