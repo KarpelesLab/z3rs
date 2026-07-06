@@ -3264,6 +3264,19 @@ impl Context {
                 }
             }
         }
+        // Cross-link the two orders: `a<b ⇒ a≤b` and `a<b ⇒ ¬(b≤a)`, sharing the
+        // `str.<=` decl so the ≤ antisymmetry/transitivity axioms see the derived
+        // edges. Refutes `x≤y ∧ y≤z ∧ z<x`.
+        if !lts.is_empty() && !les.is_empty() {
+            let le_decl = self.m.app_decl(les[0].0);
+            for (mlt, a, b) in &lts {
+                let mab_le = self.m.mk_app(le_decl, &[*a, *b]);
+                ax.push(self.m.mk_implies(*mlt, mab_le));
+                let mba_le = self.m.mk_app(le_decl, &[*b, *a]);
+                let nba = self.m.mk_not(mba_le);
+                ax.push(self.m.mk_implies(*mlt, nba));
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
