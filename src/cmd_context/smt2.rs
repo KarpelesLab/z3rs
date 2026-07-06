@@ -5434,30 +5434,38 @@ impl Context {
                 }
             }
         }
-        for (x, y) in &str_eqs {
-            for (coll, _label) in [(&prefs, 0u8), (&sufs, 1u8)] {
-                for (m1, p1, v1) in coll.iter() {
-                    if *v1 != *x {
-                        continue;
-                    }
-                    for (m2, p2, v2) in coll.iter() {
-                        if *v2 == *y && p1 == p2 {
-                            ax.push(self.m.mk_eq(*m1, *m2));
-                        }
-                    }
+        // Position-agnostic: for any present prefixof/suffixof/contains marker with
+        // x as a direct argument, the same marker with x→y (if also present) is
+        // congruent — covers `prefixof x S` (x the prefix) as well as `prefixof P x`.
+        let str_pred_markers: Vec<(String, Vec<AstId>, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t) && self.m.app_args(t).len() == 2 {
+                    self.str_op_decls.get(&self.m.app_decl(t)).and_then(|op| {
+                        matches!(
+                            op.as_str(),
+                            "str.prefixof" | "str.suffixof" | "str.contains"
+                        )
+                        .then(|| (op.clone(), self.m.app_args(t).to_vec(), t))
+                    })
+                } else {
+                    None
                 }
-            }
-            // contains(x, Q) ⟺ contains(y, Q) for each needle Q.
-            let needles: Vec<AstId> = contains_of
-                .keys()
-                .filter(|(h, _)| h == x)
-                .map(|(_, q)| *q)
-                .collect();
-            for q in needles {
-                if let (Some(&m1), Some(&m2)) =
-                    (contains_of.get(&(*x, q)), contains_of.get(&(*y, q)))
-                {
-                    ax.push(self.m.mk_eq(m1, m2));
+            })
+            .collect();
+        for (x, y) in &str_eqs {
+            for (op1, args1, m1) in &str_pred_markers {
+                let new_args: Vec<AstId> = args1
+                    .iter()
+                    .map(|&a| if a == *x { *y } else { a })
+                    .collect();
+                if new_args == *args1 {
+                    continue; // x not an argument
+                }
+                for (op2, args2, m2) in &str_pred_markers {
+                    if op2 == op1 && *args2 == new_args {
+                        ax.push(self.m.mk_eq(*m1, *m2));
+                    }
                 }
             }
         }
