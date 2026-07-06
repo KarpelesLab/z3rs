@@ -10457,7 +10457,16 @@ impl Context {
         // selectors/testers over `v` fold, and retry. Applied only on `unknown`
         // (it removes `v`, which would break a model query on the primary path).
         if res == SmtResult::Unknown && !self.datatypes.is_empty() {
-            let inlined = self.inline_ground_dt_bindings(goal);
+            // Iterate to a fixpoint: inlining `m = cons 2 nl` makes `l = cons 1 m`
+            // ground, which the next pass inlines.
+            let mut inlined = goal;
+            for _ in 0..8 {
+                let next = self.inline_ground_dt_bindings(inlined);
+                if next == inlined {
+                    break;
+                }
+                inlined = next;
+            }
             if inlined != goal {
                 let (r2, m2) = self.decide_inner(inlined);
                 if r2 != SmtResult::Unknown {
