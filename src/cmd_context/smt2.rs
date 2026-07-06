@@ -11289,7 +11289,7 @@ impl Context {
         let mut subst: Vec<(AstId, AstId)> = Vec::new();
         let mut bound: BTreeSet<AstId> = BTreeSet::new();
         for (app, parts) in self.seq_concat.clone() {
-            if parts.len() != 2 {
+            if parts.len() < 2 {
                 continue;
             }
             let mut cval: Option<Vec<AstId>> = None;
@@ -11311,21 +11311,36 @@ impl Context {
             let Some(cv) = cval else {
                 continue;
             };
-            let Some(k) = self.str_exact_len(goal, parts[0]) else {
-                continue;
-            };
-            if k > cv.len() {
+            // Determine each part's slice of `cv`: every part but the last must
+            // have a pinned length; the last takes the remainder.
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut offset = 0usize;
+            let mut ok = true;
+            for (i, &p) in parts.iter().enumerate() {
+                if i + 1 == parts.len() {
+                    ranges.push((offset, cv.len()));
+                } else if let Some(k) = self.str_exact_len(goal, p) {
+                    if offset + k > cv.len() {
+                        ok = false;
+                        break;
+                    }
+                    ranges.push((offset, offset + k));
+                    offset += k;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
                 continue;
             }
-            if self.m.is_uninterp_const(parts[0]) && !bound.contains(&parts[0]) {
-                let sv = self.mk_seq(cv[..k].to_vec());
-                subst.push((parts[0], sv));
-                bound.insert(parts[0]);
-            }
-            if self.m.is_uninterp_const(parts[1]) && !bound.contains(&parts[1]) {
-                let uv = self.mk_seq(cv[k..].to_vec());
-                subst.push((parts[1], uv));
-                bound.insert(parts[1]);
+            for (i, &p) in parts.iter().enumerate() {
+                if self.m.is_uninterp_const(p) && !bound.contains(&p) {
+                    let (lo, hi) = ranges[i];
+                    let pv = self.mk_seq(cv[lo..hi].to_vec());
+                    subst.push((p, pv));
+                    bound.insert(p);
+                }
             }
         }
         if subst.is_empty() {
