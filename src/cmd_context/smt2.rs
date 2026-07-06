@@ -3211,6 +3211,34 @@ impl Context {
         }
     }
 
+    /// Whether a datatype/record sort transitively contains a `Bool` field. Only
+    /// these need the explicit extensionality axioms — a non-Bool field equality
+    /// already feeds the EUF congruence through the constructor.
+    fn sort_has_bool_field(&self, sort: AstId, depth: u32) -> bool {
+        if depth > 6 {
+            return false;
+        }
+        let sels: Vec<AstId> = if let Some((_, s)) = self.records.get(&sort) {
+            s.clone()
+        } else if let Some(ctors) = self.datatypes.get(&sort) {
+            ctors
+                .iter()
+                .flat_map(|(_, s, _)| s.iter().copied())
+                .collect()
+        } else {
+            return false;
+        };
+        for sd in sels {
+            let Some(fsort) = self.m.func_decl(sd).map(|d| d.range) else {
+                continue;
+            };
+            if self.m.is_bool_sort(fsort) || self.sort_has_bool_field(fsort, depth + 1) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Number of distinct inhabitants of a sort, if finite and small (≤ 1M).
     /// `Bool` = 2, a small `BitVec n` = 2ⁿ, and a datatype whose every field sort is
     /// itself finite = Σ over constructors of Π field cardinalities (a nullary
@@ -3868,8 +3896,8 @@ impl Context {
         for &t in &terms {
             let s = self.m.get_sort(t);
             // Any datatype-sorted term (variable or nested selector app), bounded,
-            // so nested extensionality chains.
-            if self.datatypes.contains_key(&s) {
+            // so nested extensionality chains. Only Bool-containing sorts need it.
+            if self.datatypes.contains_key(&s) && self.sort_has_bool_field(s, 0) {
                 let v = by_sort.entry(s).or_default();
                 if v.len() < 12 && !v.contains(&t) {
                     v.push(t);
@@ -3943,8 +3971,9 @@ impl Context {
         for &t in &terms {
             let s = self.m.get_sort(t);
             // Any record-sorted term (variable or nested selector app like
-            // `inner p`), so nested extensionality chains.
-            if self.records.contains_key(&s) {
+            // `inner p`), so nested extensionality chains. Only Bool-containing
+            // sorts need it (others get congruence for free).
+            if self.records.contains_key(&s) && self.sort_has_bool_field(s, 0) {
                 let v = by_sort.entry(s).or_default();
                 if v.len() < 12 && !v.contains(&t) {
                     v.push(t);
