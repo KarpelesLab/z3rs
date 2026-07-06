@@ -657,6 +657,23 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
             if let Some(a) = omega_dark_witness(&cons, &kept_diseqs, &int_vars, &mut dark_budget) {
                 return Feas::Sat(finish(a));
             }
+            // Disequality case-split for the hard unbounded cases: `e ≠ 0` is
+            // `e ≤ −1 ∨ e ≥ 1`; feed each strict half to the dark-shadow witness
+            // (which respects an added inequality, unlike its post-hoc diseq
+            // verification). Handles e.g. `x+y ≥ 0 ∧ 2x ≤ 0 ∧ x ≠ y`.
+            if let Some((d, rest)) = kept_diseqs.split_first() {
+                let one_c = LinExpr::constant(Rational::from_integer(Int::from(1)));
+                let lo = Constraint::le(d.add(&one_c)); // e + 1 ≤ 0  ⟺  e ≤ −1
+                let hi = Constraint::le(d.neg().add(&one_c)); // 1 − e ≤ 0  ⟺  e ≥ 1
+                for extra in [lo, hi] {
+                    let mut c2 = cons.clone();
+                    c2.push(extra);
+                    let mut b2: u64 = 60_000;
+                    if let Some(a) = omega_dark_witness(&c2, rest, &int_vars, &mut b2) {
+                        return Feas::Sat(finish(a));
+                    }
+                }
+            }
         }
     }
     feas
