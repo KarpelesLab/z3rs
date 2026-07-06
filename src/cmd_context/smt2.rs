@@ -5816,10 +5816,22 @@ impl Context {
         }
         // A sequence equated to a concrete sequence is pinned element-wise:
         // `A = [c0,…,c_{n-1}]` ⇒ `len A = n ∧ nth(A, j) = cj` — so the extract
-        // element axioms above can conflict with the pinned elements.
-        let eqs: Vec<AstId> = present
-            .iter()
-            .copied()
+        // element axioms above can conflict with the pinned elements. Only
+        // TOP-LEVEL conjunct equalities count; an equality nested under `not`
+        // (`u ≠ empty`) must NOT pin `u = empty` (a fuzz-found unsoundness).
+        let mut top: Vec<AstId> = Vec::new();
+        let mut tstack = alloc::vec![goal];
+        while let Some(t) = tstack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    tstack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let eqs: Vec<AstId> = top
+            .into_iter()
             .filter(|&t| self.m.is_eq(t) && self.m.app_args(t).len() == 2)
             .collect();
         for e in eqs {
