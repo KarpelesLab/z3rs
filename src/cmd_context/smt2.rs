@@ -1137,7 +1137,7 @@ struct Context {
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
 /// to fold `(str.in_re "literal" r)` by matching.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Regex {
     /// Matches exactly this code-point sequence (`str.to_re` of a literal).
     Lit(Vec<u32>),
@@ -3610,6 +3610,20 @@ impl Context {
             };
             if positive {
                 pos_len.insert(self.m.app_args(a[0])[0]);
+            }
+        }
+        // `x ∈ r ∧ x ∈ comp(r)` is UNSAT — a word can't be in a language and its
+        // complement (`x ∈ (a-z) ∧ x ∈ re.comp(a-z)`).
+        for (i, &(x1, r1)) in in_re.iter().enumerate() {
+            for &(x2, r2) in &in_re[i + 1..] {
+                if x1 != x2 {
+                    continue;
+                }
+                let compl = matches!(r1, Regex::Comp(inner) if inner.as_ref() == r2)
+                    || matches!(r2, Regex::Comp(inner) if inner.as_ref() == r1);
+                if compl {
+                    return true;
+                }
             }
         }
         for (x, r) in in_re {
