@@ -4785,6 +4785,46 @@ impl Context {
         // `seq.extract s i l` (concrete i,l) relates to `s` element-wise:
         // `i+j < len s ⇒ nth(extract, j) = nth(s, i+j)` for `0 ≤ j < l`, plus the
         // clamped length. Lets `extract s 1 1 = unit 3 ∧ nth s 1 = 2` refute.
+        // `seq.contains s [c] ∧ len s = n` (n pinned) ⇒ `⋁_{i<n} nth(s,i) = c` — a
+        // single element must sit at some position. Refutes `contains s [5] ∧
+        // len s = 2 ∧ nth s 0 ≠ 5 ∧ nth s 1 ≠ 5`.
+        let seq_contains: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.contains")
+                    && self.m.app_args(t).len() == 2
+            })
+            .collect();
+        for t in seq_contains {
+            let a = self.m.app_args(t).to_vec();
+            let Some(needle) = self.seq_of.get(&a[1]).cloned() else {
+                continue;
+            };
+            if needle.len() != 1 {
+                continue;
+            }
+            let Some(n) = self.str_exact_len(goal, a[0]) else {
+                continue;
+            };
+            if n == 0 || n > 16 {
+                continue;
+            }
+            let c = needle[0];
+            let mut disj = Vec::new();
+            for i in 0..n {
+                let iv = self.m.mk_int(i as i64);
+                if let Ok(nth) = self.seq_op("seq.nth", &[a[0], iv]) {
+                    disj.push(self.m.mk_eq(nth, c));
+                }
+            }
+            if !disj.is_empty() {
+                let d = self.m.mk_or(&disj);
+                ax.push(self.m.mk_implies(t, d));
+            }
+        }
         // `seq.at s i = seq.unit(seq.nth s i)` when `0 ≤ i < len s`. Refutes
         // `seq.at s 2 = seq.unit 5 ∧ seq.nth s 2 = 9`.
         let seq_ats: Vec<AstId> = present
