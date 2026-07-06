@@ -2897,6 +2897,51 @@ impl Context {
                 ax.push(self.m.mk_implies(found, fits));
             }
         }
+        // Round-trip `str.to_int (str.from_int t) = ite(t ≥ 0, t, −1)`: `from_int`
+        // of a nonnegative `t` is its decimal, which `to_int` inverts; a negative
+        // `t` yields the empty/invalid string, whose `to_int` is −1.
+        let roundtrips: Vec<(AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str),
+                        Some("str.to_int") | Some("str.to-int")
+                    )
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 1
+                        && self.m.is_app(a[0])
+                        && matches!(
+                            self.str_op_decls
+                                .get(&self.m.app_decl(a[0]))
+                                .map(String::as_str),
+                            Some("str.from_int") | Some("str.from-int")
+                        )
+                    {
+                        let inner = self.m.app_args(a[0]);
+                        if inner.len() == 1 {
+                            return Some((t, inner[0]));
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+        for (app, t) in &roundtrips {
+            let zero = self.m.mk_int(0);
+            let neg1 = self.m.mk_int(-1);
+            // `t ≥ 0 ⇒ to_int = t`
+            let nonneg = self.m.mk_ge(*t, zero);
+            let eqt = self.m.mk_eq(*app, *t);
+            ax.push(self.m.mk_implies(nonneg, eqt));
+            // `t < 0 ⇒ to_int = −1`
+            let neg = self.m.mk_lt(*t, zero);
+            let eqm1 = self.m.mk_eq(*app, neg1);
+            ax.push(self.m.mk_implies(neg, eqm1));
+        }
         // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
         // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
         let lts: Vec<(AstId, AstId, AstId)> = present
