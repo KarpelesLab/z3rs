@@ -1258,6 +1258,22 @@ impl Regex {
         }
     }
 
+    /// Sound over-approximation of "some word in the language ends with code
+    /// point `c`" (mirror of [`Regex::can_start_with`]).
+    fn can_end_with(&self, c: u32) -> bool {
+        match self {
+            Regex::Lit(l) => l.last() == Some(&c),
+            Regex::Range(lo, hi) => (*lo..=*hi).contains(&c),
+            Regex::AllChar | Regex::All => true,
+            Regex::None => false,
+            Regex::Concat(a, b) => b.can_end_with(c) || (b.nullable() && a.can_end_with(c)),
+            Regex::Union(a, b) => a.can_end_with(c) || b.can_end_with(c),
+            Regex::Inter(a, b) => a.can_end_with(c) && b.can_end_with(c),
+            Regex::Star(a) => a.can_end_with(c),
+            Regex::Comp(_) => true,
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -2770,6 +2786,7 @@ impl Context {
         }
         let mut in_re: Vec<(AstId, &Regex)> = Vec::new();
         let mut first_char: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut last_char: BTreeMap<AstId, u32> = BTreeMap::new();
         for &c in &conj {
             if !self.m.is_app(c) {
                 continue;
@@ -2790,6 +2807,13 @@ impl Context {
                         && !p.is_empty()
                     {
                         first_char.entry(a[1]).or_insert(p[0]);
+                    }
+                }
+                Some("str.suffixof") if a.len() == 2 => {
+                    if let Some(p) = self.str_value(a[0])
+                        && !p.is_empty()
+                    {
+                        last_char.entry(a[1]).or_insert(p[p.len() - 1]);
                     }
                 }
                 _ => {}
@@ -2816,6 +2840,11 @@ impl Context {
         for (x, r) in in_re {
             if let Some(&fc) = first_char.get(&x)
                 && !r.can_start_with(fc)
+            {
+                return true;
+            }
+            if let Some(&lc) = last_char.get(&x)
+                && !r.can_end_with(lc)
             {
                 return true;
             }
