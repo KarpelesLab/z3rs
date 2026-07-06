@@ -3977,6 +3977,39 @@ impl Context {
                 ax.push(self.m.mk_implies(t, eqc));
             }
         }
+        // `contains x P` (P concrete): `len x ≥ len P`, and if the length is exactly
+        // `len P` then `x = P` (a length-`|P|` string containing `P` *is* `P`).
+        // Refutes `contains x "ab" ∧ len x = 2 ∧ x ≠ "ab"`.
+        for &t in &present {
+            if !self.m.is_app(t)
+                || self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                    != Some("str.contains")
+            {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            let Some(pv) = self.str_value(a[1]) else {
+                continue;
+            };
+            let x = a[0];
+            let lenf = self.str_len_fn();
+            let lenx = self.m.mk_app(lenf, &[x]);
+            let np = self.m.mk_int(pv.len() as i64);
+            let ge = self.m.mk_ge(lenx, np);
+            ax.push(self.m.mk_implies(t, ge));
+            let len_eq = self.m.mk_eq(lenx, np);
+            let pl = self.mk_str_lit(&code_points_to_string(&pv));
+            extra_lits.insert(pl);
+            let x_eq_p = self.m.mk_eq(x, pl);
+            let hyp = self.m.mk_and(&[t, len_eq]);
+            ax.push(self.m.mk_implies(hyp, x_eq_p));
+        }
         for (pm, pchars, px) in &prefs {
             for (am, ax_x, k) in &ats {
                 if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
