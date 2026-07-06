@@ -7241,8 +7241,60 @@ impl Context {
         let phi = self.term(&inner);
         self.scopes.pop();
         let phi = phi.ok()?;
+        // Integers: full Presburger QE (Cooper) — decides divisibility cases the
+        // real-shadow Fourier–Motzkin path declines on.
+        let all_int = xvars
+            .iter()
+            .chain(&yvars)
+            .all(|&v| self.m.is_int_sort(self.m.get_sort(v)));
+        if all_int && let Some(verdict) = self.cooper_forall_exists(&xvars, &yvars, phi) {
+            return Some(if verdict {
+                self.m.mk_true()
+            } else {
+                self.m.mk_false()
+            });
+        }
         let psi = self.qe_exists(&yvars, phi)?;
         self.qe_forall(&xvars, psi)
+    }
+
+    /// Decide `∀xs. ∃ys. φ` over linear-integer arithmetic by Cooper's QE:
+    /// eliminate every existential then every universal, leaving a ground formula.
+    /// `None` if `φ` is not linear-integer or the elimination exceeds its budget.
+    fn cooper_forall_exists(
+        &mut self,
+        xvars: &[AstId],
+        yvars: &[AstId],
+        phi: AstId,
+    ) -> Option<bool> {
+        use crate::smt::cooper::{self, Atom};
+        let cubes = self.body_dnf(phi, true)?;
+        let mut dnf: cooper::Dnf = Vec::new();
+        for cube in &cubes {
+            let mut c: Vec<Atom> = Vec::new();
+            for con in cube {
+                // Cooper needs integer coefficients.
+                if !con.expr.const_term().is_integer()
+                    || con.expr.terms().any(|(_, k)| !k.is_integer())
+                {
+                    return None;
+                }
+                c.push(match con.rel {
+                    Rel::Lt => Atom::Lt(con.expr.clone()),
+                    Rel::Le => Atom::Le(con.expr.clone()),
+                    Rel::Eq => Atom::Eq(con.expr.clone()),
+                });
+            }
+            dnf.push(c);
+        }
+        let mut budget: u64 = 2_000_000;
+        for &y in yvars {
+            dnf = cooper::exists(&dnf, y, &mut budget)?;
+        }
+        for &x in xvars {
+            dnf = cooper::forall(&dnf, x, &mut budget)?;
+        }
+        cooper::ground_sat(&dnf)
     }
 
     /// Strip positive existentials from `body`, collecting their binder

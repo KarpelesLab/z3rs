@@ -13,6 +13,7 @@
 
 pub mod arith;
 pub mod bv;
+pub mod cooper;
 pub mod euf;
 pub mod solver;
 
