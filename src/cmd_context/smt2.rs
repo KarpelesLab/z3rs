@@ -2730,6 +2730,42 @@ impl Context {
         true
     }
 
+    /// If the goal pins string variable `v` to an exact length via
+    /// `(= (str.len v) k)`, return `k` — so the witness search can generate
+    /// exactly-length-`k` candidates (needed for word equations with a fixed
+    /// length, e.g. `len x = 4 ∧ x·y = y·x`).
+    fn str_exact_len(&self, goal: AstId, v: AstId) -> Option<usize> {
+        let is_len_of = |a: AstId| -> bool {
+            self.m.is_app(a) && {
+                let d = self.m.app_decl(a);
+                (self.str_len_decl == Some(d) || self.seq_len_decls.contains(&d))
+                    && self.m.app_args(a).first() == Some(&v)
+            }
+        };
+        for t in self.m.postorder(goal) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            if args.len() != 2 {
+                continue;
+            }
+            for (a, b) in [(args[0], args[1]), (args[1], args[0])] {
+                if is_len_of(a)
+                    && let Some(k) = self
+                        .m
+                        .as_numeral(b)
+                        .and_then(|r| r.to_integer())
+                        .and_then(|i| i.to_i64())
+                    && (0..=64).contains(&k)
+                {
+                    return Some(k as usize);
+                }
+            }
+        }
+        None
+    }
+
     /// Bounded, sound search for a concrete satisfying assignment to a goal with
     /// symbolic strings: try short candidate strings for each free string
     /// variable, re-fold the markers to concrete values, and confirm with the
@@ -2768,29 +2804,45 @@ impl Context {
             }
         }
         alpha.truncate(4);
-        // Candidate strings, shortest first, up to a per-variable-count length cap
-        // that keeps the search bounded (≈ a few thousand combinations).
-        let max_len = match vars.len() {
+        // Per-variable candidate strings. A variable pinned to an exact length by
+        // `str.len v = k` gets exactly-length-`k` candidates (so length-fixed word
+        // equations are witnessed); others use a short default cap. Bounded.
+        let default_len = match vars.len() {
             1 => 6,
             2 => 3,
             _ => 2,
         };
-        let mut cands: Vec<Vec<u32>> = alloc::vec![Vec::new()];
-        let mut frontier: Vec<Vec<u32>> = alloc::vec![Vec::new()];
-        for _ in 0..max_len {
-            let mut next = Vec::new();
-            for base in &frontier {
-                for &c in &alpha {
-                    let mut s = base.clone();
-                    s.push(c);
-                    next.push(s);
+        let build = |max_len: usize, exact: bool| -> Vec<Vec<u32>> {
+            let mut cur: Vec<Vec<u32>> = alloc::vec![Vec::new()]; // length 0
+            let mut out: Vec<Vec<u32>> = if exact { Vec::new() } else { cur.clone() };
+            for _ in 1..=max_len {
+                let mut next = Vec::new();
+                for base in &cur {
+                    for &c in &alpha {
+                        let mut s = base.clone();
+                        s.push(c);
+                        next.push(s);
+                    }
+                }
+                cur = next;
+                if !exact {
+                    out.extend(cur.iter().cloned());
                 }
             }
-            cands.extend(next.iter().cloned());
-            frontier = next;
+            if exact { cur } else { out }
+        };
+        let per_var: Vec<Vec<Vec<u32>>> = vars
+            .iter()
+            .map(|&v| match self.str_exact_len(goal, v) {
+                Some(k) if k <= 8 => build(k, true),
+                _ => build(default_len, false),
+            })
+            .collect();
+        if per_var.iter().any(|c| c.is_empty()) {
+            return None;
         }
         // Cartesian product of candidates over the variables, capped.
-        const MAX_TRIES: usize = 2500;
+        const MAX_TRIES: usize = 3000;
         let mut idx = alloc::vec![0usize; vars.len()];
         let mut tries = 0;
         loop {
@@ -2802,7 +2854,7 @@ impl Context {
                 .iter()
                 .enumerate()
                 .map(|(k, &v)| {
-                    let s = code_points_to_string(&cands[idx[k]]);
+                    let s = code_points_to_string(&per_var[k][idx[k]]);
                     (v, self.mk_str_lit(&s))
                 })
                 .collect();
@@ -2838,7 +2890,7 @@ impl Context {
                     return None; // exhausted
                 }
                 idx[k] += 1;
-                if idx[k] < cands.len() {
+                if idx[k] < per_var[k].len() {
                     break;
                 }
                 idx[k] = 0;
