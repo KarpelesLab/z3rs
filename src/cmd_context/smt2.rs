@@ -3432,21 +3432,35 @@ impl Context {
             return None;
         }
         // Integer element candidates: 0,1,2 plus any small integer literal in the
-        // goal (so `nth s 0 = 7` can place the `7`).
+        // goal (so `nth s 0 = 7` can place the `7`) — including the elements of
+        // concrete sequences like `seq.unit 5`, whose value is held in `seq_of`
+        // metadata rather than as an AST subterm.
         let mut elems: Vec<i64> = alloc::vec![0, 1, 2];
+        let push_elem = |elems: &mut Vec<i64>, v: i64| {
+            if (-100..=100).contains(&v) && !elems.contains(&v) && elems.len() < 8 {
+                elems.push(v);
+            }
+        };
         for t in self.m.postorder(goal) {
             if let Some(v) = self
                 .m
                 .as_numeral(t)
                 .and_then(|r| r.to_integer())
                 .and_then(|i| i.to_i64())
-                && (-100..=100).contains(&v)
-                && !elems.contains(&v)
             {
-                elems.push(v);
+                push_elem(&mut elems, v);
             }
-            if elems.len() >= 8 {
-                break;
+            if let Some(content) = self.seq_of.get(&t) {
+                for &e in content.clone().iter() {
+                    if let Some(v) = self
+                        .m
+                        .as_numeral(e)
+                        .and_then(|r| r.to_integer())
+                        .and_then(|i| i.to_i64())
+                    {
+                        push_elem(&mut elems, v);
+                    }
+                }
             }
         }
         let max_len = if vars.len() == 1 { 4 } else { 2 };
