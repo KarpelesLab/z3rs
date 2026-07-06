@@ -5081,6 +5081,26 @@ impl Context {
                 None
             })
             .collect();
+        // `prefixof P x ∧ suffixof S x ∧ len x = |P| + |S|` (prefix and suffix are
+        // adjacent, covering the whole word) ⇒ `x = P·S`. Refutes
+        // `prefixof "ab" x ∧ suffixof "cd" x ∧ len x = 4 ∧ x ≠ "abcd"`.
+        for (pm, pchars, px) in &prefs {
+            for (sm, schars, sx) in &sufs {
+                if px != sx {
+                    continue;
+                }
+                if self.str_exact_len(goal, *px) != Some(pchars.len() + schars.len()) {
+                    continue;
+                }
+                let mut ps = pchars.clone();
+                ps.extend_from_slice(schars);
+                let lit = self.mk_str_lit(&code_points_to_string(&ps));
+                extra_lits.insert(lit);
+                let both = self.m.mk_and(&[*pm, *sm]);
+                let eq = self.m.mk_eq(*px, lit);
+                ax.push(self.m.mk_implies(both, eq));
+            }
+        }
         if let Some(str_sort) = self.string_sort
             && (!prefs.is_empty() || !sufs.is_empty())
         {
