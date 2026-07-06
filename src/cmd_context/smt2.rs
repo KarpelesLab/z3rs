@@ -8527,8 +8527,89 @@ impl Context {
                 self.m.mk_false()
             });
         }
+        // Conjunction body: `∀xs. ∃y. ⋀ pᵢ(xs,y) ⋈ 0` is SAT if some direction
+        // `y → ±∞` satisfies every (inequality) conjunct for large |y|, uniformly
+        // in xs — a witness at infinity.
+        if self.nl_forall_exists_infinity(&yvars, phi) {
+            return Some(self.m.mk_true());
+        }
         let psi = self.qe_exists(&yvars, phi)?;
         self.qe_forall(&xvars, psi)
+    }
+
+    /// Sound SAT check for `∀xs. ∃y. ⋀ pᵢ ⋈ 0`: if for some direction `y → +∞` or
+    /// `y → −∞` every conjunct is an inequality whose leading `y`-term (nonzero
+    /// constant coefficient) makes it hold for large `|y|`, then a witness exists
+    /// for every xs (pick `y` past all thresholds), so the sentence is SAT.
+    fn nl_forall_exists_infinity(&self, yvars: &[AstId], phi: AstId) -> bool {
+        use crate::nlsat::Rel as NRel;
+        if yvars.len() != 1 {
+            return false;
+        }
+        let y = yvars[0];
+        // Collect the top-level conjuncts.
+        let mut atoms: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![phi];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                atoms.push(t);
+            }
+        }
+        if atoms.is_empty() {
+            return false;
+        }
+        let mut var_map = BTreeMap::new();
+        let mut cons = Vec::new();
+        for a in &atoms {
+            let Some(c) = self.icp_atom(*a, false, &mut var_map) else {
+                return false;
+            };
+            if matches!(c.rel, NRel::Eq | NRel::Ne) {
+                return false; // an equality can't hold for all large y
+            }
+            cons.push(c);
+        }
+        let Some(&yi) = var_map.get(&y) else {
+            return false;
+        };
+        for dir in [1i32, -1i32] {
+            let mut all = true;
+            for c in &cons {
+                let d = c.poly.degree_of(yi);
+                if d == 0 {
+                    all = false; // a y-free conjunct isn't guaranteed for all xs
+                    break;
+                }
+                let Some(lead) = c.poly.coeff_of_var(yi, d).as_constant() else {
+                    all = false;
+                    break;
+                };
+                if lead.is_zero() {
+                    all = false;
+                    break;
+                }
+                // Sign of pᵢ for large |y| in this direction.
+                let dir_pow = if d % 2 == 0 { 1 } else { dir };
+                let sign = lead.signum() * dir_pow;
+                let holds = match c.rel {
+                    NRel::Gt | NRel::Ge => sign > 0,
+                    NRel::Lt | NRel::Le => sign < 0,
+                    _ => false,
+                };
+                if !holds {
+                    all = false;
+                    break;
+                }
+            }
+            if all {
+                return true;
+            }
+        }
+        false
     }
 
     /// Decide `∀xs. ∃y. c·y² + Q(xs) ⋈ 0` (a single existential appearing only as
