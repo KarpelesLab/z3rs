@@ -1847,6 +1847,7 @@ impl Context {
             "get-value" => self.get_value(list).map(Some),
             "get-model" => self.get_model().map(Some),
             "get-unsat-core" => self.get_unsat_core().map(Some),
+            "get-proof" => self.get_proof().map(Some),
             other => Err(alloc::format!("unsupported command {other:?}")),
         }
     }
@@ -8235,6 +8236,23 @@ impl Context {
     /// core of the last (unsatisfiable) check. Computed by deletion-based
     /// minimization: drop each named assertion; keep it only if the remainder is
     /// still unsatisfiable. Unnamed assertions are always retained.
+    /// `(get-proof)` — z3rs emits a lightweight *unsatisfiability certificate*
+    /// (the minimal named unsat core) rather than a full z3-format resolution
+    /// proof-term (a follow-on). The core is checkable: asserting exactly it is
+    /// still `unsat`.
+    fn get_proof(&mut self) -> Result<String, String> {
+        if self.last_verdict != Some(SmtResult::Unsat) {
+            return Err("get-proof requires a preceding unsatisfiable check-sat".to_string());
+        }
+        if self.assert_names.iter().any(|n| n.is_some()) {
+            let core = self.get_unsat_core()?;
+            Ok(alloc::format!("(proof (unsat-core {core}))"))
+        } else {
+            // No named assertions to reference; certify unsatisfiability directly.
+            Ok("(proof (unsat))".to_string())
+        }
+    }
+
     fn get_unsat_core(&mut self) -> Result<String, String> {
         if self.last_verdict != Some(SmtResult::Unsat) {
             return Err("get-unsat-core requires a preceding unsatisfiable check-sat".to_string());
