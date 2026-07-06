@@ -3656,14 +3656,26 @@ impl Context {
                     }
                 }
             }
-            // Finite-language membership `x ∈ {w0,…}` with every word excluded by an
-            // `x ≠ wᵢ` is UNSAT (`x ∈ ("yes"|"no") ∧ x≠"yes" ∧ x≠"no"`).
-            if let Some(excluded) = neg_eq.get(&x)
-                && let Some(words) = r.all_words(64)
+            // Finite-language membership `x ∈ {w0,…}`. If a pinned `len x = n`
+            // restricts the words, use only those; then a UNSAT arises when no word
+            // remains, or every remaining word is excluded by an `x ≠ wᵢ`.
+            // (`x ∈ opt(a)·b ∧ len x = 2 ∧ x≠"ab"` → only "ab" fits → unsat.)
+            if let Some(words) = r.all_words(64)
                 && !words.is_empty()
-                && words.iter().all(|w| excluded.contains(w))
             {
-                return true;
+                let candidates: Vec<&Vec<u32>> = match self.str_exact_len(goal, x) {
+                    Some(n) => words.iter().filter(|w| w.len() == n).collect(),
+                    None => words.iter().collect(),
+                };
+                let empty = BTreeSet::new();
+                let excluded = neg_eq.get(&x).unwrap_or(&empty);
+                // With a pinned length: no candidate word of that length ⇒ unsat.
+                if self.str_exact_len(goal, x).is_some() && candidates.is_empty() {
+                    return true;
+                }
+                if !candidates.is_empty() && candidates.iter().all(|w| excluded.contains(*w)) {
+                    return true;
+                }
             }
             // The regex forces a mandatory prefix `P`; a `¬prefixof(Q, x)` with Q a
             // prefix of P is a contradiction (`x ∈ http·(a-z)* ∧ ¬prefixof "http" x`).
