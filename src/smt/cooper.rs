@@ -194,7 +194,7 @@ fn cube_exists(cube: &[Atom], x: AstId, budget: &mut u64) -> Option<Dnf> {
             dd = dd.lcm(m);
         }
     }
-    let d_span = dd.to_i64().filter(|&n| (1..=5000).contains(&n))? as i64;
+    let d_span = dd.to_i64().filter(|&n| (1..=5000).contains(&n))?;
     // Lower-bound points B (`x > b`), and the `−∞` cube.
     let mut bset: Vec<LinExpr> = Vec::new();
     let mut minf: Vec<Atom> = Vec::new();
