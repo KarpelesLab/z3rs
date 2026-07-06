@@ -1324,15 +1324,22 @@ impl Regex {
     /// Covers `re.inter` of two non-nullable parts whose first-character sets are
     /// disjoint (`(a-z)+ ∩ (0-9)+`).
     fn is_empty_lang(&self) -> bool {
-        if let Regex::Inter(a, b) = self
-            && !a.nullable()
-            && !b.nullable()
-            && let (Some(ra), Some(rb)) = (a.first_ranges(), b.first_ranges())
-        {
-            let disjoint = ra
-                .iter()
-                .all(|&(al, ah)| rb.iter().all(|&(bl, bh)| ah < bl || bh < al));
-            if disjoint {
+        if let Regex::Inter(a, b) = self {
+            // Disjoint first-character sets (both non-nullable).
+            if !a.nullable()
+                && !b.nullable()
+                && let (Some(ra), Some(rb)) = (a.first_ranges(), b.first_ranges())
+                && ra
+                    .iter()
+                    .all(|&(al, ah)| rb.iter().all(|&(bl, bh)| ah < bl || bh < al))
+            {
+                return true;
+            }
+            // Disjoint length sets (`"abc" ∩ (a-z)(a-z)`: only-len-3 ∩ only-len-2).
+            const M: usize = 32;
+            if let (Some(la), Some(lb)) = (a.lengths(M), b.lengths(M))
+                && (0..=M).all(|n| !(la.get(n) == Some(&true) && lb.get(n) == Some(&true)))
+            {
                 return true;
             }
         }
