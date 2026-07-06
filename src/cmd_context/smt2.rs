@@ -11153,6 +11153,16 @@ impl Context {
             }
             let (ca, va) = self.flatten_mul(a[0]);
             let (cb, vb) = self.flatten_mul(a[1]);
+            // Difference of squares: `c·a² = c·b²` ⇒ `a = b ∨ a = −b`.
+            if ca == cb && va.len() == 2 && va[0] == va[1] && vb.len() == 2 && vb[0] == vb[1] {
+                let (av, bv) = (va[0], vb[0]);
+                let eqp = self.m.mk_eq(av, bv);
+                let negb = self.m.mk_uminus(bv);
+                let eqn = self.m.mk_eq(av, negb);
+                let disj = self.m.mk_or(&[eqp, eqn]);
+                ax.push(disj);
+                continue;
+            }
             // Need a genuine product on at least one side and a shared variable.
             if va.len() + vb.len() < 3 {
                 continue;
