@@ -3152,6 +3152,81 @@ impl Context {
                 }
             }
         }
+        // `str.<=` is a total order: antisymmetry `(a≤b) ∧ (b≤a) ⇒ a=b`,
+        // transitivity `(a≤b) ∧ (b≤c) ⇒ (a≤c)`, and reflexivity `a≤a`. Refutes
+        // `x≤y ∧ y≤x ∧ x≠y`.
+        let les: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.<=")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2 {
+                        return Some((t, a[0], a[1]));
+                    }
+                }
+                None
+            })
+            .collect();
+        if !les.is_empty() {
+            let le_decl = self.m.app_decl(les[0].0);
+            let mut edge: BTreeMap<(AstId, AstId), AstId> =
+                les.iter().map(|(m, a, b)| ((*a, *b), *m)).collect();
+            let mut nodes: Vec<AstId> = Vec::new();
+            for (_, a, b) in &les {
+                for x in [a, b] {
+                    if !nodes.contains(x) {
+                        nodes.push(*x);
+                    }
+                }
+            }
+            if nodes.len() <= 8 {
+                for ai in 0..nodes.len() {
+                    for bi in 0..nodes.len() {
+                        if ai == bi {
+                            continue;
+                        }
+                        let (a, b) = (nodes[ai], nodes[bi]);
+                        let mab = *edge
+                            .entry((a, b))
+                            .or_insert_with(|| self.m.mk_app(le_decl, &[a, b]));
+                        let mba = *edge
+                            .entry((b, a))
+                            .or_insert_with(|| self.m.mk_app(le_decl, &[b, a]));
+                        // antisymmetry: `(a≤b) ∧ (b≤a) ⇒ a=b`
+                        let and = self.m.mk_and(&[mab, mba]);
+                        let eqab = self.m.mk_eq(a, b);
+                        ax.push(self.m.mk_implies(and, eqab));
+                        // transitivity: `(a≤b) ∧ (b≤c) ⇒ (a≤c)`
+                        for (ci, &c) in nodes.iter().enumerate() {
+                            if ci == ai || ci == bi {
+                                continue;
+                            }
+                            let mbc = *edge
+                                .entry((b, c))
+                                .or_insert_with(|| self.m.mk_app(le_decl, &[b, c]));
+                            let mac = *edge
+                                .entry((a, c))
+                                .or_insert_with(|| self.m.mk_app(le_decl, &[a, c]));
+                            let and2 = self.m.mk_and(&[mab, mbc]);
+                            ax.push(self.m.mk_implies(and2, mac));
+                        }
+                    }
+                }
+                // reflexivity `a ≤ a`.
+                for &a in &nodes {
+                    let maa = *edge
+                        .entry((a, a))
+                        .or_insert_with(|| self.m.mk_app(le_decl, &[a, a]));
+                    ax.push(maa);
+                }
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
