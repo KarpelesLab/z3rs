@@ -10745,6 +10745,18 @@ impl Context {
                 }
             }
         }
+        // Fallback: inline `v = <integer literal>` bindings so a goal made hard by
+        // an equality-pinned auxiliary variable (a lifted `mod` remainder = 0)
+        // reduces to one the linear engine decides.
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_int_const_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         // Fallback: expand `(_ map f) a… = b` pointwise and eliminate the map, so
         // `(_ map and) a b = a ∧ a[i] ∧ ¬b[i]` decides.
         if res == SmtResult::Unknown && !self.maps.is_empty() {
@@ -10953,6 +10965,52 @@ impl Context {
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
         self.refold_str_markers(g, &mut memo)
+    }
+
+    /// Inline `v = <integer literal>` bindings by substituting the constant, so a
+    /// goal whose difficulty came from an equality-fixed auxiliary variable (a
+    /// lifted `mod` remainder pinned to 0) reduces to one the linear engine
+    /// decides. `mod(x+1,3)=0 ∧ mod(x,3)=1` → substitute the two remainders → the
+    /// residual `x+1=3q ∧ x=3q₂+1` refutes by GCD.
+    fn inline_int_const_bindings(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let int_sort = self.m.mk_int_sort();
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, k) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_uninterp_const(v)
+                    && self.m.get_sort(v) == int_sort
+                    && self.m.as_numeral(k).is_some()
+                    && !bound.contains(&v)
+                {
+                    subst.push((v, k));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
     }
 
     /// Inline `a = (as const …) v` bindings by substituting the const-array term,
