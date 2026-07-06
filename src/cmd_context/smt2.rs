@@ -2670,6 +2670,77 @@ impl Context {
         None
     }
 
+    /// Witness for pairwise-distinct enum variables: greedily colour the
+    /// disequality graph with the sort's constructors and confirm with
+    /// `check_model` — decides `distinct v0…v4` over a 5-value enum *sat* (each a
+    /// different constructor). A failed colouring (≥ card mutually-≠) is a sound
+    /// decline; `check_model` verifies any other constraints.
+    fn try_enum_distinct_witness(&mut self, goal: AstId) -> Option<Model> {
+        if self.enums.is_empty() {
+            return None;
+        }
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let is_enum_var =
+            |u: AstId| self.m.is_uninterp_const(u) && self.enums.contains_key(&self.m.get_sort(u));
+        let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
+        let mut vars_by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_not(c) {
+                continue;
+            }
+            let inner = self.m.app_args(c)[0];
+            if !self.m.is_eq(inner) {
+                continue;
+            }
+            let a = self.m.app_args(inner);
+            if a.len() != 2 || !is_enum_var(a[0]) || self.m.get_sort(a[1]) != self.m.get_sort(a[0])
+            {
+                continue;
+            }
+            diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
+            let v = vars_by_sort.entry(self.m.get_sort(a[0])).or_default();
+            for &e in &[a[0], a[1]] {
+                if is_enum_var(e) && !v.contains(&e) {
+                    v.push(e);
+                }
+            }
+        }
+        if vars_by_sort.is_empty() {
+            return None;
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for (sort, vars) in &vars_by_sort {
+            let ctors = self.enums[sort].clone();
+            let mut color: BTreeMap<AstId, usize> = BTreeMap::new();
+            for &v in vars {
+                let used: BTreeSet<usize> = vars
+                    .iter()
+                    .filter(|&&u| color.contains_key(&u) && diseq.contains(&(v.min(u), v.max(u))))
+                    .map(|u| color[u])
+                    .collect();
+                let c = (0..ctors.len()).find(|c| !used.contains(c))?;
+                color.insert(v, c);
+                subst.push((v, ctors[c]));
+            }
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        if check_model(&self.m, g).0 == SmtResult::Sat {
+            return Some(Model::from_bv(BTreeMap::new()));
+        }
+        None
+    }
+
     /// Pigeonhole refutation: `n` pairwise-distinct integers each `≥ lo` have sum
     /// `≥ n·lo + n(n−1)/2`; if the goal also bounds their sum `≤ hi < that`, it is
     /// UNSAT. Reconstructs the distinct set from the pairwise `≠` that `distinct`
@@ -11971,6 +12042,12 @@ impl Context {
         // Fallback: a distinct-integers-with-bounds witness (min distinct assignment).
         if res == SmtResult::Unknown
             && let Some(m) = self.try_distinct_witness(goal)
+        {
+            return (SmtResult::Sat, Some(m));
+        }
+        // Fallback: a distinct-enum witness (greedy constructor colouring).
+        if res == SmtResult::Unknown
+            && let Some(m) = self.try_enum_distinct_witness(goal)
         {
             return (SmtResult::Sat, Some(m));
         }
