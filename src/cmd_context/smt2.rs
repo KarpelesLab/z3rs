@@ -11006,6 +11006,93 @@ impl Context {
         axioms
     }
 
+    /// Multiply out a term into `(rational coefficient, sorted variable factors)`.
+    fn flatten_mul(&self, t: AstId) -> (Rational, Vec<AstId>) {
+        if let Some(n) = self.m.as_numeral(t) {
+            return (n, Vec::new());
+        }
+        if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
+            let mut coeff = Rational::from_integer(Int::from(1));
+            let mut vars = Vec::new();
+            for &a in self.m.app_args(t) {
+                let (c, mut vs) = self.flatten_mul(a);
+                coeff = &coeff * &c;
+                vars.append(&mut vs);
+            }
+            vars.sort();
+            return (coeff, vars);
+        }
+        (Rational::from_integer(Int::from(1)), alloc::vec![t])
+    }
+
+    /// Product-cancellation: `x·y = k·x` (a shared variable factor) implies
+    /// `x = 0 ∨ y = k` — a sound consequence that lets the linear engine finish
+    /// (`x·y = 2·x ∧ x > 0 ∧ y ≠ 2` → unsat). Emitted per equality with a common
+    /// factor on both sides.
+    fn product_cancel_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut ax = Vec::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 || !self.m.is_int_sort(self.m.get_sort(a[0])) {
+                continue;
+            }
+            let (ca, va) = self.flatten_mul(a[0]);
+            let (cb, vb) = self.flatten_mul(a[1]);
+            // Need a genuine product on at least one side and a shared variable.
+            if va.len() + vb.len() < 3 {
+                continue;
+            }
+            let Some(pos) = va.iter().position(|v| vb.contains(v)) else {
+                continue;
+            };
+            let shared = va[pos];
+            let ra: Vec<AstId> = va.iter().copied().filter(|&v| v != shared).collect();
+            let mut rb: Vec<AstId> = Vec::new();
+            let mut removed = false;
+            for &v in &vb {
+                if v == shared && !removed {
+                    removed = true;
+                } else {
+                    rb.push(v);
+                }
+            }
+            let build = |m: &mut AstManager, coeff: &Rational, vars: &[AstId]| -> AstId {
+                let mut factors: Vec<AstId> = Vec::new();
+                if *coeff != Rational::from_integer(Int::from(1)) || vars.is_empty() {
+                    factors.push(m.mk_numeral(coeff.clone(), true));
+                }
+                factors.extend_from_slice(vars);
+                if factors.len() == 1 {
+                    factors[0]
+                } else {
+                    m.mk_mul(&factors)
+                }
+            };
+            let ta = build(&mut self.m, &ca, &ra);
+            let tb = build(&mut self.m, &cb, &rb);
+            let zero = self.m.mk_int(0);
+            let sh0 = self.m.mk_eq(shared, zero);
+            let req = self.m.mk_eq(ta, tb);
+            let disj = self.m.mk_or(&[sh0, req]);
+            ax.push(disj);
+        }
+        ax
+    }
+
     /// Euclidean linking axioms for `div`/`mod` by a constant: for each such
     /// term over dividend `a` and constant divisor `n≠0`, assert
     /// `a = n·(a div n) + (a mod n)` and `0 ≤ (a mod n) < |n|`. This ties the
@@ -11067,6 +11154,7 @@ impl Context {
         axioms.extend(self.datatype_axioms(lifted));
         axioms.extend(self.string_axioms(lifted));
         axioms.extend(self.square_axioms(lifted));
+        axioms.extend(self.product_cancel_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
