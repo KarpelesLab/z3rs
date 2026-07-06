@@ -1227,6 +1227,37 @@ impl Regex {
         self.ends(s, 0).contains(&s.len())
     }
 
+    /// Does the language contain the empty string?
+    fn nullable(&self) -> bool {
+        match self {
+            Regex::Lit(l) => l.is_empty(),
+            Regex::Range(..) | Regex::AllChar | Regex::None => false,
+            Regex::All | Regex::Star(_) => true,
+            Regex::Concat(a, b) => a.nullable() && b.nullable(),
+            Regex::Union(a, b) => a.nullable() || b.nullable(),
+            Regex::Inter(a, b) => a.nullable() && b.nullable(),
+            Regex::Comp(a) => !a.nullable(),
+        }
+    }
+
+    /// A **sound over-approximation** of "some word in the language starts with
+    /// code point `c`". Returns `false` only when *no* such word exists, so a
+    /// caller may refute on `false` but must not conclude anything from `true`.
+    /// (`Comp`/`Inter` are conservatively `true`/AND to stay sound.)
+    fn can_start_with(&self, c: u32) -> bool {
+        match self {
+            Regex::Lit(l) => l.first() == Some(&c),
+            Regex::Range(lo, hi) => (*lo..=*hi).contains(&c),
+            Regex::AllChar | Regex::All => true,
+            Regex::None => false,
+            Regex::Concat(a, b) => a.can_start_with(c) || (a.nullable() && b.can_start_with(c)),
+            Regex::Union(a, b) => a.can_start_with(c) || b.can_start_with(c),
+            Regex::Inter(a, b) => a.can_start_with(c) && b.can_start_with(c),
+            Regex::Star(a) => a.can_start_with(c),
+            Regex::Comp(_) => true,
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -2713,6 +2744,80 @@ impl Context {
                         return true;
                     }
                 }
+            }
+        }
+        false
+    }
+
+    /// Refute `str.in_re x r ∧ prefixof P x` (or `str.at x 0 = c`) when no word in
+    /// `L(r)` can start with the required first character — e.g. `x ∈ (a-c)+ ∧
+    /// prefixof "d" x`. Sound: `can_start_with` is a conservative over-approximation
+    /// (only definite `false` is used).
+    fn regex_prefix_unsat(&self, goal: AstId) -> bool {
+        if self.regex_of.is_empty() {
+            return false;
+        }
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut in_re: Vec<(AstId, &Regex)> = Vec::new();
+        let mut first_char: BTreeMap<AstId, u32> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_app(c) {
+                continue;
+            }
+            let op = self
+                .str_op_decls
+                .get(&self.m.app_decl(c))
+                .map(String::as_str);
+            let a = self.m.app_args(c);
+            match op {
+                Some("str.in_re") | Some("str.in.re") if a.len() == 2 => {
+                    if let Some(r) = self.regex_of.get(&a[1]) {
+                        in_re.push((a[0], r));
+                    }
+                }
+                Some("str.prefixof") if a.len() == 2 => {
+                    if let Some(p) = self.str_value(a[0])
+                        && !p.is_empty()
+                    {
+                        first_char.entry(a[1]).or_insert(p[0]);
+                    }
+                }
+                _ => {}
+            }
+            // `str.at x 0 = "c"` also pins the first character.
+            if self.m.is_eq(c) && a.len() == 2 {
+                for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_app(l)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(l))
+                            .map(String::as_str)
+                            == Some("str.at")
+                        && self.m.app_args(l).len() == 2
+                        && self.int_arg(self.m.app_args(l)[1]) == Some(0)
+                        && let Some(cv) = self.str_value(r)
+                        && cv.len() == 1
+                    {
+                        first_char.entry(self.m.app_args(l)[0]).or_insert(cv[0]);
+                    }
+                }
+            }
+        }
+        for (x, r) in in_re {
+            if let Some(&fc) = first_char.get(&x)
+                && !r.can_start_with(fc)
+            {
+                return true;
             }
         }
         false
@@ -11618,6 +11723,11 @@ impl Context {
         // Enum pigeonhole: `n` pairwise-distinct terms of a `k`-constructor enum
         // with `n > k` is UNSAT (`distinct v0…v4` over a 4-value enum).
         if self.enum_pigeonhole_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Regex ∩ first-character: `x ∈ r ∧ prefixof P x` (or `str.at x 0 = c`) is
+        // UNSAT when no word in `L(r)` can start with the required character.
+        if self.regex_prefix_unsat(goal) {
             return (SmtResult::Unsat, None);
         }
         // Quantified formulas are not decided here (the instantiation engine ran
