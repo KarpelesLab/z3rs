@@ -2832,6 +2832,22 @@ impl Context {
         if let Some(w) = self.m.bv_sort_width(sort) {
             return if w <= 20 { Some(1u64 << w) } else { None };
         }
+        // `(Array I V)` over finite I, V has `|V|^|I|` inhabitants.
+        if let Some((idx, elem)) = self.m.array_sort_params(sort) {
+            let ci = self.datatype_cardinality(idx, depth + 1)?;
+            let ce = self.datatype_cardinality(elem, depth + 1)?;
+            if ci > 20 {
+                return None; // |V|^|I| with |I|>20 overflows the small-count cap
+            }
+            let mut r: u64 = 1;
+            for _ in 0..ci {
+                r = r.checked_mul(ce)?;
+                if r > 1_000_000 {
+                    return None;
+                }
+            }
+            return Some(r);
+        }
         // A pure enum (all-nullary constructors) is tracked separately.
         if let Some(ctors) = self.enums.get(&sort) {
             return Some(ctors.len() as u64);
