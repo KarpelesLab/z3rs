@@ -11461,12 +11461,14 @@ impl Context {
         if prods.len() > 12 {
             prods.truncate(12);
         }
+        let mut squares: Vec<(AstId, AstId)> = Vec::new(); // (a², a)
         for (p, a, b) in prods {
             let is_int = self.m.is_int_sort(self.m.get_sort(p));
             let zero = self.m.mk_numeral(rat(0), is_int);
             let p_nn = self.m.mk_ge(p, zero);
             if a == b {
                 axioms.push(p_nn); // a square is nonnegative
+                squares.push((p, a));
                 continue;
             }
             // The four sign rules `(a⋛0 ∧ b⋛0) ⇒ ab⋛0`. Non-strict (≤/≥) keeps
@@ -11483,6 +11485,32 @@ impl Context {
             ] {
                 let hyp = self.m.mk_and(&[ca, cb]);
                 axioms.push(self.m.mk_implies(hyp, concl));
+            }
+        }
+        // Square monotonicity for each pair `a², b²`: `0 ≤ a < b ⇒ a² < b²`, and
+        // the mirror over the negatives `a < b ≤ 0 ⇒ a² > b²`. Refutes
+        // `x² ≥ y² ∧ 0 < x < y`. Bounded (few squares in practice).
+        if squares.len() <= 6 {
+            for i in 0..squares.len() {
+                for j in 0..squares.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let (pa, a) = squares[i];
+                    let (pb, b) = squares[j];
+                    let zero = self.m.mk_int(0);
+                    // 0 ≤ a < b ⇒ a² < b²
+                    let a_nn = self.m.mk_ge(a, zero);
+                    let a_lt_b = self.m.mk_lt(a, b);
+                    let hyp1 = self.m.mk_and(&[a_nn, a_lt_b]);
+                    let concl1 = self.m.mk_lt(pa, pb);
+                    axioms.push(self.m.mk_implies(hyp1, concl1));
+                    // a < b ≤ 0 ⇒ a² > b²
+                    let b_np = self.m.mk_le(b, zero);
+                    let hyp2 = self.m.mk_and(&[a_lt_b, b_np]);
+                    let concl2 = self.m.mk_gt(pa, pb);
+                    axioms.push(self.m.mk_implies(hyp2, concl2));
+                }
             }
         }
         axioms
