@@ -4564,6 +4564,89 @@ impl Context {
             let le = self.m.mk_le(la, kv);
             ax.push(le);
         }
+        // `seq.extract s i l` (concrete i,l) relates to `s` element-wise:
+        // `i+j < len s ⇒ nth(extract, j) = nth(s, i+j)` for `0 ≤ j < l`, plus the
+        // clamped length. Lets `extract s 1 1 = unit 3 ∧ nth s 1 = 2` refute.
+        let extracts: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.extract")
+            })
+            .collect();
+        for t in extracts {
+            let a = self.m.app_args(t).to_vec();
+            if a.len() != 3 {
+                continue;
+            }
+            let (Some(i), Some(l)) = (self.int_arg(a[1]), self.int_arg(a[2])) else {
+                continue;
+            };
+            if !(0..=16).contains(&l) || i < 0 {
+                continue;
+            }
+            let Ok(len_s) = self.seq_op("seq.len", &[a[0]]) else {
+                continue;
+            };
+            for j in 0..l {
+                let jx = self.m.mk_int(j);
+                let ipj = self.m.mk_int(i + j);
+                let (Ok(nth_ex), Ok(nth_s)) = (
+                    self.seq_op("seq.nth", &[t, jx]),
+                    self.seq_op("seq.nth", &[a[0], ipj]),
+                ) else {
+                    continue;
+                };
+                let guard = self.m.mk_lt(ipj, len_s);
+                let eq = self.m.mk_eq(nth_ex, nth_s);
+                ax.push(self.m.mk_implies(guard, eq));
+            }
+            // Clamped length: `len(extract) = ite(len s ≤ i, 0, ite(len s < i+l,
+            // len s − i, l))`.
+            if let Ok(len_ex) = self.seq_op("seq.len", &[t]) {
+                let iv = self.m.mk_int(i);
+                let ipl = self.m.mk_int(i + l);
+                let lv = self.m.mk_int(l);
+                let zero = self.m.mk_int(0);
+                let s_le_i = self.m.mk_le(len_s, iv);
+                let s_lt_ipl = self.m.mk_lt(len_s, ipl);
+                let s_minus_i = self.m.mk_sub(&[len_s, iv]);
+                let inner = self.m.mk_ite(s_lt_ipl, s_minus_i, lv);
+                let clamped = self.m.mk_ite(s_le_i, zero, inner);
+                ax.push(self.m.mk_eq(len_ex, clamped));
+            }
+        }
+        // A sequence equated to a concrete sequence is pinned element-wise:
+        // `A = [c0,…,c_{n-1}]` ⇒ `len A = n ∧ nth(A, j) = cj` — so the extract
+        // element axioms above can conflict with the pinned elements.
+        let eqs: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| self.m.is_eq(t) && self.m.app_args(t).len() == 2)
+            .collect();
+        for e in eqs {
+            let a = self.m.app_args(e).to_vec();
+            for (sym, con) in [(a[0], a[1]), (a[1], a[0])] {
+                let Some(elems) = self.seq_of.get(&con).cloned() else {
+                    continue;
+                };
+                if self.seq_of.contains_key(&sym) || elems.len() > 16 {
+                    continue; // both concrete, or too long
+                }
+                if let Ok(len_sym) = self.seq_op("seq.len", &[sym]) {
+                    let n = self.m.mk_int(elems.len() as i64);
+                    ax.push(self.m.mk_eq(len_sym, n));
+                }
+                for (j, &cj) in elems.iter().enumerate() {
+                    let jx = self.m.mk_int(j as i64);
+                    if let Ok(nth) = self.seq_op("seq.nth", &[sym, jx]) {
+                        ax.push(self.m.mk_eq(nth, cj));
+                    }
+                }
+            }
+        }
         if self.str_lits.is_empty() {
             return ax;
         }
