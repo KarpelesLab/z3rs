@@ -11254,6 +11254,20 @@ impl Context {
                 }
             }
         }
+        // Fallback: fold ground selector/tester chains anywhere in the goal (no
+        // variable binding needed — `v(l(l(node(node(leaf 1, leaf 2), leaf 3)))) = 9`).
+        // Only a resulting UNSAT is taken: `dt_fold` is a sound simplification, so
+        // if the folded goal is unsat the original is too; a residual opaque
+        // selector-on-a-variable that could look `sat` is never trusted here.
+        if res == SmtResult::Unknown && !self.datatypes.is_empty() {
+            let folded = self.dt_fold(goal);
+            if folded != goal {
+                let folded = crate::rewriter::simplify(&mut self.m, folded);
+                if self.decide_inner(folded).0 == SmtResult::Unsat {
+                    return (SmtResult::Unsat, None);
+                }
+            }
+        }
         // Fallback: inline `a = (as const …)` and `a = (store …)` bindings so reads
         // of `a` fold. Iterated to a fixpoint so a chain `a = const 2 ∧
         // b = store a 1 5 ∧ select b 3 = 2` resolves through both bindings.
