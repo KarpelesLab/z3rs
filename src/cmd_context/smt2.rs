@@ -5313,6 +5313,56 @@ impl Context {
                 ax.push(self.m.mk_implies(hyp, *sm));
             }
         }
+        // String predicate congruence: `x = y ⇒ pred(x) ⟺ pred(y)` — the predicate
+        // markers are not fed to EUF, so add it explicitly. Refutes
+        // `x = y ∧ prefixof "ab" x ∧ ¬prefixof "ab" y`.
+        let mut str_eqs: Vec<(AstId, AstId)> = Vec::new();
+        {
+            let mut stack = alloc::vec![goal];
+            while let Some(t) = stack.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        stack.push(a);
+                    }
+                } else if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                    let a = self.m.app_args(t);
+                    if self.m.is_uninterp_const(a[0])
+                        && self.m.is_uninterp_const(a[1])
+                        && Some(self.m.get_sort(a[0])) == self.string_sort
+                    {
+                        str_eqs.push((a[0], a[1]));
+                        str_eqs.push((a[1], a[0]));
+                    }
+                }
+            }
+        }
+        for (x, y) in &str_eqs {
+            for (coll, _label) in [(&prefs, 0u8), (&sufs, 1u8)] {
+                for (m1, p1, v1) in coll.iter() {
+                    if *v1 != *x {
+                        continue;
+                    }
+                    for (m2, p2, v2) in coll.iter() {
+                        if *v2 == *y && p1 == p2 {
+                            ax.push(self.m.mk_eq(*m1, *m2));
+                        }
+                    }
+                }
+            }
+            // contains(x, Q) ⟺ contains(y, Q) for each needle Q.
+            let needles: Vec<AstId> = contains_of
+                .keys()
+                .filter(|(h, _)| h == x)
+                .map(|(_, q)| *q)
+                .collect();
+            for q in needles {
+                if let (Some(&m1), Some(&m2)) =
+                    (contains_of.get(&(*x, q)), contains_of.get(&(*y, q)))
+                {
+                    ax.push(self.m.mk_eq(m1, m2));
+                }
+            }
+        }
         if let Some(str_sort) = self.string_sort
             && (!prefs.is_empty() || !sufs.is_empty())
         {
