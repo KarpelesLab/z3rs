@@ -16,27 +16,40 @@ so the resolved dependency tree is just `z3rs → puremp`. The library is
 `no_std` (needs only `alloc`); the optional `std` feature adds std-backed
 conveniences. It aims to be behaviourally faithful to upstream Z3.
 
-> ⚠️ **Status: early, in progress.** In place: a hash-consing AST, a simplifying
-> rewriter, a **CDCL SAT core** (DIMACS), and a **lazy DPLL(T) SMT engine** that
-> decides **QF_UF / QF_LRA / QF_LIA / QF_AX** and their combinations — congruence
-> closure (incl. predicate congruence), Fourier–Motzkin linear arithmetic,
-> integer branch-and-bound, read-over-write + extensionality arrays, and
-> **bidirectional Nelson–Oppen** theory combination — plus a **bit-blasting engine
-> for QF_BV** (bitwise, add/sub/mul, shifts, signed/unsigned compares,
-> concat/extract, extend). It is **sound and terminating** (a work budget yields a
-> sound `unknown` rather than a wrong answer or a hang) and
-> **differential-tested against upstream z3** across three rounds of fuzzing. A
-> full **SMT-LIB 2 front end** drives it (`check-sat(-assuming)`, `get-value`,
-> `get-model`, `get-unsat-core`, `push`/`pop`, `define-fun`, …). Still ahead:
-> quantifiers, more theories, the fixedpoint/optimization engines, and the C API.
-> See [`ROADMAP.md`](ROADMAP.md).
+> **Status: feature-complete port, sound, hardening toward full parity.** Every
+> Z3 theory has a present, **sound** implementation driven by a full **SMT-LIB 2**
+> front end (`check-sat(-assuming)`, `get-value`, `get-model`, `get-unsat-core`,
+> `get-proof`, `push`/`pop`, `define-fun`, datatypes, …) and a **C ABI** (`z3_api.h`
+> slice big enough to link and run real find-model programs). In place:
+>
+> - a hash-consing AST, a simplifying rewriter, a **CDCL SAT core** (DIMACS), and a
+>   **lazy DPLL(T)** engine with **bidirectional Nelson–Oppen** combination;
+> - **QF_UF** (congruence closure), **QF_LIA/LRA** (Fourier–Motzkin + Omega +
+>   branch-and-bound), **QF_BV** (full bit-blasting), **arrays** (read-over-write,
+>   extensionality, const/`map`/`lambda`), **datatypes** (recursive, mutual,
+>   parametric; occurs-check, enum pigeonhole);
+> - **floating-point** bit-exact over the common surface (all arithmetic + rounding
+>   modes + conversions), **QF_NRA** (full CAD), **QF_NIA** (CAD + witness + symbolic
+>   `div`/`mod`), **strings & sequences** (order theories, word equations, witness),
+>   **regex**, **quantifiers** (E-matching + Presburger/nonlinear ∀∃), and
+>   **CHC/Horn** (BMC + k-induction + polyhedral reachability).
+>
+> The governing invariant is **soundness before completeness**: a work budget (or an
+> undecided fragment) yields a sound **`unknown`**, never a wrong verdict or a hang.
+> This is enforced by **continuous differential fuzzing against upstream z3** —
+> ~90k+ scripts across every fragment, **0 known wrong verdict**; the method has
+> driven out **15+ real soundness bugs**, each captured as a regression test. On a
+> broad, common fragment of every theory z3rs returns the *same definite verdict* as
+> z3; the remaining work (see [`ROADMAP.md`](ROADMAP.md)) is closing the hard
+> completeness tail where z3rs still soundly declines, and performance on the largest
+> circuits. Per-theory coverage: [`PARITY.md`](PARITY.md).
 >
 > ```sh
 > $ z3rs problem.cnf          # DIMACS CNF
 > s SATISFIABLE
 > v 1 2 3 0
 >
-> $ z3rs problem.smt2         # SMT-LIB2 (QF_UF/LRA/LIA/AX/BV)
+> $ z3rs problem.smt2         # SMT-LIB2 (all theories above)
 > unsat
 > ```
 

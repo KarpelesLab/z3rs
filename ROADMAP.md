@@ -1,19 +1,31 @@
 # z3rs — Roadmap to full behavioral parity with Z3
 
-> **Where we are.** The initial port is **complete**: `z3rs` is a single-crate,
-> pure-Rust, `no_std + alloc` reimplementation of Z3 (pinned at **v4.17.0**) whose
-> only dependency is our own dependency-free numeric core,
+> **Where we are.** The initial port is **complete** and the theory roadmap
+> (Phases A–J below) is **met**: `z3rs` is a single-crate, pure-Rust,
+> `no_std + alloc` reimplementation of Z3 (pinned at **v4.17.0**) whose only
+> dependency is our own dependency-free numeric core,
 > [`puremp`](https://github.com/KarpelesLab/puremp). Every theory has a present,
-> **sound** implementation — across ~90k differential-fuzz scripts vs upstream z3
-> there is **no known wrong verdict and no crash**. The full port history lives in
-> [`CHANGELOG.md`](CHANGELOG.md); per-theory coverage in [`PARITY.md`](PARITY.md).
+> **sound** implementation; across ~90k+ differential-fuzz scripts vs upstream z3
+> there is **no known wrong verdict and no crash**, and the method has driven out
+> **15+ real soundness bugs** (each a regression test). The full port history lives
+> in [`CHANGELOG.md`](CHANGELOG.md); per-theory coverage in [`PARITY.md`](PARITY.md).
 >
-> **Where we are going.** Sound ≠ complete. On a broad, common fragment of every
-> theory z3rs returns the *same definite verdict* as z3, but on a hard tail it
-> returns a sound **`unknown`** where z3 decides. **This roadmap closes that gap**
-> — the goal is *true behavioral parity*: decide everything z3 decides, at
-> competitive speed, never returning `unknown` where z3 is definite (except on
-> genuinely open/undecidable inputs, where z3 is also `unknown`).
+> **Where we are going — the road to 100%.** Sound ≠ complete. On a broad, common
+> fragment of every theory z3rs returns the *same definite verdict* as z3, but on a
+> hard **completeness tail** it returns a sound **`unknown`** where z3 decides. The
+> remaining road to true drop-in parity has exactly two threads, tracked in **§7**:
+>
+> 1. **Close the completeness tail** — the concrete, reproduced classes where z3 is
+>    definite and z3rs is `unknown` (enumerated in §7). Each is attacked with the
+>    same reproduce → implement → differentially-fuzz → regression loop (§4) that
+>    closed the phases; the metric is the shrinking tail.
+> 2. **Performance parity** — the largest circuits (symbolic Float32/64, hardest
+>    QF_BV multiply) currently decline on the work budget rather than run unbounded;
+>    closing this needs SAT in-processing (Phase A follow-on).
+>
+> The goal is unchanged: decide everything z3 decides, at competitive speed, never
+> returning `unknown` where z3 is definite (except on genuinely open/undecidable
+> inputs, where z3 is also `unknown`).
 
 ---
 
@@ -25,8 +37,8 @@
 3. **Soundness never regresses.** Every change is differentially fuzzed vs z3
    *before* it lands; a completeness gain that introduces a wrong verdict or a
    crash is reverted, not shipped. `unknown` is always acceptable; a wrong
-   `sat`/`unsat` or a panic never is. (This invariant caught 12 bugs in the last
-   hardening cycle — see `CHANGELOG.md`.)
+   `sat`/`unsat` or a panic never is. (This invariant has caught **15+** real
+   soundness bugs — see `CHANGELOG.md` / `PARITY.md`.)
 4. **Behavioural fidelity is the target metric.** Progress is measured by the
    shrinking set of inputs where z3 is definite and z3rs is `unknown`.
 
@@ -201,3 +213,32 @@ factor — i.e. true drop-in parity.
 - **Soundness under new theories.** Every phase adds reasoning that could
   introduce a wrong verdict; the differential-fuzz gate (§4) is the mitigation and
   must run before each merge.
+
+---
+
+## 7. The completeness tail — road to 100%
+
+With the theory phases met, "100% equivalence" now means driving the set of
+inputs where **z3 is definite and z3rs is `unknown`** to empty (outside genuinely
+undecidable fragments). These are the concrete, reproduced classes that remain,
+each a self-contained work item attacked with the §4 loop. Status: 🟨 in progress
+· ⬜ not started · ✅ closed. Ongoing differential sweeps refresh this list; the
+metric is that a sustained cross-theory sweep finds **no** new definite/`unknown`
+divergence.
+
+| Class | Reproducer | Status | Notes / approach |
+|-------|-----------|:------:|------------------|
+| **Symbolic Float32/64 circuits** | `fp.add`/`mul`/`sqrt` on symbolic 32/64-bit operands | 🟨 | *Performance*, not correctness — the exact circuit exists but blows the work budget. Gated on Phase-A SAT in-processing (BVE + self-subsuming resolution + incremental bit-blasting). Shared tail with hardest QF_BV. |
+| **Regex ∩ predicate** | `x ∈ (a-z)+ ∧ suffixof "d" x`; `re.comp`/`re.inter`/`re.loop` coupled to `contains`/length | ⬜ | Needs a regex-derivative/automaton product that also tracks length and prefix/suffix constraints, not just membership folding. |
+| **Concat = literal ∧ length-sum** | `x·y = "abcd" ∧ len x + len y = 4` | 🟨 | The split disjunction is correct but `check_model` can't confirm the SAT branch through the length-sum; needs disjunction-aware string model construction (or a targeted length-consistency witness). |
+| **Nested datatype selectors** | `v(l(node(leaf 1, leaf 2)))`, `t = node(…) ∧ v(l t) = k` | ⬜ | Ground selector chains must fold to a value on the decide path without unmasking the opaque-selector-on-a-variable case (a naive `dt_fold` over the whole goal was reverted for exactly that). Fold only fully-ground selector applications; give selector-on-variable the read-over-write-style axiom instead of a free value. |
+| **Deep quantifier alternation / MBQI** | nested `∀∃` beyond the current QE families; model-based instantiation over uninterpreted functions | ⬜ | Phase-F follow-on: build a candidate model, find a falsifying instance, iterate. |
+| **Length-coupled word equations** | deep-content SAT word equations past the bounded witness | 🟨 | Extend the Nielsen procedure with length arithmetic (Makanin-style) instead of the bounded search. |
+| **Proof terms at scale** | full z3-format resolution proof *terms* (beyond the current checkable certificate) | ⬜ | Emit and independently validate resolution/DRAT-style proofs on large `unsat`. |
+| **Performance parity** | within a target factor of z3 on SMT-LIB | 🟨 | Continuous; the hard-circuit tail above is the dominant cost. Practical cross-theory fragment already benchmarks at **median 0.3× (z3rs faster)**. |
+
+**Definition of done for 100%:** a sustained large-scale differential vs z3 finds
+**no input where z3 is definite and z3rs is `unknown`** (outside genuinely
+open/undecidable problems), with performance within the target factor — true
+drop-in parity. Every row above collapses to ✅, and no new row appears under
+continued fuzzing.
