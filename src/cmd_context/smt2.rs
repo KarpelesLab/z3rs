@@ -10171,6 +10171,12 @@ impl Context {
         // uninterpreted, array, or arithmetic terms is not combined yet, so return
         // a sound `unknown` rather than a possibly-wrong verdict.
         if self.is_bv_goal(goal) {
+            // Expand read-over-write so `select`s land on free arrays that the
+            // free-read handling below can turn into fresh bit-vectors.
+            let goal = {
+                let mut memo = BTreeMap::new();
+                self.expand_select_store(goal, &mut memo)
+            };
             // A free array read `(select m i)` of bit-vector sort (m a free array
             // constant read once, otherwise unconstrained) is an unconstrained
             // bit-vector — replace it by a fresh bit-vector constant so an
@@ -10779,6 +10785,40 @@ impl Context {
     }
 
     /// Does `goal` mention any bit-vector-sorted term?
+    /// Rewrite `select(store a i v, j)` → `ite(i=j, v, select(a, j))` throughout,
+    /// eliminating stores under reads so a bit-vector array goal reduces to reads
+    /// of free arrays (which become fresh bit-vectors).
+    fn expand_select_store(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let args: Vec<AstId> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.expand_select_store(a, memo))
+                .collect();
+            if self.m.is_select(t) && self.m.is_store(args[0]) {
+                let sa = self.m.app_args(args[0]).to_vec(); // [array, index, value]
+                let (arr, i, v) = (sa[0], sa[1], sa[2]);
+                let j = args[1];
+                let cond = self.m.mk_eq(i, j);
+                let sel = self.m.mk_select(arr, j);
+                let sel = self.expand_select_store(sel, memo);
+                self.m.mk_ite(cond, v, sel)
+            } else {
+                self.m.mk_app(decl, &args)
+            }
+        } else {
+            t
+        };
+        memo.insert(t, out);
+        out
+    }
+
     fn is_bv_goal(&self, goal: AstId) -> bool {
         self.m
             .postorder(goal)
