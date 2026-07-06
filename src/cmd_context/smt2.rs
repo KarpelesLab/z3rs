@@ -3805,6 +3805,49 @@ impl Context {
                 }
             }
         }
+        // `str.from_int n = L` (L literal): determine or refute `n`. `from_int`
+        // yields the canonical non-negative decimal for `n ≥ 0` and `""` for
+        // `n < 0`, so `= "42"` pins `n = 42`, `= "042"`/non-digit is impossible,
+        // and `= ""` forces `n < 0`.
+        for &t in &present {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (fi, litarg) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_app(fi)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(fi))
+                            .map(String::as_str),
+                        Some("str.from_int") | Some("str.from-int")
+                    )
+                    && !self.m.app_args(fi).is_empty()
+                    && let Some(lv) = self.str_value(litarg)
+                {
+                    let n = self.m.app_args(fi)[0];
+                    let zero = self.m.mk_int(0);
+                    if lv.is_empty() {
+                        let lt = self.m.mk_lt(n, zero);
+                        ax.push(self.m.mk_implies(t, lt));
+                    } else {
+                        let s = code_points_to_string(&lv);
+                        let canonical = s.chars().all(|c| c.is_ascii_digit())
+                            && (s.chars().count() == 1 || !s.starts_with('0'));
+                        if canonical && let Ok(v) = s.parse::<i64>() {
+                            let nv = self.m.mk_int(v);
+                            let eq = self.m.mk_eq(n, nv);
+                            ax.push(self.m.mk_implies(t, eq));
+                        } else if !canonical {
+                            ax.push(self.m.mk_not(t));
+                        }
+                    }
+                }
+            }
+        }
         // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
         // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
         let lts: Vec<(AstId, AstId, AstId)> = present
