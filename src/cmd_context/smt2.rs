@@ -7876,9 +7876,7 @@ impl Context {
                 // trigger matched nothing, OR when E-matching produced *no*
                 // instance for this universal (a triggered predicate/function with
                 // no ground application to seed it — e.g. `∀x. p(x) ∧ ¬p(x)`).
-                let enumerate = trigs[ui].is_empty()
-                    || (dt_binder && ematch_counts[ui] == 0)
-                    || ematch_counts[ui] == 0;
+                let enumerate = trigs[ui].is_empty() || ematch_counts[ui] == 0;
                 if !enumerate {
                     continue; // handled completely by E-matching
                 }
