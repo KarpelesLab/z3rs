@@ -11623,11 +11623,18 @@ impl Context {
                     }
                 }
                 if !subst.is_empty() {
-                    g = crate::rewriter::substitute(&mut self.m, goal, &subst);
-                    if !axioms.is_empty() {
-                        axioms.push(g);
-                        g = self.m.mk_and(&axioms);
-                    }
+                    // Substitute the congruence axioms too, not just the goal: a
+                    // nested application's argument is itself an Ackermannized app
+                    // (`g(g(x))` has arg `g(x)`), so the axiom's argument-equality
+                    // must reference the fresh constant, else `g(x)` stays free and
+                    // the congruence never fires.
+                    let combined = if axioms.is_empty() {
+                        goal
+                    } else {
+                        axioms.push(goal);
+                        self.m.mk_and(&axioms)
+                    };
+                    g = crate::rewriter::substitute(&mut self.m, combined, &subst);
                 }
             }
             if self.bv_goal_is_pure(g) {
