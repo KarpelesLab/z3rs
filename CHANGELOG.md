@@ -7,6 +7,95 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/z3rs/compare/v0.0.6...v0.0.7) - 2026-07-06
+
+### Other
+
+- inline `a = (lambda …)` bindings and beta-reduce reads of a
+- fold str.replace with concrete s,t into a concat so the equation decides
+- PARITY for const-array/map/BV-array, UFBV Ackermann, to_fp re-fold
+- decide array map equalities by pointwise expansion
+- QF sequences: inline `s = <concrete sequence>` so nth/len over s fold
+- inline `a = (as const …) v` bindings so const-array reads fold
+- re-fold to_fp(to_real n) once n is pinned, re-blasting the FP equality
+- witness for distinct integers with lower bounds
+- pigeonhole refutation for distinct integers with a sum bound
+- Ackermannize uninterpreted bit-vector function applications
+- read-over-write for bit-vector arrays
+- record 598/598 cross-theory soundness stress result
+- QF sequences: make symbolic seq.nth congruent (same (s,i) → same marker)
+- Fix CI regression: apply datatype binding inline only as an unknown-fallback
+- QF sequences: out-of-bounds seq.nth is an underspecified free value
+- record the record/mutual-recursion datatype acyclicity soundness fix
+- fold literal-literal str.< / str.<= order markers to their lexicographic truth
+- QF sequences: length links for seq.contains / seq.prefixof / seq.suffixof
+- Fix unsound datatypes: acyclicity for record/mutual-recursion cycles
+- QF sequences: seq.prefixof / seq.suffixof partial-order axioms
+- PARITY updates for NIA box witness, nonlinear ∀∃ conjunction, prefixof order
+- bounded small-solution witness for ≤2-variable integer goals
+- nonlinear ∀x∃y conjunction bodies via witness-at-infinity
+- str.prefixof / str.suffixof partial-order axioms
+- seed string witness with str.to_code target characters
+- prefix/suffix character-overlap refutation over a length-pinned string
+- inline ground constructor bindings so selectors/testers fold
+- link str.prefixof to str.at (prefix pins leading characters)
+- regex intersection length analysis
+- cross-link str.< and str.<= (a<b ⇒ a≤b, a<b ⇒ ¬(b≤a))
+- PARITY updates for extensionality, occurs-check, string ordering/ops, sequences
+- link str.contains and str.indexof (contains ⟺ indexof x t 0 ≥ 0)
+- str.<= total-order axioms (antisymmetry, transitivity, reflexivity)
+- array extensionality refutation from a universal equality
+- QF sequences: seed seq witness with elements of concrete sequences
+- occurs-check refutation for cyclic datatype equalities among variables
+- QF sequences: seq witness returns a model on sat even when check_model gives none
+- fold str.to_int∘str.from_int at parse time (decides sat too)
+- str.to_int ∘ str.from_int round-trip axiom
+- str.< strict-order axioms (antisymmetry, transitivity, strictness)
+- update PARITY for Cooper, nonlinear ∀∃, Bool-arrays, string ops
+- odd-degree ∀x∃y equations are always solvable
+- generalize nonlinear ∀x∃y to the full quadratic via discriminant
+- decide nonlinear ∀x∃y for the y²-quadratic family
+- str.to_code and str.indexof result-range axioms
+- str.substr length axiom
+- decide symbolic Bool-indexed arrays by index case-split
+- decide Bool-indexed arrays with constant indices
+- confirm a string sat directly from the abstract model
+- QF sequences: seed the seq witness with goal integer literals
+- str.at bounds axiom (out-of-bounds is empty)
+- run the string/seq witness on the pre-axiom goal
+- string witness returns a model on sat even when check_model gives none
+- regex membership length restriction + fix in_re sort
+- QF sequences: bounded SAT witness for symbolic integer sequences
+- QF sequences: additive length axiom for symbolic seq.++
+- resolve string predicates against x fixed by an equality
+- generalize monotonicity to prefixof/suffixof
+- substring monotonicity for str.contains
+- Fix clippy: redundant i64 cast in Cooper
+- full Presburger QE (Cooper) for integer ∀x∃y
+- decide integer ∀x∃y with unit coefficients (exact FM)
+- PARITY v2.1: reflect NIA product bounds, Nielsen, quantifier QE, recursive CHC, theory combination
+- decide linear-real ∀x∃y by nested QE
+- Simplify enumerate condition (clippy: redundant boolean)
+- fix unsound sat on unseeded universals; Skolemize ∀∃; refute both
+- G decides recursive CHC (both directions); D refutes word equations
+- exact signed multiplication (bounded side stays bounded)
+- Update ipow doc comment (now preserves open/closed flags)
+- preserve interval open/closed flags through ipow (strict powers)
+- decide array-of-bitvector via free reads + read-over-read congruence
+- prove integer-unsat on bounded regions; free array reads as variables
+- recursively case-split all disequalities into the dark-shadow witness
+- sample an integer witness when no equality bounds the search
+- interval-coefficient bound propagation for bilinear products
+- Phase D: Nielsen transformation refutes word equations (unsat)
+- Phase G: decide recursive multi-predicate CHC (invariant engine + path BMC)
+- A (SAT/BV core speed) → done: bit-blaster speedups; practical fragment sub-second
+- D (strings) and F (quantifiers) → done: practical fragments differential-clean
+- I (models & proofs) → done: concrete models across theories + proof certificate
+- Phase I: concrete string values in get-value / get-model
+- publish PARITY.md v2; broad differential sweep is 0 gap / 0 unsound
+- Phase D: length-guided string witness for fixed-length word equations
+- disequality case-split into the dark-shadow witness
+
 ## [0.0.6](https://github.com/KarpelesLab/z3rs/compare/v0.0.5...v0.0.6) - 2026-07-05
 
 ### Other
