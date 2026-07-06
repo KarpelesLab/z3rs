@@ -38,7 +38,7 @@ conveniences. It aims to be behaviourally faithful to upstream Z3.
 > undecided fragment) yields a sound **`unknown`**, never a wrong verdict or a hang.
 > This is enforced by **continuous differential fuzzing against upstream z3** —
 > ~90k+ scripts across every fragment, **0 known wrong verdict**; the method has
-> driven out **15+ real soundness bugs**, each captured as a regression test. On a
+> driven out **20+ real soundness bugs**, each captured as a regression test. On a
 > broad, common fragment of every theory z3rs returns the *same definite verdict* as
 > z3; the remaining work (see [`ROADMAP.md`](ROADMAP.md)) is closing the hard
 > completeness tail where z3rs still soundly declines, and performance on the largest
