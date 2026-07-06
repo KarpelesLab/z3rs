@@ -5344,13 +5344,29 @@ impl Context {
             if needle.len() != 1 {
                 continue;
             }
+            let c = needle[0];
+            // Converse: a matching element at *any* existing `nth(s, k)` implies
+            // containment. Refutes `¬contains(s, [5]) ∧ nth s k = 5`.
+            for &nth in &present {
+                if self.m.is_app(nth)
+                    && self
+                        .seqop_ops
+                        .get(&self.m.app_decl(nth))
+                        .map(String::as_str)
+                        == Some("seq.nth")
+                    && self.m.app_args(nth).len() == 2
+                    && self.m.app_args(nth)[0] == a[0]
+                {
+                    let eq = self.m.mk_eq(nth, c);
+                    ax.push(self.m.mk_implies(eq, t));
+                }
+            }
             let Some(n) = self.str_exact_len(goal, a[0]) else {
                 continue;
             };
             if n == 0 || n > 16 {
                 continue;
             }
-            let c = needle[0];
             let mut disj = Vec::new();
             for i in 0..n {
                 let iv = self.m.mk_int(i as i64);
