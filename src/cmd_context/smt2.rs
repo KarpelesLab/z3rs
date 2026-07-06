@@ -2521,6 +2521,40 @@ impl Context {
             let imp = self.m.mk_implies(app, ge);
             ax.push(imp);
         }
+        // Substring monotonicity: `contains(x, s) ⇒ contains(x, t)` when literal
+        // `t` is a (contiguous) substring of literal `s` on the same `x`. Refutes
+        // `contains(x, "ab") ∧ ¬contains(x, "b")`.
+        let contains: Vec<(AstId, AstId, Vec<u32>)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.contains")
+                {
+                    let args = self.m.app_args(t);
+                    if args.len() == 2
+                        && let Some(sub) = self.str_value(args[1])
+                    {
+                        return Some((t, args[0], sub));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (ai, xi, si) in &contains {
+            for (aj, xj, sj) in &contains {
+                if ai != aj
+                    && xi == xj
+                    && (sj.is_empty() || si.windows(sj.len().max(1)).any(|w| w == sj.as_slice()))
+                {
+                    let imp = self.m.mk_implies(*ai, *aj); // contains(x,si) ⇒ contains(x,sj)
+                    ax.push(imp);
+                }
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
