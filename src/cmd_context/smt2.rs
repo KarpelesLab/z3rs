@@ -3449,6 +3449,76 @@ impl Context {
                 ax.push(self.m.mk_implies(*mlt, nba));
             }
         }
+        // `str.prefixof` / `str.suffixof` are partial orders: antisymmetry
+        // `pre x y ∧ pre y x ⇒ x=y` and transitivity `pre x y ∧ pre y z ⇒ pre x z`.
+        // Refutes `prefixof x y ∧ prefixof y x ∧ x≠y`.
+        for opname in ["str.prefixof", "str.suffixof"] {
+            let ords: Vec<(AstId, AstId, AstId)> = present
+                .iter()
+                .filter_map(|&t| {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some(opname)
+                    {
+                        let a = self.m.app_args(t);
+                        if a.len() == 2 {
+                            return Some((t, a[0], a[1]));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            if ords.is_empty() {
+                continue;
+            }
+            let decl = self.m.app_decl(ords[0].0);
+            let mut edge: BTreeMap<(AstId, AstId), AstId> =
+                ords.iter().map(|(m, a, b)| ((*a, *b), *m)).collect();
+            let mut nodes: Vec<AstId> = Vec::new();
+            for (_, a, b) in &ords {
+                for x in [a, b] {
+                    if !nodes.contains(x) {
+                        nodes.push(*x);
+                    }
+                }
+            }
+            if nodes.len() > 8 {
+                continue;
+            }
+            for ai in 0..nodes.len() {
+                for bi in 0..nodes.len() {
+                    if ai == bi {
+                        continue;
+                    }
+                    let (a, b) = (nodes[ai], nodes[bi]);
+                    let mab = *edge
+                        .entry((a, b))
+                        .or_insert_with(|| self.m.mk_app(decl, &[a, b]));
+                    let mba = *edge
+                        .entry((b, a))
+                        .or_insert_with(|| self.m.mk_app(decl, &[b, a]));
+                    let and = self.m.mk_and(&[mab, mba]);
+                    let eqab = self.m.mk_eq(a, b);
+                    ax.push(self.m.mk_implies(and, eqab));
+                    for (ci, &c) in nodes.iter().enumerate() {
+                        if ci == ai || ci == bi {
+                            continue;
+                        }
+                        let mbc = *edge
+                            .entry((b, c))
+                            .or_insert_with(|| self.m.mk_app(decl, &[b, c]));
+                        let mac = *edge
+                            .entry((a, c))
+                            .or_insert_with(|| self.m.mk_app(decl, &[a, c]));
+                        let and2 = self.m.mk_and(&[mab, mbc]);
+                        ax.push(self.m.mk_implies(and2, mac));
+                    }
+                }
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
