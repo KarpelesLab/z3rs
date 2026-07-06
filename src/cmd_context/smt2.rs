@@ -4938,11 +4938,24 @@ impl Context {
                     == Some("str.++")
             {
                 let parts = self.m.app_args(x).to_vec();
+                // Q spans the `p0|p1` boundary iff some split `Q = Q1·Q2` (both
+                // non-empty) has Q1 an achievable suffix of p0 and Q2 an achievable
+                // prefix of p1 (a concrete part constrains its piece; a symbolic
+                // part admits any). No spanning split ⇒ distribution is sound.
                 let span_free = pv.len() == 1
                     || (parts.len() == 2 && {
-                        // parts[0] concrete P, no proper prefix of Q is a suffix of P.
-                        self.str_value(parts[0]).is_some_and(|p| {
-                            (1..pv.len()).all(|s| p.len() < s || p[p.len() - s..] != pv[..s])
+                        let p0c = self.str_value(parts[0]);
+                        let p1c = self.str_value(parts[1]);
+                        !(1..pv.len()).any(|s| {
+                            let q1_ok = p0c
+                                .as_ref()
+                                .map(|p| p.len() >= s && p[p.len() - s..] == pv[..s])
+                                .unwrap_or(true);
+                            let q2_ok = p1c
+                                .as_ref()
+                                .map(|p| p.len() >= pv.len() - s && p[..pv.len() - s] == pv[s..])
+                                .unwrap_or(true);
+                            q1_ok && q2_ok
                         })
                     });
                 // Each part's `contains(partᵢ, Q)`: a concrete part folds to a
