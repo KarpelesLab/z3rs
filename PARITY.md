@@ -67,6 +67,8 @@ and captured as a regression test:
 - string-witness search reporting spurious `sat` (new literals not asserted distinct)
 - "functional" array constants (`(_ map f)`, `(_ as-array f)`, `(lambda …)`) used
   in equalities treated as free variables → spurious `sat`
+- single-constructor/record and mutually-recursive datatypes given no acyclicity
+  measure → a cycle through them (`x = mka(mkb x)`) reported `sat` not `unsat`
 - (plus earlier datatype selector-trigger and FP free-BV bugs)
 
 Every one was a **wrong definite verdict** caught by differential fuzzing before
