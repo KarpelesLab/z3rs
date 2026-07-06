@@ -12828,7 +12828,7 @@ impl Context {
     /// Whether every coefficient (and the constant) of the integer linear form of
     /// `e` is divisible by `n` — so `e ≡ 0 (mod n)`. Conservative (a bare variable
     /// or a non-linear/unknown subterm ⇒ `false`).
-    fn linear_divisible_by(&self, e: AstId, n: i64) -> bool {
+    fn linear_divisible_by(&self, e: AstId, n: i64, zero_mod: &BTreeSet<AstId>) -> bool {
         use crate::ast::ArithOp;
         if n == 0 {
             return false;
@@ -12836,20 +12836,24 @@ impl Context {
         if let Some(k) = self.int_arg(e) {
             return k % n == 0;
         }
+        if zero_mod.contains(&e) {
+            return true; // `e ≡ 0 (mod n)` is asserted
+        }
         match self.m.arith_op(e) {
             Some(ArithOp::Add) | Some(ArithOp::Sub) => self
                 .m
                 .app_args(e)
                 .iter()
-                .all(|&p| self.linear_divisible_by(p, n)),
+                .all(|&p| self.linear_divisible_by(p, n, zero_mod)),
             Some(ArithOp::Mul) => {
-                // A product is divisible by n if any numeral factor is.
+                // A product is divisible by n if any factor is (a numeral
+                // divisible by n, or a variable known `≡ 0 (mod n)`).
                 self.m
                     .app_args(e)
                     .iter()
-                    .any(|&p| self.int_arg(p).is_some_and(|c| c % n == 0))
+                    .any(|&p| self.int_arg(p).is_some_and(|c| c % n == 0) || zero_mod.contains(&p))
             }
-            Some(ArithOp::Uminus) => self.linear_divisible_by(self.m.app_args(e)[0], n),
+            Some(ArithOp::Uminus) => self.linear_divisible_by(self.m.app_args(e)[0], n, zero_mod),
             _ => false,
         }
     }
@@ -12887,14 +12891,35 @@ impl Context {
             if n == 0 {
                 continue;
             }
+            // Skip `mod(a+b, n)` — the mod-of-sum lifting is expensive and the
+            // axiom (though sound) doesn't prevent it; keep the fast `mod(c·x,n)` /
+            // `mod(v,n)` (v a bound multiple) cases.
+            if self.m.arith_op(v) == Some(ArithOp::Add) {
+                continue;
+            }
+            // Variables `w` known `≡ 0 (mod n)` from an asserted `mod w n = 0`.
+            let mut zero_mod: BTreeSet<AstId> = BTreeSet::new();
+            for &c in &conj {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.int_arg(r) == Some(0)
+                            && self.m.arith_op(l) == Some(ArithOp::Mod)
+                            && self.int_arg(self.m.app_args(l)[1]) == Some(n)
+                        {
+                            zero_mod.insert(self.m.app_args(l)[0]);
+                        }
+                    }
+                }
+            }
             // `v` divisible directly, or equal to a multiple of n.
-            let mut mult = self.linear_divisible_by(v, n);
+            let mut mult = self.linear_divisible_by(v, n, &zero_mod);
             if !mult {
                 for &c in &conj {
                     if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
                         let a = self.m.app_args(c);
-                        if (a[0] == v && self.linear_divisible_by(a[1], n))
-                            || (a[1] == v && self.linear_divisible_by(a[0], n))
+                        if (a[0] == v && self.linear_divisible_by(a[1], n, &zero_mod))
+                            || (a[1] == v && self.linear_divisible_by(a[0], n, &zero_mod))
                         {
                             mult = true;
                             break;
