@@ -11347,6 +11347,19 @@ impl Context {
             }
             let (ca, va) = self.flatten_mul(a[0]);
             let (cb, vb) = self.flatten_mul(a[1]);
+            // Zero product: `c·(v0·v1·…) = 0` (c ≠ 0) ⇒ `v0 = 0 ∨ v1 = 0 ∨ …`.
+            for (coeff, vars, other) in [(&ca, &va, a[1]), (&cb, &vb, a[0])] {
+                if vars.len() >= 2
+                    && *coeff != Rational::from_integer(Int::from(0))
+                    && self.m.as_numeral(other).is_some_and(|n| n.is_zero())
+                {
+                    let zero = self.m.mk_int(0);
+                    let disj: Vec<AstId> = vars.iter().map(|&v| self.m.mk_eq(v, zero)).collect();
+                    let d = self.m.mk_or(&disj);
+                    ax.push(d);
+                    break;
+                }
+            }
             // Difference of squares: `c·a² = c·b²` ⇒ `a = b ∨ a = −b`.
             if ca == cb && va.len() == 2 && va[0] == va[1] && vb.len() == 2 && vb[0] == vb[1] {
                 let (av, bv) = (va[0], vb[0]);
