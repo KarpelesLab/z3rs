@@ -6328,6 +6328,43 @@ impl Context {
             let clen = self.m.mk_ite(in_range, one, zero);
             ax.push(self.m.mk_eq(len_at, clen));
         }
+        // Element congruence between seq.at markers: `at_i = at_j ⇒ nth(at_i,0) =
+        // nth(at_j,0)` (seq equality is not fed to element congruence). With the
+        // element axioms above this links `nth s i` and `nth s j`. Refutes
+        // `at s 1 = at s 2 ∧ nth s 1 = 4 ∧ nth s 2 ≠ 4`.
+        let seq_at_markers: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str) == Some("seq.at")
+                    && self.m.app_args(t).len() == 2
+            })
+            .collect();
+        for i in 0..seq_at_markers.len() {
+            for j in i + 1..seq_at_markers.len() {
+                let (t1, t2) = (seq_at_markers[i], seq_at_markers[j]);
+                let zero0 = self.m.mk_int(0);
+                if let (Ok(n1), Ok(n2)) = (
+                    self.seq_op("seq.nth", &[t1, zero0]),
+                    self.seq_op("seq.nth", &[t2, zero0]),
+                ) {
+                    let eq = self.m.mk_eq(t1, t2);
+                    let neq = self.m.mk_eq(n1, n2);
+                    ax.push(self.m.mk_implies(eq, neq));
+                }
+                // Length congruence too: `at_i = at_j ⇒ len(at_i) = len(at_j)` (an
+                // in-range at ≠ an out-of-range empty at). Refutes
+                // `at s 1 = at s 5 ∧ len s = 2`.
+                if let (Ok(l1), Ok(l2)) =
+                    (self.seq_op("seq.len", &[t1]), self.seq_op("seq.len", &[t2]))
+                {
+                    let eq = self.m.mk_eq(t1, t2);
+                    let leq = self.m.mk_eq(l1, l2);
+                    ax.push(self.m.mk_implies(eq, leq));
+                }
+            }
+        }
         let extracts: Vec<AstId> = present
             .iter()
             .copied()
