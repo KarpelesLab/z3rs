@@ -7798,6 +7798,33 @@ impl Context {
         }
     }
 
+    /// Exact real value of a finite IEEE-754 constant of format `(eb, sb)` from its
+    /// bits, as a dyadic rational. `None` for ±inf / NaN.
+    fn fp_real_value(bits: u64, eb: u32, sb: u32) -> Option<Rational> {
+        if sb == 0 {
+            return None;
+        }
+        let exp_mask = (1u64 << eb) - 1;
+        let bias = (1i64 << (eb - 1)) - 1;
+        let sign = (bits >> (eb + sb - 1)) & 1;
+        let exp = (bits >> (sb - 1)) & exp_mask;
+        let mant = (bits & ((1u64 << (sb - 1)) - 1)) as i64;
+        if exp == exp_mask {
+            return None; // ±inf / NaN
+        }
+        let (m, p) = if exp == 0 {
+            (mant, 1 - bias - (sb as i64 - 1))
+        } else {
+            (
+                mant | (1i64 << (sb - 1)),
+                exp as i64 - bias - (sb as i64 - 1),
+            )
+        };
+        let val =
+            Rational::from_integer(puremp::Int::from(m)).mul(&Rational::power_of_two(p as i32));
+        Some(if sign == 1 { val.neg() } else { val })
+    }
+
     /// The `(eb, sb)` format of an FP sort, if known.
     fn fp_format_of(&self, sort: AstId) -> Option<(u32, u32)> {
         self.fp_sorts
@@ -9577,23 +9604,10 @@ impl Context {
                 self.symbolic_fp(op, args)
             }
             "fp.to_real" if args.len() == 1 => {
-                // Exact real value of a finite Float64 constant as a dyadic
-                // rational `mant · 2^p`, decomposed from the IEEE-754 bits.
-                if let Some(a) = self.fp64(args[0])
-                    && a.is_finite()
+                // Exact real value of a finite FP constant of *any* format.
+                if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0])
+                    && let Some(val) = Self::fp_real_value(bits, eb, sb)
                 {
-                    let bits = a.to_bits();
-                    let s = (bits >> 63) & 1;
-                    let e = ((bits >> 52) & 0x7ff) as i32;
-                    let m = (bits & 0x000f_ffff_ffff_ffff) as i64;
-                    let (mant, p) = if e == 0 {
-                        (m, -1074i32) // subnormal / zero
-                    } else {
-                        (m | (1i64 << 52), e - 1075) // normal (hidden bit)
-                    };
-                    let val = Rational::from_integer(puremp::Int::from(mant))
-                        .mul(&Rational::power_of_two(p));
-                    let val = if s == 1 { val.neg() } else { val };
                     return Ok(self.m.mk_numeral(val, false));
                 }
                 self.symbolic_fp(op, args)
