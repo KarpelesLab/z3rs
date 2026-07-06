@@ -13204,6 +13204,38 @@ impl Context {
             if mult {
                 let zero = self.m.mk_int(0);
                 ax.push(self.m.mk_eq(mt, zero));
+                continue;
+            }
+            // Residue product: `mod(f0·f1·…, n) = mod(∏ residue(fᵢ), n)` when every
+            // factor has an asserted residue `mod fᵢ n = rᵢ`. Refutes
+            // `mod x 10 = 7 ∧ mod(x·x, 10) ≠ 9`.
+            if self.m.arith_op(v) == Some(ArithOp::Mul) {
+                let mut residue: BTreeMap<AstId, i64> = BTreeMap::new();
+                for &c in &conj {
+                    if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                        let a = self.m.app_args(c);
+                        for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                            if let Some(rv) = self.int_arg(r)
+                                && self.m.arith_op(l) == Some(ArithOp::Mod)
+                                && self.int_arg(self.m.app_args(l)[1]) == Some(n)
+                            {
+                                residue.insert(self.m.app_args(l)[0], rv.rem_euclid(n));
+                            }
+                        }
+                    }
+                }
+                let factors = self.m.app_args(v);
+                let prod: Option<i64> = factors.iter().try_fold(1i64, |acc, f| {
+                    let rf = self
+                        .int_arg(*f)
+                        .map(|k| k.rem_euclid(n))
+                        .or_else(|| residue.get(f).copied())?;
+                    Some((acc * rf).rem_euclid(n))
+                });
+                if let Some(p) = prod {
+                    let pv = self.m.mk_int(p);
+                    ax.push(self.m.mk_eq(mt, pv));
+                }
             }
         }
         ax
