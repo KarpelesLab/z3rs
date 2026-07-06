@@ -2937,6 +2937,11 @@ impl Context {
             return goal;
         }
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        // Fold selector/tester chains now that the variables are ground
+        // constructors (`v(l(node(leaf 1, leaf 2)))` → 1). Applied only here, on the
+        // *inlined* goal — after the variables are substituted away there is no
+        // opaque selector-on-a-variable left to mis-handle.
+        let g = self.dt_fold(g);
         crate::rewriter::simplify(&mut self.m, g)
     }
 
