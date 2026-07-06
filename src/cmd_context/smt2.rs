@@ -11439,8 +11439,86 @@ impl Context {
         self.m.mk_and(&ranges)
     }
 
+    /// Does `branch` (a conjunction) pin some string variable to a concrete
+    /// literal? Used to recognise the concat-split disjunction shape.
+    fn branch_pins_str(&self, branch: AstId) -> bool {
+        let mut stack = alloc::vec![branch];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else if self.m.is_eq(t) {
+                let a = self.m.app_args(t);
+                if a.len() == 2
+                    && ((self.m.is_uninterp_const(a[0]) && self.str_value(a[1]).is_some())
+                        || (self.m.is_uninterp_const(a[1]) && self.str_value(a[0]).is_some()))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Case-split a single string-pinning disjunction (the concat split
+    /// `⋁ₖ (x = lit[:k] ∧ …)`) against the other conjuncts and re-decide each
+    /// branch, so a pin propagates into `str.to_int`/`str.len`/… that `check_model`
+    /// leaves opaque under a disjunction (`x·y = "123" ∧ str.to_int x = 99 ∧
+    /// len x = 2` → unsat). Sound: `(⋁ b) ∧ R` is sat iff some `b ∧ R` is. Bounded
+    /// to ≤ 12 branches and one level (branches go through `decide_inner`, which
+    /// never re-enters this).
+    fn decide_via_case_split(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let or_idx = conj.iter().position(|&c| {
+            self.m.is_or(c)
+                && (2..=12).contains(&self.m.app_args(c).len())
+                && self.m.app_args(c).iter().all(|&b| self.branch_pins_str(b))
+        })?;
+        let branches = self.m.app_args(conj[or_idx]).to_vec();
+        let rest: Vec<AstId> = conj
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(i, _)| i != or_idx)
+            .map(|(_, c)| c)
+            .collect();
+        for &b in &branches {
+            let mut parts = rest.clone();
+            parts.push(b);
+            let sub = if parts.len() == 1 {
+                parts[0]
+            } else {
+                self.m.mk_and(&parts)
+            };
+            match self.decide(sub) {
+                (SmtResult::Unsat, _) => continue,
+                (SmtResult::Sat, m) => return Some((SmtResult::Sat, m)),
+                (SmtResult::Unknown, _) => return None,
+            }
+        }
+        Some((SmtResult::Unsat, None))
+    }
+
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let (res, model) = self.decide_inner(goal);
+        // Fallback: case-split a string-pinning disjunction (the concat split) so a
+        // pin reaches str ops that check_model leaves opaque under a disjunction.
+        if res == SmtResult::Unknown
+            && let Some(rr) = self.decide_via_case_split(goal)
+        {
+            return rr;
+        }
         // Fallback: re-fold `to_fp(to_real n)` conversions once `n` is pinned by a
         // `v = k` binding, re-blasting the FP equality so it reduces to a pure query.
         if res == SmtResult::Unknown
