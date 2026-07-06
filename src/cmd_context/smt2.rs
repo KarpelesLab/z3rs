@@ -1424,6 +1424,22 @@ impl Regex {
         Some(out)
     }
 
+    /// Whether every character of every word is an ASCII digit `'0'..='9'`
+    /// (sound: only a definite `true`). A non-empty such word is numeric, so
+    /// `str.to_int` of it is ≥ 0.
+    fn only_digits(&self) -> bool {
+        let (d0, d9) = ('0' as u32, '9' as u32);
+        match self {
+            Regex::Lit(l) => l.iter().all(|&c| (d0..=d9).contains(&c)),
+            Regex::Range(lo, hi) => *lo >= d0 && *hi <= d9,
+            Regex::None => true,
+            Regex::Concat(a, b) | Regex::Union(a, b) => a.only_digits() && b.only_digits(),
+            Regex::Inter(a, b) => a.only_digits() || b.only_digits(),
+            Regex::Star(a) => a.only_digits(),
+            _ => false,
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -3600,6 +3616,31 @@ impl Context {
             // Membership in a provably-empty language (e.g. `(a-z)+ ∩ (0-9)+`).
             if r.is_empty_lang() {
                 return true;
+            }
+            // A non-empty all-digit `x` (regex alphabet ⊆ 0-9) is numeric, so
+            // `str.to_int x ≥ 0` — a negative value is UNSAT
+            // (`x ∈ (0-9) ∧ str.to_int x = -1`).
+            if (pos_len.contains(&x) || !r.nullable()) && r.only_digits() {
+                for &c in &conj {
+                    if self.m.is_eq(c) {
+                        let e = self.m.app_args(c);
+                        if e.len() == 2 {
+                            for (ti, val) in [(e[0], e[1]), (e[1], e[0])] {
+                                if self.m.is_app(ti)
+                                    && self
+                                        .str_op_decls
+                                        .get(&self.m.app_decl(ti))
+                                        .map(String::as_str)
+                                        == Some("str.to_int")
+                                    && self.m.app_args(ti).first() == Some(&x)
+                                    && self.int_arg(val).is_some_and(|v| v < 0)
+                                {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Finite-language membership `x ∈ {w0,…}` with every word excluded by an
             // `x ≠ wᵢ` is UNSAT (`x ∈ ("yes"|"no") ∧ x≠"yes" ∧ x≠"no"`).
