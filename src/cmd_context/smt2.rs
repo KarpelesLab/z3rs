@@ -11342,6 +11342,21 @@ impl Context {
     /// decides. `mod(x+1,3)=0 ∧ mod(x,3)=1` → substitute the two remainders → the
     /// residual `x+1=3q ∧ x=3q₂+1` refutes by GCD.
     fn inline_int_const_bindings(&mut self, goal: AstId) -> AstId {
+        // Conversion ops (`bv2nat`/`int2bv`/…) do not fold under plain
+        // substitution, so a pinned integer flowing into one would be left as a
+        // free term after inlining — a spurious verdict. Skip such goals.
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && let Some(d) = self.m.func_decl(self.m.app_decl(t))
+                && let Some(nm) = d.name.as_str()
+                && matches!(
+                    nm,
+                    "bv2int" | "bv2nat" | "ubv_to_int" | "sbv_to_int" | "int2bv"
+                )
+            {
+                return goal;
+            }
+        }
         let mut conj: Vec<AstId> = Vec::new();
         let mut stack = alloc::vec![goal];
         while let Some(t) = stack.pop() {
