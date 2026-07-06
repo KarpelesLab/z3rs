@@ -5425,6 +5425,82 @@ impl Context {
                 ax.push(self.m.mk_implies(found, fits));
             }
         }
+        // `str.to_code` inverse: `str.to_code x = c` (0 ≤ c ≤ 0x10FFFF) pins x to the
+        // single character with code c. Refutes `str.to_code x = 97 ∧ x ≠ "a"`.
+        for (app, op, args) in &ops {
+            if (op != "str.to_code" && op != "str.to-code") || args.is_empty() {
+                continue;
+            }
+            for &e in &present {
+                if self.m.is_eq(e) && self.m.app_args(e).len() == 2 {
+                    let ea = self.m.app_args(e);
+                    for (l, r) in [(ea[0], ea[1]), (ea[1], ea[0])] {
+                        if l == *app
+                            && let Some(c) = self
+                                .m
+                                .as_numeral(r)
+                                .and_then(|q| q.to_integer())
+                                .and_then(|i| i.to_i64())
+                            && (0..=0x10FFFF).contains(&c)
+                        {
+                            let lit = self.mk_str_lit(&code_points_to_string(&[c as u32]));
+                            extra_lits.insert(lit);
+                            let x_eq = self.m.mk_eq(args[0], lit);
+                            ax.push(self.m.mk_implies(e, x_eq));
+                        }
+                    }
+                }
+            }
+        }
+        // `str.to_int` inverse: `str.to_int x = n` (n ≥ 0) with `len x = |dec n|`
+        // pinned leaves no room for leading zeros, so `x = dec(n)`. Refutes
+        // `str.to_int x = 42 ∧ len x = 2 ∧ x ≠ "42"`.
+        let toint: Vec<(AstId, AstId)> = present
+            .iter()
+            .filter(|&&t| {
+                self.m.is_app(t)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str),
+                        Some("str.to_int") | Some("str.to-int")
+                    )
+                    && self.m.app_args(t).len() == 1
+            })
+            .map(|&t| (t, self.m.app_args(t)[0]))
+            .collect();
+        for (app, x) in toint {
+            for &e in &present {
+                if self.m.is_eq(e) && self.m.app_args(e).len() == 2 {
+                    let ea = self.m.app_args(e);
+                    for (l, r) in [(ea[0], ea[1]), (ea[1], ea[0])] {
+                        if l == app
+                            && let Some(n) = self
+                                .m
+                                .as_numeral(r)
+                                .and_then(|q| q.to_integer())
+                                .and_then(|i| i.to_i64())
+                            && n >= 0
+                        {
+                            // With `len x = L` pinned, the only digit string of
+                            // value n and length L ≥ |dec n| is `dec(n)` left-padded
+                            // with zeros (unique).
+                            let dec = alloc::format!("{n}");
+                            let d = dec.chars().count();
+                            if let Some(len) = self.str_exact_len(goal, x)
+                                && len >= d
+                            {
+                                let padded = alloc::format!("{}{}", "0".repeat(len - d), dec);
+                                let lit = self.mk_str_lit(&padded);
+                                extra_lits.insert(lit);
+                                let x_eq = self.m.mk_eq(x, lit);
+                                ax.push(self.m.mk_implies(e, x_eq));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `str.contains x t ⟺ str.indexof x t 0 ≥ 0`: a match exists iff its first
         // index is found. Refutes `indexof x "z" 0 = −1 ∧ contains x "z"`.
         let pred_of = |m: &AstManager, t: AstId, name: &str| -> Option<Vec<AstId>> {
