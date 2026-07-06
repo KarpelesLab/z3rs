@@ -503,8 +503,15 @@ pub fn decide_int(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
             });
         }
     }
-    let Some(cands) = candidates else {
-        return None; // no equality to bound the integer search
+    // With an equality the candidate set is the (exhaustive) integer roots; a
+    // witness among them decides `sat`, and their exhaustion decides `unsat`.
+    // Without one — an inequality-only system such as `8y ≥ 14 ∧ y ≥ 1` — sample
+    // a bounded range for a witness: finding one is a sound `sat`, but failing to
+    // does not prove `unsat` (a solution may lie outside the sampled range), so
+    // fall back to `unknown`.
+    let (cands, exhaustive) = match candidates {
+        Some(c) => (c, true),
+        None => ((-256..=256).collect::<Vec<i64>>(), false),
     };
     for c in cands {
         let x = Rational::from_integer(puremp::Int::from(c));
@@ -518,7 +525,7 @@ pub fn decide_int(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
             return Some(true);
         }
     }
-    Some(false)
+    if exhaustive { Some(false) } else { None }
 }
 
 /// The sign of `p` at the unique root of the critical product isolated in
