@@ -2818,11 +2818,62 @@ impl Context {
         false
     }
 
-    /// Enum pigeonhole: a clique of pairwise-distinct terms of a `k`-constructor
-    /// enum larger than `k` cannot be satisfied (`distinct v0…v4` over a 4-value
-    /// enum is UNSAT).
+    /// Number of distinct inhabitants of a sort, if finite and small (≤ 1M).
+    /// `Bool` = 2, a small `BitVec n` = 2ⁿ, and a datatype whose every field sort is
+    /// itself finite = Σ over constructors of Π field cardinalities (a nullary
+    /// constructor contributes 1). `None` for infinite/recursive/large sorts.
+    fn datatype_cardinality(&self, sort: AstId, depth: u32) -> Option<u64> {
+        if depth > 6 {
+            return None;
+        }
+        if self.m.is_bool_sort(sort) {
+            return Some(2);
+        }
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return if w <= 20 { Some(1u64 << w) } else { None };
+        }
+        // A pure enum (all-nullary constructors) is tracked separately.
+        if let Some(ctors) = self.enums.get(&sort) {
+            return Some(ctors.len() as u64);
+        }
+        // A single-constructor datatype is stored as a record `(cdecl, selectors)`.
+        if let Some((_, sels)) = self.records.get(&sort) {
+            let mut prod: u64 = 1;
+            for &sd in sels {
+                let fsort = self.m.func_decl(sd)?.range;
+                let c = self.datatype_cardinality(fsort, depth + 1)?;
+                prod = prod.checked_mul(c)?;
+                if prod > 1_000_000 {
+                    return None;
+                }
+            }
+            return Some(prod);
+        }
+        let ctors = self.datatypes.get(&sort)?;
+        let mut total: u64 = 0;
+        for (_, sels, _) in ctors {
+            let mut prod: u64 = 1;
+            for &sd in sels {
+                let fsort = self.m.func_decl(sd)?.range;
+                let c = self.datatype_cardinality(fsort, depth + 1)?;
+                prod = prod.checked_mul(c)?;
+                if prod > 1_000_000 {
+                    return None;
+                }
+            }
+            total = total.checked_add(prod)?;
+            if total > 1_000_000 {
+                return None;
+            }
+        }
+        Some(total)
+    }
+
+    /// Enum pigeonhole: a clique of pairwise-distinct terms of a sort with `k`
+    /// inhabitants larger than `k` cannot be satisfied (`distinct v0…v4` over a
+    /// 4-value enum, or over `mk(Bool, Bool)` which also has 4 inhabitants).
     fn enum_pigeonhole_unsat(&self, goal: AstId) -> bool {
-        if self.enums.is_empty() {
+        if self.enums.is_empty() && self.datatypes.is_empty() {
             return false;
         }
         let mut conj: Vec<AstId> = Vec::new();
@@ -2838,6 +2889,7 @@ impl Context {
         }
         let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
         let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        let mut card: BTreeMap<AstId, Option<u64>> = BTreeMap::new();
         for &c in &conj {
             if !self.m.is_not(c) {
                 continue;
@@ -2851,7 +2903,14 @@ impl Context {
                 continue;
             }
             let s = self.m.get_sort(a[0]);
-            if !self.enums.contains_key(&s) || self.m.get_sort(a[1]) != s {
+            if self.m.get_sort(a[1]) != s {
+                continue;
+            }
+            // Only sorts with a finite inhabitant count can pigeonhole.
+            let fin = card
+                .entry(s)
+                .or_insert_with_key(|&s| self.datatype_cardinality(s, 0));
+            if fin.is_none() {
                 continue;
             }
             diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
@@ -2863,7 +2922,10 @@ impl Context {
             }
         }
         for (s, terms) in &by_sort {
-            let k = self.enums[s].len();
+            let Some(Some(k)) = card.get(s).copied() else {
+                continue;
+            };
+            let k = k as usize;
             // Greedy clique: for a `distinct` the disequality graph is complete,
             // so any order yields the full set.
             let mut clique: Vec<AstId> = Vec::new();
@@ -13977,6 +14039,19 @@ impl Context {
     }
 
     fn apply(&mut self, head: &str, args: Vec<AstId>) -> Result<AstId, String> {
+        // `distinct` of more terms than a finite sort has inhabitants is
+        // unsatisfiable — fold to `false` before the equality expansion (which
+        // would field-expand record equalities and hide the pigeonhole). Covers
+        // `distinct` over `Bool`, small `BitVec`, enums, and records of these.
+        if head == "distinct" && args.len() >= 2 {
+            let s = self.m.get_sort(args[0]);
+            if let Some(k) = self.datatype_cardinality(s, 0)
+                && args.len() as u64 > k
+                && args.iter().all(|&a| self.m.get_sort(a) == s)
+            {
+                return Ok(self.m.mk_false());
+            }
+        }
         let m = &mut self.m;
         // Bit-vector binary ops and comparisons require equal operand widths;
         // reject a mismatch (as z3 does) instead of building a garbage term.
