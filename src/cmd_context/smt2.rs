@@ -4742,6 +4742,69 @@ impl Context {
                 ax.push(self.m.mk_implies(eq, cm));
             }
         }
+        // All characters of a length-pinned `x` pinned by `str.at x i = cᵢ` fix the
+        // whole string: `(⋀_{i<n} str.at x i = cᵢ) ⇒ x = c0…c_{n-1}`. Refutes
+        // `len x = 3 ∧ str.at x 0="a" ∧ str.at x 1="b" ∧ str.at x 2="c" ∧ x≠"abc"`.
+        // Gather `str.at x i = <char>` equalities keyed by (x, i).
+        let mut at_char: BTreeMap<(AstId, i64), (AstId, u32)> = BTreeMap::new();
+        for &c in &present {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (am, lit) in [(a[0], a[1]), (a[1], a[0])] {
+                if let Some((_, x, i)) = ats.iter().find(|&&(m, _, _)| m == am)
+                    && *i >= 0
+                    && let Some(cv) = self.str_value(lit)
+                    && cv.len() == 1
+                {
+                    at_char.insert((*x, *i), (am, cv[0]));
+                }
+            }
+        }
+        let at_vars: BTreeSet<AstId> = ats.iter().map(|&(_, x, _)| x).collect();
+        for x in at_vars {
+            let Some(n) = self.str_exact_len(goal, x) else {
+                continue;
+            };
+            if n == 0 || n > 16 {
+                continue;
+            }
+            let mut hyps = Vec::new();
+            let mut chars = Vec::new();
+            let mut complete = true;
+            for i in 0..n as i64 {
+                if let Some(&(am, ch)) = at_char.get(&(x, i)) {
+                    hyps.push(am);
+                    chars.push(ch);
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete && !chars.is_empty() {
+                let lit = self.mk_str_lit(&code_points_to_string(&chars));
+                extra_lits.insert(lit);
+                let cli: Vec<AstId> = chars
+                    .iter()
+                    .zip(&hyps)
+                    .map(|(&ch, &am)| {
+                        let chl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                        self.m.mk_eq(am, chl)
+                    })
+                    .collect();
+                let hyp = if cli.len() == 1 {
+                    cli[0]
+                } else {
+                    self.m.mk_and(&cli)
+                };
+                let concl = self.m.mk_eq(x, lit);
+                ax.push(self.m.mk_implies(hyp, concl));
+            }
+        }
         // Prefix/suffix character overlap over a length-pinned `x`: pin each
         // character position with a *congruent* `str.at` marker (shared decl) so a
         // prefix and a suffix that disagree at a shared position conflict. Refutes
