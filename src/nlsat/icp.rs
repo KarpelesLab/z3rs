@@ -180,28 +180,74 @@ pub fn ipow(vi: &Interval, e: u32) -> Interval {
     if e == 0 {
         return Interval::point(Rational::from_integer(1.into()));
     }
+    if e == 1 {
+        return vi.clone(); // identity — preserves the open/closed flags exactly
+    }
     let Some((lo, hi)) = vi.bounds() else {
         return Interval::Empty;
     };
-    let lo = Ext::lower_of(lo);
-    let hi = Ext::upper_of(hi);
-    let (rlo, rhi) = if !e.is_multiple_of(2) {
-        // Odd powers are monotonically increasing.
-        (lo.pow(e), hi.pow(e))
-    } else if lo.sign() >= 0 {
-        // Wholly nonnegative → increasing.
-        (lo.pow(e), hi.pow(e))
-    } else if hi.sign() <= 0 {
-        // Wholly nonpositive → decreasing.
-        (hi.pow(e), lo.pow(e))
-    } else {
-        // Straddles zero → minimum is 0, maximum is the larger endpoint power.
-        (
-            Ext::Val(Rational::from_integer(0.into())),
-            Ext::max(lo.pow(e), hi.pow(e)),
-        )
+    // Raise an endpoint's value to the power `e`, preserving its open/closed flag
+    // (`±∞ ↦ ±∞`); the flag carry is what lets `y > 1 ⇒ y² > 1` stay strict.
+    let powv = |v: &Rational| -> Rational {
+        let mut p = Rational::from_integer(1.into());
+        for _ in 0..e {
+            p = p.mul(v);
+        }
+        p
     };
-    Interval::new(rlo.to_lower_bound(), rhi.to_upper_bound())
+    let powb = |b: &Bound| -> Bound {
+        match b {
+            Bound::Infinite => Bound::Infinite,
+            Bound::Finite { value, open } => Bound::Finite {
+                value: powv(value),
+                open: *open,
+            },
+        }
+    };
+    if e % 2 == 1 {
+        // Odd powers are monotonically increasing over all reals.
+        return Interval::new(powb(lo), powb(hi));
+    }
+    let lo_nonneg = matches!(lo, Bound::Finite { value, .. } if !value.is_negative());
+    let hi_nonpos = matches!(hi, Bound::Finite { value, .. } if !value.is_positive());
+    if lo_nonneg {
+        Interval::new(powb(lo), powb(hi)) // increasing on [0, ∞)
+    } else if hi_nonpos {
+        Interval::new(powb(hi), powb(lo)) // decreasing on (−∞, 0]
+    } else {
+        // Straddles 0: the minimum 0 is attained (closed); the maximum is the
+        // larger endpoint power, or +∞ if either endpoint is infinite.
+        let up = match (lo, hi) {
+            (Bound::Infinite, _) | (_, Bound::Infinite) => Bound::Infinite,
+            (
+                Bound::Finite {
+                    value: lv,
+                    open: lo_open,
+                },
+                Bound::Finite {
+                    value: hv,
+                    open: hi_open,
+                },
+            ) => {
+                let (pl, ph) = (powv(lv), powv(hv));
+                match pl.cmp(&ph) {
+                    Ordering::Greater => Bound::Finite {
+                        value: pl,
+                        open: *lo_open,
+                    },
+                    Ordering::Less => Bound::Finite {
+                        value: ph,
+                        open: *hi_open,
+                    },
+                    Ordering::Equal => Bound::Finite {
+                        value: ph,
+                        open: *lo_open && *hi_open,
+                    },
+                }
+            }
+        };
+        Interval::new(Bound::closed(Rational::from_integer(0.into())), up)
+    }
 }
 
 /// Can an interval `i` contain a value satisfying `value REL 0`?
@@ -487,12 +533,20 @@ fn bound_recip(b: &Bound) -> Bound {
 
 /// Reciprocal of a definite-sign interval (0 excluded): `1/[lo,hi] = [1/hi,1/lo]`.
 /// `None` if the interval straddles (or touches) 0.
+/// A bound that excludes 0 from below (`> 0`): a positive value, or an open 0.
+fn bound_gt_zero(b: &Bound) -> bool {
+    matches!(b, Bound::Finite { value, open } if value.is_positive() || (value.is_zero() && *open))
+}
+
+/// A bound that excludes 0 from above (`< 0`): a negative value, or an open 0.
+fn bound_lt_zero(b: &Bound) -> bool {
+    matches!(b, Bound::Finite { value, open } if value.is_negative() || (value.is_zero() && *open))
+}
+
 fn interval_recip(iv: &Interval) -> Option<Interval> {
     let (lo, hi) = iv.bounds()?;
-    let pos = matches!(lo, Bound::Finite { value, .. } if value.is_positive());
-    let neg = matches!(hi, Bound::Finite { value, .. } if value.is_negative());
-    if !pos && !neg {
-        return None;
+    if !bound_gt_zero(lo) && !bound_lt_zero(hi) {
+        return None; // straddles or touches 0
     }
     Some(Interval::new(bound_recip(hi), bound_recip(lo)))
 }
@@ -510,13 +564,25 @@ fn product_bound(c: &Constraint, v: Var, box_: &[Interval]) -> Option<Interval> 
     let a = eval_interval(&c1, box_);
     let b = eval_interval(&c0, box_);
     let (alo, ahi) = a.bounds()?;
-    let a_pos = matches!(alo, Bound::Finite { value, .. } if value.is_positive());
-    let a_neg = matches!(ahi, Bound::Finite { value, .. } if value.is_negative());
+    let a_pos = bound_gt_zero(alo);
+    let a_neg = bound_lt_zero(ahi);
     if !a_pos && !a_neg {
         return None; // coefficient straddles 0 — no bound
     }
     // Solution of `a·v = -b`  ⇒  `v = -b / a`.
-    let sol = b.neg().mul(&interval_recip(&a)?);
+    let recip = interval_recip(&a)?; // also asserts a excludes 0
+    let b_zero = matches!(
+        b.bounds(),
+        Some((Bound::Finite { value: lv, open: false }, Bound::Finite { value: hv, open: false }))
+            if lv.is_zero() && hv.is_zero()
+    );
+    // `-b / a` with `b = 0` is exactly 0 (`a` excludes 0); computing it via the
+    // generic interval product would hit `0·∞` and over-approximate.
+    let sol = if b_zero {
+        Interval::point(Rational::from_integer(0.into()))
+    } else {
+        b.neg().mul(&recip)
+    };
     let (slo, shi) = sol.bounds()?;
     let neg_inf = Bound::infinite();
     let result = match (c.rel, a_pos) {
@@ -748,6 +814,23 @@ mod tests {
             Constraint::new(poly1v(1, -4, 1), Rel::Le), // y <= 4
         ];
         assert_eq!(decide_bounded_int(&c, 2), Some(true));
+    }
+
+    // x·y − x = 0 ∧ x>1 ∧ y>1 is UNSAT: x(y−1)=0 forces x=0 or y=1.
+    #[test]
+    fn bounded_int_xy_eq_x_unsat() {
+        let c = vec![
+            Constraint::new(
+                Polynomial::from_terms(vec![
+                    (r(1), Monomial::from_powers(&[(0, 1), (1, 1)])), // x·y
+                    (r(-1), Monomial::from_powers(&[(0, 1)])),        // − x
+                ]),
+                Rel::Eq,
+            ),
+            Constraint::new(poly1(1, -1), Rel::Gt), // x > 1
+            Constraint::new(poly1v(1, -1, 1), Rel::Gt), // y > 1
+        ];
+        assert_eq!(decide_bounded_int(&c, 2), Some(false));
     }
 
     // x·y = 7 ∧ 1≤x≤3 ∧ 1≤y≤3 is UNSAT (7 is prime, exceeds the box).
