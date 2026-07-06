@@ -5606,6 +5606,44 @@ impl Context {
                 ax.push(self.m.mk_implies(hyp, eq));
             }
         }
+        // `seq.suffixof s u ⇒ (i < len s ⇒ nth(s,i) = nth(u, len u − len s + i))`.
+        // Refutes `suffixof s u ∧ len s = len u = 1 ∧ nth u 0 = 5 ∧ nth s 0 ≠ 5`.
+        let seq_sufs: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.suffixof")
+                    && self.m.app_args(t).len() == 2
+            })
+            .collect();
+        for t in seq_sufs {
+            let a = self.m.app_args(t).to_vec();
+            let (s, u) = (a[0], a[1]);
+            // Need both lengths pinned so the `u` index `len u − len s + i` is a
+            // concrete index that matches the goal's `nth(u, k)` markers.
+            let (Some(ls), Some(lu)) = (self.str_exact_len(goal, s), self.str_exact_len(goal, u))
+            else {
+                continue;
+            };
+            if lu < ls || lu > 64 {
+                continue;
+            }
+            let off = (lu - ls) as i64;
+            for i in 0..ls as i64 {
+                let iv = self.m.mk_int(i);
+                let uiv = self.m.mk_int(off + i);
+                let (Ok(ns), Ok(nu)) = (
+                    self.seq_op("seq.nth", &[s, iv]),
+                    self.seq_op("seq.nth", &[u, uiv]),
+                ) else {
+                    continue;
+                };
+                let eq = self.m.mk_eq(ns, nu);
+                ax.push(self.m.mk_implies(t, eq));
+            }
+        }
         // `seq.at s i = seq.unit(seq.nth s i)` when `0 ≤ i < len s`. Refutes
         // `seq.at s 2 = seq.unit 5 ∧ seq.nth s 2 = 9`.
         let seq_ats: Vec<AstId> = present
