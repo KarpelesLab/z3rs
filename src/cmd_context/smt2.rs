@@ -1104,6 +1104,9 @@ struct Context {
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
+    /// Symbolic `seq.++` markers with their parts, so the additive length axiom
+    /// `len(s ++ t) = len(s) + len(t)` can be attached.
+    seq_concat: Vec<(AstId, Vec<AstId>)>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -1269,6 +1272,7 @@ impl Context {
             symbolic_divisors: BTreeSet::new(),
             symbolic_divmod: Vec::new(),
             seq_len_decls: BTreeSet::new(),
+            seq_concat: Vec::new(),
         }
     }
 
@@ -2505,6 +2509,29 @@ impl Context {
             let lenu = self.m.mk_app(d, &[u]);
             let nv = self.m.mk_int(n as i64);
             let eq = self.m.mk_eq(lenu, nv);
+            ax.push(eq);
+        }
+        // Additive length for symbolic concatenation: `len(s ++ t) = len s + len t`.
+        // Refutes `s ++ t = seq.unit(x) ∧ len s > 0 ∧ len t > 0` (a unit has length 1).
+        for (app, parts) in self.seq_concat.clone() {
+            if !present_set.contains(&app) {
+                continue;
+            }
+            let d = self.seq_len_decl_for(self.m.get_sort(app));
+            let total = self.m.mk_app(d, &[app]);
+            let part_lens: Vec<AstId> = parts
+                .iter()
+                .map(|&p| {
+                    let dp = self.seq_len_decl_for(self.m.get_sort(p));
+                    self.m.mk_app(dp, &[p])
+                })
+                .collect();
+            let sum = if part_lens.len() == 1 {
+                part_lens[0]
+            } else {
+                self.m.mk_add(&part_lens)
+            };
+            let eq = self.m.mk_eq(total, sum);
             ax.push(eq);
         }
         // Length links for symbolic predicates present in the goal:
@@ -5737,6 +5764,9 @@ impl Context {
         let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
         let app = self.m.mk_app(d, args);
         self.str_symbolic.insert(app);
+        if op == "seq.++" {
+            self.seq_concat.push((app, args.to_vec()));
+        }
         Ok(app)
     }
 
