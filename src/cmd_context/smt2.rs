@@ -3859,6 +3859,39 @@ impl Context {
                 }
             }
         }
+        // Constructor-conditional extensionality: two same-sort datatype variables
+        // built by the *same* constructor with equal fields are equal — added
+        // directly because a Bool-field equality feeds propositional iff, not the
+        // EUF congruence through the constructor (`is-wrap p ∧ is-wrap q ∧
+        // w p = w q ∧ p ≠ q` over `wrap(Bool)` was a spurious sat).
+        let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &t in &terms {
+            let s = self.m.get_sort(t);
+            if self.datatypes.contains_key(&s) && self.m.is_uninterp_const(t) {
+                by_sort.entry(s).or_default().push(t);
+            }
+        }
+        for (s, vars) in by_sort {
+            let ctors = self.datatypes[&s].clone();
+            for i in 0..vars.len() {
+                for j in i + 1..vars.len() {
+                    let (p, q) = (vars[i], vars[j]);
+                    for (_, sels, tdecl) in &ctors {
+                        let is_p = self.m.mk_app(*tdecl, &[p]);
+                        let is_q = self.m.mk_app(*tdecl, &[q]);
+                        let mut hyp = alloc::vec![is_p, is_q];
+                        for &sd in sels {
+                            let sp = self.m.mk_app(sd, &[p]);
+                            let sq = self.m.mk_app(sd, &[q]);
+                            hyp.push(self.m.mk_eq(sp, sq));
+                        }
+                        let h = self.m.mk_and(&hyp);
+                        let concl = self.m.mk_eq(p, q);
+                        ax.push(self.m.mk_implies(h, concl));
+                    }
+                }
+            }
+        }
         ax
     }
 
