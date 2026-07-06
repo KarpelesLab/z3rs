@@ -5018,6 +5018,34 @@ impl Context {
                 ax.push(self.m.mk_implies(eq, cm));
             }
         }
+        // Reverse: the leading characters of `x` matching `P` (and `len x ≥ |P|`)
+        // imply `prefixof P x`. Refutes `str.at x 0 = "a" ∧ ¬prefixof "a" x`.
+        for (pm, pchars, px) in &prefs {
+            let mut hyps = Vec::new();
+            let mut complete = true;
+            for (i, &ch) in pchars.iter().enumerate() {
+                if let Some(&(am, _, _)) =
+                    ats.iter().find(|&&(_, x, idx)| x == *px && idx == i as i64)
+                {
+                    let chl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                    extra_lits.insert(chl);
+                    hyps.push(self.m.mk_eq(am, chl));
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete && !hyps.is_empty() {
+                // Each `str.at x i = cᵢ` (cᵢ non-empty) already implies the position
+                // exists, so no explicit length guard is needed.
+                let hyp = if hyps.len() == 1 {
+                    hyps[0]
+                } else {
+                    self.m.mk_and(&hyps)
+                };
+                ax.push(self.m.mk_implies(hyp, *pm));
+            }
+        }
         // All characters of a length-pinned `x` pinned by `str.at x i = cᵢ` fix the
         // whole string: `(⋀_{i<n} str.at x i = cᵢ) ⇒ x = c0…c_{n-1}`. Refutes
         // `len x = 3 ∧ str.at x 0="a" ∧ str.at x 1="b" ∧ str.at x 2="c" ∧ x≠"abc"`.
