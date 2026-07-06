@@ -4673,7 +4673,46 @@ impl Context {
         None
     }
 
+    /// Rewrite `(str.replace S T R)` (concrete `S`, `T`; first occurrence of `T`)
+    /// into `(str.++ "before" R "after")` at the S-expression level, so the
+    /// concat-vs-literal split decides the equation. Returns the input unchanged
+    /// otherwise.
+    fn expand_replace_sexpr(&mut self, s: &SExpr) -> SExpr {
+        let SExpr::List(l) = s else {
+            return s.clone();
+        };
+        if l.len() != 4 || !matches!(&l[0], SExpr::Atom(h) if h == "str.replace") {
+            return s.clone();
+        }
+        let (Ok(sv), Ok(tv)) = (self.term(&l[1]), self.term(&l[2])) else {
+            return s.clone();
+        };
+        let (Some(sval), Some(tval)) = (self.str_value(sv), self.str_value(tv)) else {
+            return s.clone();
+        };
+        if tval.is_empty() {
+            return s.clone();
+        }
+        let Some(p) = (0..=sval.len().saturating_sub(tval.len()))
+            .find(|&p| sval[p..p + tval.len()] == tval[..])
+        else {
+            // `T` absent: `str.replace` returns `S` unchanged.
+            return SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(&sval)));
+        };
+        let lit = |cs: &[u32]| SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(cs)));
+        SExpr::List(alloc::vec![
+            SExpr::Atom("str.++".to_string()),
+            lit(&sval[..p]),
+            l[3].clone(),
+            lit(&sval[p + tval.len()..]),
+        ])
+    }
+
     fn try_split_concat_eq(&mut self, a: &SExpr, b: &SExpr) -> Result<Option<AstId>, String> {
+        // Expand `(str.replace S T R)` with concrete `S`, `T` into
+        // `(str.++ before R after)` so the concat split below applies.
+        let a = &self.expand_replace_sexpr(a);
+        let b = &self.expand_replace_sexpr(b);
         // Flatten a (possibly nested) `str.++` into its sequence of parts.
         fn flatten(s: &SExpr, out: &mut Vec<SExpr>) {
             if let SExpr::List(l) = s
@@ -5016,6 +5055,26 @@ impl Context {
             "str.at" | "str.substr" | "str.replace" | "str.from_int" | "str.from-int" => {
                 if let Some(v) = self.fold_string_producer(op, raw) {
                     return Ok(self.mk_str_lit(&v));
+                }
+                // `str.replace s t r` with concrete `s`, `t` and symbolic `r`
+                // rewrites to `before ++ r ++ after` (first occurrence of `t`), so
+                // the equation decides via the concat handling.
+                if op == "str.replace"
+                    && raw.len() == 3
+                    && let (Some(s), Some(t)) = (self.str_value(raw[0]), self.str_value(raw[1]))
+                    && self.str_value(raw[2]).is_none()
+                    && !t.is_empty()
+                {
+                    let pos =
+                        (0..=s.len().saturating_sub(t.len())).find(|&p| s[p..p + t.len()] == t[..]);
+                    if let Some(p) = pos {
+                        let before = self.mk_str_lit(&code_points_to_string(&s[..p]));
+                        let after = self.mk_str_lit(&code_points_to_string(&s[p + t.len()..]));
+                        let parts = alloc::vec![before, raw[2], after];
+                        return self.string_op("str.++", &parts);
+                    }
+                    // `t` does not occur: `str.replace` returns `s` unchanged.
+                    return Ok(self.mk_str_lit(&code_points_to_string(&s)));
                 }
                 self.symbolic_string(op, raw)
             }
