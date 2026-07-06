@@ -4250,6 +4250,48 @@ impl Context {
                 }
             }
         }
+        // `contains(L, x)` with `L` concrete and `len x = k` pinned ⇒ `x` is one of
+        // L's length-k substrings. Refutes `contains "hello" x ∧ len x = 2 ∧
+        // x ∉ {he,el,ll,lo}`.
+        for &t in &present {
+            if !self.m.is_app(t)
+                || self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                    != Some("str.contains")
+            {
+                continue;
+            }
+            let a = self.m.app_args(t).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            let Some(hay) = self.str_value(a[0]) else {
+                continue;
+            };
+            let x = a[1];
+            let Some(k) = self.str_exact_len(goal, x) else {
+                continue;
+            };
+            if k == 0 || k > hay.len() || hay.len() > 64 {
+                continue;
+            }
+            let mut disj = Vec::new();
+            let mut seen: BTreeSet<Vec<u32>> = BTreeSet::new();
+            for i in 0..=hay.len() - k {
+                let sub = hay[i..i + k].to_vec();
+                if seen.insert(sub.clone()) {
+                    let lit = self.mk_str_lit(&code_points_to_string(&sub));
+                    extra_lits.insert(lit);
+                    disj.push(self.m.mk_eq(x, lit));
+                }
+            }
+            if !disj.is_empty() {
+                let d = self.m.mk_or(&disj);
+                ax.push(self.m.mk_implies(t, d));
+            }
+        }
         for (pm, pchars, px) in &prefs {
             for (am, ax_x, k) in &ats {
                 if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
