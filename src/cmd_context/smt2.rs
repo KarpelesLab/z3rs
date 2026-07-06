@@ -3867,8 +3867,13 @@ impl Context {
         let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
         for &t in &terms {
             let s = self.m.get_sort(t);
-            if self.datatypes.contains_key(&s) && self.m.is_uninterp_const(t) {
-                by_sort.entry(s).or_default().push(t);
+            // Any datatype-sorted term (variable or nested selector app), bounded,
+            // so nested extensionality chains.
+            if self.datatypes.contains_key(&s) {
+                let v = by_sort.entry(s).or_default();
+                if v.len() < 12 && !v.contains(&t) {
+                    v.push(t);
+                }
             }
         }
         for (s, vars) in by_sort {
@@ -3937,8 +3942,13 @@ impl Context {
         let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
         for &t in &terms {
             let s = self.m.get_sort(t);
-            if self.records.contains_key(&s) && self.m.is_uninterp_const(t) {
-                by_sort.entry(s).or_default().push(t);
+            // Any record-sorted term (variable or nested selector app like
+            // `inner p`), so nested extensionality chains.
+            if self.records.contains_key(&s) {
+                let v = by_sort.entry(s).or_default();
+                if v.len() < 12 && !v.contains(&t) {
+                    v.push(t);
+                }
             }
         }
         for (s, vars) in by_sort {
