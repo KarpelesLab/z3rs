@@ -4879,15 +4879,24 @@ impl Context {
                 _ => self.m.mk_and(&eqs),
             }));
         }
-        // A single literal against a concatenation: reuse the split search.
+        // A single literal against a concatenation: reuse the split search. But a
+        // concatenation of ≥3 parts (a literal between two variables) against a
+        // long literal expands to a nested disjunction the general solver handles
+        // exponentially; leave it symbolic so the bounded string witness decides it.
         if pa.len() == 1
             && let Some(l) = lit(&pa[0])
         {
+            if pb.len() >= 3 && l.len() > 3 {
+                return Ok(None);
+            }
             return Ok(Some(self.split_concat_eq(pb, &l)?));
         }
         if pb.len() == 1
             && let Some(l) = lit(&pb[0])
         {
+            if pa.len() >= 3 && l.len() > 3 {
+                return Ok(None);
+            }
             return Ok(Some(self.split_concat_eq(pa, &l)?));
         }
         // Both reduced to a single term: a direct equality.
