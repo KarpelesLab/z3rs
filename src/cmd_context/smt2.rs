@@ -1107,6 +1107,9 @@ struct Context {
     /// Symbolic `seq.++` markers with their parts, so the additive length axiom
     /// `len(s ++ t) = len(s) + len(t)` can be attached.
     seq_concat: Vec<(AstId, Vec<AstId>)>,
+    /// The operation name behind each symbolic sequence marker declaration, so a
+    /// marker can be re-folded once its arguments become concrete (witness search).
+    seqop_ops: BTreeMap<AstId, String>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -1273,6 +1276,7 @@ impl Context {
             symbolic_divmod: Vec::new(),
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
+            seqop_ops: BTreeMap::new(),
         }
     }
 
@@ -2690,13 +2694,19 @@ impl Context {
                 .map(|&a| self.refold_str_markers(a, memo))
                 .collect();
             let is_len = self.str_len_decl == Some(decl) || self.seq_len_decls.contains(&decl);
-            if is_len
-                && args.len() == 1
-                && let Some(v) = self.str_value(args[0])
-            {
-                self.m.mk_int(v.len() as i64)
+            if is_len && args.len() == 1 {
+                if let Some(v) = self.str_value(args[0]) {
+                    self.m.mk_int(v.len() as i64)
+                } else if let Some(l) = self.seq_of.get(&args[0]) {
+                    self.m.mk_int(l.len() as i64)
+                } else {
+                    self.m.mk_app(decl, &args)
+                }
             } else if let Some(op) = self.str_op_decls.get(&decl).cloned() {
                 self.string_op(&op, &args)
+                    .unwrap_or_else(|_| self.m.mk_app(decl, &args))
+            } else if let Some(op) = self.seqop_ops.get(&decl).cloned() {
+                self.seq_op(&op, &args)
                     .unwrap_or_else(|_| self.m.mk_app(decl, &args))
             } else {
                 self.m.mk_app(decl, &args)
@@ -2942,6 +2952,109 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Bounded, sound SAT witness for a goal with symbolic **integer sequences**:
+    /// substitute short concrete sequences for each symbolic seq variable, re-fold
+    /// the sequence markers, and confirm with the core solver. A found witness is a
+    /// real `sat`; failure keeps the sound `unknown`.
+    fn try_seq_witness(&mut self, goal: AstId) -> Option<Model> {
+        let int_sort = self.m.mk_int_sort();
+        let mut vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && self.m.app_args(t).is_empty()
+                && !self.seq_of.contains_key(&t)
+                && self.seq_elem_sort(self.m.get_sort(t)) == Some(int_sort)
+                && !vars.contains(&t)
+            {
+                vars.push(t);
+            }
+        }
+        if vars.is_empty() || vars.len() > 2 {
+            return None;
+        }
+        // Integer element candidates, and element-lists up to a small length.
+        let elems: [i64; 3] = [0, 1, 2];
+        let max_len = if vars.len() == 1 { 4 } else { 2 };
+        let mut cands: Vec<Vec<i64>> = alloc::vec![Vec::new()];
+        let mut frontier: Vec<Vec<i64>> = alloc::vec![Vec::new()];
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for base in &frontier {
+                for &e in &elems {
+                    let mut s = base.clone();
+                    s.push(e);
+                    next.push(s);
+                }
+            }
+            cands.extend(next.iter().cloned());
+            frontier = next;
+        }
+        const MAX_TRIES: usize = 900;
+        let mut idx = alloc::vec![0usize; vars.len()];
+        let mut tries = 0;
+        loop {
+            if tries >= MAX_TRIES {
+                return None;
+            }
+            tries += 1;
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    let es: Vec<AstId> = cands[idx[k]].iter().map(|&n| self.m.mk_int(n)).collect();
+                    (v, self.mk_seq(es))
+                })
+                .collect();
+            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let mut memo = BTreeMap::new();
+            let g2 = self.refold_str_markers(g1, &mut memo);
+            let clean = !self.m.postorder(g2).iter().any(|&t| {
+                self.str_symbolic.contains(&t)
+                    || (self.m.is_app(t) && self.seqop_ops.contains_key(&self.m.app_decl(t)))
+            });
+            if clean {
+                // Concrete sequences are uninterpreted constants; without (dis)
+                // equality axioms `check_model` could equate two *different* ones
+                // (a spurious `sat`). Link every pair by content.
+                let seqs: Vec<AstId> = self
+                    .m
+                    .postorder(g2)
+                    .into_iter()
+                    .filter(|t| self.seq_of.contains_key(t))
+                    .collect();
+                let mut conj: Vec<AstId> = Vec::new();
+                for i in 0..seqs.len() {
+                    for j in i + 1..seqs.len() {
+                        let same = self.seq_of[&seqs[i]] == self.seq_of[&seqs[j]];
+                        let eq = self.m.mk_eq(seqs[i], seqs[j]);
+                        conj.push(if same { eq } else { self.m.mk_not(eq) });
+                    }
+                }
+                let g3 = if conj.is_empty() {
+                    g2
+                } else {
+                    conj.push(g2);
+                    self.m.mk_and(&conj)
+                };
+                if let (SmtResult::Sat, m) = check_model(&self.m, g3) {
+                    return m;
+                }
+            }
+            let mut k = 0;
+            loop {
+                if k == vars.len() {
+                    return None;
+                }
+                idx[k] += 1;
+                if idx[k] < cands.len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
     }
 
     /// Bounded, sound search for a concrete satisfying assignment to a goal with
@@ -5767,6 +5880,7 @@ impl Context {
         if op == "seq.++" {
             self.seq_concat.push((app, args.to_vec()));
         }
+        self.seqop_ops.insert(d, op.to_string());
         Ok(app)
     }
 
@@ -8692,8 +8806,11 @@ impl Context {
             if check_model(&self.m, goal).0 == SmtResult::Unsat {
                 return (SmtResult::Unsat, None);
             }
-            // Not refuted: try to exhibit a concrete satisfying string assignment.
+            // Not refuted: try to exhibit a concrete satisfying string/seq model.
             if let Some(m) = self.try_string_witness(goal) {
+                return (SmtResult::Sat, Some(m));
+            }
+            if let Some(m) = self.try_seq_witness(goal) {
                 return (SmtResult::Sat, Some(m));
             }
             return (SmtResult::Unknown, None);
