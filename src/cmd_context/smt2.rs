@@ -4876,6 +4876,23 @@ impl Context {
                 ax.push(self.m.mk_implies(both, eq));
             }
         }
+        // Equal-length containment `contains(x, y) ∧ len x = len y ⇒ x = y` (a
+        // same-length substring is the whole string). Refutes
+        // `contains x y ∧ len x = len y = 2 ∧ x ≠ y`.
+        let contains_pairs: Vec<(AstId, AstId, AstId)> =
+            contains_of.iter().map(|(&(x, y), &m)| (x, y, m)).collect();
+        for (x, y, cm) in contains_pairs {
+            if x == y {
+                continue;
+            }
+            let lenf = self.str_len_fn();
+            let lx = self.m.mk_app(lenf, &[x]);
+            let ly = self.m.mk_app(lenf, &[y]);
+            let len_eq = self.m.mk_eq(lx, ly);
+            let hyp = self.m.mk_and(&[cm, len_eq]);
+            let eq = self.m.mk_eq(x, y);
+            ax.push(self.m.mk_implies(hyp, eq));
+        }
         // `contains x P` (P concrete): `len x ≥ len P`, and if the length is exactly
         // `len P` then `x = P` (a length-`|P|` string containing `P` *is* `P`).
         // Refutes `contains x "ab" ∧ len x = 2 ∧ x ≠ "ab"`.
