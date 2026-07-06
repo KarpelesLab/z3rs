@@ -10057,9 +10057,24 @@ impl Context {
     }
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        let (res, model) = self.decide_inner(goal);
+        // Fallback: if undecided, inline `v = <ground constructor>` bindings so
+        // selectors/testers over `v` fold, and retry. Applied only on `unknown`
+        // (it removes `v`, which would break a model query on the primary path).
+        if res == SmtResult::Unknown && !self.datatypes.is_empty() {
+            let inlined = self.inline_ground_dt_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
+        (res, model)
+    }
+
+    fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
-        // Inline `v = <ground constructor>` so selectors/testers over `v` fold.
-        let goal = self.inline_ground_dt_bindings(goal);
         // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
