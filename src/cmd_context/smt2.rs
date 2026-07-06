@@ -4973,8 +4973,30 @@ impl Context {
                 }
             }
         }
+        // Variables pinned to a literal by `v = "…"`: their only candidate is that
+        // literal, so the search doesn't grind every alphabet string when a binding
+        // already determines the value (`x = "b" ∧ str.at x 0 = "z"` refutes fast).
+        let mut pinned: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_eq(t) {
+                let a = self.m.app_args(t);
+                if a.len() == 2 {
+                    for (v, l) in [(a[0], a[1]), (a[1], a[0])] {
+                        if vars.contains(&v)
+                            && let Some(lv) = self.str_value(l)
+                        {
+                            pinned.entry(v).or_insert(lv);
+                        }
+                    }
+                }
+            }
+        }
         let mut per_var: Vec<Vec<Vec<u32>>> = Vec::new();
         for &v in &vars {
+            if let Some(lv) = pinned.get(&v) {
+                per_var.push(alloc::vec![lv.clone()]);
+                continue;
+            }
             let exact = self.str_exact_len(goal, v);
             // Try literal substrings first (a concat piece is usually one of them).
             let mut cands: Vec<Vec<u32>> = Vec::new();
