@@ -2934,6 +2934,215 @@ impl Context {
         false
     }
 
+    /// When integer bounds pin a variable to a single value (`0 < x < 2 ⇒ x = 1`)
+    /// emit the equality `x = v`. This feeds the constant-inline so a nonlinear term
+    /// over `x` folds — `(x²=4 ∨ x²=9) ∧ 0<x<2` refutes instead of a spurious sat.
+    fn determined_int_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut upper: BTreeMap<AstId, i64> = BTreeMap::new();
+        for &c in &conj {
+            let Some(op) = self.m.arith_op(c) else {
+                continue;
+            };
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            let num = |m: &AstManager, u: AstId| {
+                m.as_numeral(u)
+                    .and_then(|r| r.to_integer())
+                    .and_then(|i| i.to_i64())
+            };
+            let iv =
+                |m: &AstManager, u: AstId| m.is_uninterp_const(u) && m.is_int_sort(m.get_sort(u));
+            let (v, k, dir) = if iv(&self.m, a[0]) && num(&self.m, a[1]).is_some() {
+                (a[0], num(&self.m, a[1]).unwrap(), 1)
+            } else if iv(&self.m, a[1]) && num(&self.m, a[0]).is_some() {
+                (a[1], num(&self.m, a[0]).unwrap(), -1)
+            } else {
+                continue;
+            };
+            match (op, dir) {
+                (ArithOp::Ge, 1) | (ArithOp::Le, -1) => {
+                    let e = lower.entry(v).or_insert(k);
+                    *e = (*e).max(k);
+                }
+                (ArithOp::Gt, 1) | (ArithOp::Lt, -1) => {
+                    let e = lower.entry(v).or_insert(k + 1);
+                    *e = (*e).max(k + 1);
+                }
+                (ArithOp::Le, 1) | (ArithOp::Ge, -1) => {
+                    let e = upper.entry(v).or_insert(k);
+                    *e = (*e).min(k);
+                }
+                (ArithOp::Lt, 1) | (ArithOp::Gt, -1) => {
+                    let e = upper.entry(v).or_insert(k - 1);
+                    *e = (*e).min(k - 1);
+                }
+                _ => {}
+            }
+        }
+        let mut ax = Vec::new();
+        let pinned: Vec<(AstId, i64)> = lower
+            .iter()
+            .filter(|(v, lo)| upper.get(v) == Some(lo))
+            .map(|(&v, &lo)| (v, lo))
+            .collect();
+        for (v, lo) in pinned {
+            let kv = self.m.mk_int(lo);
+            ax.push(self.m.mk_eq(v, kv));
+        }
+        ax
+    }
+
+    /// Collect per-variable integer `[lower, upper]` bounds from the top-level
+    /// literals of `goal` (both argument orders).
+    fn collect_int_bounds(&self, goal: AstId) -> (BTreeMap<AstId, i64>, BTreeMap<AstId, i64>) {
+        use crate::ast::ArithOp;
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut upper: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut stack = alloc::vec![goal];
+        let mut conj: Vec<AstId> = Vec::new();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        for &c in &conj {
+            let Some(op) = self.m.arith_op(c) else {
+                continue;
+            };
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            let num = |u: AstId| {
+                self.m
+                    .as_numeral(u)
+                    .and_then(|r| r.to_integer())
+                    .and_then(|i| i.to_i64())
+            };
+            let iv =
+                |u: AstId| self.m.is_uninterp_const(u) && self.m.is_int_sort(self.m.get_sort(u));
+            let (v, k, dir) = if iv(a[0]) && num(a[1]).is_some() {
+                (a[0], num(a[1]).unwrap(), 1)
+            } else if iv(a[1]) && num(a[0]).is_some() {
+                (a[1], num(a[0]).unwrap(), -1)
+            } else {
+                continue;
+            };
+            match (op, dir) {
+                (ArithOp::Ge, 1) | (ArithOp::Le, -1) => {
+                    let e = lower.entry(v).or_insert(k);
+                    *e = (*e).max(k);
+                }
+                (ArithOp::Gt, 1) | (ArithOp::Lt, -1) => {
+                    let e = lower.entry(v).or_insert(k + 1);
+                    *e = (*e).max(k + 1);
+                }
+                (ArithOp::Le, 1) | (ArithOp::Ge, -1) => {
+                    let e = upper.entry(v).or_insert(k);
+                    *e = (*e).min(k);
+                }
+                (ArithOp::Lt, 1) | (ArithOp::Gt, -1) => {
+                    let e = upper.entry(v).or_insert(k - 1);
+                    *e = (*e).min(k - 1);
+                }
+                _ => {}
+            }
+        }
+        (lower, upper)
+    }
+
+    /// Decide a nonlinear goal by enumerating the (small, bounded) integer values
+    /// of every variable that appears inside a product. Returns `None` (fall
+    /// through) when there is no such product, a product variable is unbounded, or
+    /// the combination count is too large. Sound: it substitutes concrete values
+    /// and re-decides each ground instance.
+    fn bounded_nonlinear_enum(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        use crate::ast::ArithOp;
+        let mut nlvars: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
+                let (_, vars) = self.flatten_mul(t);
+                if vars.len() >= 2 {
+                    for v in vars {
+                        if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
+                            nlvars.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+        if nlvars.is_empty() {
+            return None;
+        }
+        let (lower, upper) = self.collect_int_bounds(goal);
+        let mut ranges: Vec<(AstId, i64, i64)> = Vec::new();
+        let mut combos: u64 = 1;
+        for &v in &nlvars {
+            let (&lo, &hi) = (lower.get(&v)?, upper.get(&v)?);
+            if hi < lo {
+                return Some((SmtResult::Unsat, None));
+            }
+            ranges.push((v, lo, hi));
+            combos = combos.checked_mul((hi - lo + 1) as u64)?;
+            if combos > 4096 {
+                return None;
+            }
+        }
+        // Odometer over the cartesian product of the ranges.
+        let mut idx = alloc::vec![0i64; ranges.len()];
+        let mut all_unsat = true;
+        loop {
+            let subst: Vec<(AstId, AstId)> = ranges
+                .iter()
+                .zip(&idx)
+                .map(|(&(v, lo, _), &d)| (v, self.m.mk_int(lo + d)))
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            match self.decide_inner(g) {
+                (SmtResult::Sat, m) => return Some((SmtResult::Sat, m)),
+                (SmtResult::Unknown, _) => all_unsat = false,
+                (SmtResult::Unsat, _) => {}
+            }
+            // Advance the odometer.
+            let mut carry = ranges.len();
+            while carry > 0 {
+                carry -= 1;
+                idx[carry] += 1;
+                if idx[carry] <= ranges[carry].2 - ranges[carry].1 {
+                    break;
+                }
+                idx[carry] = 0;
+                if carry == 0 {
+                    return if all_unsat {
+                        Some((SmtResult::Unsat, None))
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+    }
+
     /// Number of distinct inhabitants of a sort, if finite and small (≤ 1M).
     /// `Bool` = 2, a small `BitVec n` = 2ⁿ, and a datatype whose every field sort is
     /// itself finite = Σ over constructors of Π field cardinalities (a nullary
@@ -11838,6 +12047,7 @@ impl Context {
         axioms.extend(self.string_axioms(lifted));
         axioms.extend(self.square_axioms(lifted));
         axioms.extend(self.product_cancel_axioms(lifted));
+        axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
@@ -12754,6 +12964,14 @@ impl Context {
         // with `n > k` is UNSAT (`distinct v0…v4` over a 4-value enum).
         if self.enum_pigeonhole_unsat(goal) {
             return (SmtResult::Unsat, None);
+        }
+        // Bounded nonlinear enumeration: when every variable in a product is pinned
+        // to a small integer range, enumerate the combinations and decide each
+        // ground/linear instance — the linear model check treats a product as an
+        // opaque free term and would otherwise return a spurious sat under a
+        // disjunction (`(x²=4 ∨ x²=9) ∧ 0<x<2`, `1≤x≤3 ∧ x²∈{14,20}`).
+        if let Some(r) = self.bounded_nonlinear_enum(goal) {
+            return r;
         }
         // Regex ∩ first-character: `x ∈ r ∧ prefixof P x` (or `str.at x 0 = c`) is
         // UNSAT when no word in `L(r)` can start with the required character.
