@@ -4680,22 +4680,63 @@ impl Context {
         if per_var.iter().any(|c| c.is_empty()) {
             return None;
         }
+        // Precompute candidate *terms* for each string variable, then append any
+        // integer index variables (arguments of `str.at`/`str.substr`/
+        // `str.indexof`) with small concrete values — so `str.at x i = "a" ∧
+        // len x = 3` decides by also trying i ∈ {−1,0,1,…}.
+        let mut all_vars: Vec<AstId> = vars.clone();
+        let mut per_term: Vec<Vec<AstId>> = Vec::new();
+        for cs in &per_var {
+            let mut terms: Vec<AstId> = Vec::with_capacity(cs.len());
+            for cp in cs {
+                let s = code_points_to_string(cp);
+                let lit = self.mk_str_lit(&s);
+                terms.push(lit);
+            }
+            per_term.push(terms);
+        }
+        let mut idx_vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && matches!(
+                    self.str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str),
+                    Some("str.at") | Some("str.substr") | Some("str.indexof")
+                )
+            {
+                for &ia in &self.m.app_args(t).to_vec()[1..] {
+                    if self.m.is_uninterp_const(ia)
+                        && self.m.is_int_sort(self.m.get_sort(ia))
+                        && !all_vars.contains(&ia)
+                        && !idx_vars.contains(&ia)
+                    {
+                        idx_vars.push(ia);
+                    }
+                }
+            }
+        }
+        // Keep the combined search space bounded.
+        if all_vars.len() + idx_vars.len() <= 3 {
+            for &iv in &idx_vars {
+                all_vars.push(iv);
+                let terms: Vec<AstId> = (-1..=8i64).map(|n| self.m.mk_int(n)).collect();
+                per_term.push(terms);
+            }
+        }
         // Cartesian product of candidates over the variables, capped.
         const MAX_TRIES: usize = 3000;
-        let mut idx = alloc::vec![0usize; vars.len()];
+        let mut idx = alloc::vec![0usize; all_vars.len()];
         let mut tries = 0;
         loop {
             if tries >= MAX_TRIES {
                 return None;
             }
             tries += 1;
-            let subst: Vec<(AstId, AstId)> = vars
+            let subst: Vec<(AstId, AstId)> = all_vars
                 .iter()
                 .enumerate()
-                .map(|(k, &v)| {
-                    let s = code_points_to_string(&per_var[k][idx[k]]);
-                    (v, self.mk_str_lit(&s))
-                })
+                .map(|(k, &v)| (v, per_term[k][idx[k]]))
                 .collect();
             let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let mut memo = BTreeMap::new();
@@ -4730,11 +4771,11 @@ impl Context {
             // Advance the mixed-radix counter over candidate indices.
             let mut k = 0;
             loop {
-                if k == vars.len() {
+                if k == all_vars.len() {
                     return None; // exhausted
                 }
                 idx[k] += 1;
-                if idx[k] < per_var[k].len() {
+                if idx[k] < per_term[k].len() {
                     break;
                 }
                 idx[k] = 0;
