@@ -1265,7 +1265,22 @@ impl Regex {
                     }
                 }
             }
-            Regex::Inter(_, _) | Regex::Comp(_) => return None,
+            Regex::Inter(a, b) => {
+                // `lengths(A ∩ B) ⊆ lengths(A) ∩ lengths(B)` — a string of length k
+                // in the intersection is in both, so the set-intersection is a sound
+                // over-approximation (an unknown side is "all lengths").
+                match (a.lengths(max), b.lengths(max)) {
+                    (Some(la), Some(lb)) => {
+                        for i in 0..=max {
+                            v[i] = la[i] && lb[i];
+                        }
+                    }
+                    (Some(la), None) => v = la,
+                    (None, Some(lb)) => v = lb,
+                    (None, None) => return None,
+                }
+            }
+            Regex::Comp(_) => return None,
         }
         Some(v)
     }
