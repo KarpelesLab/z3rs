@@ -1335,6 +1335,26 @@ impl Regex {
         matches!(self, Regex::None)
     }
 
+    /// Whether the language contains no *non-empty* word (it may contain `""`).
+    /// Sound: only a definite `true`. Covers `re.inter` of two parts with disjoint
+    /// first-character sets (`(a-m)* ∩ (n-z)*` matches only `""`).
+    fn nonempty_impossible(&self) -> bool {
+        match self {
+            Regex::None => true,
+            Regex::Lit(l) => l.is_empty(),
+            Regex::Inter(a, b) => {
+                if let (Some(ra), Some(rb)) = (a.first_ranges(), b.first_ranges()) {
+                    ra.iter()
+                        .all(|&(al, ah)| rb.iter().all(|&(bl, bh)| ah < bl || bh < al))
+                } else {
+                    false
+                }
+            }
+            Regex::Star(a) => a.nonempty_impossible(),
+            _ => false,
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -3363,9 +3383,52 @@ impl Context {
                 }
             }
         }
+        // Variables `x` known to be non-empty (`len x ≥ 1`, from a positive lower
+        // bound or a pinned length ≥ 1).
+        let mut pos_len: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_app(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            let is_len = |m: &AstManager, u: AstId| {
+                m.is_app(u)
+                    && m.app_args(u).len() == 1
+                    && (self.str_len_decl == Some(m.app_decl(u))
+                        || self.seq_len_decls.contains(&m.app_decl(u)))
+            };
+            let num = |m: &AstManager, u: AstId| {
+                m.as_numeral(u)
+                    .and_then(|r| r.to_integer())
+                    .and_then(|i| i.to_i64())
+            };
+            if !is_len(&self.m, a[0]) {
+                continue;
+            }
+            let Some(k) = num(&self.m, a[1]) else {
+                continue;
+            };
+            // `len x > k` (k≥0), `len x >= k` (k≥1), or `len x = k` (k≥1).
+            let positive = match self.m.arith_op(c) {
+                Some(ArithOp::Gt) => k >= 0,
+                Some(ArithOp::Ge) => k >= 1,
+                _ => self.m.is_eq(c) && k >= 1,
+            };
+            if positive {
+                pos_len.insert(self.m.app_args(a[0])[0]);
+            }
+        }
         for (x, r) in in_re {
             // Membership in a provably-empty language (e.g. `(a-z)+ ∩ (0-9)+`).
             if r.is_empty_lang() {
+                return true;
+            }
+            // A non-empty `x` in a language with no non-empty word (e.g.
+            // `(a-m)* ∩ (n-z)*`, matching only `""`) is UNSAT.
+            if pos_len.contains(&x) && r.nonempty_impossible() {
                 return true;
             }
             if let Some(&fc) = first_char.get(&x)
