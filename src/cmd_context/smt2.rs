@@ -2572,6 +2572,41 @@ impl Context {
                 }
             }
         }
+        // Resolve a predicate against a concrete `x` fixed by `x = L` (L literal):
+        // `(x = L) ⇒ [¬]pred`. Refutes `x = "hello" ∧ ¬contains(x, "ell")`.
+        let str_eqs: Vec<(AstId, AstId, Vec<u32>)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_eq(t) {
+                    return None;
+                }
+                let a = self.m.app_args(t);
+                if a.len() != 2 {
+                    return None;
+                }
+                for (v, lit) in [(a[0], a[1]), (a[1], a[0])] {
+                    if let Some(l) = self.str_value(lit) {
+                        return Some((t, v, l));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (app, x, lit, kind) in &preds {
+            for (eq, v, l) in &str_eqs {
+                if v != x {
+                    continue;
+                }
+                let holds = match kind {
+                    0 => is_sub(lit, l),
+                    1 => lit.len() <= l.len() && l[..lit.len()] == lit[..],
+                    _ => lit.len() <= l.len() && l[l.len() - lit.len()..] == lit[..],
+                };
+                let concl = if holds { *app } else { self.m.mk_not(*app) };
+                let imp = self.m.mk_implies(*eq, concl);
+                ax.push(imp);
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
