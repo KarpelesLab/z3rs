@@ -1274,6 +1274,22 @@ impl Regex {
         }
     }
 
+    /// Sound over-approximation of "some word in the language contains code point
+    /// `c`" (anywhere). Used to refute `x ∈ r ∧ contains x "…c…"` when `c` is
+    /// outside the language's alphabet (`x ∈ (a|b)* ∧ contains x "c"`).
+    fn can_contain(&self, c: u32) -> bool {
+        match self {
+            Regex::Lit(l) => l.contains(&c),
+            Regex::Range(lo, hi) => (*lo..=*hi).contains(&c),
+            Regex::AllChar | Regex::All => true,
+            Regex::None => false,
+            Regex::Concat(a, b) | Regex::Union(a, b) => a.can_contain(c) || b.can_contain(c),
+            Regex::Inter(a, b) => a.can_contain(c) && b.can_contain(c),
+            Regex::Star(a) => a.can_contain(c),
+            Regex::Comp(_) => true,
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -2787,6 +2803,7 @@ impl Context {
         let mut in_re: Vec<(AstId, &Regex)> = Vec::new();
         let mut first_char: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut last_char: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut contains: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
         for &c in &conj {
             if !self.m.is_app(c) {
                 continue;
@@ -2814,6 +2831,11 @@ impl Context {
                         && !p.is_empty()
                     {
                         last_char.entry(a[1]).or_insert(p[p.len() - 1]);
+                    }
+                }
+                Some("str.contains") if a.len() == 2 => {
+                    if let Some(p) = self.str_value(a[1]) {
+                        contains.entry(a[0]).or_default().extend(p);
                     }
                 }
                 _ => {}
@@ -2845,6 +2867,11 @@ impl Context {
             }
             if let Some(&lc) = last_char.get(&x)
                 && !r.can_end_with(lc)
+            {
+                return true;
+            }
+            if let Some(cs) = contains.get(&x)
+                && cs.iter().any(|&ch| !r.can_contain(ch))
             {
                 return true;
             }
