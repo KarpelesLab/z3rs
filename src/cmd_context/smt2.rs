@@ -9941,13 +9941,23 @@ impl Context {
         }
         let (instances, saturated) = self.universal_instances();
         let base = self.conjunction();
-        let combined = if instances.is_empty() {
+        let mut combined = if instances.is_empty() {
             base
         } else {
             let mut conj = alloc::vec![base];
             conj.extend(instances);
             self.m.mk_and(&conj)
         };
+        // Function congruence for div/mod, added BEFORE lifting replaces the mod
+        // terms by fresh remainders (which lose EUF congruence): equal dividends
+        // (same divisor) ⇒ equal div/mod. Refutes `x = y ∧ mod x 5 = 2 ∧
+        // mod y 5 ≠ 2`.
+        let cong = self.divmod_congruence_axioms(combined);
+        if !cong.is_empty() {
+            let mut c = cong;
+            c.push(combined);
+            combined = self.m.mk_and(&c);
+        }
         let lifted = self.lift(combined);
         // Fold ground selector/tester chains before the datatype axioms are built,
         // so the eager eta/selector instantiation doesn't unfold over an unreduced
@@ -12687,6 +12697,43 @@ impl Context {
     /// `a = n·(a div n) + (a mod n)` and `0 ≤ (a mod n) < |n|`. This ties the
     /// otherwise-opaque `div`/`mod` variables to `a`, so e.g. `x mod 2 = 0 ∧
     /// (x+1) mod 2 = 0` is refuted.
+    /// EUF congruence for div/mod, generated on the PRE-lift goal (lifting later
+    /// replaces `mod(a,n)` by a fresh remainder, losing it): for two div/mod terms
+    /// of the same op and divisor, `dividend1 = dividend2 ⇒ term1 = term2`.
+    fn divmod_congruence_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut terms: Vec<(AstId, AstId, AstId, bool)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            match self.m.arith_op(t) {
+                Some(ArithOp::Mod) => {
+                    let a = self.m.app_args(t);
+                    terms.push((t, a[0], a[1], true));
+                }
+                Some(ArithOp::Idiv) => {
+                    let a = self.m.app_args(t);
+                    terms.push((t, a[0], a[1], false));
+                }
+                _ => {}
+            }
+        }
+        let mut ax = Vec::new();
+        if terms.len() <= 16 {
+            for i in 0..terms.len() {
+                for j in i + 1..terms.len() {
+                    let (t1, a1, n1, m1) = terms[i];
+                    let (t2, a2, n2, m2) = terms[j];
+                    if n1 != n2 || m1 != m2 || a1 == a2 || t1 == t2 {
+                        continue;
+                    }
+                    let deq = self.m.mk_eq(a1, a2);
+                    let req = self.m.mk_eq(t1, t2);
+                    ax.push(self.m.mk_implies(deq, req));
+                }
+            }
+        }
+        ax
+    }
+
     fn divmod_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         // Distinct (dividend, divisor) pairs of `div`/`mod` applications.
         let mut pairs: Vec<(AstId, AstId)> = Vec::new();
