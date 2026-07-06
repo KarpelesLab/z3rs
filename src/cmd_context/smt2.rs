@@ -2521,36 +2521,53 @@ impl Context {
             let imp = self.m.mk_implies(app, ge);
             ax.push(imp);
         }
-        // Substring monotonicity: `contains(x, s) ⇒ contains(x, t)` when literal
-        // `t` is a (contiguous) substring of literal `s` on the same `x`. Refutes
-        // `contains(x, "ab") ∧ ¬contains(x, "b")`.
-        let contains: Vec<(AstId, AstId, Vec<u32>)> = present
+        // Substring/prefix/suffix monotonicity. Each `contains(x,s)`,
+        // `prefixof(s,x)`, `suffixof(s,x)` (literal `s`) implies `x ⊇ s`, hence
+        // `contains(x,t)` for every substring `t ⊑ s`; a prefix `s` also implies
+        // `prefixof(t,x)` for prefixes `t` of `s`, symmetrically for suffixes.
+        // Refutes e.g. `prefixof("ab",x) ∧ ¬contains(x,"a")`. Kind 0=contains,
+        // 1=prefix, 2=suffix.
+        let preds: Vec<(AstId, AstId, Vec<u32>, u8)> = present
             .iter()
             .filter_map(|&t| {
-                if self.m.is_app(t)
-                    && self
-                        .str_op_decls
-                        .get(&self.m.app_decl(t))
-                        .map(String::as_str)
-                        == Some("str.contains")
-                {
-                    let args = self.m.app_args(t);
-                    if args.len() == 2
-                        && let Some(sub) = self.str_value(args[1])
-                    {
-                        return Some((t, args[0], sub));
-                    }
+                if !self.m.is_app(t) {
+                    return None;
                 }
-                None
+                let kind = match self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                {
+                    Some("str.contains") => 0u8,
+                    Some("str.prefixof") => 1,
+                    Some("str.suffixof") => 2,
+                    _ => return None,
+                };
+                let args = self.m.app_args(t);
+                if args.len() != 2 {
+                    return None;
+                }
+                let (x, lit_arg) = if kind == 0 {
+                    (args[0], args[1])
+                } else {
+                    (args[1], args[0])
+                };
+                self.str_value(lit_arg).map(|lit| (t, x, lit, kind))
             })
             .collect();
-        for (ai, xi, si) in &contains {
-            for (aj, xj, sj) in &contains {
-                if ai != aj
-                    && xi == xj
-                    && (sj.is_empty() || si.windows(sj.len().max(1)).any(|w| w == sj.as_slice()))
-                {
-                    let imp = self.m.mk_implies(*ai, *aj); // contains(x,si) ⇒ contains(x,sj)
+        let is_sub = |t: &[u32], s: &[u32]| t.is_empty() || s.windows(t.len()).any(|w| w == t);
+        for (ai, xi, si, ki) in &preds {
+            for (aj, xj, sj, kj) in &preds {
+                if ai == aj || xi != xj {
+                    continue;
+                }
+                let implies = match kj {
+                    0 => is_sub(sj, si),
+                    1 => *ki == 1 && sj.len() <= si.len() && si[..sj.len()] == sj[..],
+                    _ => *ki == 2 && sj.len() <= si.len() && si[si.len() - sj.len()..] == sj[..],
+                };
+                if implies {
+                    let imp = self.m.mk_implies(*ai, *aj);
                     ax.push(imp);
                 }
             }
