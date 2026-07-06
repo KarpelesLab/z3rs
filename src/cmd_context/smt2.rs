@@ -14082,8 +14082,18 @@ impl Context {
                 continue;
             };
             for &i in &indices {
-                let selects: Vec<AstId> =
-                    arrays.iter().map(|&ar| self.m.mk_select(ar, i)).collect();
+                // A const-array source reads its value at any index; resolve it so
+                // `f` sees the constant (`(_ map +) (const 1) (const 2)` → +(1,2)).
+                let selects: Vec<AstId> = arrays
+                    .iter()
+                    .map(|&ar| {
+                        if self.m.is_const_array(ar) {
+                            self.m.app_args(ar)[0]
+                        } else {
+                            self.m.mk_select(ar, i)
+                        }
+                    })
+                    .collect();
                 if let Ok(lhs) = self.apply(&fname, selects) {
                     let rhs = self.m.mk_select(*b, i);
                     let eq = self.m.mk_eq(lhs, rhs);
@@ -14530,6 +14540,15 @@ impl Context {
         } else {
             let mut memo = BTreeMap::new();
             self.blast_fp_equalities(goal, &mut memo)
+        };
+        // Expand `(_ map f) a… = b` bindings eagerly — check_model treats the
+        // map-bound array as a free term and would return a spurious sat before the
+        // (Unknown-gated) fallback runs. `a = (map +) (const 1) (const 2) ∧
+        // a[0] ≠ 3` must be unsat.
+        let goal = if self.maps.is_empty() {
+            goal
+        } else {
+            self.inline_map_bindings(goal)
         };
         // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
