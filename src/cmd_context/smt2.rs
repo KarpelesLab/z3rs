@@ -1075,6 +1075,8 @@ struct Context {
     sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
     /// Floating-point sorts `(_ FloatingPoint eb sb)`, keyed by `(eb, sb)`.
     fp_sorts: BTreeMap<(u32, u32), AstId>,
+    /// Opaque to_fp conversion markers -> (rm, x, eb, sb).
+    fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
     /// The `RoundingMode` sort, once used.
     rm_sort: Option<AstId>,
     /// Floating-point constants: term → `(raw bits, eb, sb)`. Only `Float64`
@@ -1344,6 +1346,7 @@ impl Context {
             regex_of: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
+            fp_conv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
@@ -2377,6 +2380,109 @@ impl Context {
     /// constructors), pairwise tester exclusivity, and each tester's definition
     /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
     /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    /// Rewrite every floating-point equality `a = b` to its bit-vector form
+    /// `fp_to_bv(a) = fp_to_bv(b)` (reusing each operand's cached bit-vector), so a
+    /// now-constant conversion connects to already-blasted classification predicates.
+    fn blast_fp_equalities(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let args: Vec<AstId> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.blast_fp_equalities(a, memo))
+                .collect();
+            if self.m.is_eq(t)
+                && args.len() == 2
+                && self.fp_format_of(self.m.get_sort(args[0])).is_some()
+            {
+                if let (Some(ba), Some(bb)) = (self.fp_to_bv(args[0]), self.fp_to_bv(args[1])) {
+                    self.m.mk_eq(ba, bb)
+                } else {
+                    self.m.mk_app(decl, &args)
+                }
+            } else {
+                self.m.mk_app(decl, &args)
+            }
+        } else {
+            t
+        };
+        memo.insert(t, out);
+        out
+    }
+
+    fn fold_fp_conversions(&mut self, goal: AstId) -> Option<AstId> {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for &c in &conj {
+            if self.m.is_eq(c) {
+                let a = self.m.app_args(c);
+                if a.len() == 2 {
+                    for (v, k) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v) && self.m.as_numeral(k).is_some() {
+                            subst.push((v, k));
+                        }
+                    }
+                }
+            }
+        }
+        if subst.is_empty() {
+            return None;
+        }
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let convs: Vec<(AstId, AstId, AstId, u32, u32)> = self
+            .fp_conv
+            .iter()
+            .filter(|(t, _)| present.contains(t))
+            .map(|(&t, &(rm, x, eb, sb))| (t, rm, x, eb, sb))
+            .collect();
+        let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
+        for (t, rm, x, eb, sb) in &convs {
+            let xs = crate::rewriter::substitute(&mut self.m, *x, &subst);
+            let xs = crate::rewriter::simplify(&mut self.m, xs);
+            let val = self.m.as_numeral(xs).or_else(|| {
+                if self.m.is_app(xs)
+                    && self.m.app_args(xs).len() == 1
+                    && self.decl_name(self.m.app_decl(xs)).as_deref() == Some("to_real")
+                {
+                    self.m.as_numeral(self.m.app_args(xs)[0])
+                } else {
+                    None
+                }
+            });
+            if let (Some(rmc), Some(r)) = (self.rm_code(*rm), val)
+                && let Some(bits) = Self::real_to_fp_bits(&r, *eb, *sb, rmc)
+            {
+                let fv = self.mk_fp(bits, *eb, *sb);
+                fold_subst.push((*t, fv));
+            }
+        }
+        if fold_subst.is_empty() {
+            return None;
+        }
+        // Eliminate the pinned constant variables from the goal (so no leftover
+        // integer binding makes it a mixed query) and fold the conversion markers.
+        subst.extend(fold_subst);
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        let g = self.blast_fp_equalities(g, &mut memo);
+        Some(crate::rewriter::simplify(&mut self.m, g))
+    }
+
     /// Witness for pairwise-distinct integers with lower bounds: assign each the
     /// smallest distinct value `≥` its bound and confirm with `check_model` (so any
     /// sum/other constraints are verified). Decides e.g. `distinct a…e ∧ Σ ≤ 10 ∧
@@ -10235,6 +10341,17 @@ impl Context {
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let (res, model) = self.decide_inner(goal);
+        // Fallback: re-fold `to_fp(to_real n)` conversions once `n` is pinned by a
+        // `v = k` binding, re-blasting the FP equality so it reduces to a pure query.
+        if res == SmtResult::Unknown
+            && !self.fp_conv.is_empty()
+            && let Some(g) = self.fold_fp_conversions(goal)
+        {
+            let (r2, m2) = self.decide_inner(g);
+            if r2 != SmtResult::Unknown {
+                return (r2, m2);
+            }
+        }
         // Fallback: a distinct-integers-with-bounds witness (min distinct assignment).
         if res == SmtResult::Unknown
             && let Some(m) = self.try_distinct_witness(goal)
@@ -11555,6 +11672,10 @@ impl Context {
                         let s = self.fp_sort(eb, sb);
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
+                        if has_rm {
+                            let rm = self.term(&l[1])?;
+                            self.fp_conv.insert(t, (rm, x, eb, sb));
+                        }
                         return Ok(t);
                     }
                     // Pseudo-boolean cardinality ((_ at-least k) / (_ at-most k)):
