@@ -13103,6 +13103,16 @@ impl Context {
                 }
             }
         }
+        // Fallback: split `x1·…·xn = <literal>` at pinned part lengths (strings).
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_str_concat_split(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         // Fallback: inline `v = <string literal>` so predicates over a
         // literal-bound variable resolve (`prefixof x y ∧ y = "abcd"`).
         if res == SmtResult::Unknown {
@@ -13440,6 +13450,93 @@ impl Context {
                 if self.m.is_uninterp_const(p) && !bound.contains(&p) {
                     let (lo, hi) = ranges[i];
                     let pv = self.mk_seq(cv[lo..hi].to_vec());
+                    subst.push((p, pv));
+                    bound.insert(p);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        self.refold_str_markers(g, &mut memo)
+    }
+
+    /// String analog of `inline_seq_concat_split`: `x1·…·xn = L` (L a literal) with
+    /// every part but the last having a pinned `str.len` fixes each part to its
+    /// slice of L. Refutes `x·y·z = "abc" ∧ len x = 1 ∧ len y = 1 ∧ z ≠ "c"`.
+    fn inline_str_concat_split(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let concats: Vec<(AstId, Vec<AstId>)> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.++")
+                    && self.m.app_args(t).len() >= 2
+            })
+            .map(|t| (t, self.m.app_args(t).to_vec()))
+            .collect();
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for (app, parts) in concats {
+            let mut cval: Option<Vec<u32>> = None;
+            for &c in &conj {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                        if l == app
+                            && let Some(cv) = self.str_value(r)
+                        {
+                            cval = Some(cv);
+                        }
+                    }
+                }
+            }
+            let Some(cv) = cval else {
+                continue;
+            };
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            let mut offset = 0usize;
+            let mut ok = true;
+            for (i, &p) in parts.iter().enumerate() {
+                if i + 1 == parts.len() {
+                    ranges.push((offset, cv.len()));
+                } else if let Some(k) = self.str_exact_len(goal, p) {
+                    if offset + k > cv.len() {
+                        ok = false;
+                        break;
+                    }
+                    ranges.push((offset, offset + k));
+                    offset += k;
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok {
+                continue;
+            }
+            for (i, &p) in parts.iter().enumerate() {
+                if self.m.is_uninterp_const(p) && !bound.contains(&p) {
+                    let (lo, hi) = ranges[i];
+                    let pv = self.mk_str_lit(&code_points_to_string(&cv[lo..hi]));
                     subst.push((p, pv));
                     bound.insert(p);
                 }
