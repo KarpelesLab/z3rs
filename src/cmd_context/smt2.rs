@@ -14558,6 +14558,27 @@ impl Context {
         } else {
             self.inline_map_bindings(goal)
         };
+        // Eager UNSAT check for variable-bound ground datatype selector chains:
+        // inline `v = <ground ctor>` to a fixpoint and fold the selector towers, then
+        // take only a resulting UNSAT (inlining removes `v`, so a sat model is left to
+        // the primary path). Cheaply refutes `t = node(leaf, node(leaf,leaf)) ∧
+        // l(r t) ≠ leaf` that otherwise churns the depth axioms for seconds.
+        if !self.datatypes.is_empty() {
+            let mut inlined = goal;
+            for _ in 0..8 {
+                let next = self.inline_ground_dt_bindings(inlined);
+                if next == inlined {
+                    break;
+                }
+                inlined = next;
+            }
+            if inlined != goal {
+                let folded = self.dt_fold(inlined);
+                if check_model(&self.m, folded).0 == SmtResult::Unsat {
+                    return (SmtResult::Unsat, None);
+                }
+            }
+        }
         // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
