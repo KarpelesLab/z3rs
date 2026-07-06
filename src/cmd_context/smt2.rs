@@ -8231,8 +8231,55 @@ impl Context {
         // uninterpreted, array, or arithmetic terms is not combined yet, so return
         // a sound `unknown` rather than a possibly-wrong verdict.
         if self.is_bv_goal(goal) {
-            if self.bv_goal_is_pure(goal) {
-                let (res, bv) = check_bv_model(&self.m, goal);
+            // A free array read `(select m i)` of bit-vector sort (m a free array
+            // constant read once, otherwise unconstrained) is an unconstrained
+            // bit-vector — replace it by a fresh bit-vector constant so an
+            // otherwise-pure goal like `select m i = i+1 ∧ select m i = 0`
+            // bit-blasts. Sound: a free array can realise any read value.
+            let mut g = goal;
+            if !self.bv_goal_is_pure(goal) {
+                let groups = self.free_array_read_groups(goal);
+                let mut subst: Vec<(AstId, AstId)> = Vec::new();
+                let mut axioms: Vec<AstId> = Vec::new();
+                for terms in groups {
+                    // Multi-read groups need read-over-read congruence, which is
+                    // only expressible in pure bit-vectors when the indices are
+                    // themselves bit-vectors; otherwise skip the group.
+                    let bv_idx = terms.iter().all(|&t| {
+                        self.m
+                            .bv_sort_width(self.m.get_sort(self.m.app_args(t)[1]))
+                            .is_some()
+                    });
+                    if terms.len() > 1 && !bv_idx {
+                        continue;
+                    }
+                    let fresh: Vec<AstId> = terms
+                        .iter()
+                        .map(|&r| self.fresh_const(self.m.get_sort(r)))
+                        .collect();
+                    for (a, b) in
+                        (0..terms.len()).flat_map(|i| (i + 1..terms.len()).map(move |j| (i, j)))
+                    {
+                        let idx_eq = self
+                            .m
+                            .mk_eq(self.m.app_args(terms[a])[1], self.m.app_args(terms[b])[1]);
+                        let val_eq = self.m.mk_eq(fresh[a], fresh[b]);
+                        axioms.push(self.m.mk_implies(idx_eq, val_eq));
+                    }
+                    for (r, f) in terms.iter().zip(fresh.iter()) {
+                        subst.push((*r, *f));
+                    }
+                }
+                if !subst.is_empty() {
+                    g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+                    if !axioms.is_empty() {
+                        axioms.push(g);
+                        g = self.m.mk_and(&axioms);
+                    }
+                }
+            }
+            if self.bv_goal_is_pure(g) {
+                let (res, bv) = check_bv_model(&self.m, g);
                 return (res, bv.map(Model::from_bv));
             }
             return (SmtResult::Unknown, None);
@@ -8376,7 +8423,7 @@ impl Context {
     /// appears except as a select's array argument (so it is not a store target,
     /// not equated to another array — the read is genuinely unconstrained). Sound
     /// for both directions: a free array can realise any value at the read.
-    fn nonlinear_free_reads(&self, goal: AstId) -> BTreeSet<AstId> {
+    fn free_array_reads(&self, goal: AstId) -> BTreeSet<AstId> {
         let mut reads: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
         let mut tainted: BTreeSet<AstId> = BTreeSet::new();
         for t in self.m.postorder(goal) {
@@ -8399,6 +8446,36 @@ impl Context {
             }
         }
         out
+    }
+
+    /// Groups of `(select a i)` reads by their free, untainted array `a` (a free
+    /// constant used only as a select argument). Unlike [`Self::free_array_reads`]
+    /// this keeps *all* reads of an array together, so a caller can add the
+    /// read-over-read congruence `(i = j) → (read_i = read_j)` when replacing them
+    /// by fresh variables.
+    fn free_array_read_groups(&self, goal: AstId) -> Vec<Vec<AstId>> {
+        let mut reads: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        let mut tainted: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_select(t) {
+                let bucket = reads.entry(self.m.app_args(t)[0]).or_default();
+                if !bucket.contains(&t) {
+                    bucket.push(t);
+                }
+            }
+            for &a in self.m.app_args(t) {
+                if self.m.is_array_sort(self.m.get_sort(a))
+                    && !(self.m.is_select(t) && self.m.app_args(t)[0] == a)
+                {
+                    tainted.insert(a);
+                }
+            }
+        }
+        reads
+            .into_iter()
+            .filter(|(arr, _)| self.m.is_uninterp_const(*arr) && !tainted.contains(arr))
+            .map(|(_, terms)| terms)
+            .collect()
     }
 
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
@@ -8424,7 +8501,7 @@ impl Context {
         // uninterpreted constant, or a *free read* `(select a i)` whose array is a
         // free constant read exactly once (so the read is unconstrained — sound to
         // treat as an independent variable in both directions).
-        let free_reads = self.nonlinear_free_reads(goal);
+        let free_reads = self.free_array_reads(goal);
         let mut int_of: BTreeMap<u32, bool> = BTreeMap::new();
         for (&ast, &idx) in &var_map {
             if !self.m.is_uninterp_const(ast) && !free_reads.contains(&ast) {
