@@ -11171,16 +11171,22 @@ impl Context {
                 continue;
             };
             let shared = va[pos];
-            let ra: Vec<AstId> = va.iter().copied().filter(|&v| v != shared).collect();
-            let mut rb: Vec<AstId> = Vec::new();
-            let mut removed = false;
-            for &v in &vb {
-                if v == shared && !removed {
-                    removed = true;
-                } else {
-                    rb.push(v);
+            // Remove exactly ONE occurrence of the shared factor from each side —
+            // for `x·x = 4·x` the residual is `x = 4`, not `1 = 4`.
+            let drop_one = |vars: &[AstId]| -> Vec<AstId> {
+                let mut out = Vec::new();
+                let mut removed = false;
+                for &v in vars {
+                    if v == shared && !removed {
+                        removed = true;
+                    } else {
+                        out.push(v);
+                    }
                 }
-            }
+                out
+            };
+            let ra = drop_one(&va);
+            let rb = drop_one(&vb);
             let build = |m: &mut AstManager, coeff: &Rational, vars: &[AstId]| -> AstId {
                 let mut factors: Vec<AstId> = Vec::new();
                 if *coeff != Rational::from_integer(Int::from(1)) || vars.is_empty() {
