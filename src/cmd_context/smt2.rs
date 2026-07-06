@@ -3155,6 +3155,14 @@ impl Context {
                     self.m.mk_app(dp, &[p])
                 })
                 .collect();
+            // Each part length is non-negative — introduced here (not in the
+            // original goal), so `s ++ u = empty ∧ len s = 2` refutes via
+            // `len s + len u = 0 ∧ len u ≥ 0`.
+            let zero = self.m.mk_int(0);
+            for &pl in &part_lens {
+                let ge = self.m.mk_ge(pl, zero);
+                ax.push(ge);
+            }
             let sum = if part_lens.len() == 1 {
                 part_lens[0]
             } else {
