@@ -3130,8 +3130,24 @@ impl Context {
         if vars.is_empty() || vars.len() > 2 {
             return None;
         }
-        // Integer element candidates, and element-lists up to a small length.
-        let elems: [i64; 3] = [0, 1, 2];
+        // Integer element candidates: 0,1,2 plus any small integer literal in the
+        // goal (so `nth s 0 = 7` can place the `7`).
+        let mut elems: Vec<i64> = alloc::vec![0, 1, 2];
+        for t in self.m.postorder(goal) {
+            if let Some(v) = self
+                .m
+                .as_numeral(t)
+                .and_then(|r| r.to_integer())
+                .and_then(|i| i.to_i64())
+                && (-100..=100).contains(&v)
+                && !elems.contains(&v)
+            {
+                elems.push(v);
+            }
+            if elems.len() >= 8 {
+                break;
+            }
+        }
         let max_len = if vars.len() == 1 { 4 } else { 2 };
         let mut cands: Vec<Vec<i64>> = alloc::vec![Vec::new()];
         let mut frontier: Vec<Vec<i64>> = alloc::vec![Vec::new()];
