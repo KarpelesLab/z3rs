@@ -657,26 +657,51 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
             if let Some(a) = omega_dark_witness(&cons, &kept_diseqs, &int_vars, &mut dark_budget) {
                 return Feas::Sat(finish(a));
             }
-            // Disequality case-split for the hard unbounded cases: `e ≠ 0` is
-            // `e ≤ −1 ∨ e ≥ 1`; feed each strict half to the dark-shadow witness
-            // (which respects an added inequality, unlike its post-hoc diseq
-            // verification). Handles e.g. `x+y ≥ 0 ∧ 2x ≤ 0 ∧ x ≠ y`.
-            if let Some((d, rest)) = kept_diseqs.split_first() {
-                let one_c = LinExpr::constant(Rational::from_integer(Int::from(1)));
-                let lo = Constraint::le(d.add(&one_c)); // e + 1 ≤ 0  ⟺  e ≤ −1
-                let hi = Constraint::le(d.neg().add(&one_c)); // 1 − e ≤ 0  ⟺  e ≥ 1
-                for extra in [lo, hi] {
-                    let mut c2 = cons.clone();
-                    c2.push(extra);
-                    let mut b2: u64 = 60_000;
-                    if let Some(a) = omega_dark_witness(&c2, rest, &int_vars, &mut b2) {
-                        return Feas::Sat(finish(a));
-                    }
-                }
+            // Disequality case-split for the hard unbounded cases: each `e ≠ 0`
+            // is `e ≤ −1 ∨ e ≥ 1`. Recursively split *every* disequality into a
+            // strict inequality (so `distinct x y z` — three disequalities — is
+            // handled, not just one), then run the dark-shadow witness on the
+            // resulting inequality-only system.
+            if (1..=5).contains(&kept_diseqs.len())
+                && let Some(a) = diseq_split_witness(&cons, &kept_diseqs, &int_vars)
+            {
+                return Feas::Sat(finish(a));
             }
         }
     }
     feas
+}
+
+/// Recursively case-split every disequality `e ≠ 0` into `e ≤ −1 ∨ e ≥ 1`,
+/// adding the chosen strict half to the constraints, and try the dark-shadow
+/// witness on the resulting inequality-only system. A returned assignment
+/// satisfies the original disequalities (each branch implies them), so it is a
+/// sound `sat` witness. Bounded by the ≤ 5 disequalities gated at the call site
+/// (≤ 32 leaves).
+fn diseq_split_witness(
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+) -> Option<Assignment> {
+    match diseqs.split_first() {
+        None => {
+            let mut budget: u64 = 60_000;
+            omega_dark_witness(cons, &[], int_vars, &mut budget)
+        }
+        Some((d, rest)) => {
+            let one_c = LinExpr::constant(Rational::from_integer(Int::from(1)));
+            let lo = Constraint::le(d.add(&one_c)); // e + 1 ≤ 0  ⟺  e ≤ −1
+            let hi = Constraint::le(d.neg().add(&one_c)); // 1 − e ≤ 0  ⟺  e ≥ 1
+            for extra in [lo, hi] {
+                let mut c2 = cons.to_vec();
+                c2.push(extra);
+                if let Some(a) = diseq_split_witness(&c2, rest, int_vars) {
+                    return Some(a);
+                }
+            }
+            None
+        }
+    }
 }
 
 /// Omega-test **dark shadow** witness for a pure-integer system: try to prove
