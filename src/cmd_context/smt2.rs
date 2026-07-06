@@ -7856,28 +7856,44 @@ impl Context {
         let con = self.icp_atom(phi, false, &mut var_map)?;
         let yi = *var_map.get(&y)?;
         let poly = &con.poly;
-        // `y` must occur only as `y²` with a nonzero constant leading coefficient.
-        if poly.degree_of(yi) != 2 || !poly.coeff_of_var(yi, 1).is_zero() {
+        // `y` must occur to degree exactly 2 with a nonzero constant leading
+        // coefficient (a genuine quadratic in `y`).
+        if poly.degree_of(yi) != 2 {
             return None;
         }
-        let c = poly.coeff_of_var(yi, 2).as_constant()?;
-        if c.is_zero() {
+        let a = poly.coeff_of_var(yi, 2).as_constant()?;
+        if a.is_zero() {
             return None;
         }
+        let bpoly = poly.coeff_of_var(yi, 1); // linear-in-`y` coefficient, over xs
         let q = poly.coeff_of_var(yi, 0); // the `y`-free part Q(xs)
-        // `∃y. c·y² + Q ⋈ 0` as a condition on `Q` (with `c·y²` ranging over
-        // `[0,∞)` when `c>0`, `(−∞,0]` when `c<0`):
-        //   `=`  : solvable iff `−Q/c ≥ 0`  → `c>0 ⇒ Q ≤ 0`, `c<0 ⇒ Q ≥ 0`
-        //   `≤`  : same threshold as `=` for `c>0` / `c<0`
-        //   `≥`  : `c>0` always solvable (large `y`); `c<0 ⇒ Q ≥ 0`
+        let nvars = var_map.len();
+        // Equation `a·y² + b·y + Q = 0` has a real `y` iff the discriminant
+        // `b² − 4aQ ≥ 0`; the residual universal `∀xs. disc ≥ 0` refutes iff
+        // `∃xs. disc < 0`.
+        if con.rel == crate::nlsat::Rel::Eq {
+            let four_a = a.mul(&Rational::from_integer(Int::from(4)));
+            let disc = bpoly.mul(&bpoly).sub(&q.scale(&four_a));
+            let sat = cad_sat(&[(disc, NRel::Lt)], nvars)?;
+            return Some(!sat);
+        }
+        // Inequalities: only the pure-`y²` case (no linear term), where `c·y²`
+        // ranges over `[0,∞)` (`c>0`) or `(−∞,0]` (`c<0`).
+        if !bpoly.is_zero() {
+            return None;
+        }
+        let c = a;
+        // `∃y. c·y² + Q ⋈ 0` as a condition on `Q`:
+        //   `≤`  : solvable iff `c>0 ⇒ Q ≤ 0`, `c<0` always
+        //   `≥`  : `c>0` always; `c<0 ⇒ Q ≥ 0`
         // The universal `∀xs. cond` holds iff its negation is UNSAT over `xs`.
         let cpos = c.signum() > 0;
         // `neg_cond`: the `(poly, rel)` whose satisfiability refutes the universal.
         let neg_cond = match (con.rel, cpos) {
             // Q ≤ 0 required → refute with Q > 0.
-            (NRel::Eq | NRel::Le, true) => (q, NRel::Gt),
+            (NRel::Le, true) => (q, NRel::Gt),
             // Q ≥ 0 required → refute with Q < 0.
-            (NRel::Eq | NRel::Ge, false) => (q, NRel::Lt),
+            (NRel::Ge, false) => (q, NRel::Lt),
             // Q < 0 required (strict, `c·y²` reaches its min 0 at y=0) → refute Q ≥ 0.
             (NRel::Lt, true) => (q, NRel::Ge),
             // Q > 0 required (`c·y²` reaches its max 0 at y=0) → refute Q ≤ 0.
