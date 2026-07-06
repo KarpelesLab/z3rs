@@ -9121,11 +9121,11 @@ impl Context {
             }
             return (SmtResult::Unknown, None);
         }
-        // Arrays indexed by Bool need boolean-value reasoning on the indices
-        // (Bool is 2-valued, true ≠ false) that the array axioms do not yet do;
-        // return a sound `unknown` rather than a possibly-wrong verdict.
+        // Arrays indexed by a *symbolic* Bool need the index's 2-valuedness: decide
+        // by case-splitting the Bool index variables (`true`/`false`), which makes
+        // every index constant and reduces to plain congruence reads.
         if self.has_bool_indexed_array(goal) {
-            return (SmtResult::Unknown, None);
+            return self.decide_bool_array(goal);
         }
         let (res, model) = check_model(&self.m, goal);
         // SAT witness for symbolic-divisor div/mod goals: a small concrete divisor
@@ -9551,6 +9551,66 @@ impl Context {
 
     /// Does `goal` contain a `select`/`store` over an array whose index sort is
     /// `Bool`? (An unsupported corner needing boolean-value index reasoning.)
+    /// Decide a goal with symbolic-Bool-indexed arrays by exhaustively splitting
+    /// the Bool index variables into `true`/`false`: each branch has only constant
+    /// indices (plain congruence). `sat` on any branch is `sat`; all `unsat` is
+    /// `unsat`; any undecided branch keeps a sound `unknown`.
+    fn decide_bool_array(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        let mut bvars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if (self.m.is_select(t) || self.m.is_store(t))
+                && self
+                    .m
+                    .array_sort_params(self.m.get_sort(self.m.app_args(t)[0]))
+                    .is_some_and(|(i, _)| self.m.is_bool_sort(i))
+            {
+                let idx = self.m.app_args(t)[1];
+                for u in self.m.postorder(idx) {
+                    if self.m.is_app(u)
+                        && self.m.app_args(u).is_empty()
+                        && self.m.is_bool_sort(self.m.get_sort(u))
+                        && !self.m.is_true(u)
+                        && !self.m.is_false(u)
+                        && !bvars.contains(&u)
+                    {
+                        bvars.push(u);
+                    }
+                }
+            }
+        }
+        if bvars.is_empty() || bvars.len() > 4 {
+            return (SmtResult::Unknown, None);
+        }
+        let n = bvars.len();
+        let mut any_unknown = false;
+        for mask in 0..(1u32 << n) {
+            let subst: Vec<(AstId, AstId)> = bvars
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| {
+                    let b = if (mask >> i) & 1 == 1 {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    };
+                    (v, b)
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            match self.decide(g) {
+                (SmtResult::Sat, m) => return (SmtResult::Sat, m),
+                (SmtResult::Unknown, _) => any_unknown = true,
+                (SmtResult::Unsat, _) => {}
+            }
+        }
+        if any_unknown {
+            (SmtResult::Unknown, None)
+        } else {
+            (SmtResult::Unsat, None)
+        }
+    }
+
     fn has_bool_indexed_array(&self, goal: AstId) -> bool {
         self.m.postorder(goal).iter().any(|&t| {
             (self.m.is_select(t) || self.m.is_store(t))
