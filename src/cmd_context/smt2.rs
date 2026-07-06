@@ -11287,6 +11287,17 @@ impl Context {
                 }
             }
         }
+        // Fallback: `store a i c = store b i c` — try the model `a = b` (only a
+        // resulting *sat* is taken: it exhibits a real satisfying assignment).
+        if res == SmtResult::Unknown {
+            let witnessed = self.store_eq_witness(goal);
+            if witnessed != goal {
+                let (r2, m2) = self.decide_inner(witnessed);
+                if r2 == SmtResult::Sat {
+                    return (r2, m2);
+                }
+            }
+        }
         // Fallback: inline `s = <concrete sequence>` and re-fold seq markers, so
         // `s = unit 1 ++ unit 2 ∧ nth s 1 = 9` refutes.
         if res == SmtResult::Unknown {
@@ -11733,6 +11744,55 @@ impl Context {
 
     /// Inline `a = (as const …) v` bindings by substituting the const-array term,
     /// so `select a i` folds to `v`.
+    /// Witness for `store a i c = store b i c`: the two base arrays may be equal
+    /// (they already agree everywhere but `i`, and both write `c` there), so
+    /// substituting `a := b` gives a concrete candidate. Returns the substituted
+    /// goal, whose *sat* implies the original's sat (a valid model exists); an
+    /// unsat/unknown residual is inconclusive and the caller ignores it.
+    fn store_eq_witness(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 || !self.m.is_store(a[0]) || !self.m.is_store(a[1]) {
+                continue;
+            }
+            let (sa, sb) = (
+                self.m.app_args(a[0]).to_vec(),
+                self.m.app_args(a[1]).to_vec(),
+            );
+            // Same index and same stored value: only the base arrays may differ.
+            if sa.len() == 3 && sb.len() == 3 && sa[1] == sb[1] && sa[2] == sb[2] {
+                for (u, v) in [(sa[0], sb[0]), (sb[0], sa[0])] {
+                    if self.m.is_uninterp_const(u) && u != v && !bound.contains(&u) {
+                        subst.push((u, v));
+                        bound.insert(u);
+                        break;
+                    }
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
+    }
+
     fn inline_const_array_bindings(&mut self, goal: AstId) -> AstId {
         let mut conj: Vec<AstId> = Vec::new();
         let mut stack = alloc::vec![goal];
