@@ -3087,6 +3087,10 @@ impl Context {
         let present: Vec<AstId> = self.m.postorder(goal);
         let present_set: BTreeSet<AstId> = present.iter().copied().collect();
         let mut ax = Vec::new();
+        // Literals synthesised by axioms below (e.g. the prefix/suffix a variable
+        // is pinned to) that must join the literal-distinctness set even though
+        // they are absent from the original goal.
+        let mut extra_lits: BTreeSet<AstId> = BTreeSet::new();
         // Non-negativity: `str.len(t) ≥ 0` for every length application in the
         // goal (a string has no negative length). Without this a symbolic
         // `str.len` is an unconstrained UF and `(= (str.len s) -1)` looks sat.
@@ -3421,6 +3425,41 @@ impl Context {
                 None
             })
             .collect();
+        // `prefixof x L ∧ len x = k` (L concrete, k ≤ |L|) pins `x = L[:k]`;
+        // `suffixof x L` pins `x = L[|L|−k:]`. Both together over the same length
+        // refute when the required prefix and suffix disagree (`prefixof x "abcd"
+        // ∧ suffixof x "abcd" ∧ len x = 2`).
+        for &t in &present {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            let op = self
+                .str_op_decls
+                .get(&self.m.app_decl(t))
+                .map(String::as_str);
+            if !matches!(op, Some("str.prefixof") | Some("str.suffixof")) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            let x = a[0];
+            if let Some(l) = self.str_value(a[1])
+                && let Some(k) = self.str_exact_len(goal, x)
+                && k <= l.len()
+            {
+                let sub = if op == Some("str.prefixof") {
+                    l[..k].to_vec()
+                } else {
+                    l[l.len() - k..].to_vec()
+                };
+                let lit = self.mk_str_lit(&code_points_to_string(&sub));
+                extra_lits.insert(lit);
+                let eq = self.m.mk_eq(x, lit);
+                ax.push(self.m.mk_implies(t, eq));
+            }
+        }
         for (pm, pchars, px) in &prefs {
             for (am, ax_x, k) in &ats {
                 if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
@@ -3974,7 +4013,9 @@ impl Context {
         let lits: Vec<(AstId, i64)> = self
             .str_lits
             .iter()
-            .filter(|(text, c)| present_set.contains(*c) || text.chars().count() == 1)
+            .filter(|(text, c)| {
+                present_set.contains(*c) || text.chars().count() == 1 || extra_lits.contains(*c)
+            })
             .map(|(text, &c)| (c, text.chars().count() as i64))
             .collect();
         if !lits.is_empty() {
