@@ -4925,11 +4925,12 @@ impl Context {
             let x_eq_p = self.m.mk_eq(x, pl);
             let hyp = self.m.mk_and(&[t, len_eq]);
             ax.push(self.m.mk_implies(hyp, x_eq_p));
-            // Single-character `contains(u·v·…, c)` cannot span a boundary, so it
-            // distributes: `contains(concat, c) ⇒ ⋁ contains(partᵢ, c)`. Refutes
-            // `contains(x·y,"a") ∧ ¬contains(x,"a") ∧ ¬contains(y,"a")`.
-            if pv.len() == 1
-                && self.m.is_app(x)
+            // `contains(u·v·…, Q)` distributes to `⋁ contains(partᵢ, Q)` when Q
+            // cannot span a boundary. A single character never spans. For a
+            // 2-part `P·x` with P concrete, Q spans iff a non-empty proper prefix
+            // of Q is a suffix of P — if none is, distribution is sound. Refutes
+            // `contains("pre"·x,"zzz") ∧ ¬contains("pre","zzz") ∧ ¬contains(x,"zzz")`.
+            if self.m.is_app(x)
                 && self
                     .str_op_decls
                     .get(&self.m.app_decl(x))
@@ -4937,13 +4938,35 @@ impl Context {
                     == Some("str.++")
             {
                 let parts = self.m.app_args(x).to_vec();
-                // Only sound-usefully refutes when every part's contains atom is
-                // already in the goal (otherwise a fresh atom is unconstrained).
+                let span_free = pv.len() == 1
+                    || (parts.len() == 2 && {
+                        // parts[0] concrete P, no proper prefix of Q is a suffix of P.
+                        self.str_value(parts[0]).is_some_and(|p| {
+                            (1..pv.len()).all(|s| p.len() < s || p[p.len() - s..] != pv[..s])
+                        })
+                    });
+                // Each part's `contains(partᵢ, Q)`: a concrete part folds to a
+                // true/false constant (its `contains` marker was eliminated at
+                // parse), a symbolic part uses its goal marker.
                 let markers: Option<Vec<AstId>> = parts
                     .iter()
-                    .map(|&p| contains_of.get(&(p, a[1])).copied())
+                    .map(|&p| {
+                        if let Some(pval) = self.str_value(p) {
+                            let has = pv.is_empty()
+                                || (pval.len() >= pv.len()
+                                    && pval.windows(pv.len()).any(|w| w == pv.as_slice()));
+                            Some(if has {
+                                self.m.mk_true()
+                            } else {
+                                self.m.mk_false()
+                            })
+                        } else {
+                            contains_of.get(&(p, a[1])).copied()
+                        }
+                    })
                     .collect();
-                if let Some(disj) = markers
+                if span_free
+                    && let Some(disj) = markers
                     && !disj.is_empty()
                 {
                     let d = self.m.mk_or(&disj);
