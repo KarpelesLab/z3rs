@@ -10043,11 +10043,11 @@ impl Context {
         // terms by fresh remainders (which lose EUF congruence): equal dividends
         // (same divisor) ⇒ equal div/mod. Refutes `x = y ∧ mod x 5 = 2 ∧
         // mod y 5 ≠ 2`.
-        let cong = self.divmod_congruence_axioms(combined);
+        let mut cong = self.divmod_congruence_axioms(combined);
+        cong.extend(self.mod_multiple_axioms(combined));
         if !cong.is_empty() {
-            let mut c = cong;
-            c.push(combined);
-            combined = self.m.mk_and(&c);
+            cong.push(combined);
+            combined = self.m.mk_and(&cong);
         }
         let lifted = self.lift(combined);
         // Fold ground selector/tester chains before the datatype axioms are built,
@@ -12820,6 +12820,91 @@ impl Context {
                     let req = self.m.mk_eq(t1, t2);
                     ax.push(self.m.mk_implies(deq, req));
                 }
+            }
+        }
+        ax
+    }
+
+    /// Whether every coefficient (and the constant) of the integer linear form of
+    /// `e` is divisible by `n` — so `e ≡ 0 (mod n)`. Conservative (a bare variable
+    /// or a non-linear/unknown subterm ⇒ `false`).
+    fn linear_divisible_by(&self, e: AstId, n: i64) -> bool {
+        use crate::ast::ArithOp;
+        if n == 0 {
+            return false;
+        }
+        if let Some(k) = self.int_arg(e) {
+            return k % n == 0;
+        }
+        match self.m.arith_op(e) {
+            Some(ArithOp::Add) | Some(ArithOp::Sub) => self
+                .m
+                .app_args(e)
+                .iter()
+                .all(|&p| self.linear_divisible_by(p, n)),
+            Some(ArithOp::Mul) => {
+                // A product is divisible by n if any numeral factor is.
+                self.m
+                    .app_args(e)
+                    .iter()
+                    .any(|&p| self.int_arg(p).is_some_and(|c| c % n == 0))
+            }
+            Some(ArithOp::Uminus) => self.linear_divisible_by(self.m.app_args(e)[0], n),
+            _ => false,
+        }
+    }
+
+    /// `mod(v, n) = 0` when `v` is (via an equality) a multiple of `n`
+    /// (`2·x = y ⇒ mod y 2 = 0`).
+    fn mod_multiple_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mods: Vec<(AstId, AstId, i64)> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter_map(|t| {
+                if self.m.arith_op(t) == Some(ArithOp::Mod) {
+                    let a = self.m.app_args(t);
+                    self.int_arg(a[1]).map(|n| (t, a[0], n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut ax = Vec::new();
+        for (mt, v, n) in mods {
+            if n == 0 {
+                continue;
+            }
+            // `v` divisible directly, or equal to a multiple of n.
+            let mut mult = self.linear_divisible_by(v, n);
+            if !mult {
+                for &c in &conj {
+                    if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                        let a = self.m.app_args(c);
+                        if (a[0] == v && self.linear_divisible_by(a[1], n))
+                            || (a[1] == v && self.linear_divisible_by(a[0], n))
+                        {
+                            mult = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if mult {
+                let zero = self.m.mk_int(0);
+                ax.push(self.m.mk_eq(mt, zero));
             }
         }
         ax
