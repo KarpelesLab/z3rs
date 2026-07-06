@@ -1792,6 +1792,16 @@ impl Context {
                             (SExpr::List(bs), inner)
                         }
                     };
+                    // Real linear `∀x. ∃y. φ`: eliminate `∃y` (exact Fourier–Motzkin
+                    // over the reals) then decide the residual `∀x. ψ` by real QE —
+                    // a complete decision for that fragment (both directions).
+                    if let Some(qf) = self.try_forall_exists_qe(&binders, &inner) {
+                        self.assertions.push(qf);
+                        self.assert_names.push(None);
+                        self.last_model = None;
+                        self.last_verdict = None;
+                        return Ok(None);
+                    }
                     // Skolemize positive existentials in the body so `∀x. ∃y. P`
                     // becomes a purely universal `∀x. P[y := f(x)]` the
                     // instantiation engine can use.
@@ -7191,6 +7201,132 @@ impl Context {
             _ => self.m.mk_or(&disjuncts),
         };
         Some(self.m.mk_not(exists_neg)) // ¬∃x.¬body
+    }
+
+    /// Decide `∀x. ∃y. φ` over **linear real** arithmetic: parse `x` and `y` into
+    /// one scope, eliminate `∃y` exactly (Fourier–Motzkin), then eliminate `∀x`.
+    /// `None` if the shape/sorts/body are outside this fragment (fall through to
+    /// Skolemization + instantiation).
+    fn try_forall_exists_qe(&mut self, binders: &SExpr, inner: &SExpr) -> Option<AstId> {
+        // Prenex the positive existentials of the body to the front (`guard ⇒ ∃y.φ`
+        // ≡ `∃y. guard ⇒ φ`, since `guard` is `y`-free). No existential ⇒ not our
+        // shape.
+        let mut ybind: Vec<SExpr> = Vec::new();
+        let body = Self::prenex_pos_exists(inner, &mut ybind, true);
+        if ybind.is_empty() {
+            return None;
+        }
+        let xbind = as_list(binders).ok()?;
+        let ybind = &ybind[..];
+        let inner = body;
+        // Push a combined scope with all universal and existential binders; all
+        // must be real-sorted.
+        let mut scope = Vec::new();
+        let mut xvars = Vec::new();
+        let mut yvars = Vec::new();
+        for (bs, out) in [(xbind, &mut xvars), (ybind, &mut yvars)] {
+            for b in bs {
+                let pair = as_list(b).ok()?;
+                let nm = Self::sym(&pair[0]).ok()?.to_string();
+                let s = self.resolve_sort(&pair[1]).ok()?;
+                if !self.m.is_arith_sort(s) || self.m.is_int_sort(s) {
+                    return None;
+                }
+                let c = self.fresh_const(s);
+                scope.push((nm, c));
+                out.push(c);
+            }
+        }
+        self.scopes.push(scope);
+        let phi = self.term(&inner);
+        self.scopes.pop();
+        let phi = phi.ok()?;
+        let psi = self.qe_exists(&yvars, phi)?;
+        self.qe_forall(&xvars, psi)
+    }
+
+    /// Strip positive existentials from `body`, collecting their binder
+    /// declarations into `out` (prenexing them to the front). Descends through
+    /// `not` (flipping polarity), `=>`, `and`, `or`; existentials in negative
+    /// position (or under `ite`) are left in place.
+    fn prenex_pos_exists(body: &SExpr, out: &mut Vec<SExpr>, positive: bool) -> SExpr {
+        let SExpr::List(l) = body else {
+            return body.clone();
+        };
+        let Some(SExpr::Atom(head)) = l.first() else {
+            return body.clone();
+        };
+        match (head.as_str(), l.len()) {
+            ("exists", 3) if positive => {
+                if let SExpr::List(bs) = &l[1] {
+                    out.extend(bs.iter().cloned());
+                }
+                Self::prenex_pos_exists(&l[2], out, positive)
+            }
+            ("not", 2) => SExpr::List(alloc::vec![
+                l[0].clone(),
+                Self::prenex_pos_exists(&l[1], out, !positive),
+            ]),
+            ("=>", 3) => SExpr::List(alloc::vec![
+                l[0].clone(),
+                Self::prenex_pos_exists(&l[1], out, !positive),
+                Self::prenex_pos_exists(&l[2], out, positive),
+            ]),
+            ("and" | "or", _) => {
+                let mut v = alloc::vec![l[0].clone()];
+                for a in &l[1..] {
+                    v.push(Self::prenex_pos_exists(a, out, positive));
+                }
+                SExpr::List(v)
+            }
+            _ => body.clone(),
+        }
+    }
+
+    /// Eliminate the existential binders `vars` from `∃vars. body`, returning the
+    /// equivalent quantifier-free formula. **Real binders only** — Fourier–Motzkin
+    /// is exact over the reals, so both directions are sound (over the integers it
+    /// would over-approximate). `None` if the body is not purely linear or a binder
+    /// occurs inside a compound term.
+    fn qe_exists(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
+        if !vars.iter().all(|&v| {
+            self.m.is_arith_sort(self.m.get_sort(v)) && !self.m.is_int_sort(self.m.get_sort(v))
+        }) {
+            return None;
+        }
+        let cubes = self.body_dnf(body, true)?;
+        let bound: BTreeSet<AstId> = vars.iter().copied().collect();
+        for cube in &cubes {
+            for c in cube {
+                for (u, _) in c.expr.terms() {
+                    if !bound.contains(&u) && self.m.postorder(u).iter().any(|t| bound.contains(t))
+                    {
+                        return None;
+                    }
+                }
+            }
+        }
+        let mut budget: u64 = 100_000;
+        let mut disjuncts: Vec<AstId> = Vec::new();
+        for mut cube in cubes {
+            for &v in vars {
+                cube = project(&cube, v, &mut budget)?;
+            }
+            let atoms: Vec<AstId> = cube
+                .iter()
+                .map(|c| self.constraint_atom(c, false))
+                .collect();
+            disjuncts.push(match atoms.len() {
+                0 => self.m.mk_true(),
+                1 => atoms[0],
+                _ => self.m.mk_and(&atoms),
+            });
+        }
+        Some(match disjuncts.len() {
+            0 => self.m.mk_false(),
+            1 => disjuncts[0],
+            _ => self.m.mk_or(&disjuncts),
+        })
     }
 
     /// The DNF of `term` (or its negation when `positive` is false) as a list of
