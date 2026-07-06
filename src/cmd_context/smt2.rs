@@ -3234,6 +3234,60 @@ impl Context {
     /// variable, re-fold the markers to concrete values, and confirm with the
     /// core solver. A found witness is a real `sat`; failure returns `None`
     /// (keeping the sound `unknown`).
+    /// Verify an abstract model by substituting each string variable's
+    /// model-implied literal into `goal`, refolding, and re-checking with the
+    /// string axioms — turning a possibly-spurious symbolic `sat` into a confirmed
+    /// concrete one. `None` if the model does not pin every string variable.
+    fn verify_string_model(&mut self, goal: AstId, model: &mut Model) -> Option<Model> {
+        let string_sort = self.string_sort?;
+        let lit_consts: BTreeSet<AstId> = self.str_lits.values().copied().collect();
+        let mut vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && self.m.app_args(t).is_empty()
+                && self.m.get_sort(t) == string_sort
+                && !lit_consts.contains(&t)
+                && !vars.contains(&t)
+            {
+                vars.push(t);
+            }
+        }
+        if vars.is_empty() {
+            return None;
+        }
+        let lits: Vec<AstId> = lit_consts.iter().copied().collect();
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for &v in &vars {
+            // The literal this variable equals under the model (if any).
+            let lit = lits.iter().find(|&&l| model.terms_equal(&self.m, v, l))?;
+            subst.push((v, *lit));
+        }
+        let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        let g2 = self.refold_str_markers(g1, &mut memo);
+        let clean = !self
+            .m
+            .postorder(g2)
+            .iter()
+            .any(|t| self.str_symbolic.contains(t) || self.str_op_marker(*t));
+        if !clean {
+            return None;
+        }
+        let mut conj = self.string_axioms(g2);
+        let g3 = if conj.is_empty() {
+            g2
+        } else {
+            conj.push(g2);
+            self.m.mk_and(&conj)
+        };
+        let (res, m) = check_model(&self.m, g3);
+        if res == SmtResult::Sat {
+            self.str_witness = subst;
+            return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+        }
+        None
+    }
+
     fn try_string_witness(&mut self, goal: AstId) -> Option<Model> {
         let string_sort = self.string_sort?;
         let lit_consts: BTreeSet<AstId> = self.str_lits.values().copied().collect();
@@ -8985,13 +9039,22 @@ impl Context {
                 .iter()
                 .any(|t| self.str_symbolic.contains(t));
         if has_symbolic_str {
-            if check_model(&self.m, goal).0 == SmtResult::Unsat {
+            let (res0, model0) = check_model(&self.m, goal);
+            if res0 == SmtResult::Unsat {
                 return (SmtResult::Unsat, None);
             }
-            // Not refuted: try to exhibit a concrete satisfying string/seq model,
-            // searching the pre-axiom formula when available (its axioms fold
-            // cleanly under substitution, unlike the pre-applied ones).
             let wg = self.witness_base.unwrap_or(goal);
+            // The abstract model may already pin every string variable to a
+            // literal (e.g. a concat-vs-literal split forces `x="ab", y="cd"`);
+            // verify that concrete assignment directly — it confirms `sat` without
+            // an exponential candidate search.
+            if let Some(mut model) = model0
+                && let Some(m) = self.verify_string_model(wg, &mut model)
+            {
+                return (SmtResult::Sat, Some(m));
+            }
+            // Otherwise search for a concrete satisfying string/seq model, from the
+            // pre-axiom formula (its axioms fold cleanly under substitution).
             if let Some(m) = self.try_string_witness(wg) {
                 return (SmtResult::Sat, Some(m));
             }
