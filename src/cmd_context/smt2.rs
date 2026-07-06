@@ -3995,6 +3995,37 @@ impl Context {
             }
         }
         alpha.truncate(4);
+        // Ensure characters required by `str.to_code x = c` constraints are
+        // available (their code may be outside the literal alphabet), appended
+        // past the truncation so they are never dropped.
+        for t in self.m.postorder(goal) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_app(l)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(l))
+                            .map(String::as_str),
+                        Some("str.to_code") | Some("str.to-code")
+                    )
+                    && let Some(c) = self
+                        .m
+                        .as_numeral(r)
+                        .and_then(|q| q.to_integer())
+                        .and_then(|i| i.to_i64())
+                    && (0..=0x10FFFF).contains(&c)
+                    && !alpha.contains(&(c as u32))
+                {
+                    alpha.push(c as u32);
+                }
+            }
+        }
         // Per-variable candidate strings. A variable pinned to an exact length by
         // `str.len v = k` gets exactly-length-`k` candidates (so length-fixed word
         // equations are witnessed); others use a short default cap. Bounded.
