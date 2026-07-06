@@ -10158,6 +10158,8 @@ impl Context {
             // unsatisfiable; that refutation is sound.
             if self.nonlinear_icp_refutes(lin) {
                 (SmtResult::Unsat, None)
+            } else if let Some(m) = self.try_int_box_witness(lin) {
+                (SmtResult::Sat, Some(m))
             } else {
                 (SmtResult::Unknown, None)
             }
@@ -10295,6 +10297,51 @@ impl Context {
             .filter(|(arr, _)| self.m.is_uninterp_const(*arr) && !tainted.contains(arr))
             .map(|(_, terms)| terms)
             .collect()
+    }
+
+    /// Bounded small-solution witness for a pure ≤2-variable integer nonlinear
+    /// goal: substitute each variable over a small box and confirm a ground model.
+    /// A found assignment is a real `sat` (e.g. `x² = y² + 17 ∧ y>0 ∧ x<10` at
+    /// x=9, y=8); failure keeps the sound `unknown`.
+    fn try_int_box_witness(&mut self, goal: AstId) -> Option<Model> {
+        let int_sort = self.m.mk_int_sort();
+        let mut vars: Vec<AstId> = Vec::new();
+        let mut has_other = false;
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t) && self.m.app_args(t).is_empty() && self.m.is_uninterp_const(t) {
+                if self.m.get_sort(t) == int_sort {
+                    if !vars.contains(&t) {
+                        vars.push(t);
+                    }
+                } else {
+                    has_other = true;
+                }
+            }
+        }
+        if has_other || vars.is_empty() || vars.len() > 2 {
+            return None;
+        }
+        const B: i64 = 32;
+        let dims = vars.len();
+        let side = (2 * B + 1) as usize;
+        let total = side.pow(dims as u32);
+        for idx in 0..total {
+            let mut rem = idx;
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .map(|&v| {
+                    let d = (rem % side) as i64 - B;
+                    rem /= side;
+                    (v, self.m.mk_int(d))
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if let (SmtResult::Sat, m) = check_model(&self.m, g) {
+                return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+            }
+        }
+        None
     }
 
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
