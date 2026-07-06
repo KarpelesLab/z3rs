@@ -448,6 +448,16 @@ pub fn narrow_box(constraints: &[Constraint], num_vars: usize) -> Option<Vec<Int
                         changed = true;
                     }
                 }
+                // Interval-coefficient linear bounds `c1(rest)·v + c0(rest) ⋈ 0`
+                // (bilinear terms like `x·y = k`, which the pure-linear and square
+                // rules miss).
+                if let Some(iv) = product_bound(c, v, &box_) {
+                    let tightened = box_[v as usize].intersect(&iv);
+                    if tightened != box_[v as usize] {
+                        box_[v as usize] = tightened;
+                        changed = true;
+                    }
+                }
             }
         }
         if box_.iter().any(Interval::is_empty) {
@@ -455,6 +465,73 @@ pub fn narrow_box(constraints: &[Constraint], num_vars: usize) -> Option<Vec<Int
         }
     }
     Some(box_)
+}
+
+/// Reciprocal `1/b` of a bound (its finite value assumed nonzero); `±∞ ↦ 0`
+/// (open).
+fn bound_recip(b: &Bound) -> Bound {
+    match b {
+        Bound::Infinite => Bound::open(Rational::from_integer(0.into())),
+        Bound::Finite { value, open } => {
+            if value.is_zero() {
+                Bound::infinite()
+            } else {
+                Bound::Finite {
+                    value: value.recip(),
+                    open: *open,
+                }
+            }
+        }
+    }
+}
+
+/// Reciprocal of a definite-sign interval (0 excluded): `1/[lo,hi] = [1/hi,1/lo]`.
+/// `None` if the interval straddles (or touches) 0.
+fn interval_recip(iv: &Interval) -> Option<Interval> {
+    let (lo, hi) = iv.bounds()?;
+    let pos = matches!(lo, Bound::Finite { value, .. } if value.is_positive());
+    let neg = matches!(hi, Bound::Finite { value, .. } if value.is_negative());
+    if !pos && !neg {
+        return None;
+    }
+    Some(Interval::new(bound_recip(hi), bound_recip(lo)))
+}
+
+/// Bound on `v` from a constraint linear in `v` with interval coefficients:
+/// `c1(rest)·v + c0(rest) ⋈ 0`. Evaluates `c1`, `c0` over the box; when `c1` has
+/// a definite sign, solves for `v`'s interval. Over-approximates (so it is a
+/// sound narrowing), catching bilinear products like `x·y = k`.
+fn product_bound(c: &Constraint, v: Var, box_: &[Interval]) -> Option<Interval> {
+    if c.poly.degree_of(v) != 1 {
+        return None;
+    }
+    let c1 = c.poly.coeff_of_var(v, 1);
+    let c0 = c.poly.coeff_of_var(v, 0);
+    let a = eval_interval(&c1, box_);
+    let b = eval_interval(&c0, box_);
+    let (alo, ahi) = a.bounds()?;
+    let a_pos = matches!(alo, Bound::Finite { value, .. } if value.is_positive());
+    let a_neg = matches!(ahi, Bound::Finite { value, .. } if value.is_negative());
+    if !a_pos && !a_neg {
+        return None; // coefficient straddles 0 — no bound
+    }
+    // Solution of `a·v = -b`  ⇒  `v = -b / a`.
+    let sol = b.neg().mul(&interval_recip(&a)?);
+    let (slo, shi) = sol.bounds()?;
+    let neg_inf = Bound::infinite();
+    let result = match (c.rel, a_pos) {
+        (Rel::Eq, _) => sol.clone(),
+        // `a·v + b ≤/<​ 0` ⇒ `v ≤ -b/a` (a>0) or `v ≥ -b/a` (a<0); closed bounds
+        // (an over-approximation, hence sound).
+        (Rel::Le | Rel::Lt, true) | (Rel::Ge | Rel::Gt, false) => {
+            Interval::new(neg_inf, shi.clone())
+        }
+        (Rel::Le | Rel::Lt, false) | (Rel::Ge | Rel::Gt, true) => {
+            Interval::new(slo.clone(), neg_inf)
+        }
+        (Rel::Ne, _) => return None,
+    };
+    Some(result)
 }
 
 /// Attempt to prove `constraints` (a conjunction, all must hold) unsatisfiable
