@@ -2859,6 +2859,44 @@ impl Context {
             let eavail = self.m.mk_eq(sublen, avail3);
             ax.push(self.m.mk_implies(c2, eavail));
         }
+        // `str.to_code x`: a valid code (≥ 0) requires a single character, so
+        // `str.to_code x ≥ 0 ⇒ len x = 1`. Refutes `str.to_code x = 97 ∧ len x = 2`.
+        // `str.indexof x t i`: a found index (≥ 0) leaves room for the needle, so
+        // `idx ≥ 0 ⇒ idx + len t ≤ len x`. Refutes `indexof x "a" 0 = 5 ∧ len x = 3`.
+        let ops: Vec<(AstId, String, Vec<AstId>)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_app(t) {
+                    return None;
+                }
+                self.str_op_decls.get(&self.m.app_decl(t)).and_then(|op| {
+                    matches!(op.as_str(), "str.to_code" | "str.to-code" | "str.indexof")
+                        .then(|| (t, op.clone(), self.m.app_args(t).to_vec()))
+                })
+            })
+            .collect();
+        for (app, op, args) in &ops {
+            let lenf = self.str_len_fn();
+            let zero = self.m.mk_int(0);
+            if op.starts_with("str.to") && !args.is_empty() {
+                let lx = self.m.mk_app(lenf, &[args[0]]);
+                let one = self.m.mk_int(1);
+                let nonneg = self.m.mk_ge(*app, zero);
+                let len1 = self.m.mk_eq(lx, one);
+                ax.push(self.m.mk_implies(nonneg, len1));
+            } else if op == "str.indexof" && args.len() >= 2 {
+                let lx = self.m.mk_app(lenf, &[args[0]]);
+                let lt = if let Some(v) = self.str_value(args[1]) {
+                    self.m.mk_int(v.len() as i64)
+                } else {
+                    self.m.mk_app(lenf, &[args[1]])
+                };
+                let end = self.m.mk_add(&[*app, lt]);
+                let fits = self.m.mk_le(end, lx);
+                let found = self.m.mk_ge(*app, zero);
+                ax.push(self.m.mk_implies(found, fits));
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
