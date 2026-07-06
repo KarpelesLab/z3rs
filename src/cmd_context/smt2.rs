@@ -2479,6 +2479,63 @@ impl Context {
         false
     }
 
+    /// Array extensionality refutation: an asserted `∀i. select a i = select b i`
+    /// forces `a = b`, so a co-asserted `a ≠ b` is UNSAT. Instantiation alone can't
+    /// see this (extensionality is not a ground-instance rule).
+    fn extensionality_unsat(&self, goal: AstId) -> bool {
+        // Array pairs forced equal by a `∀i. a[i] = b[i]` assertion.
+        let mut pairs: Vec<(AstId, AstId)> = Vec::new();
+        for (binders, body) in &self.universals {
+            if binders.len() != 1 || !self.m.is_eq(*body) {
+                continue;
+            }
+            let i = binders[0];
+            let ba = self.m.app_args(*body);
+            if ba.len() != 2 || !self.m.is_select(ba[0]) || !self.m.is_select(ba[1]) {
+                continue;
+            }
+            let (l, r) = (self.m.app_args(ba[0]), self.m.app_args(ba[1]));
+            if l.len() == 2 && r.len() == 2 && l[1] == i && r[1] == i && l[0] != r[0] {
+                pairs.push((l[0], r[0]));
+            }
+        }
+        if pairs.is_empty() {
+            return false;
+        }
+        // Does the goal assert `a ≠ b` for such a pair?
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        for c in conj {
+            let inner = if self.m.is_not(c) {
+                self.m.app_args(c).first().copied()
+            } else {
+                None
+            };
+            if let Some(e) = inner
+                && self.m.is_eq(e)
+            {
+                let a = self.m.app_args(e);
+                if a.len() == 2 {
+                    for &(x, y) in &pairs {
+                        if (a[0] == x && a[1] == y) || (a[0] == y && a[1] == x) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn datatype_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         if self.datatypes.is_empty() {
             return Vec::new();
@@ -9428,6 +9485,10 @@ impl Context {
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
         if self.datatype_occurs_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Array extensionality: `a ≠ b ∧ ∀i. a[i] = b[i]` is UNSAT.
+        if self.extensionality_unsat(goal) {
             return (SmtResult::Unsat, None);
         }
         // Quantified formulas are not decided here (the instantiation engine ran
