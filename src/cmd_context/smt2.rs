@@ -2369,6 +2369,67 @@ impl Context {
     /// constructors), pairwise tester exclusivity, and each tester's definition
     /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
     /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    /// Inline `v = <ground constructor term>` datatype bindings by substituting
+    /// `v` with the term, so selectors/testers over `v` fold to concrete values
+    /// (`l = cons 1 (cons 2 nl) ∧ is-nl (tl (tl l))` becomes decidable). Sound: `v`
+    /// is exactly the term. Only ground right-hand sides, never a `v` in its own
+    /// binding (a cycle — handled by the occurs-check).
+    fn inline_ground_dt_bindings(&mut self, goal: AstId) -> AstId {
+        if self.datatypes.is_empty() {
+            return goal;
+        }
+        let is_dt_var = |m: &AstManager, u: AstId| -> bool {
+            // A 0-ary datatype term that is *not* a nullary constructor.
+            m.is_app(u)
+                && m.app_args(u).is_empty()
+                && self
+                    .datatypes
+                    .get(&m.get_sort(u))
+                    .is_some_and(|cs| !cs.iter().any(|(cd, _, _)| *cd == m.app_decl(u)))
+        };
+        let is_ground_ctor = |m: &AstManager, t: AstId| -> bool {
+            m.is_app(t)
+                && self
+                    .datatypes
+                    .get(&m.get_sort(t))
+                    .is_some_and(|cs| cs.iter().any(|(cd, _, _)| *cd == m.app_decl(t)))
+                && m.postorder(t).iter().all(|&u| !is_dt_var(m, u))
+        };
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, t) in [(a[0], a[1]), (a[1], a[0])] {
+                if is_dt_var(&self.m, v) && !bound.contains(&v) && is_ground_ctor(&self.m, t) {
+                    subst.push((v, t));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
+    }
+
     /// Sound occurs-check refutation for cyclic datatype equalities among
     /// variables: from the asserted `v = C(… w …)` facts, `v` is strictly deeper
     /// than every datatype variable `w` in the constructor expression. Variables
@@ -9655,6 +9716,8 @@ impl Context {
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // Inline `v = <ground constructor>` so selectors/testers over `v` fold.
+        let goal = self.inline_ground_dt_bindings(goal);
         // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
