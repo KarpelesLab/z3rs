@@ -1457,6 +1457,89 @@ impl Regex {
         Some(out)
     }
 
+    /// Every word of *exactly* length `n` (finite even through `Star`, since the
+    /// length is bounded). `None` if the alphabet is too wide (`AllChar`/`All`) or
+    /// the count exceeds `cap`, or the language is opaque (`Inter`/`Comp`).
+    fn words_of_length(&self, n: usize, cap: usize) -> Option<Vec<Vec<u32>>> {
+        let out = match self {
+            Regex::None => Vec::new(),
+            Regex::Lit(l) => {
+                if l.len() == n {
+                    alloc::vec![l.clone()]
+                } else {
+                    Vec::new()
+                }
+            }
+            Regex::Range(lo, hi) => {
+                if n != 1 {
+                    Vec::new()
+                } else if (*hi as usize).saturating_sub(*lo as usize) >= cap {
+                    return None;
+                } else {
+                    (*lo..=*hi).map(|c| alloc::vec![c]).collect()
+                }
+            }
+            Regex::Union(a, b) => {
+                let mut w = a.words_of_length(n, cap)?;
+                w.extend(b.words_of_length(n, cap)?);
+                w
+            }
+            Regex::Concat(a, b) => {
+                let mut w = Vec::new();
+                for i in 0..=n {
+                    let wa = a.words_of_length(i, cap)?;
+                    if wa.is_empty() {
+                        continue;
+                    }
+                    let wb = b.words_of_length(n - i, cap)?;
+                    for x in &wa {
+                        for y in &wb {
+                            let mut c = x.clone();
+                            c.extend_from_slice(y);
+                            w.push(c);
+                            if w.len() > cap {
+                                return None;
+                            }
+                        }
+                    }
+                }
+                w
+            }
+            Regex::Star(r) => {
+                if n == 0 {
+                    alloc::vec![Vec::new()]
+                } else {
+                    let mut w = Vec::new();
+                    for i in 1..=n {
+                        let wr = r.words_of_length(i, cap)?;
+                        if wr.is_empty() {
+                            continue;
+                        }
+                        let rest = self.words_of_length(n - i, cap)?; // Star of the remainder
+                        for x in &wr {
+                            for y in &rest {
+                                let mut c = x.clone();
+                                c.extend_from_slice(y);
+                                w.push(c);
+                                if w.len() > cap {
+                                    return None;
+                                }
+                            }
+                        }
+                    }
+                    w.sort();
+                    w.dedup();
+                    w
+                }
+            }
+            _ => return None, // AllChar/All/Inter/Comp
+        };
+        if out.len() > cap {
+            return None;
+        }
+        Some(out)
+    }
+
     /// Whether every character of every word is an ASCII digit `'0'..='9'`
     /// (sound: only a definite `true`). A non-empty such word is numeric, so
     /// `str.to_int` of it is ≥ 0.
@@ -3723,6 +3806,21 @@ impl Context {
                             }
                         }
                     }
+                }
+            }
+            // With `len x = n` pinned, enumerate the words of *exactly* length n —
+            // finite even through a Kleene star, where `all_words` gives up.
+            // `x ∈ (ab)+ ∧ len x = 2 ∧ x ≠ "ab"` → only "ab" fits → unsat.
+            if let Some(n) = self.str_exact_len(goal, x)
+                && let Some(words) = r.words_of_length(n, 128)
+            {
+                if words.is_empty() {
+                    return true;
+                }
+                let empty = BTreeSet::new();
+                let excluded = neg_eq.get(&x).unwrap_or(&empty);
+                if words.iter().all(|w| excluded.contains(w)) {
+                    return true;
                 }
             }
             // Finite-language membership `x ∈ {w0,…}`. If a pinned `len x = n`
