@@ -10381,7 +10381,62 @@ impl Context {
                 }
             }
         }
+        // Fallback: inline `s = <concrete sequence>` and re-fold seq markers, so
+        // `s = unit 1 ++ unit 2 ∧ nth s 1 = 9` refutes.
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_seq_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         (res, model)
+    }
+
+    /// Inline `s = <concrete sequence>` bindings (RHS a folded `seq_of` term) by
+    /// substituting the sequence and re-folding seq markers, so `nth`/`len` over
+    /// `s` reduce to concrete values.
+    fn inline_seq_bindings(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, sq) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_uninterp_const(v)
+                    && !self.seq_of.contains_key(&v)
+                    && self.seq_of.contains_key(&sq)
+                    && !bound.contains(&v)
+                {
+                    subst.push((v, sq));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        self.refold_str_markers(g, &mut memo)
     }
 
     /// Inline `a = (as const …) v` bindings by substituting the const-array term,
