@@ -721,6 +721,22 @@ fn attr_int(list: &[SExpr], key: &str) -> Option<i64> {
 /// Peel nested `forall` binders (and transparent `!` annotations) from a
 /// quantifier body, returning the extra binders and the innermost body. So
 /// `∀y.∀z. φ` contributes `[y, z]` and `φ`.
+/// Substitute atom names by S-expressions throughout `e` (no capture avoidance —
+/// used for Skolemization, where the replacements are fresh applications).
+fn subst_sexpr(e: &SExpr, subst: &[(String, SExpr)]) -> SExpr {
+    match e {
+        SExpr::Atom(a) => {
+            for (n, r) in subst {
+                if n == a {
+                    return r.clone();
+                }
+            }
+            e.clone()
+        }
+        SExpr::List(l) => SExpr::List(l.iter().map(|x| subst_sexpr(x, subst)).collect()),
+    }
+}
+
 fn flatten_foralls(body: &SExpr) -> (Vec<SExpr>, SExpr) {
     let mut extra: Vec<SExpr> = Vec::new();
     let mut cur = body.clone();
@@ -1776,6 +1792,17 @@ impl Context {
                             (SExpr::List(bs), inner)
                         }
                     };
+                    // Skolemize positive existentials in the body so `∀x. ∃y. P`
+                    // becomes a purely universal `∀x. P[y := f(x)]` the
+                    // instantiation engine can use.
+                    let univ: Vec<(String, SExpr)> = as_list(&binders)?
+                        .iter()
+                        .map(|b| {
+                            let p = as_list(b)?;
+                            Ok::<_, String>((Self::sym(&p[0])?.to_string(), p[1].clone()))
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let inner = self.skolemize_body(&inner, &univ, true)?;
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
                     if let Some(qf) = self.qe_forall(&vars, body) {
                         self.assertions.push(qf);
@@ -7379,6 +7406,87 @@ impl Context {
         Ok(())
     }
 
+    /// Skolemize the positive existentials of a universal body: `∀xs. … ∃y:S. P …`
+    /// (`y` in positive position) becomes `∀xs. … P[y := f(xs)] …` with a fresh
+    /// Skolem function `f : (sorts of xs) → S`. Descends through `not` (flipping
+    /// polarity), `=>`/`and`/`or`/`ite`; positive nested `∀` extend the scope.
+    /// Existentials in negative position are left for the sound `unknown` path.
+    fn skolemize_body(
+        &mut self,
+        body: &SExpr,
+        univ: &[(String, SExpr)],
+        positive: bool,
+    ) -> Result<SExpr, String> {
+        let SExpr::List(l) = body else {
+            return Ok(body.clone());
+        };
+        let Some(SExpr::Atom(head)) = l.first() else {
+            return Ok(body.clone());
+        };
+        let recur = |ctx: &mut Self, e: &SExpr, pos: bool| ctx.skolemize_body(e, univ, pos);
+        match (head.as_str(), l.len()) {
+            ("exists", 3) if positive => {
+                let mut subst: Vec<(String, SExpr)> = Vec::new();
+                for b in as_list(&l[1])? {
+                    let pair = as_list(b)?;
+                    let yname = Self::sym(&pair[0])?.to_string();
+                    let ysort = pair[1].clone();
+                    let fname = alloc::format!("!sk!{}", self.fresh_counter);
+                    self.fresh_counter += 1;
+                    let dom: Vec<AstId> = univ
+                        .iter()
+                        .map(|(_, s)| self.resolve_sort(s))
+                        .collect::<Result<_, _>>()?;
+                    let ran = self.resolve_sort(&ysort)?;
+                    let d = self.m.mk_func_decl(Symbol::new(&fname), &dom, ran);
+                    self.funcs.insert(fname.clone(), d);
+                    let skterm = if univ.is_empty() {
+                        SExpr::Atom(fname)
+                    } else {
+                        let mut app = alloc::vec![SExpr::Atom(fname)];
+                        app.extend(univ.iter().map(|(n, _)| SExpr::Atom(n.clone())));
+                        SExpr::List(app)
+                    };
+                    subst.push((yname, skterm));
+                }
+                let inner = subst_sexpr(&l[2], &subst);
+                self.skolemize_body(&inner, univ, positive)
+            }
+            ("forall", 3) if positive => {
+                let mut u2 = univ.to_vec();
+                for b in as_list(&l[1])? {
+                    let p = as_list(b)?;
+                    u2.push((Self::sym(&p[0])?.to_string(), p[1].clone()));
+                }
+                let inner = self.skolemize_body(&l[2], &u2, positive)?;
+                Ok(SExpr::List(alloc::vec![l[0].clone(), l[1].clone(), inner]))
+            }
+            ("not", 2) => Ok(SExpr::List(alloc::vec![
+                l[0].clone(),
+                recur(self, &l[1], !positive)?,
+            ])),
+            ("=>", 3) => Ok(SExpr::List(alloc::vec![
+                l[0].clone(),
+                recur(self, &l[1], !positive)?,
+                recur(self, &l[2], positive)?,
+            ])),
+            ("and" | "or", _) => {
+                let mut out = alloc::vec![l[0].clone()];
+                for a in &l[1..] {
+                    out.push(recur(self, a, positive)?);
+                }
+                Ok(SExpr::List(out))
+            }
+            ("ite", 4) => Ok(SExpr::List(alloc::vec![
+                l[0].clone(),
+                l[1].clone(),
+                recur(self, &l[2], positive)?,
+                recur(self, &l[3], positive)?,
+            ])),
+            _ => Ok(body.clone()),
+        }
+    }
+
     fn parse_quantifier(
         &mut self,
         binders: &SExpr,
@@ -7661,15 +7769,22 @@ impl Context {
             }
         }
         // Ensure every binder sort has at least one ground term (a fresh rep).
+        // `seeded_sorts` = those that had *no* real ground term (only the fresh
+        // rep): enumerating a universal over such a sort can refute it (a fresh
+        // instance is a sound counterexample witness) but cannot *saturate* it —
+        // so a `sat` over a seed-only enumeration stays a sound `unknown`.
+        let mut seeded_sorts: BTreeSet<AstId> = BTreeSet::new();
         for (vars, _) in &universals {
             for &v in vars {
                 let s = self.m.get_sort(v);
                 if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
                     let rep = self.fresh_const(s);
                     by_sort.entry(s).or_default().insert(rep);
+                    seeded_sorts.insert(s);
                 }
             }
         }
+        let mut seed_enumerated = false;
 
         let mut instances: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
@@ -7757,12 +7872,26 @@ impl Context {
                 let dt_binder = vars
                     .iter()
                     .any(|&v| self.datatypes.contains_key(&self.m.get_sort(v)));
-                let enumerate = trigs[ui].is_empty() || (dt_binder && ematch_counts[ui] == 0);
+                // Enumerate when there is no covering trigger, when a datatype
+                // trigger matched nothing, OR when E-matching produced *no*
+                // instance for this universal (a triggered predicate/function with
+                // no ground application to seed it — e.g. `∀x. p(x) ∧ ¬p(x)`).
+                let enumerate = trigs[ui].is_empty()
+                    || (dt_binder && ematch_counts[ui] == 0)
+                    || ematch_counts[ui] == 0;
                 if !enumerate {
                     continue; // handled completely by E-matching
                 }
                 if dt_binder {
                     dt_enumerated = true; // infinite domain → cannot claim saturation
+                }
+                // A binder ranging over a seed-only sort makes this a refutation-
+                // only enumeration: it cannot prove the universal for every value.
+                if vars
+                    .iter()
+                    .any(|&v| seeded_sorts.contains(&self.m.get_sort(v)))
+                {
+                    seed_enumerated = true;
                 }
                 if self.universal_arith_productive(vars, *body) {
                     arith_enumerated = true; // arithmetic recursion → cannot saturate
@@ -7829,7 +7958,7 @@ impl Context {
                 // infinite-domain (datatype) binder to have been enumerated.
                 return (
                     instances,
-                    ematch_saturated && !dt_enumerated && !arith_enumerated,
+                    ematch_saturated && !dt_enumerated && !arith_enumerated && !seed_enumerated,
                 );
             }
         }
