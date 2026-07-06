@@ -5834,6 +5834,18 @@ impl Context {
         if self.str_symbolic.contains(&t) {
             return None;
         }
+        // `ite(c, a, b)` over FP: blast to a bit-vector `ite` of the branches, so
+        // the selector links the result to the chosen branch. Otherwise a fresh
+        // free bit-vector would satisfy any comparison — a spurious `sat` for
+        // `fp.eq(ite(b, x, +0), +0) ∧ b ∧ isNormal x`.
+        if self.m.is_ite(t) {
+            let args = self.m.app_args(t).to_vec();
+            if args.len() == 3 {
+                let bt = self.fp_to_bv(args[1])?;
+                let be = self.fp_to_bv(args[2])?;
+                return Some(self.m.mk_ite(args[0], bt, be));
+            }
+        }
         let (eb, sb) = self.fp_format_of(self.m.get_sort(t))?;
         let bv = self
             .m
