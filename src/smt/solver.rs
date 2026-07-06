@@ -1097,7 +1097,8 @@ fn dioph_witness(
 }
 
 /// Replace variable `v` in `e` by the linear expression `v_expr`.
-fn substitute_lin(e: &LinExpr, v: AstId, v_expr: &LinExpr) -> LinExpr {
+/// Replace variable `v` by the linear expression `v_expr` throughout `e`.
+pub fn substitute_lin(e: &LinExpr, v: AstId, v_expr: &LinExpr) -> LinExpr {
     match e.terms().find(|(u, _)| *u == v).map(|(_, c)| c.clone()) {
         Some(c) => e.sub(&LinExpr::var(v).scale(&c)).add(&v_expr.scale(&c)),
         None => e.clone(),

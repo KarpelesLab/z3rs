@@ -30,8 +30,8 @@ use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::rewriter::substitute;
 use crate::smt::{
-    Constraint, Model, OptOutcome, Rel, SmtResult, Value, arith_optimize, ast_to_lin,
-    check_bv_model, check_model, linear_constraints, project,
+    Constraint, LinExpr, Model, OptOutcome, Rel, SmtResult, Value, arith_optimize, ast_to_lin,
+    check_bv_model, check_model, feasible, linear_constraints, project, substitute_lin,
 };
 
 /// The result of optimizing a real-valued objective.
@@ -5703,6 +5703,8 @@ impl Context {
             && let Some(r) = self
                 .solve_chc()
                 .or_else(|| self.solve_chc_acyclic())
+                .or_else(|| self.solve_chc_invariant())
+                .or_else(|| self.solve_chc_bmc_paths())
                 .or_else(|| self.solve_chc_multi())
         {
             return (r, None);
@@ -6183,6 +6185,289 @@ impl Context {
             }
         }
         None
+    }
+
+    /// `reach[body]` restricted to a rule's body application: each stored
+    /// polyhedron over the body predicate's canonical state, with those state
+    /// variables substituted by the (linear) body arguments. A fact (no body
+    /// predicate) contributes the single empty polyhedron (trivially reachable).
+    fn chc_body_polys(
+        &self,
+        body_app: Option<AstId>,
+        reach: &BTreeMap<AstId, Vec<Vec<Constraint>>>,
+        state: &BTreeMap<AstId, Vec<AstId>>,
+    ) -> Option<Vec<Vec<Constraint>>> {
+        let Some(bapp) = body_app else {
+            return Some(alloc::vec![Vec::new()]);
+        };
+        let bp = self.predicate_of(bapp)?;
+        let bstate = state.get(&bp)?.clone();
+        let bargs: Vec<AstId> = self.m.app_args(bapp).to_vec();
+        if bargs.len() != bstate.len() {
+            return None;
+        }
+        let bargs_lin: Vec<LinExpr> = bargs.iter().map(|&a| ast_to_lin(&self.m, a)).collect();
+        let mut out = Vec::new();
+        for poly in reach.get(&bp)? {
+            let sub: Vec<Constraint> = poly
+                .iter()
+                .map(|c| {
+                    let mut e = c.expr.clone();
+                    for (i, &sv) in bstate.iter().enumerate() {
+                        e = substitute_lin(&e, sv, &bargs_lin[i]);
+                    }
+                    Self::con(e, c.rel)
+                })
+                .collect();
+            out.push(sub);
+        }
+        Some(out)
+    }
+
+    /// A [`Constraint`] from a linear expression and relation (`expr ⋈ 0`).
+    fn con(expr: LinExpr, rel: Rel) -> Constraint {
+        match rel {
+            Rel::Le => Constraint::le(expr),
+            Rel::Lt => Constraint::lt(expr),
+            Rel::Eq => Constraint::eq(expr),
+        }
+    }
+
+    /// Eliminate every variable not in `keep` from the polyhedron by
+    /// Fourier–Motzkin (an over-approximation of the integer projection).
+    fn poly_project(
+        poly: &[Constraint],
+        keep: &BTreeSet<AstId>,
+        budget: &mut u64,
+    ) -> Option<Vec<Constraint>> {
+        let mut cs = poly.to_vec();
+        let mut elim: Vec<AstId> = cs
+            .iter()
+            .flat_map(|c| c.expr.vars())
+            .filter(|v| !keep.contains(v))
+            .collect();
+        elim.sort();
+        elim.dedup();
+        for v in elim {
+            cs = project(&cs, v, budget)?;
+        }
+        Some(cs)
+    }
+
+    /// Does `poly` entail the constraint `c`? (`poly ⇒ c`, decided by
+    /// infeasibility of `poly ∧ ¬c`.)
+    fn poly_entails(poly: &[Constraint], c: &Constraint) -> bool {
+        match c.rel {
+            Rel::Le => {
+                let mut t = poly.to_vec();
+                t.push(Constraint::lt(c.expr.neg())); // ¬(e≤0) = e>0
+                !feasible(&t)
+            }
+            Rel::Lt => {
+                let mut t = poly.to_vec();
+                t.push(Constraint::le(c.expr.neg())); // ¬(e<0) = e≥0
+                !feasible(&t)
+            }
+            Rel::Eq => {
+                let mut lo = poly.to_vec();
+                lo.push(Constraint::lt(c.expr.clone()));
+                let mut hi = poly.to_vec();
+                hi.push(Constraint::lt(c.expr.neg()));
+                !feasible(&lo) && !feasible(&hi)
+            }
+        }
+    }
+
+    /// Is `poly` already covered by one of the polyhedra in `union`?
+    fn poly_subsumed(poly: &[Constraint], union: &[Vec<Constraint>]) -> bool {
+        if !feasible(poly) {
+            return true; // empty adds nothing
+        }
+        union
+            .iter()
+            .any(|e| e.iter().all(|c| Self::poly_entails(poly, c)))
+    }
+
+    /// Multi-predicate CHC **safety** via forward polyhedral reachability. Each
+    /// `reach[P]` is a union of polyhedra over `P`'s canonical state, grown by
+    /// applying the rules with Fourier–Motzkin projection to eliminate the path
+    /// variables. FM over the reals *over-approximates* the integer reach, so a
+    /// fixpoint whose reachable states never satisfy any query is a sound proof of
+    /// **safety** (`sat`) — the exact counterexample (`unsat`) direction is left
+    /// to the bounded engine. `None` when it doesn't converge or the
+    /// over-approximation is too coarse (a query looks reachable).
+    fn solve_chc_invariant(&mut self) -> Option<SmtResult> {
+        let (preds, state, rules) = self.chc_parse_multi()?;
+        let mut reach: BTreeMap<AstId, Vec<Vec<Constraint>>> =
+            preds.iter().map(|&p| (p, Vec::new())).collect();
+        let mut budget: u64 = 400_000;
+        const MAX_ROUNDS: usize = 16;
+        for _ in 0..MAX_ROUNDS {
+            let mut changed = false;
+            for (_bs, body_app, guards, head_app) in &rules.clone() {
+                let Some(happ) = *head_app else { continue };
+                let hp = self.predicate_of(happ)?;
+                let hstate = state.get(&hp)?.clone();
+                let hargs: Vec<AstId> = self.m.app_args(happ).to_vec();
+                if hargs.len() != hstate.len() {
+                    return None;
+                }
+                // Head equalities `state[hp]_i = arg_i`.
+                let head_eqs: Vec<Constraint> = hstate
+                    .iter()
+                    .zip(hargs.iter())
+                    .map(|(&sv, &ha)| {
+                        Constraint::eq(LinExpr::var(sv).sub(&ast_to_lin(&self.m, ha)))
+                    })
+                    .collect();
+                let guard_cubes = self.chc_guard_cubes(guards)?;
+                let body_polys = self.chc_body_polys(*body_app, &reach, &state)?;
+                let keep: BTreeSet<AstId> = hstate.iter().copied().collect();
+                for bpoly in &body_polys {
+                    for gcube in &guard_cubes {
+                        let mut cs: Vec<Constraint> = bpoly.clone();
+                        cs.extend(gcube.clone());
+                        cs.extend(head_eqs.clone());
+                        if !feasible(&cs) {
+                            continue;
+                        }
+                        let proj = Self::poly_project(&cs, &keep, &mut budget)?;
+                        if !feasible(&proj) {
+                            continue;
+                        }
+                        if !Self::poly_subsumed(&proj, &reach[&hp]) {
+                            reach.get_mut(&hp).unwrap().push(proj);
+                            changed = true;
+                        }
+                    }
+                }
+                if reach[&hp].len() > 12 {
+                    return None; // too many polyhedra — bail
+                }
+            }
+            if !changed {
+                // Fixpoint reached. A query is unreachable in the over-approx ⇒ safe.
+                for (_bs, body_app, guards, head_app) in &rules.clone() {
+                    if head_app.is_some() {
+                        continue;
+                    }
+                    let guard_cubes = self.chc_guard_cubes(guards)?;
+                    let body_polys = self.chc_body_polys(*body_app, &reach, &state)?;
+                    for bpoly in &body_polys {
+                        for gcube in &guard_cubes {
+                            let mut cs = bpoly.clone();
+                            cs.extend(gcube.clone());
+                            if feasible(&cs) {
+                                return None; // over-approx hits the query — inconclusive
+                            }
+                        }
+                    }
+                }
+                return Some(SmtResult::Sat);
+            }
+        }
+        None
+    }
+
+    /// Multi-predicate CHC **unsafety** via BFS path unrolling. Each predicate's
+    /// frontier holds the concrete path formulas reached at the current depth
+    /// (each a single feasible conjunction over that predicate's canonical state,
+    /// with fresh path variables per step — never OR-accumulated, so the formulas
+    /// stay small even at depth). A query satisfiable against any frontier path is
+    /// a genuine counterexample (`unsat`). Bounded in depth and breadth; `None`
+    /// when neither a counterexample nor a saturated (empty) frontier is found.
+    fn solve_chc_bmc_paths(&mut self) -> Option<SmtResult> {
+        let (_preds, state, rules) = self.chc_parse_multi()?;
+        let empty: BTreeMap<AstId, AstId> = BTreeMap::new();
+        // Depth 0: the fact rules (no body predicate).
+        let mut frontier: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for (bs, body_app, guards, head_app) in &rules {
+            if body_app.is_some() {
+                continue;
+            }
+            let Some(happ) = *head_app else { continue };
+            let hp = self.predicate_of(happ)?;
+            let img = self.chc_rule_image(bs, None, guards, Some(happ), &empty, &state)?;
+            let img = crate::rewriter::simplify(&mut self.m, img);
+            if matches!(check_model(&self.m, img).0, SmtResult::Sat) {
+                frontier.entry(hp).or_default().push(img);
+            }
+        }
+        const DEPTH: usize = 30;
+        const MAX_PATHS: usize = 40;
+        for _ in 0..DEPTH {
+            // Query check against the current frontier.
+            for (bs, body_app, guards, head_app) in &rules {
+                if head_app.is_some() {
+                    continue;
+                }
+                let paths: Vec<(BTreeMap<AstId, AstId>, &[AstId])> = match *body_app {
+                    None => alloc::vec![(empty.clone(), &bs[..])],
+                    Some(bapp) => {
+                        let bp = self.predicate_of(bapp)?;
+                        frontier
+                            .get(&bp)
+                            .into_iter()
+                            .flatten()
+                            .map(|&p| {
+                                let mut rm = BTreeMap::new();
+                                rm.insert(bp, p);
+                                (rm, &bs[..])
+                            })
+                            .collect()
+                    }
+                };
+                for (rm, bsl) in paths {
+                    let q = self.chc_rule_image(bsl, *body_app, guards, None, &rm, &state)?;
+                    if matches!(check_model(&self.m, q).0, SmtResult::Sat) {
+                        return Some(SmtResult::Unsat);
+                    }
+                }
+            }
+            // Extend one transition step: next[P] = images of transition rules.
+            let mut next: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            for (bs, body_app, guards, head_app) in &rules {
+                let (Some(bapp), Some(happ)) = (*body_app, *head_app) else {
+                    continue;
+                };
+                let bp = self.predicate_of(bapp)?;
+                let hp = self.predicate_of(happ)?;
+                for &path in frontier.get(&bp).into_iter().flatten() {
+                    let mut rm = BTreeMap::new();
+                    rm.insert(bp, path);
+                    let img =
+                        self.chc_rule_image(bs, Some(bapp), guards, Some(happ), &rm, &state)?;
+                    let img = crate::rewriter::simplify(&mut self.m, img);
+                    let bucket = next.entry(hp).or_default();
+                    if !bucket.contains(&img)
+                        && matches!(check_model(&self.m, img).0, SmtResult::Sat)
+                    {
+                        bucket.push(img);
+                    }
+                    if bucket.len() > MAX_PATHS {
+                        return None;
+                    }
+                }
+            }
+            if next.values().all(|v| v.is_empty()) {
+                break; // saturated — no counterexample reachable
+            }
+            frontier = next;
+        }
+        None
+    }
+
+    /// The guard of a rule as DNF constraint cubes (empty guard ⇒ one empty cube).
+    fn chc_guard_cubes(&mut self, guards: &[AstId]) -> Option<Vec<Vec<Constraint>>> {
+        if guards.is_empty() {
+            return Some(alloc::vec![Vec::new()]);
+        }
+        let g = if guards.len() == 1 {
+            guards[0]
+        } else {
+            self.m.mk_and(guards)
+        };
+        self.body_dnf(g, true)
     }
 
     /// Bounded model checking + k-induction over a parsed transition system.

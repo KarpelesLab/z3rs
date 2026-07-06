@@ -22,4 +22,6 @@ pub use arith::{
 };
 pub use bv::{check_bv, check_bv_model};
 pub use euf::Egraph;
-pub use solver::{Model, SmtResult, Value, ast_to_lin, check, check_model, linear_constraints};
+pub use solver::{
+    Model, SmtResult, Value, ast_to_lin, check, check_model, linear_constraints, substitute_lin,
+};
