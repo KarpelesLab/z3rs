@@ -1027,6 +1027,10 @@ struct Context {
     /// mentions any is answered `unknown` (their word semantics aren't solved),
     /// keeping every definite verdict sound.
     str_symbolic: BTreeSet<AstId>,
+    /// The concrete `(string var → literal)` assignment from the last successful
+    /// string-witness search, so `get-value`/`get-model` report a concrete string
+    /// (e.g. `"aaa"`) rather than an uninterpreted placeholder.
+    str_witness: Vec<(AstId, AstId)>,
     /// Length links for symbolic string predicates: `(pred_app, longer, shorter)`
     /// asserts `pred_app ⇒ str.len(longer) ≥ str.len(shorter)` — sound for
     /// `str.contains`/`str.prefixof`/`str.suffixof`, and enough to refute e.g.
@@ -1224,6 +1228,7 @@ impl Context {
             str_lits: BTreeMap::new(),
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
+            str_witness: Vec::new(),
             str_pred_len: Vec::new(),
             str_len_ub: Vec::new(),
             str_op_decls: BTreeMap::new(),
@@ -2204,6 +2209,20 @@ impl Context {
         Ok(())
     }
 
+    /// If `id` is a string that equals a known string literal under `model`,
+    /// render that literal's text (so `x = "hi"` prints `"hi"`, not a placeholder).
+    fn str_model_value(&self, model: &mut Model, id: AstId) -> Option<String> {
+        if Some(self.m.get_sort(id)) != self.string_sort {
+            return None;
+        }
+        for (text, &c) in &self.str_lits {
+            if c == id || model.terms_equal(&self.m, id, c) {
+                return Some(alloc::format!("\"{text}\""));
+            }
+        }
+        None
+    }
+
     /// If `id` has an enum sort, the name of the constructor it equals under
     /// `model` (so `get-value` prints `green`, not `Color!val!2`).
     fn enum_value_name(&self, model: &mut Model, id: AstId) -> Option<String> {
@@ -2880,6 +2899,7 @@ impl Context {
                     self.m.mk_and(&conj)
                 };
                 if let (SmtResult::Sat, m) = check_model(&self.m, g3) {
+                    self.str_witness = subst.clone(); // record for get-value/get-model
                     return m;
                 }
             }
@@ -8253,7 +8273,16 @@ impl Context {
         // Build every queried term first (this borrows `self.m` mutably).
         let mut terms: Vec<(String, AstId)> = Vec::new();
         for q in queries {
-            let id = self.term(q)?;
+            let mut id = self.term(q)?;
+            // Substitute the string-witness assignment and re-fold, so a string
+            // term evaluates to its concrete literal instead of a placeholder.
+            if !self.str_witness.is_empty() {
+                let sub = self.str_witness.clone();
+                id = crate::rewriter::substitute(&mut self.m, id, &sub);
+                let mut memo = BTreeMap::new();
+                id = self.refold_str_markers(id, &mut memo);
+                id = crate::rewriter::simplify(&mut self.m, id);
+            }
             terms.push((render_sexpr(q), id));
         }
         // Then evaluate against the model (disjoint immutable borrow of `m`).
@@ -8264,7 +8293,10 @@ impl Context {
                 out.push(' ');
             }
             let v = self
-                .enum_value_name(&mut model, *id)
+                .str_value(*id)
+                .map(|cps| alloc::format!("\"{}\"", code_points_to_string(&cps)))
+                .or_else(|| self.str_model_value(&mut model, *id))
+                .or_else(|| self.enum_value_name(&mut model, *id))
                 .unwrap_or_else(|| model.value_string(&self.m, *id));
             out.push_str(&alloc::format!("({text} {v})"));
         }
