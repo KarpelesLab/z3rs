@@ -3529,6 +3529,87 @@ impl Context {
                 }
             }
         }
+        // `str.substr x i n = L` (i concrete, L concrete) pins each character:
+        // `str.at x (i+j) = L[j]`. Refutes `substr x 1 2 = "cd" ∧ prefixof "ab" x`
+        // (the prefix forces `str.at x 1 = "b"`, the substring `= "c"`).
+        for &t in &present {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (m, litarg) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_app(m)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(m))
+                        .map(String::as_str)
+                        == Some("str.substr")
+                    && self.m.app_args(m).len() == 3
+                    && let Some(lv) = self.str_value(litarg)
+                {
+                    let args = self.m.app_args(m).to_vec();
+                    let x = args[0];
+                    if let Some(i) = self.int_arg(args[1])
+                        && i >= 0
+                    {
+                        for (j, &ch) in lv.iter().enumerate() {
+                            let idx = self.m.mk_int(i + j as i64);
+                            if let Ok(at) = self.string_op("str.at", &[x, idx]) {
+                                let chl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                                extra_lits.insert(chl);
+                                let eqc = self.m.mk_eq(at, chl);
+                                ax.push(self.m.mk_implies(t, eqc));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // `prefixof P x` / `suffixof P x` (P concrete) pins the leading/trailing
+        // characters `str.at x j = P[j]`, *creating* the markers so they conflict
+        // with a substring's characters (`prefixof "ab" x ∧ substr x 1 2 = "cd"`).
+        for &t in &present {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            let op = self
+                .str_op_decls
+                .get(&self.m.app_decl(t))
+                .map(String::as_str);
+            if !matches!(op, Some("str.prefixof") | Some("str.suffixof")) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            let Some(pv) = self.str_value(a[0]) else {
+                continue;
+            };
+            let x = a[1];
+            let base = if op == Some("str.prefixof") {
+                Some(0usize)
+            } else {
+                self.str_exact_len(goal, x)
+                    .filter(|&k| pv.len() <= k)
+                    .map(|k| k - pv.len())
+            };
+            let Some(b) = base else {
+                continue;
+            };
+            for (j, &ch) in pv.iter().enumerate() {
+                let idx = self.m.mk_int((b + j) as i64);
+                if let Ok(at) = self.string_op("str.at", &[x, idx]) {
+                    let chl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                    extra_lits.insert(chl);
+                    let eqc = self.m.mk_eq(at, chl);
+                    ax.push(self.m.mk_implies(t, eqc));
+                }
+            }
+        }
         for (pm, pchars, px) in &prefs {
             for (am, ax_x, k) in &ats {
                 if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
