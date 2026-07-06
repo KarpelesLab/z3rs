@@ -173,9 +173,8 @@ impl Ext {
 }
 
 /// The exact interval image of `vi` raised to the nonnegative power `e`,
-/// respecting even/odd monotonicity (so squares are nonnegative). Result
-/// endpoints are marked *closed* — a sound widening (it never shrinks the value
-/// set, so no false refutation).
+/// respecting even/odd monotonicity (so squares are nonnegative) and preserving
+/// each endpoint's open/closed flag (so `y > 1 ⇒ y² > 1` stays strict).
 pub fn ipow(vi: &Interval, e: u32) -> Interval {
     if e == 0 {
         return Interval::point(Rational::from_integer(1.into()));
