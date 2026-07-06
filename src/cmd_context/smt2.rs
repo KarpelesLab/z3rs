@@ -1110,6 +1110,9 @@ struct Context {
     /// The operation name behind each symbolic sequence marker declaration, so a
     /// marker can be re-folded once its arguments become concrete (witness search).
     seqop_ops: BTreeMap<AstId, String>,
+    /// The pre-axiom goal for the string/seq witness (set around `decide`), so the
+    /// witness substitutes into a clean formula rather than the axiom-laden one.
+    witness_base: Option<AstId>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -1331,6 +1334,7 @@ impl Context {
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seqop_ops: BTreeMap::new(),
+            witness_base: None,
         }
     }
 
@@ -6266,7 +6270,13 @@ impl Context {
         };
         let lifted = self.lift(combined);
         let goal = self.with_axioms(lifted);
+        // The string/seq witness re-derives its own axioms on the concretised
+        // goal, so it must start from the pre-axiom formula (substituting into the
+        // axiom-laden `goal` leaves partially-folded axiom terms that block a `sat`
+        // — the refutation path still uses the full `goal`).
+        self.witness_base = Some(lifted);
         let (res, model) = self.decide(goal);
+        self.witness_base = None;
         // A `sat` result is complete only if instantiation reached a fixpoint
         // (every ground instance is present — e.g. a finite Datalog domain);
         // otherwise the un-instantiated cases keep it a sound `unknown`.
@@ -8912,11 +8922,14 @@ impl Context {
             if check_model(&self.m, goal).0 == SmtResult::Unsat {
                 return (SmtResult::Unsat, None);
             }
-            // Not refuted: try to exhibit a concrete satisfying string/seq model.
-            if let Some(m) = self.try_string_witness(goal) {
+            // Not refuted: try to exhibit a concrete satisfying string/seq model,
+            // searching the pre-axiom formula when available (its axioms fold
+            // cleanly under substitution, unlike the pre-applied ones).
+            let wg = self.witness_base.unwrap_or(goal);
+            if let Some(m) = self.try_string_witness(wg) {
                 return (SmtResult::Sat, Some(m));
             }
-            if let Some(m) = self.try_seq_witness(goal) {
+            if let Some(m) = self.try_seq_witness(wg) {
                 return (SmtResult::Sat, Some(m));
             }
             return (SmtResult::Unknown, None);
