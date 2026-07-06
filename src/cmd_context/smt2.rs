@@ -4664,6 +4664,53 @@ impl Context {
                 None
             })
             .collect();
+        // `prefixof P (C·y)` with C concrete: if `|C| ≥ |P|` it is the constant
+        // "is P a prefix of C"; if P starts with C it reduces to `prefixof P[|C|:] y`;
+        // otherwise it is false. Refutes `prefixof "ab" ("a"·x) ∧ ¬prefixof "b" x`.
+        let pref_concat: Vec<(AstId, Vec<u32>, AstId)> = prefs
+            .iter()
+            .filter(|&&(_, _, hay)| {
+                self.m.is_app(hay)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(hay))
+                        .map(String::as_str)
+                        == Some("str.++")
+                    && self.m.app_args(hay).len() == 2
+            })
+            .map(|(pm, pchars, hay)| (*pm, pchars.clone(), *hay))
+            .collect();
+        // Existing `prefixof(chars, hay)` markers, so the reduction can reference
+        // the goal's atom rather than an unconstrained fresh one.
+        let pref_map: BTreeMap<(Vec<u32>, AstId), AstId> = prefs
+            .iter()
+            .map(|(m, p, h)| ((p.clone(), *h), *m))
+            .collect();
+        for (pm, pchars, hay) in pref_concat {
+            let parts = self.m.app_args(hay).to_vec();
+            let Some(c) = self.str_value(parts[0]) else {
+                continue;
+            };
+            if c.len() >= pchars.len() {
+                let holds = c[..pchars.len()] == pchars[..];
+                let v = if holds {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                };
+                ax.push(self.m.mk_eq(pm, v));
+            } else if pchars[..c.len()] == c[..] {
+                // `prefixof P (C·y) ⟺ prefixof P[|C|:] y` — only useful if that atom
+                // is already in the goal.
+                let rest = pchars[c.len()..].to_vec();
+                if let Some(&pref) = pref_map.get(&(rest, parts[1])) {
+                    ax.push(self.m.mk_eq(pm, pref));
+                }
+            } else {
+                let f = self.m.mk_false();
+                ax.push(self.m.mk_eq(pm, f));
+            }
+        }
         // Variable → literal value bindings (`y = "abcd"`), so a predicate whose
         // container is a literal-bound variable still resolves.
         let mut str_bind: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
