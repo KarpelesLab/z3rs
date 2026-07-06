@@ -4482,13 +4482,49 @@ impl Context {
             }
             if exact { cur } else { out }
         };
-        let per_var: Vec<Vec<Vec<u32>>> = vars
-            .iter()
-            .map(|&v| match self.str_exact_len(goal, v) {
+        // Contiguous substrings of the goal's string literals — a concat variable
+        // is often a piece of a literal (`x·y = "abcdef"` ⇒ x="abc", y="def"),
+        // which the alphabet search may not reach.
+        let mut lit_subs: Vec<Vec<u32>> = Vec::new();
+        for text in self.str_lits.keys() {
+            let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
+            if cps.len() > 12 {
+                continue;
+            }
+            for i in 0..cps.len() {
+                for j in (i + 1)..=cps.len() {
+                    let sub = cps[i..j].to_vec();
+                    if !lit_subs.contains(&sub) {
+                        lit_subs.push(sub);
+                    }
+                }
+            }
+        }
+        let mut per_var: Vec<Vec<Vec<u32>>> = Vec::new();
+        for &v in &vars {
+            let exact = self.str_exact_len(goal, v);
+            // Try literal substrings first (a concat piece is usually one of them).
+            let mut cands: Vec<Vec<u32>> = Vec::new();
+            for sub in &lit_subs {
+                let ok = match exact {
+                    Some(k) => sub.len() == k,
+                    None => sub.len() <= default_len,
+                };
+                if ok && !cands.contains(sub) {
+                    cands.push(sub.clone());
+                }
+            }
+            let rest = match exact {
                 Some(k) if k <= 8 => build(k, true),
                 _ => build(default_len, false),
-            })
-            .collect();
+            };
+            for c in rest {
+                if !cands.contains(&c) {
+                    cands.push(c);
+                }
+            }
+            per_var.push(cands);
+        }
         if per_var.iter().any(|c| c.is_empty()) {
             return None;
         }
