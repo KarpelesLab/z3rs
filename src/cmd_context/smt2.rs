@@ -5274,6 +5274,47 @@ impl Context {
                 _ => self.m.mk_and(&eqs),
             }));
         }
+        // Strip matching leading/trailing literal parts when the other side is a
+        // single literal, so `"a"·x·"c" = "abc"` reduces to `x = "b"` directly
+        // (no split, no witness grind). A leading/trailing literal that is not the
+        // corresponding prefix/suffix of the target makes the equation UNSAT.
+        for flip in [false, true] {
+            let (parts, other) = if flip { (pb, pa) } else { (pa, pb) };
+            if other.len() != 1 {
+                continue;
+            }
+            let Some(mut l) = lit(&other[0]) else {
+                continue;
+            };
+            let (mut lo, mut hi) = (0usize, parts.len());
+            while lo < hi {
+                let Some(p) = lit(&parts[lo]) else {
+                    break;
+                };
+                if p.len() <= l.len() && l[..p.len()] == p[..] {
+                    l = l[p.len()..].to_vec();
+                    lo += 1;
+                } else {
+                    return Ok(Some(self.m.mk_false()));
+                }
+            }
+            while lo < hi {
+                let Some(p) = lit(&parts[hi - 1]) else {
+                    break;
+                };
+                if p.len() <= l.len() && l[l.len() - p.len()..] == p[..] {
+                    l.truncate(l.len() - p.len());
+                    hi -= 1;
+                } else {
+                    return Ok(Some(self.m.mk_false()));
+                }
+            }
+            if lo > 0 || hi < parts.len() {
+                let residual: Vec<SExpr> = parts[lo..hi].to_vec();
+                let l_lit = SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(&l)));
+                return self.concat_residual_eq(&residual, &[l_lit]);
+            }
+        }
         // A single literal against a concatenation: reuse the split search. But a
         // concatenation of ≥3 parts (a literal between two variables) against a
         // long literal expands to a nested disjunction the general solver handles
