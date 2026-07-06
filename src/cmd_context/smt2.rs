@@ -4013,6 +4013,28 @@ impl Context {
             } else if let Some(op) = self.seqop_ops.get(&decl).cloned() {
                 self.seq_op(&op, &args)
                     .unwrap_or_else(|_| self.m.mk_app(decl, &args))
+            } else if self.m.is_eq(t) && args.len() == 2 {
+                // Fold an equality of two now-concrete sequences (or strings) by
+                // content: `substitute` rebuilt this node without re-folding, and
+                // the general solver treats distinct concrete `seq_of` constants as
+                // free — a spurious `sat`. Deciding it here keeps the fold sound.
+                if let (Some(a), Some(b)) = (self.seq_of.get(&args[0]), self.seq_of.get(&args[1])) {
+                    if a == b {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    }
+                } else if let (Some(a), Some(b)) =
+                    (self.str_value(args[0]), self.str_value(args[1]))
+                {
+                    if a == b {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    }
+                } else {
+                    self.m.mk_app(decl, &args)
+                }
             } else {
                 self.m.mk_app(decl, &args)
             }
