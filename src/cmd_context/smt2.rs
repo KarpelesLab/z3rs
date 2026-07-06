@@ -10462,7 +10462,92 @@ impl Context {
                 }
             }
         }
+        // Fallback: inline `a = (lambda …)` bindings and beta-reduce reads of `a`.
+        if res == SmtResult::Unknown && !self.lambdas.is_empty() {
+            let inlined = self.inline_lambda_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         (res, model)
+    }
+
+    /// Beta-reduce `select((lambda (x…) body), i…)` to `body[x… := i…]` throughout.
+    fn beta_reduce_lambda_selects(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let args: Vec<AstId> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.beta_reduce_lambda_selects(a, memo))
+                .collect();
+            if self.m.is_select(t)
+                && let Some((params, body)) = self.lambdas.get(&args[0]).cloned()
+                && params.len() == args.len() - 1
+            {
+                let sub: Vec<(AstId, AstId)> =
+                    params.into_iter().zip(args[1..].iter().copied()).collect();
+                let reduced = crate::rewriter::substitute(&mut self.m, body, &sub);
+                self.beta_reduce_lambda_selects(reduced, memo)
+            } else {
+                self.m.mk_app(decl, &args)
+            }
+        } else {
+            t
+        };
+        memo.insert(t, out);
+        out
+    }
+
+    /// Inline `a = (lambda …)` bindings by substituting the lambda array, then
+    /// beta-reduce reads of `a`, so `a = lambda i. 2i ∧ select a k = v` decides.
+    fn inline_lambda_bindings(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, lam) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_uninterp_const(v)
+                    && self.lambdas.contains_key(&lam)
+                    && !bound.contains(&v)
+                {
+                    subst.push((v, lam));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        let g = self.beta_reduce_lambda_selects(g, &mut memo);
+        crate::rewriter::simplify(&mut self.m, g)
     }
 
     /// Expand `((_ map f) a…) = b` at every index the goal reads: assert
