@@ -4486,16 +4486,34 @@ impl Context {
         // is often a piece of a literal (`x·y = "abcdef"` ⇒ x="abc", y="def"),
         // which the alphabet search may not reach.
         let mut lit_subs: Vec<Vec<u32>> = Vec::new();
+        let mut lit_cps: Vec<Vec<u32>> = Vec::new();
         for text in self.str_lits.keys() {
             let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
             if cps.len() > 12 {
                 continue;
             }
+            lit_cps.push(cps.clone());
             for i in 0..cps.len() {
                 for j in (i + 1)..=cps.len() {
                     let sub = cps[i..j].to_vec();
                     if !lit_subs.contains(&sub) {
                         lit_subs.push(sub);
+                    }
+                }
+            }
+        }
+        // Pairwise concatenations of two literals — a variable satisfying several
+        // `contains` is often their juxtaposition (`contains x "abc" ∧ contains x
+        // "def"` ⇒ x="abcdef").
+        if lit_cps.len() <= 8 {
+            for a in &lit_cps {
+                for b in &lit_cps {
+                    if a.len() + b.len() <= 12 {
+                        let mut cat = a.clone();
+                        cat.extend_from_slice(b);
+                        if !lit_subs.contains(&cat) {
+                            lit_subs.push(cat);
+                        }
                     }
                 }
             }
