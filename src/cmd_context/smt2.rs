@@ -3079,6 +3079,43 @@ impl Context {
                 ax.push(self.m.mk_implies(found, fits));
             }
         }
+        // `str.contains x t ⟺ str.indexof x t 0 ≥ 0`: a match exists iff its first
+        // index is found. Refutes `indexof x "z" 0 = −1 ∧ contains x "z"`.
+        let pred_of = |m: &AstManager, t: AstId, name: &str| -> Option<Vec<AstId>> {
+            (m.is_app(t) && self.str_op_decls.get(&m.app_decl(t)).map(String::as_str) == Some(name))
+                .then(|| m.app_args(t).to_vec())
+        };
+        let contains_m: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                pred_of(&self.m, t, "str.contains")
+                    .and_then(|a| (a.len() == 2).then_some((t, a[0], a[1])))
+            })
+            .collect();
+        let indexof0_m: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                pred_of(&self.m, t, "str.indexof").and_then(|a| {
+                    (a.len() == 3
+                        && self
+                            .m
+                            .as_numeral(a[2])
+                            .and_then(|r| r.to_integer())
+                            .and_then(|i| i.to_i64())
+                            == Some(0))
+                    .then_some((t, a[0], a[1]))
+                })
+            })
+            .collect();
+        for (cm, cx, ct) in &contains_m {
+            for (im, ix, it) in &indexof0_m {
+                if cx == ix && ct == it {
+                    let zero = self.m.mk_int(0);
+                    let ge = self.m.mk_ge(*im, zero);
+                    ax.push(self.m.mk_eq(*cm, ge));
+                }
+            }
+        }
         // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
         // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
         let lts: Vec<(AstId, AstId, AstId)> = present
