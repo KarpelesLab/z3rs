@@ -2897,6 +2897,79 @@ impl Context {
                 ax.push(self.m.mk_implies(found, fits));
             }
         }
+        // `str.<` is a strict order: antisymmetry `(a<b) ⇒ ¬(b<a)` and transitivity
+        // `(a<b) ∧ (b<c) ⇒ (a<c)`. Refutes `x<y ∧ y<x` and cyclic `x<y<z<x`.
+        let lts: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.<")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2 {
+                        return Some((t, a[0], a[1]));
+                    }
+                }
+                None
+            })
+            .collect();
+        if !lts.is_empty() {
+            // Each `str.<` occurrence is a content-fresh marker, so reuse the goal's
+            // marker for an existing edge and build a *consistent* one (shared decl,
+            // interned by args) for a derived edge, keyed in `edge`.
+            let lt_decl = self.m.app_decl(lts[0].0);
+            let mut edge: BTreeMap<(AstId, AstId), AstId> =
+                lts.iter().map(|(m, a, b)| ((*a, *b), *m)).collect();
+            let mut nodes: Vec<AstId> = Vec::new();
+            for (_, a, b) in &lts {
+                for x in [a, b] {
+                    if !nodes.contains(x) {
+                        nodes.push(*x);
+                    }
+                }
+            }
+            if nodes.len() <= 8 {
+                for ai in 0..nodes.len() {
+                    for bi in 0..nodes.len() {
+                        if ai == bi {
+                            continue;
+                        }
+                        let (a, b) = (nodes[ai], nodes[bi]);
+                        let mab = *edge
+                            .entry((a, b))
+                            .or_insert_with(|| self.m.mk_app(lt_decl, &[a, b]));
+                        let mba = *edge
+                            .entry((b, a))
+                            .or_insert_with(|| self.m.mk_app(lt_decl, &[b, a]));
+                        // antisymmetry: `(a<b) ⇒ ¬(b<a)`
+                        let nba = self.m.mk_not(mba);
+                        ax.push(self.m.mk_implies(mab, nba));
+                        // strictness: `(a<b) ⇒ a ≠ b`
+                        let eqab = self.m.mk_eq(a, b);
+                        let neqab = self.m.mk_not(eqab);
+                        ax.push(self.m.mk_implies(mab, neqab));
+                        // transitivity: `(a<b) ∧ (b<c) ⇒ (a<c)`
+                        for (ci, &c) in nodes.iter().enumerate() {
+                            if ci == ai || ci == bi {
+                                continue;
+                            }
+                            let mbc = *edge
+                                .entry((b, c))
+                                .or_insert_with(|| self.m.mk_app(lt_decl, &[b, c]));
+                            let mac = *edge
+                                .entry((a, c))
+                                .or_insert_with(|| self.m.mk_app(lt_decl, &[a, c]));
+                            let and = self.m.mk_and(&[mab, mbc]);
+                            ax.push(self.m.mk_implies(and, mac));
+                        }
+                    }
+                }
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
