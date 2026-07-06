@@ -3463,6 +3463,23 @@ impl Context {
                 None
             })
             .collect();
+        // Variable → literal value bindings (`y = "abcd"`), so a predicate whose
+        // container is a literal-bound variable still resolves.
+        let mut str_bind: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
+        for &c in &present {
+            if self.m.is_eq(c) {
+                let a = self.m.app_args(c);
+                if a.len() == 2 {
+                    for (v, lit) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v)
+                            && let Some(lv) = self.str_value(lit)
+                        {
+                            str_bind.entry(v).or_insert(lv);
+                        }
+                    }
+                }
+            }
+        }
         // `prefixof x L ∧ len x = k` (L concrete, k ≤ |L|) pins `x = L[:k]`;
         // `suffixof x L` pins `x = L[|L|−k:]`. Both together over the same length
         // refute when the required prefix and suffix disagree (`prefixof x "abcd"
@@ -3483,7 +3500,9 @@ impl Context {
                 continue;
             }
             let x = a[0];
-            if let Some(l) = self.str_value(a[1])
+            if let Some(l) = self
+                .str_value(a[1])
+                .or_else(|| str_bind.get(&a[1]).cloned())
                 && let Some(k) = self.str_exact_len(goal, x)
                 && k <= l.len()
             {
@@ -3496,6 +3515,18 @@ impl Context {
                 extra_lits.insert(lit);
                 let eq = self.m.mk_eq(x, lit);
                 ax.push(self.m.mk_implies(t, eq));
+                // Also pin each character: `str.at x i = sub[i]`, so reads of the
+                // determined string fold (`str.at x 0 = "b"` refutes when the
+                // prefix forces `str.at x 0 = "a"`).
+                for (i, &ch) in sub.iter().enumerate() {
+                    let idx = self.m.mk_int(i as i64);
+                    if let Ok(at) = self.string_op("str.at", &[x, idx]) {
+                        let ch_lit = self.mk_str_lit(&code_points_to_string(&[ch]));
+                        extra_lits.insert(ch_lit);
+                        let eqc = self.m.mk_eq(at, ch_lit);
+                        ax.push(self.m.mk_implies(t, eqc));
+                    }
+                }
             }
         }
         for (pm, pchars, px) in &prefs {
@@ -10846,6 +10877,17 @@ impl Context {
                 }
             }
         }
+        // Fallback: inline `v = <string literal>` so predicates over a
+        // literal-bound variable resolve (`prefixof x y ∧ y = "abcd"`).
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_str_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         // Fallback: expand `(_ map f) a… = b` pointwise and eliminate the map, so
         // `(_ map and) a b = a ∧ a[i] ∧ ¬b[i]` decides.
         if res == SmtResult::Unknown && !self.maps.is_empty() {
@@ -11044,6 +11086,55 @@ impl Context {
                     && !bound.contains(&v)
                 {
                     subst.push((v, sq));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        self.refold_str_markers(g, &mut memo)
+    }
+
+    /// Inline `v = <string literal>` bindings and re-fold, so a predicate over a
+    /// literal-bound variable resolves (`prefixof x y ∧ y = "abcd"` becomes
+    /// `prefixof x "abcd"`, which the fixed-length pinning axiom can use).
+    fn inline_str_bindings(&mut self, goal: AstId) -> AstId {
+        let Some(ss) = self.string_sort else {
+            return goal;
+        };
+        let lit_consts: BTreeSet<AstId> = self.str_lits.values().copied().collect();
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, l) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_uninterp_const(v)
+                    && self.m.get_sort(v) == ss
+                    && !lit_consts.contains(&v)
+                    && lit_consts.contains(&l)
+                    && !bound.contains(&v)
+                {
+                    subst.push((v, l));
                     bound.insert(v);
                 }
             }
