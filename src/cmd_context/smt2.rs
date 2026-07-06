@@ -10392,7 +10392,85 @@ impl Context {
                 }
             }
         }
+        // Fallback: expand `(_ map f) a… = b` pointwise and eliminate the map, so
+        // `(_ map and) a b = a ∧ a[i] ∧ ¬b[i]` decides.
+        if res == SmtResult::Unknown && !self.maps.is_empty() {
+            let inlined = self.inline_map_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         (res, model)
+    }
+
+    /// Expand `((_ map f) a…) = b` at every index the goal reads: assert
+    /// `f(select a i …) = select b i`, then substitute the map array by `b` so the
+    /// (otherwise gated) functional constant disappears.
+    fn inline_map_bindings(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut map_eqs: Vec<(AstId, AstId)> = Vec::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() == 2 {
+                for (m, b) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.maps.contains_key(&m) {
+                        map_eqs.push((m, b));
+                    }
+                }
+            }
+        }
+        if map_eqs.is_empty() {
+            return goal;
+        }
+        let mut indices: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_select(t) {
+                let i = self.m.app_args(t)[1];
+                if !indices.contains(&i) {
+                    indices.push(i);
+                }
+            }
+        }
+        let mut axioms: Vec<AstId> = Vec::new();
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for (m, b) in &map_eqs {
+            let Some((fname, arrays)) = self.maps.get(m).cloned() else {
+                continue;
+            };
+            for &i in &indices {
+                let selects: Vec<AstId> =
+                    arrays.iter().map(|&ar| self.m.mk_select(ar, i)).collect();
+                if let Ok(lhs) = self.apply(&fname, selects) {
+                    let rhs = self.m.mk_select(*b, i);
+                    let eq = self.m.mk_eq(lhs, rhs);
+                    axioms.push(eq);
+                }
+            }
+            subst.push((*m, *b));
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        axioms.push(g);
+        let out = self.m.mk_and(&axioms);
+        crate::rewriter::simplify(&mut self.m, out)
     }
 
     /// Inline `s = <concrete sequence>` bindings (RHS a folded `seq_of` term) by
