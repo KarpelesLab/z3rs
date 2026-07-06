@@ -3204,6 +3204,44 @@ impl Context {
             let ge = self.m.mk_ge(ll, ls);
             ax.push(self.m.mk_implies(*app, ge));
         }
+        // `seq.prefixof P s` (P a concrete sequence) pins the leading elements
+        // `nth s i = P[i]`; `seq.suffixof P s` with `len s` pinned pins the
+        // trailing elements. Refutes `prefixof [1] s ∧ nth s 0 = 9`.
+        for &t in &present {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            let Some(op) = self.seqop_ops.get(&self.m.app_decl(t)).cloned() else {
+                continue;
+            };
+            let a = self.m.app_args(t).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            let (p_arg, s_arg) = (a[0], a[1]);
+            let Some(pv) = self.seq_of.get(&p_arg).cloned() else {
+                continue;
+            };
+            let base = if op == "seq.prefixof" {
+                Some(0usize)
+            } else if op == "seq.suffixof" {
+                self.str_exact_len(goal, s_arg)
+                    .filter(|&k| pv.len() <= k)
+                    .map(|k| k - pv.len())
+            } else {
+                None
+            };
+            let Some(b) = base else {
+                continue;
+            };
+            for (i, &el) in pv.iter().enumerate() {
+                let idx = self.m.mk_int((b + i) as i64);
+                if let Ok(nth) = self.seq_op("seq.nth", &[s_arg, idx]) {
+                    let eq = self.m.mk_eq(nth, el);
+                    ax.push(self.m.mk_implies(t, eq));
+                }
+            }
+        }
         // Length links for symbolic predicates present in the goal:
         // `str.contains(s,sub) ⇒ len(s) ≥ len(sub)` etc.
         let links = self.str_pred_len.clone();
