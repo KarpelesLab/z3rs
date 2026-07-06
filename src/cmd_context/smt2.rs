@@ -2991,6 +2991,38 @@ impl Context {
                 ax.push(self.m.mk_implies(inb, len_one));
             }
         }
+        // `str.prefixof p x ⇒ str.at x k = p[k]` for a literal `p` and constant
+        // `k < len p` — the prefix pins the first `len p` characters. Refutes
+        // `str.at x 0 = "a" ∧ str.prefixof "b" x`.
+        let prefs: Vec<(AstId, Vec<u32>, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.prefixof")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2
+                        && let Some(p) = self.str_value(a[0])
+                    {
+                        return Some((t, p, a[1]));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (pm, pchars, px) in &prefs {
+            for (am, ax_x, k) in &ats {
+                if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
+                    let ch = self.mk_str_lit(&code_points_to_string(&[pchars[*k as usize]]));
+                    let eq = self.m.mk_eq(*am, ch);
+                    ax.push(self.m.mk_implies(*pm, eq));
+                }
+            }
+        }
         // `str.substr x i n` length (constant `i ≥ 0`, `n`): the extracted length
         // is `min(n, max(0, len x − i))`. Refutes `str.substr x 0 2 = "ab" ∧ len x = 1`.
         let subs: Vec<(AstId, AstId, i64, i64)> = present
@@ -3307,11 +3339,13 @@ impl Context {
         if self.str_lits.is_empty() {
             return ax;
         }
-        // Literals occurring in the goal, with their lengths.
+        // Literals occurring in the goal, plus every single-character literal
+        // (cheap, and covers the per-character literals introduced by the
+        // prefix/`str.at` axioms above), with their lengths.
         let lits: Vec<(AstId, i64)> = self
             .str_lits
             .iter()
-            .filter(|(_, c)| present_set.contains(*c))
+            .filter(|(text, c)| present_set.contains(*c) || text.chars().count() == 1)
             .map(|(text, &c)| (c, text.chars().count() as i64))
             .collect();
         if !lits.is_empty() {
