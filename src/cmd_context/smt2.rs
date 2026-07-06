@@ -2654,6 +2654,70 @@ impl Context {
         false
     }
 
+    /// Enum pigeonhole: a clique of pairwise-distinct terms of a `k`-constructor
+    /// enum larger than `k` cannot be satisfied (`distinct v0…v4` over a 4-value
+    /// enum is UNSAT).
+    fn enum_pigeonhole_unsat(&self, goal: AstId) -> bool {
+        if self.enums.is_empty() {
+            return false;
+        }
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
+        let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_not(c) {
+                continue;
+            }
+            let inner = self.m.app_args(c)[0];
+            if !self.m.is_eq(inner) {
+                continue;
+            }
+            let a = self.m.app_args(inner);
+            if a.len() != 2 {
+                continue;
+            }
+            let s = self.m.get_sort(a[0]);
+            if !self.enums.contains_key(&s) || self.m.get_sort(a[1]) != s {
+                continue;
+            }
+            diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
+            let v = by_sort.entry(s).or_default();
+            for &e in &[a[0], a[1]] {
+                if !v.contains(&e) {
+                    v.push(e);
+                }
+            }
+        }
+        for (s, terms) in &by_sort {
+            let k = self.enums[s].len();
+            // Greedy clique: for a `distinct` the disequality graph is complete,
+            // so any order yields the full set.
+            let mut clique: Vec<AstId> = Vec::new();
+            for &t in terms {
+                if clique
+                    .iter()
+                    .all(|&c| diseq.contains(&(t.min(c), t.max(c))))
+                {
+                    clique.push(t);
+                    if clique.len() > k {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Inline `v = <ground constructor term>` datatype bindings by substituting
     /// `v` with the term, so selectors/testers over `v` fold to concrete values
     /// (`l = cons 1 (cons 2 nl) ∧ is-nl (tl (tl l))` becomes decidable). Sound: `v`
@@ -11527,6 +11591,11 @@ impl Context {
         }
         // Pigeonhole: `n` distinct integers `≥ lo` with sum `≤ hi < n·lo+n(n−1)/2`.
         if self.distinct_sum_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Enum pigeonhole: `n` pairwise-distinct terms of a `k`-constructor enum
+        // with `n > k` is UNSAT (`distinct v0…v4` over a 4-value enum).
+        if self.enum_pigeonhole_unsat(goal) {
             return (SmtResult::Unsat, None);
         }
         // Quantified formulas are not decided here (the instantiation engine ran
