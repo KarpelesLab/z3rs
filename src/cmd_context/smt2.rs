@@ -2377,6 +2377,81 @@ impl Context {
     /// constructors), pairwise tester exclusivity, and each tester's definition
     /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
     /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    /// Witness for pairwise-distinct integers with lower bounds: assign each the
+    /// smallest distinct value `≥` its bound and confirm with `check_model` (so any
+    /// sum/other constraints are verified). Decides e.g. `distinct a…e ∧ Σ ≤ 10 ∧
+    /// all ≥ 0` sat via 0,1,2,3,4.
+    fn try_distinct_witness(&mut self, goal: AstId) -> Option<Model> {
+        use crate::ast::ArithOp;
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let is_int_var =
+            |u: AstId| self.m.is_uninterp_const(u) && self.m.is_int_sort(self.m.get_sort(u));
+        let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        for &c in &conj {
+            if self.m.is_not(c) {
+                let inner = self.m.app_args(c)[0];
+                if self.m.is_eq(inner) {
+                    let a = self.m.app_args(inner);
+                    if a.len() == 2 && is_int_var(a[0]) && is_int_var(a[1]) {
+                        diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
+                    }
+                }
+            } else if let Some(op) = self.m.arith_op(c) {
+                let a = self.m.app_args(c);
+                if a.len() == 2
+                    && matches!(op, ArithOp::Ge | ArithOp::Gt)
+                    && is_int_var(a[0])
+                    && let Some(k) = self
+                        .m
+                        .as_numeral(a[1])
+                        .and_then(|r| r.to_integer())
+                        .and_then(|i| i.to_i64())
+                {
+                    let lo = if op == ArithOp::Gt { k + 1 } else { k };
+                    let e = lower.entry(a[0]).or_insert(lo);
+                    *e = (*e).max(lo);
+                }
+            }
+        }
+        // Largest pairwise-distinct set among the lower-bounded variables.
+        let mut cand: Vec<AstId> = lower.keys().copied().collect();
+        cand.retain(|&v| {
+            lower
+                .keys()
+                .filter(|&&w| w != v)
+                .all(|&w| diseq.contains(&(v.min(w), v.max(w))))
+        });
+        if cand.len() < 2 {
+            return None;
+        }
+        cand.sort_by_key(|v| lower[v]);
+        let mut prev = i64::MIN;
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for &v in &cand {
+            let val = lower[&v].max(prev.saturating_add(1));
+            subst.push((v, self.m.mk_int(val)));
+            prev = val;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        let (res, m) = check_model(&self.m, g);
+        if res == SmtResult::Sat {
+            return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+        }
+        None
+    }
+
     /// Pigeonhole refutation: `n` pairwise-distinct integers each `≥ lo` have sum
     /// `≥ n·lo + n(n−1)/2`; if the goal also bounds their sum `≤ hi < that`, it is
     /// UNSAT. Reconstructs the distinct set from the pairwise `≠` that `distinct`
@@ -10160,6 +10235,12 @@ impl Context {
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let (res, model) = self.decide_inner(goal);
+        // Fallback: a distinct-integers-with-bounds witness (min distinct assignment).
+        if res == SmtResult::Unknown
+            && let Some(m) = self.try_distinct_witness(goal)
+        {
+            return (SmtResult::Sat, Some(m));
+        }
         // Fallback: if undecided, inline `v = <ground constructor>` bindings so
         // selectors/testers over `v` fold, and retry. Applied only on `unknown`
         // (it removes `v`, which would break a model query on the primary path).
