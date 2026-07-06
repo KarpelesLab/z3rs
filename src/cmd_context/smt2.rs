@@ -1359,6 +1359,31 @@ impl Regex {
         }
     }
 
+    /// The longest literal every matching word must start with (sound: a definite
+    /// lower bound). `re.++ "http" (a-z)*` ⇒ `"http"`.
+    fn mandatory_prefix(&self) -> Vec<u32> {
+        match self {
+            Regex::Lit(l) => l.clone(),
+            Regex::Range(lo, hi) if lo == hi => alloc::vec![*lo],
+            Regex::Concat(a, b) => {
+                let mut p = a.mandatory_prefix();
+                // Only extend past `a` if `a` matches exactly one word (a fixed
+                // literal), so its prefix is the whole of `a`.
+                if let Regex::Lit(la) = a.as_ref()
+                    && *la == p
+                {
+                    p.extend(b.mandatory_prefix());
+                }
+                p
+            }
+            Regex::Inter(a, b) => {
+                let (pa, pb) = (a.mandatory_prefix(), b.mandatory_prefix());
+                if pa.len() >= pb.len() { pa } else { pb }
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -3404,7 +3429,25 @@ impl Context {
         let mut first_char: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut last_char: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut contains: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
+        let mut neg_prefixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
         for &c in &conj {
+            // `¬prefixof(Q, x)` with Q concrete: x must NOT start with Q.
+            if self.m.is_not(c)
+                && let inner = self.m.app_args(c)[0]
+                && self.m.is_app(inner)
+                && self
+                    .str_op_decls
+                    .get(&self.m.app_decl(inner))
+                    .map(String::as_str)
+                    == Some("str.prefixof")
+                && self.m.app_args(inner).len() == 2
+                && let Some(q) = self.str_value(self.m.app_args(inner)[0])
+            {
+                neg_prefixof
+                    .entry(self.m.app_args(inner)[1])
+                    .or_default()
+                    .push(q);
+            }
             if !self.m.is_app(c) {
                 continue;
             }
@@ -3501,6 +3544,17 @@ impl Context {
             // Membership in a provably-empty language (e.g. `(a-z)+ ∩ (0-9)+`).
             if r.is_empty_lang() {
                 return true;
+            }
+            // The regex forces a mandatory prefix `P`; a `¬prefixof(Q, x)` with Q a
+            // prefix of P is a contradiction (`x ∈ http·(a-z)* ∧ ¬prefixof "http" x`).
+            if let Some(qs) = neg_prefixof.get(&x) {
+                let p = r.mandatory_prefix();
+                if qs
+                    .iter()
+                    .any(|q| !q.is_empty() && q.len() <= p.len() && p[..q.len()] == q[..])
+                {
+                    return true;
+                }
             }
             // A non-empty `x` in a language with no non-empty word (e.g.
             // `(a-m)* ∩ (n-z)*`, matching only `""`) is UNSAT.
