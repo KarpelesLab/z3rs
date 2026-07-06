@@ -2744,6 +2744,56 @@ impl Context {
                 ax.push(imp);
             }
         }
+        // `str.at` bounds: `str.at x k` is a single character when `0 ≤ k < len x`
+        // and the empty string otherwise. Refutes `str.at x 3 = "a" ∧ len x = 2`.
+        let ats: Vec<(AstId, AstId, i64)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.at")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2
+                        && let Some(k) = self
+                            .m
+                            .as_numeral(a[1])
+                            .and_then(|r| r.to_integer())
+                            .and_then(|i| i.to_i64())
+                    {
+                        return Some((t, a[0], k));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (app, x, k) in &ats {
+            let lenf = self.str_len_fn();
+            let lx = self.m.mk_app(lenf, &[*x]);
+            let atlen = self.m.mk_app(lenf, &[*app]);
+            let zero = self.m.mk_int(0);
+            if *k < 0 {
+                // Negative index ⇒ empty ⇒ `len(app) = 0`.
+                let e = self.m.mk_eq(atlen, zero);
+                ax.push(e);
+            } else {
+                let kv = self.m.mk_int(*k);
+                // Out of bounds `k ≥ len x ⇒ len(app) = 0` (a non-empty `str.at x k`
+                // then contradicts by length congruence).
+                let oob = self.m.mk_ge(kv, lx);
+                let empty_len = self.m.mk_eq(atlen, zero);
+                ax.push(self.m.mk_implies(oob, empty_len));
+                // In bounds `k < len x ⇒ len(app) = 1`.
+                let kv2 = self.m.mk_int(*k);
+                let inb = self.m.mk_lt(kv2, lx);
+                let one = self.m.mk_int(1);
+                let len_one = self.m.mk_eq(atlen, one);
+                ax.push(self.m.mk_implies(inb, len_one));
+            }
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
