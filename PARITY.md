@@ -54,7 +54,7 @@ scripts, run both `z3rs` and `z3`, and flag any case where *both* return a
 definite verdict but they *disagree*. `unknown` (either side), errors, and
 timeouts are ignored — only a both-definite contradiction is a bug.
 
-Across the project this method drove out **13+ real soundness bugs**, each fixed
+Across the project this method drove out **14+ real soundness bugs**, each fixed
 and captured as a regression test:
 
 - opaque term treated as a free variable in the univariate `sat` path
@@ -72,6 +72,9 @@ and captured as a regression test:
 - a sequence marker re-folded to a concrete sequence under an inline, whose
   equality node was rebuilt without re-folding, so two distinct concrete
   sequences were treated as free (`extract s 1 2 = [2,1]` reported `sat` not `unsat`)
+- an integer `v = const` inline that substitutes and simplifies, but `bv2nat`/
+  `int2bv` do not fold under substitution, so a pinned integer flowing into one
+  was left free (`int2bv 8 n = x ∧ n = 5 ∧ x = bv7` reported `sat` not `unsat`)
 - (plus earlier datatype selector-trigger and FP free-BV bugs)
 
 Every one was a **wrong definite verdict** caught by differential fuzzing before
