@@ -5046,6 +5046,7 @@ impl Context {
                 ax.push(self.m.mk_implies(hyp, *pm));
             }
         }
+
         // All characters of a length-pinned `x` pinned by `str.at x i = cᵢ` fix the
         // whole string: `(⋀_{i<n} str.at x i = cᵢ) ⇒ x = c0…c_{n-1}`. Refutes
         // `len x = 3 ∧ str.at x 0="a" ∧ str.at x 1="b" ∧ str.at x 2="c" ∧ x≠"abc"`.
@@ -5161,6 +5162,41 @@ impl Context {
                 let both = self.m.mk_and(&[*pm, *sm]);
                 let eq = self.m.mk_eq(*px, lit);
                 ax.push(self.m.mk_implies(both, eq));
+            }
+        }
+        // Suffix mirror of the str.at→prefixof reverse: trailing
+        // `str.at x (n−|S|+i) = S[i]` (with `len x = n` pinned) imply `suffixof S x`.
+        // Refutes `len x = 3 ∧ str.at x 2 = "z" ∧ ¬suffixof "z" x`.
+        for (sm, schars, sx) in &sufs {
+            let Some(n) = self.str_exact_len(goal, *sx) else {
+                continue;
+            };
+            if schars.len() > n {
+                continue;
+            }
+            let base = n - schars.len();
+            let mut hyps = Vec::new();
+            let mut complete = true;
+            for (i, &ch) in schars.iter().enumerate() {
+                if let Some(&(am, _, _)) = ats
+                    .iter()
+                    .find(|&&(_, x, idx)| x == *sx && idx == (base + i) as i64)
+                {
+                    let chl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                    extra_lits.insert(chl);
+                    hyps.push(self.m.mk_eq(am, chl));
+                } else {
+                    complete = false;
+                    break;
+                }
+            }
+            if complete && !hyps.is_empty() {
+                let hyp = if hyps.len() == 1 {
+                    hyps[0]
+                } else {
+                    self.m.mk_and(&hyps)
+                };
+                ax.push(self.m.mk_implies(hyp, *sm));
             }
         }
         if let Some(str_sort) = self.string_sort
