@@ -5044,10 +5044,15 @@ impl Context {
         // concatenation of ≥3 parts (a literal between two variables) against a
         // long literal expands to a nested disjunction the general solver handles
         // exponentially; leave it symbolic so the bounded string witness decides it.
+        // Leave the equation symbolic (for the bounded witness) when the split
+        // would be costly *and* weak: a long literal (nested disjunction blows up
+        // the general solver), or an all-variable concatenation (the split can't
+        // confirm a concrete sat, whereas literal-anchored parts still refute).
         if pa.len() == 1
             && let Some(l) = lit(&pa[0])
         {
-            if pb.len() >= 3 && l.len() > 3 {
+            let all_vars = pb.iter().all(|p| lit(p).is_none());
+            if pb.len() >= 3 && (l.len() > 3 || all_vars) {
                 return Ok(None);
             }
             return Ok(Some(self.split_concat_eq(pb, &l)?));
@@ -5055,7 +5060,8 @@ impl Context {
         if pb.len() == 1
             && let Some(l) = lit(&pb[0])
         {
-            if pa.len() >= 3 && l.len() > 3 {
+            let all_vars = pa.iter().all(|p| lit(p).is_none());
+            if pa.len() >= 3 && (l.len() > 3 || all_vars) {
                 return Ok(None);
             }
             return Ok(Some(self.split_concat_eq(pa, &l)?));
