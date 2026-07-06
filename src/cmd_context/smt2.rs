@@ -2878,6 +2878,35 @@ impl Context {
             let eq = self.m.mk_eq(total, sum);
             ax.push(eq);
         }
+        // Seq predicate length links: `seq.contains s t ⇒ len s ≥ len t` and
+        // `seq.prefixof/suffixof s t ⇒ len s ≤ len t`. Refutes
+        // `seq.contains s (seq.unit 3) ∧ len s = 0`.
+        let seq_preds: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_app(t) {
+                    return None;
+                }
+                let op = self.seqop_ops.get(&self.m.app_decl(t))?;
+                let a = self.m.app_args(t);
+                if a.len() != 2 {
+                    return None;
+                }
+                match op.as_str() {
+                    "seq.contains" => Some((t, a[0], a[1])), // len s ≥ len t
+                    "seq.prefixof" | "seq.suffixof" => Some((t, a[1], a[0])), // len(container) ≥ len(part)
+                    _ => None,
+                }
+            })
+            .collect();
+        for (app, longer, shorter) in &seq_preds {
+            let dl = self.seq_len_decl_for(self.m.get_sort(*longer));
+            let ds = self.seq_len_decl_for(self.m.get_sort(*shorter));
+            let ll = self.m.mk_app(dl, &[*longer]);
+            let ls = self.m.mk_app(ds, &[*shorter]);
+            let ge = self.m.mk_ge(ll, ls);
+            ax.push(self.m.mk_implies(*app, ge));
+        }
         // Length links for symbolic predicates present in the goal:
         // `str.contains(s,sub) ⇒ len(s) ≥ len(sub)` etc.
         let links = self.str_pred_len.clone();
