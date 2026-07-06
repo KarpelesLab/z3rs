@@ -5895,6 +5895,61 @@ impl Context {
                 ax.push(self.m.mk_implies(t, d));
             }
         }
+        // `seq.contains(u·v·…, [c])` (single element) distributes to
+        // `⋁ contains(partᵢ, [c])` — one element cannot span a boundary. Refutes
+        // `contains((seq.unit 1)·s, [9]) ∧ ¬contains(s, [9])`.
+        // Keyed by (haystack, needle *element list*) — `seq.unit e` mints a fresh
+        // constant on each parse, so two syntactically equal needles differ by AstId
+        // and must be matched by value.
+        let seq_contains_by_val: BTreeMap<(AstId, Vec<AstId>), AstId> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.contains")
+                    && self.m.app_args(t).len() == 2
+                {
+                    let a = self.m.app_args(t);
+                    self.seq_of.get(&a[1]).map(|nv| ((a[0], nv.clone()), t))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let seq_concat = self.seq_concat.clone();
+        let contains_markers: Vec<(AstId, Vec<AstId>, AstId)> = seq_contains_by_val
+            .iter()
+            .map(|((hay, nv), &t)| (*hay, nv.clone(), t))
+            .collect();
+        for (hay, nv, t) in contains_markers {
+            if nv.len() != 1 {
+                continue;
+            }
+            let Some((_, parts)) = seq_concat.iter().find(|(app, _)| *app == hay) else {
+                continue;
+            };
+            let markers: Option<Vec<AstId>> = parts
+                .iter()
+                .map(|&p| {
+                    if let Some(pv) = self.seq_of.get(&p) {
+                        let has = pv.iter().any(|&e| e == nv[0]);
+                        Some(if has {
+                            self.m.mk_true()
+                        } else {
+                            self.m.mk_false()
+                        })
+                    } else {
+                        seq_contains_by_val.get(&(p, nv.clone())).copied()
+                    }
+                })
+                .collect();
+            if let Some(disj) = markers
+                && !disj.is_empty()
+            {
+                let d = self.m.mk_or(&disj);
+                ax.push(self.m.mk_implies(t, d));
+            }
+        }
         // `seq.prefixof s u ⇒ (i < len s ⇒ nth(s,i) = nth(u,i))`. Refutes
         // `prefixof s u ∧ len s = 2 ∧ nth u 0 = 5 ∧ nth s 0 ≠ 5`.
         let seq_prefs: Vec<AstId> = present
