@@ -9832,6 +9832,12 @@ impl Context {
             self.m.mk_and(&conj)
         };
         let lifted = self.lift(combined);
+        // Fold ground selector/tester chains before the datatype axioms are built,
+        // so the eager eta/selector instantiation doesn't unfold over an unreduced
+        // selector tower (`v(l(l(node …))) = 9`). Sound on the pre-axiom goal — it
+        // only rewrites selector-on-constructor, and the axioms are then generated
+        // on the folded goal.
+        let lifted = self.dt_fold(lifted);
         let goal = self.with_axioms(lifted);
         // The string/seq witness re-derives its own axioms on the concretised
         // goal, so it must start from the pre-axiom formula (substituting into the
