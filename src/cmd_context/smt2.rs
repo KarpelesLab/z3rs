@@ -8371,6 +8371,36 @@ impl Context {
     /// Every variable must be a genuine *free* uninterpreted constant: an opaque
     /// compound term (`(^ 2.0 0.5)` = √2, `(f x)`) has a determined value, so
     /// treating it as free would make a `sat` claim unsound.
+    /// The `(select a i)` terms in `goal` that may be treated as free nonlinear
+    /// variables: `a` is a free array constant, is read exactly once, and never
+    /// appears except as a select's array argument (so it is not a store target,
+    /// not equated to another array — the read is genuinely unconstrained). Sound
+    /// for both directions: a free array can realise any value at the read.
+    fn nonlinear_free_reads(&self, goal: AstId) -> BTreeSet<AstId> {
+        let mut reads: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
+        let mut tainted: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_select(t) {
+                reads.entry(self.m.app_args(t)[0]).or_default().insert(t);
+            }
+            // Taint any array-sorted term used other than as a select's array arg.
+            for &a in self.m.app_args(t) {
+                if self.m.is_array_sort(self.m.get_sort(a))
+                    && !(self.m.is_select(t) && self.m.app_args(t)[0] == a)
+                {
+                    tainted.insert(a);
+                }
+            }
+        }
+        let mut out = BTreeSet::new();
+        for (arr, terms) in reads {
+            if self.m.is_uninterp_const(arr) && !tainted.contains(&arr) && terms.len() == 1 {
+                out.extend(terms);
+            }
+        }
+        out
+    }
+
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
         use crate::nlsat::{Constraint, Rel};
         let mut conjuncts = Vec::new();
@@ -8390,10 +8420,14 @@ impl Context {
         if var_map.is_empty() || constraints.is_empty() {
             return None;
         }
-        // `int_of[idx]` = is this variable integer-sorted? All must be free consts.
+        // `int_of[idx]` = is this variable integer-sorted? Each must be a free
+        // uninterpreted constant, or a *free read* `(select a i)` whose array is a
+        // free constant read exactly once (so the read is unconstrained — sound to
+        // treat as an independent variable in both directions).
+        let free_reads = self.nonlinear_free_reads(goal);
         let mut int_of: BTreeMap<u32, bool> = BTreeMap::new();
         for (&ast, &idx) in &var_map {
-            if !self.m.is_uninterp_const(ast) {
+            if !self.m.is_uninterp_const(ast) && !free_reads.contains(&ast) {
                 return None;
             }
             int_of.insert(idx, self.m.is_int_sort(self.m.get_sort(ast)));

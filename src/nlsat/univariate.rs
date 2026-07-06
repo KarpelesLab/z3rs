@@ -509,9 +509,10 @@ pub fn decide_int(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
     // a bounded range for a witness: finding one is a sound `sat`, but failing to
     // does not prove `unsat` (a solution may lie outside the sampled range), so
     // fall back to `unknown`.
+    const SAMPLE: i64 = 256;
     let (cands, exhaustive) = match candidates {
         Some(c) => (c, true),
-        None => ((-256..=256).collect::<Vec<i64>>(), false),
+        None => ((-SAMPLE..=SAMPLE).collect::<Vec<i64>>(), false),
     };
     for c in cands {
         let x = Rational::from_integer(puremp::Int::from(c));
@@ -525,7 +526,22 @@ pub fn decide_int(constraints: &[(Polynomial, Rel)], var: Var) -> Option<bool> {
             return Some(true);
         }
     }
-    if exhaustive { Some(false) } else { None }
+    if exhaustive {
+        return Some(false);
+    }
+    // No witness among the sampled integers. If the real-feasible region lies
+    // entirely within `[-SAMPLE, SAMPLE]` (adding `x ≥ SAMPLE` or `x ≤ -SAMPLE`
+    // is real-infeasible), then every candidate integer was checked ⇒ `unsat`.
+    let bound = Rational::from_integer(puremp::Int::from(SAMPLE));
+    let x = Polynomial::var(var);
+    let mut hi = constraints.to_vec();
+    hi.push((x.sub(&Polynomial::constant(bound.clone())), Rel::Ge)); // x ≥ SAMPLE
+    let mut lo = constraints.to_vec();
+    lo.push((x.add(&Polynomial::constant(bound)), Rel::Le)); // x ≤ -SAMPLE
+    if decide(&hi, var) == Some(false) && decide(&lo, var) == Some(false) {
+        return Some(false);
+    }
+    None
 }
 
 /// The sign of `p` at the unique root of the critical product isolated in
