@@ -14521,6 +14521,16 @@ impl Context {
 
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // Lower every FP structural equality to a bit-vector equality (including
+        // ones nested under `not`, as `distinct` expands to), so a bit-blasted FP
+        // op result (`fp.add`/`fp.roundToIntegral`/…) is decided by QF_BV rather
+        // than treated as a free term — a fuzz-found spurious sat under `distinct`.
+        let goal = if self.fp_sorts.is_empty() {
+            goal
+        } else {
+            let mut memo = BTreeMap::new();
+            self.blast_fp_equalities(goal, &mut memo)
+        };
         // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
@@ -16244,6 +16254,29 @@ impl Context {
                 && args.iter().all(|&a| self.m.get_sort(a) == s)
             {
                 return Ok(self.m.mk_false());
+            }
+        }
+        // Concrete floating-point `=`/`distinct` folds by bit pattern — each
+        // `(to_fp …)` constant is a fresh AstId per parse, so structural equality of
+        // two equal-valued constants is not reflexive and would otherwise be treated
+        // as a free equality (a fuzz-found spurious sat in `distinct`).
+        if (head == "distinct" || head == "=") && args.len() >= 2 {
+            let fps: Option<Vec<(u64, u32, u32)>> =
+                args.iter().map(|a| self.fp_of.get(a).copied()).collect();
+            if let Some(fps) = fps {
+                let any_eq = (0..fps.len()).any(|i| (i + 1..fps.len()).any(|j| fps[i] == fps[j]));
+                let all_eq = fps.iter().all(|&f| f == fps[0]);
+                return Ok(if head == "distinct" {
+                    if any_eq {
+                        self.m.mk_false()
+                    } else {
+                        self.m.mk_true()
+                    }
+                } else if all_eq {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                });
             }
         }
         let m = &mut self.m;
