@@ -3084,6 +3084,70 @@ impl Context {
                 }
             }
         }
+        // Prefix/suffix character overlap over a length-pinned `x`: pin each
+        // character position with a *congruent* `str.at` marker (shared decl) so a
+        // prefix and a suffix that disagree at a shared position conflict. Refutes
+        // `prefixof "abc" x ∧ suffixof "abc" x ∧ len x = 4`.
+        let sufs: Vec<(AstId, Vec<u32>, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.suffixof")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2
+                        && let Some(q) = self.str_value(a[0])
+                    {
+                        return Some((t, q, a[1]));
+                    }
+                }
+                None
+            })
+            .collect();
+        if let Some(str_sort) = self.string_sort
+            && (!prefs.is_empty() || !sufs.is_empty())
+        {
+            let int_sort = self.m.mk_int_sort();
+            let at_decl =
+                self.m
+                    .mk_func_decl(Symbol::new("!prefsuf_at!"), &[str_sort, int_sort], str_sort);
+            let mut xs: Vec<AstId> = Vec::new();
+            for (_, _, x) in prefs.iter().chain(sufs.iter()) {
+                if !xs.contains(x) {
+                    xs.push(*x);
+                }
+            }
+            for x in xs {
+                let ln = self.str_exact_len(goal, x);
+                let mut pin = |s: &mut Self, marker: AstId, pos: usize, ch_code: u32| {
+                    let posv = s.m.mk_int(pos as i64);
+                    let at = s.m.mk_app(at_decl, &[x, posv]);
+                    let ch = s.mk_str_lit(&code_points_to_string(&[ch_code]));
+                    let eq = s.m.mk_eq(at, ch);
+                    ax.push(s.m.mk_implies(marker, eq));
+                };
+                for (pm, pchars, px) in &prefs {
+                    if *px == x {
+                        for (k, &c) in pchars.iter().take(8).enumerate() {
+                            pin(self, *pm, k, c);
+                        }
+                    }
+                }
+                if let Some(l) = ln {
+                    for (sm, schars, sx) in &sufs {
+                        if *sx == x && schars.len() <= l {
+                            for (k, &c) in schars.iter().take(8).enumerate() {
+                                pin(self, *sm, l - schars.len() + k, c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // `str.substr x i n` length (constant `i ≥ 0`, `n`): the extracted length
         // is `min(n, max(0, len x − i))`. Refutes `str.substr x 0 2 = "ab" ∧ len x = 1`.
         let subs: Vec<(AstId, AstId, i64, i64)> = present
