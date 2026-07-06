@@ -1107,6 +1107,9 @@ struct Context {
     /// Symbolic `seq.++` markers with their parts, so the additive length axiom
     /// `len(s ++ t) = len(s) + len(t)` can be attached.
     seq_concat: Vec<(AstId, Vec<AstId>)>,
+    /// Out-of-bounds `seq.nth` on a concrete sequence → a cached fresh free
+    /// element (underspecified, matching z3), keyed by `(sequence, index)`.
+    seq_nth_oob: BTreeMap<(AstId, i64), AstId>,
     /// The operation name behind each symbolic sequence marker declaration, so a
     /// marker can be re-folded once its arguments become concrete (witness search).
     seqop_ops: BTreeMap<AstId, String>,
@@ -1348,6 +1351,7 @@ impl Context {
             symbolic_divmod: Vec::new(),
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
+            seq_nth_oob: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
         }
@@ -6843,10 +6847,24 @@ impl Context {
             "seq.nth" => {
                 if let (Some(l), Some(i)) =
                     (self.seq_of.get(&args[0]).cloned(), self.int_arg(args[1]))
-                    && i >= 0
-                    && (i as usize) < l.len()
                 {
-                    return Ok(l[i as usize]);
+                    if i >= 0 && (i as usize) < l.len() {
+                        return Ok(l[i as usize]);
+                    }
+                    // Out of bounds on a concrete sequence: an underspecified free
+                    // element (matching z3), cached per (sequence, index).
+                    if let Some(&c) = self.seq_nth_oob.get(&(args[0], i)) {
+                        return Ok(c);
+                    }
+                    let elem = self
+                        .seq_elem_sort(self.m.get_sort(args[0]))
+                        .unwrap_or_else(|| self.m.mk_int_sort());
+                    let name = alloc::format!("!nth_oob!{}", self.fresh_counter);
+                    self.fresh_counter += 1;
+                    let d = self.m.mk_func_decl(Symbol::new(&name), &[], elem);
+                    let c = self.m.mk_const(d);
+                    self.seq_nth_oob.insert((args[0], i), c);
+                    return Ok(c);
                 }
                 self.symbolic_seq(op, args)
             }
