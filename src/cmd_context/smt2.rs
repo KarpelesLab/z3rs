@@ -1290,6 +1290,51 @@ impl Regex {
         }
     }
 
+    /// The set of code points a matching word can *start* with, as sorted
+    /// inclusive ranges — `None` when it can't be bounded (`AllChar`/`Comp`, or an
+    /// `Inter` we don't intersect exactly). Used to detect an empty `re.inter`.
+    fn first_ranges(&self) -> Option<Vec<(u32, u32)>> {
+        match self {
+            Regex::Lit(l) => Some(l.first().map(|&c| alloc::vec![(c, c)]).unwrap_or_default()),
+            Regex::Range(lo, hi) => Some(alloc::vec![(*lo, *hi)]),
+            Regex::None => Some(Vec::new()),
+            Regex::AllChar | Regex::All | Regex::Comp(_) => None,
+            Regex::Union(a, b) => {
+                let mut r = a.first_ranges()?;
+                r.extend(b.first_ranges()?);
+                Some(r)
+            }
+            Regex::Concat(a, b) => {
+                let mut r = a.first_ranges()?;
+                if a.nullable() {
+                    r.extend(b.first_ranges()?);
+                }
+                Some(r)
+            }
+            Regex::Star(a) => a.first_ranges(),
+            Regex::Inter(_, _) => None,
+        }
+    }
+
+    /// Whether the language is provably empty (sound: only a definite `true`).
+    /// Covers `re.inter` of two non-nullable parts whose first-character sets are
+    /// disjoint (`(a-z)+ ∩ (0-9)+`).
+    fn is_empty_lang(&self) -> bool {
+        if let Regex::Inter(a, b) = self
+            && !a.nullable()
+            && !b.nullable()
+            && let (Some(ra), Some(rb)) = (a.first_ranges(), b.first_ranges())
+        {
+            let disjoint = ra
+                .iter()
+                .all(|&(al, ah)| rb.iter().all(|&(bl, bh)| ah < bl || bh < al));
+            if disjoint {
+                return true;
+            }
+        }
+        matches!(self, Regex::None)
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -3039,6 +3084,10 @@ impl Context {
             }
         }
         for (x, r) in in_re {
+            // Membership in a provably-empty language (e.g. `(a-z)+ ∩ (0-9)+`).
+            if r.is_empty_lang() {
+                return true;
+            }
             if let Some(&fc) = first_char.get(&x)
                 && !r.can_start_with(fc)
             {
