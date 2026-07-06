@@ -3840,6 +3840,42 @@ impl Context {
                 }
             }
         }
+        // `suffixof P x` (P concrete) pins the *last* character even without a
+        // pinned length: `str.at x (str.len x − 1) = P[last]` — the index matches
+        // the goal's `str.at x (len x − 1)` marker (`suffixof "ab" x ∧
+        // str.at x (len x − 1) = "z"` refutes).
+        for &t in &present {
+            if !self.m.is_app(t)
+                || self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                    != Some("str.suffixof")
+            {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            let Some(pv) = self.str_value(a[0]) else {
+                continue;
+            };
+            if pv.is_empty() {
+                continue;
+            }
+            let x = a[1];
+            let lenf = self.str_len_fn();
+            let lenx = self.m.mk_app(lenf, &[x]);
+            let one = self.m.mk_int(1);
+            let idx = self.m.mk_sub(&[lenx, one]);
+            if let Ok(at) = self.string_op("str.at", &[x, idx]) {
+                let chl = self.mk_str_lit(&code_points_to_string(&[pv[pv.len() - 1]]));
+                extra_lits.insert(chl);
+                let eqc = self.m.mk_eq(at, chl);
+                ax.push(self.m.mk_implies(t, eqc));
+            }
+        }
         for (pm, pchars, px) in &prefs {
             for (am, ax_x, k) in &ats {
                 if px == ax_x && *k >= 0 && (*k as usize) < pchars.len() {
