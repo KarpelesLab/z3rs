@@ -163,8 +163,9 @@ impl Interval {
         self.add(&other.neg())
     }
 
-    /// Product: the image `{ x*y : x∈a, y∈b }`, computed from the four endpoint
-    /// products (the exact hull for intervals of rationals).
+    /// Product: the image `{ x*y : x∈a, y∈b }`, the exact hull of the four
+    /// endpoint products on the extended real line (signed ∞ endpoints tracked, so
+    /// a bounded side stays bounded — e.g. `(-∞,6)·(0,1) = (-∞,6)`, not `(-∞,∞)`).
     pub fn mul(&self, other: &Interval) -> Interval {
         let (
             Interval::Range {
@@ -179,35 +180,18 @@ impl Interval {
         else {
             return Interval::Empty;
         };
-        // Products involving an infinite endpoint yield an infinite result
-        // endpoint unless the finite factor is exactly zero (0·∞ ⇒ 0). Rather
-        // than enumerate the sign cases, fall back to `all()` whenever an
-        // infinite bound can reach the product, which stays sound.
+        let (el1, eu1) = (Ev::lower(l1), Ev::upper(u1));
+        let (el2, eu2) = (Ev::lower(l2), Ev::upper(u2));
         let corners = [
-            mul_bound(l1, l2),
-            mul_bound(l1, u2),
-            mul_bound(u1, l2),
-            mul_bound(u1, u2),
+            ev_mul(&el1, &el2),
+            ev_mul(&el1, &eu2),
+            ev_mul(&eu1, &el2),
+            ev_mul(&eu1, &eu2),
         ];
-        if corners.iter().any(|c| c.is_none()) {
-            // Some corner is unbounded — over-approximate to a half/whole line by
-            // computing the finite hull we can and widening the infinite side.
-            return infinite_mul_hull(&corners);
-        }
-        let mut pts: Vec<(Rational, bool)> = corners.into_iter().map(|c| c.unwrap()).collect();
-        pts.sort_by(|a, b| a.0.cmp(&b.0));
-        // Lowest corner is the min; open iff that corner is open. Symmetric for max.
-        let min = pts.first().unwrap().clone();
-        let max = pts.last().unwrap().clone();
+        // The image's lower end is the least corner; its upper end the greatest.
         Interval::new(
-            Bound::Finite {
-                value: min.0,
-                open: min.1,
-            },
-            Bound::Finite {
-                value: max.0,
-                open: max.1,
-            },
+            ev_extreme(&corners, true).to_lower_bound(),
+            ev_extreme(&corners, false).to_upper_bound(),
         )
     }
 
@@ -232,8 +216,6 @@ impl Interval {
     }
 }
 
-use alloc::vec::Vec;
-
 fn neg_bound(b: &Bound) -> Bound {
     match b {
         Bound::Infinite => Bound::Infinite,
@@ -256,41 +238,118 @@ fn add_bound(a: &Bound, b: &Bound) -> Bound {
     }
 }
 
-/// Multiply two endpoint values, returning `None` if the product is unbounded
-/// (an infinite endpoint times a nonzero finite/infinite one).
-fn mul_bound(a: &Bound, b: &Bound) -> Option<(Rational, bool)> {
-    match (a, b) {
-        (Bound::Finite { value: x, open: ox }, Bound::Finite { value: y, open: oy }) => {
-            let prod = x.mul(y);
-            // The product endpoint is open iff either factor endpoint is open and
-            // the other factor is nonzero (a zero factor pins the product to 0).
-            let open = (*ox && !y.is_zero()) || (*oy && !x.is_zero());
-            Some((prod, open))
+/// An extended-real endpoint value for interval multiplication: a signed ∞ or a
+/// finite rational carrying its open/closed flag.
+#[derive(Clone)]
+enum Ev {
+    NegInf,
+    PosInf,
+    Fin { value: Rational, open: bool },
+}
+
+impl Ev {
+    /// The endpoint viewed as a *lower* bound (`Infinite ↦ −∞`).
+    fn lower(b: &Bound) -> Ev {
+        match b {
+            Bound::Infinite => Ev::NegInf,
+            Bound::Finite { value, open } => Ev::Fin {
+                value: value.clone(),
+                open: *open,
+            },
         }
-        // ∞ * 0 = 0 (a genuinely finite, attained corner).
-        (Bound::Infinite, Bound::Finite { value, .. })
-        | (Bound::Finite { value, .. }, Bound::Infinite)
-            if value.is_zero() =>
-        {
-            Some((Rational::from_integer(0.into()), false))
+    }
+    /// The endpoint viewed as an *upper* bound (`Infinite ↦ +∞`).
+    fn upper(b: &Bound) -> Ev {
+        match b {
+            Bound::Infinite => Ev::PosInf,
+            Bound::Finite { value, open } => Ev::Fin {
+                value: value.clone(),
+                open: *open,
+            },
         }
-        _ => None,
+    }
+    fn sign(&self) -> i32 {
+        match self {
+            Ev::NegInf => -1,
+            Ev::PosInf => 1,
+            Ev::Fin { value, .. } => value.signum(),
+        }
+    }
+    fn to_lower_bound(&self) -> Bound {
+        match self {
+            Ev::NegInf | Ev::PosInf => Bound::infinite(),
+            Ev::Fin { value, open } => Bound::Finite {
+                value: value.clone(),
+                open: *open,
+            },
+        }
+    }
+    fn to_upper_bound(&self) -> Bound {
+        self.to_lower_bound() // same representation; the caller places it
     }
 }
 
-/// Widen a set of product corners (some unbounded) into a sound hull. If any
-/// corner is unbounded we cannot in general pin both sides, so we return the
-/// tightest half-line consistent with the finite corners, or the whole line.
-fn infinite_mul_hull(corners: &[Option<(Rational, bool)>; 4]) -> Interval {
-    let finite: Vec<&(Rational, bool)> = corners.iter().filter_map(|c| c.as_ref()).collect();
-    if finite.is_empty() {
-        return Interval::all();
+/// Compare two extended values on the real line.
+fn ev_cmp(a: &Ev, b: &Ev) -> Ordering {
+    match (a, b) {
+        (Ev::NegInf, Ev::NegInf) | (Ev::PosInf, Ev::PosInf) => Ordering::Equal,
+        (Ev::NegInf, _) | (_, Ev::PosInf) => Ordering::Less,
+        (Ev::PosInf, _) | (_, Ev::NegInf) => Ordering::Greater,
+        (Ev::Fin { value: x, .. }, Ev::Fin { value: y, .. }) => x.cmp(y),
     }
-    // We know an unbounded corner exists on at least one side; without sign
-    // tracking we conservatively leave both ends infinite. This is sound (it
-    // over-approximates) and matches Z3 falling back to (-oo,+oo) when a factor
-    // straddles zero with an unbounded partner.
-    Interval::all()
+}
+
+/// Product of two extended endpoint values (`0·∞ = 0`, else the sign rule).
+fn ev_mul(a: &Ev, b: &Ev) -> Ev {
+    if let (Ev::Fin { value: x, open: ox }, Ev::Fin { value: y, open: oy }) = (a, b) {
+        // Open iff a factor endpoint is open and the *other* factor is nonzero
+        // (a zero factor pins the product to an attained 0).
+        let open = (*ox && !y.is_zero()) || (*oy && !x.is_zero());
+        return Ev::Fin {
+            value: x.mul(y),
+            open,
+        };
+    }
+    // At least one infinite; a zero finite factor pins the product to 0.
+    let zero = |e: &Ev| matches!(e, Ev::Fin { value, .. } if value.is_zero());
+    if zero(a) || zero(b) {
+        return Ev::Fin {
+            value: Rational::from_integer(0.into()),
+            open: false,
+        };
+    }
+    if a.sign() * b.sign() < 0 {
+        Ev::NegInf
+    } else {
+        Ev::PosInf
+    }
+}
+
+/// The extreme (min if `want_min`, else max) of the four corners. At a finite
+/// extreme the bound is *closed* if any corner attains that value closed
+/// (i.e. open only when every corner at the extreme value is open) — the sound,
+/// tight choice.
+fn ev_extreme(corners: &[Ev; 4], want_min: bool) -> Ev {
+    let mut best = &corners[0];
+    for c in &corners[1..] {
+        let o = ev_cmp(c, best);
+        if (want_min && o == Ordering::Less) || (!want_min && o == Ordering::Greater) {
+            best = c;
+        }
+    }
+    match best {
+        Ev::Fin { value, .. } => {
+            let open = corners.iter().all(|c| match c {
+                Ev::Fin { value: v, open } => v != value || *open,
+                _ => true,
+            });
+            Ev::Fin {
+                value: value.clone(),
+                open,
+            }
+        }
+        other => other.clone(),
+    }
 }
 
 /// The tighter (larger) of two *lower* bounds.
