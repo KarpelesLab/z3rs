@@ -1110,6 +1110,9 @@ struct Context {
     /// Out-of-bounds `seq.nth` on a concrete sequence → a cached fresh free
     /// element (underspecified, matching z3), keyed by `(sequence, index)`.
     seq_nth_oob: BTreeMap<(AstId, i64), AstId>,
+    /// Symbolic `seq.nth s i` markers, cached by `(s, i)` so repeated reads are
+    /// the *same* term (congruent) — `nth s 0 = 1 ∧ nth s 0 = 2` then refutes.
+    seq_nth_sym: BTreeMap<(AstId, AstId), AstId>,
     /// The operation name behind each symbolic sequence marker declaration, so a
     /// marker can be re-folded once its arguments become concrete (witness search).
     seqop_ops: BTreeMap<AstId, String>,
@@ -1352,6 +1355,7 @@ impl Context {
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
+            seq_nth_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
         }
@@ -6866,7 +6870,13 @@ impl Context {
                     self.seq_nth_oob.insert((args[0], i), c);
                     return Ok(c);
                 }
-                self.symbolic_seq(op, args)
+                // Symbolic `seq.nth s i`: reuse one congruent marker per (s, i).
+                if let Some(&c) = self.seq_nth_sym.get(&(args[0], args[1])) {
+                    return Ok(c);
+                }
+                let c = self.symbolic_seq(op, args)?;
+                self.seq_nth_sym.insert((args[0], args[1]), c);
+                Ok(c)
             }
             "seq.at" => {
                 if let (Some(l), Some(i)) =
