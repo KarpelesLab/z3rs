@@ -1212,6 +1212,60 @@ impl Regex {
     fn matches(&self, s: &[u32]) -> bool {
         self.ends(s, 0).contains(&s.len())
     }
+
+    /// Which lengths `0..=max` a matching word can have — *exact* for the
+    /// supported constructors. `None` when the length set cannot be computed
+    /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
+    fn lengths(&self, max: usize) -> Option<Vec<bool>> {
+        let mut v = alloc::vec![false; max + 1];
+        match self {
+            Regex::Lit(l) => {
+                if l.len() <= max {
+                    v[l.len()] = true;
+                }
+            }
+            Regex::Range(_, _) | Regex::AllChar => {
+                if max >= 1 {
+                    v[1] = true;
+                }
+            }
+            Regex::All => v.iter_mut().for_each(|b| *b = true),
+            Regex::None => {}
+            Regex::Concat(a, b) => {
+                let (la, lb) = (a.lengths(max)?, b.lengths(max)?);
+                for i in 0..=max {
+                    if la[i] {
+                        for j in 0..=(max - i) {
+                            if lb[j] {
+                                v[i + j] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Regex::Union(a, b) => {
+                let (la, lb) = (a.lengths(max)?, b.lengths(max)?);
+                for i in 0..=max {
+                    v[i] = la[i] || lb[i];
+                }
+            }
+            Regex::Star(a) => {
+                let la = a.lengths(max)?;
+                v[0] = true;
+                for i in 0..=max {
+                    if v[i] {
+                        for u in 1..=(max - i) {
+                            if la[u] {
+                                v[i + u] = true;
+                            }
+                        }
+                    }
+                }
+            }
+            Regex::Inter(_, _) | Regex::Comp(_) => return None,
+        }
+        Some(v)
+    }
 }
 
 impl Context {
@@ -2635,6 +2689,54 @@ impl Context {
                 };
                 let concl = if holds { *app } else { self.m.mk_not(*app) };
                 let imp = self.m.mk_implies(*eq, concl);
+                ax.push(imp);
+            }
+        }
+        // Regex membership length restriction: `in_re(x, r) ⇒ len x ∈ L(r)` for a
+        // constant regex `r`, expressed as a disjunction over the achievable
+        // lengths ≤ MAX (with a `> MAX` escape). Refutes `x ∈ (ab)* ∧ len x = 3`.
+        const RLMAX: usize = 24;
+        let in_res: Vec<(AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.in_re")
+                {
+                    let a = self.m.app_args(t);
+                    if a.len() == 2 {
+                        return Some((t, a[0], a[1]));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (app, x, r) in &in_res {
+            // Only refute against a length the goal pins `x` to (avoids a costly
+            // membership disjunction): if `x ∈ r` yet `len x = k` is unachievable,
+            // add `in_re(x,r) ⇒ len x ≠ k`.
+            let Some(k) = self.str_exact_len(goal, *x) else {
+                continue;
+            };
+            if k > RLMAX {
+                continue;
+            }
+            let Some(regex) = self.regex_of.get(r).cloned() else {
+                continue;
+            };
+            let Some(lens) = regex.lengths(RLMAX) else {
+                continue;
+            };
+            if !lens[k] {
+                let lenf = self.str_len_fn();
+                let lx = self.m.mk_app(lenf, &[*x]);
+                let kv = self.m.mk_int(k as i64);
+                let eq = self.m.mk_eq(lx, kv);
+                let ne = self.m.mk_not(eq);
+                let imp = self.m.mk_implies(*app, ne);
                 ax.push(imp);
             }
         }
@@ -5969,7 +6071,7 @@ impl Context {
         // Result sort: Bool for predicates, Int for indexof/to_int, else String.
         let sort = match op {
             "str.contains" | "str.prefixof" | "str.suffixof" | "str.is_digit" | "str.<"
-            | "str.<=" => self.m.mk_bool_sort(),
+            | "str.<=" | "str.in_re" | "str.in.re" => self.m.mk_bool_sort(),
             "str.indexof" | "str.to_int" | "str.to-int" | "str.to_code" | "str.to-code" => {
                 self.m.mk_int_sort()
             }
