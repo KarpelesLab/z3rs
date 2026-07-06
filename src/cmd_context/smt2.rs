@@ -3386,8 +3386,11 @@ impl Context {
                     conj.push(g2);
                     self.m.mk_and(&conj)
                 };
-                if let (SmtResult::Sat, m) = check_model(&self.m, g3) {
-                    return m;
+                let (res, m) = check_model(&self.m, g3);
+                if res == SmtResult::Sat {
+                    // `check_model` may report `sat` without a model when the goal
+                    // folded to a ground truth; the assignment still exists.
+                    return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
                 }
             }
             let mut k = 0;
