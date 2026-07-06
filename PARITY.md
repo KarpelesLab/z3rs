@@ -37,7 +37,7 @@ than guessing.
 | **QF_LRA** | Fourier–Motzkin with witness reconstruction, strict/non-strict | budget exhaustion |
 | **QF_BV** | full core bit-blasting (arith/bitwise/shift/div/rem/compare/concat/extract/ext) over CDCL with **gate constant-folding + structural hashing** | conflict-budget exhaustion on hard instances |
 | **QF_A / AX** | read-over-write + extensionality array axioms, **extensionality refutation from a universal** (`a≠b ∧ ∀i. a[i]=b[i]`), **Bool-indexed arrays** (index case-split), **const-array binding inline**, **`(_ map f)` equalities by pointwise expansion**, **bit-vector arrays read-over-write** | non-constant array combinators beyond the read set |
-| **QF_DT** | datatypes: enums, records, recursive & mutually-recursive, parametric; `match`, selectors/testers; **occurs-check refutation of cyclic variable equalities** (`p = cons(0,q) ∧ q = cons(0,p)`, n-cycles) | — |
+| **QF_DT** | datatypes: enums, records, recursive & mutually-recursive, parametric; `match`, selectors/testers; **occurs-check refutation of cyclic variable equalities**, **enum pigeonhole** (`distinct v0…v4` over a 4-value enum) | — |
 | **QF_S** | string constant folding, symbolic `str.len`, regex membership, length-link refutation, substring/prefix/suffix **monotonicity**, `str.at`/`str.substr`/`str.to_code`/`str.indexof` **length-range axioms**, **`str.contains ⟺ str.indexof …0 ≥ 0`**, **disjoint/overlap multi-`contains` length bounds**, **`str.to_int` digit witness + `len ≥ #digits` bound**, **`str.to_int∘str.from_int` round-trip fold**, **`str.<` / `str.<=` order theories**, **`str.replace` (concrete s,t) → concat**, **congruent `str.at x i` markers**, **prefixof/suffixof against a literal at a fixed length pins `x`** (`prefixof x "abcd" ∧ suffixof x "abcd" ∧ len x = 2` refutes), length-guided bounded witness (literal-substring/concat/overlap seeded, **small integer index variables**, index expressions folded), and a **Nielsen word-equation procedure** | deep-content SAT word equations (length-coupled); regex-range ∩ suffix; concat = literal coupled to a length-sum |
 | **QF sequences** | integer-sequence length links, additive `seq.++` length with **part-length non-negativity** (`s ++ u = empty ∧ len s = 2` refutes), congruent `seq.nth`, **concrete-sequence inline with re-fold**, **concat split at a pinned `len s`** (`s ++ u = [1,2] ∧ len s = 1 ∧ nth u 0 = 9` refutes), and a **bounded SAT witness** deciding concat/`nth`/empty-subsequence cases | symbolic element sorts beyond Int; long sequences past the search bound |
 | **QF_FP** | **the whole common surface bit-exact**: classification, ordered compares, `min`/`max`, `abs`/`neg`, exact `to_real`, **all arithmetic — `add`/`sub`/`mul`/`div`/`sqrt`/`fma`/`roundToIntegral`** (all 5 rounding modes), `to_fp(real/int/bv/fp-widening)`; concrete all-formats + symbolic Float16 decide | symbolic **Float32/64** circuits (performance-bound, like QF_BV); `rem`/`to_ubv`/`to_sbv`/`to_fp`-narrowing |
@@ -54,7 +54,7 @@ scripts, run both `z3rs` and `z3`, and flag any case where *both* return a
 definite verdict but they *disagree*. `unknown` (either side), errors, and
 timeouts are ignored — only a both-definite contradiction is a bug.
 
-Across the project this method drove out **14+ real soundness bugs**, each fixed
+Across the project this method drove out **15+ real soundness bugs**, each fixed
 and captured as a regression test:
 
 - opaque term treated as a free variable in the univariate `sat` path
@@ -75,6 +75,9 @@ and captured as a regression test:
 - an integer `v = const` inline that substitutes and simplifies, but `bv2nat`/
   `int2bv` do not fold under substitution, so a pinned integer flowing into one
   was left free (`int2bv 8 n = x ∧ n = 5 ∧ x = bv7` reported `sat` not `unsat`)
+- an FP `ite` blasted to a fresh, unconstrained bit-vector, so the selector never
+  tied the result to the chosen branch (`fp.eq(ite(b,x,+0),+0) ∧ b ∧ isNormal x`
+  reported `sat` not `unsat`) — now blasted to a bit-vector `ite` of the branches
 - (plus earlier datatype selector-trigger and FP free-BV bugs)
 
 Every one was a **wrong definite verdict** caught by differential fuzzing before
