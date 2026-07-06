@@ -2717,6 +2717,107 @@ impl Context {
         false
     }
 
+    /// Integer range pigeonhole: `n` pairwise-distinct integers all lying in a
+    /// common `[L, H]` with `H − L + 1 < n` cannot be assigned distinct values
+    /// (`distinct v0…v3 ∧ ∀i. 0 ≤ vi ≤ 2` is UNSAT). Sound: every variable's own
+    /// bounds are within `[min lo, max hi]`, so the union range must hold `n`
+    /// distinct values.
+    fn int_range_pigeonhole_unsat(&self, goal: AstId) -> bool {
+        use crate::ast::ArithOp;
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let num = |u: AstId| {
+            self.m
+                .as_numeral(u)
+                .and_then(|r| r.to_integer())
+                .and_then(|i| i.to_i64())
+        };
+        let is_int_var =
+            |u: AstId| self.m.is_uninterp_const(u) && self.m.is_int_sort(self.m.get_sort(u));
+        let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut upper: BTreeMap<AstId, i64> = BTreeMap::new();
+        for &c in &conj {
+            if self.m.is_not(c) {
+                let inner = self.m.app_args(c)[0];
+                if self.m.is_eq(inner) {
+                    let a = self.m.app_args(inner);
+                    if a.len() == 2 && is_int_var(a[0]) && is_int_var(a[1]) {
+                        diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
+                    }
+                }
+                continue;
+            }
+            let Some(op) = self.m.arith_op(c) else {
+                continue;
+            };
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            // Normalise to `var ⋈ const`, both argument orders.
+            let (v, k, dir) = if is_int_var(a[0]) && num(a[1]).is_some() {
+                (a[0], num(a[1]).unwrap(), 1)
+            } else if is_int_var(a[1]) && num(a[0]).is_some() {
+                (a[1], num(a[0]).unwrap(), -1)
+            } else {
+                continue;
+            };
+            // `dir = 1`: `v op k`; `dir = -1`: `k op v` (flip the relation).
+            match (op, dir) {
+                (ArithOp::Ge, 1) | (ArithOp::Le, -1) => {
+                    let e = lower.entry(v).or_insert(k);
+                    *e = (*e).max(k);
+                }
+                (ArithOp::Gt, 1) | (ArithOp::Lt, -1) => {
+                    let e = lower.entry(v).or_insert(k + 1);
+                    *e = (*e).max(k + 1);
+                }
+                (ArithOp::Le, 1) | (ArithOp::Ge, -1) => {
+                    let e = upper.entry(v).or_insert(k);
+                    *e = (*e).min(k);
+                }
+                (ArithOp::Lt, 1) | (ArithOp::Gt, -1) => {
+                    let e = upper.entry(v).or_insert(k - 1);
+                    *e = (*e).min(k - 1);
+                }
+                _ => {}
+            }
+        }
+        let bounded: Vec<AstId> = lower
+            .keys()
+            .copied()
+            .filter(|v| upper.contains_key(v))
+            .collect();
+        // Greedy clique over the disequality graph.
+        let mut clique: Vec<AstId> = Vec::new();
+        for &v in &bounded {
+            if clique
+                .iter()
+                .all(|&c| diseq.contains(&(v.min(c), v.max(c))))
+            {
+                clique.push(v);
+            }
+        }
+        if clique.len() >= 2 {
+            let min_lo = clique.iter().map(|v| lower[v]).min().unwrap();
+            let max_hi = clique.iter().map(|v| upper[v]).max().unwrap();
+            if max_hi - min_lo + 1 < clique.len() as i64 {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Enum pigeonhole: a clique of pairwise-distinct terms of a `k`-constructor
     /// enum larger than `k` cannot be satisfied (`distinct v0…v4` over a 4-value
     /// enum is UNSAT).
@@ -11977,6 +12078,10 @@ impl Context {
         }
         // Pigeonhole: `n` distinct integers `≥ lo` with sum `≤ hi < n·lo+n(n−1)/2`.
         if self.distinct_sum_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Integer range pigeonhole: `n` distinct integers in a range of size < n.
+        if self.int_range_pigeonhole_unsat(goal) {
             return (SmtResult::Unsat, None);
         }
         // Enum pigeonhole: `n` pairwise-distinct terms of a `k`-constructor enum
