@@ -3452,16 +3452,23 @@ impl Context {
         // `str.prefixof` / `str.suffixof` are partial orders: antisymmetry
         // `pre x y ∧ pre y x ⇒ x=y` and transitivity `pre x y ∧ pre y z ⇒ pre x z`.
         // Refutes `prefixof x y ∧ prefixof y x ∧ x≠y`.
-        for opname in ["str.prefixof", "str.suffixof"] {
+        for opname in [
+            "str.prefixof",
+            "str.suffixof",
+            "seq.prefixof",
+            "seq.suffixof",
+        ] {
             let ords: Vec<(AstId, AstId, AstId)> = present
                 .iter()
                 .filter_map(|&t| {
                     if self.m.is_app(t)
-                        && self
+                        && (self
                             .str_op_decls
                             .get(&self.m.app_decl(t))
                             .map(String::as_str)
                             == Some(opname)
+                            || self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                                == Some(opname))
                     {
                         let a = self.m.app_args(t);
                         if a.len() == 2 {
