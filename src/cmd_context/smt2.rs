@@ -4139,6 +4139,22 @@ impl Context {
                 }
             }
         }
+        // `str.at x i = c ⇒ contains(x, c)` — a character read out of `x` proves
+        // `x` contains it. Refutes `str.at x 1 = "b" ∧ ¬contains(x, "b")`.
+        let at_contains: Vec<(AstId, AstId, AstId)> = ats
+            .iter()
+            .flat_map(|&(am, ax_x, _)| {
+                contains_of.iter().filter_map(move |(&(hay, needle), &cm)| {
+                    (hay == ax_x).then_some((am, needle, cm))
+                })
+            })
+            .collect();
+        for (am, needle, cm) in at_contains {
+            if self.str_value(needle).is_some_and(|v| v.len() == 1) {
+                let eq = self.m.mk_eq(am, needle);
+                ax.push(self.m.mk_implies(eq, cm));
+            }
+        }
         // Prefix/suffix character overlap over a length-pinned `x`: pin each
         // character position with a *congruent* `str.at` marker (shared decl) so a
         // prefix and a suffix that disagree at a shared position conflict. Refutes
