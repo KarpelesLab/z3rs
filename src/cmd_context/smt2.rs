@@ -10635,10 +10635,18 @@ impl Context {
                 }
             }
         }
-        // Fallback: inline `a = (as const …) v` bindings so reads of `a` fold to `v`
-        // (`a = const 5 ∧ select a i = select a j` becomes trivially sat).
+        // Fallback: inline `a = (as const …)` and `a = (store …)` bindings so reads
+        // of `a` fold. Iterated to a fixpoint so a chain `a = const 2 ∧
+        // b = store a 1 5 ∧ select b 3 = 2` resolves through both bindings.
         if res == SmtResult::Unknown {
-            let inlined = self.inline_const_array_bindings(goal);
+            let mut inlined = goal;
+            for _ in 0..8 {
+                let next = self.inline_const_array_bindings(inlined);
+                if next == inlined {
+                    break;
+                }
+                inlined = next;
+            }
             if inlined != goal {
                 let (r2, m2) = self.decide_inner(inlined);
                 if r2 != SmtResult::Unknown {
@@ -10892,7 +10900,15 @@ impl Context {
                 continue;
             }
             for (v, ca) in [(a[0], a[1]), (a[1], a[0])] {
-                if self.m.is_uninterp_const(v) && self.m.is_const_array(ca) && !bound.contains(&v) {
+                // Inline `v = (as const …)` and `v = (store …)` bindings: reads of
+                // `v` then fold via read-over-write and const-array collapse. Chains
+                // like `a = const 2 ∧ b = store a 1 5` resolve because the fallback
+                // iterates this to a fixpoint.
+                if self.m.is_uninterp_const(v)
+                    && (self.m.is_const_array(ca) || self.m.is_store(ca))
+                    && v != ca
+                    && !bound.contains(&v)
+                {
                     subst.push((v, ca));
                     bound.insert(v);
                 }
@@ -10902,6 +10918,8 @@ impl Context {
             return goal;
         }
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        let g = self.expand_select_store(g, &mut memo);
         crate::rewriter::simplify(&mut self.m, g)
     }
 
