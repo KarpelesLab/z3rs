@@ -10798,6 +10798,16 @@ impl Context {
                 }
             }
         }
+        // Fallback: split `s ++ u = <concrete seq>` at a pinned `len s`.
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_seq_concat_split(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         // Fallback: expand `(_ map f) a… = b` pointwise and eliminate the map, so
         // `(_ map and) a b = a ∧ a[i] ∧ ¬b[i]` decides.
         if res == SmtResult::Unknown && !self.maps.is_empty() {
@@ -10998,6 +11008,71 @@ impl Context {
                     subst.push((v, sq));
                     bound.insert(v);
                 }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        self.refold_str_markers(g, &mut memo)
+    }
+
+    /// Split `s ++ u = C` (C a concrete sequence) at a pinned `len s = k`:
+    /// substitute `s = C[:k]`, `u = C[k:]` and re-fold, so `nth`/`len` over the
+    /// determined parts reduce (`s ++ u = [1,2] ∧ len s = 1 ∧ nth u 0 = 9` refutes).
+    fn inline_seq_concat_split(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for (app, parts) in self.seq_concat.clone() {
+            if parts.len() != 2 {
+                continue;
+            }
+            let mut cval: Option<Vec<AstId>> = None;
+            for &c in &conj {
+                if !self.m.is_eq(c) {
+                    continue;
+                }
+                let a = self.m.app_args(c);
+                if a.len() == 2 {
+                    for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                        if l == app
+                            && let Some(cv) = self.seq_of.get(&r)
+                        {
+                            cval = Some(cv.clone());
+                        }
+                    }
+                }
+            }
+            let Some(cv) = cval else {
+                continue;
+            };
+            let Some(k) = self.str_exact_len(goal, parts[0]) else {
+                continue;
+            };
+            if k > cv.len() {
+                continue;
+            }
+            if self.m.is_uninterp_const(parts[0]) && !bound.contains(&parts[0]) {
+                let sv = self.mk_seq(cv[..k].to_vec());
+                subst.push((parts[0], sv));
+                bound.insert(parts[0]);
+            }
+            if self.m.is_uninterp_const(parts[1]) && !bound.contains(&parts[1]) {
+                let uv = self.mk_seq(cv[k..].to_vec());
+                subst.push((parts[1], uv));
+                bound.insert(parts[1]);
             }
         }
         if subst.is_empty() {
