@@ -2354,6 +2354,131 @@ impl Context {
     /// constructors), pairwise tester exclusivity, and each tester's definition
     /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
     /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    /// Sound occurs-check refutation for cyclic datatype equalities among
+    /// variables: from the asserted `v = C(… w …)` facts, `v` is strictly deeper
+    /// than every datatype variable `w` in the constructor expression. Variables
+    /// tied by `v = w` share a depth. A strict cycle (`v > … > v`) is impossible in
+    /// a finite datatype, so the goal is UNSAT — catching `p = cons(0,q) ∧
+    /// q = cons(0,p)` where the depth axioms miss the multi-variable cycle.
+    fn datatype_occurs_unsat(&self, goal: AstId) -> bool {
+        if self.datatypes.is_empty() {
+            return false;
+        }
+        let is_dt_var = |m: &AstManager, t: AstId| {
+            m.is_app(t) && m.app_args(t).is_empty() && self.datatypes.contains_key(&m.get_sort(t))
+        };
+        let is_ctor = |m: &AstManager, t: AstId| {
+            m.is_app(t)
+                && self
+                    .datatypes
+                    .get(&m.get_sort(t))
+                    .is_some_and(|cs| cs.iter().any(|(cd, _, _)| *cd == m.app_decl(t)))
+        };
+        // Collect the top-level conjuncts (asserted facts).
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        // Union-find over datatype variables tied by `v = w`.
+        let mut rep: BTreeMap<AstId, AstId> = BTreeMap::new();
+        fn find(rep: &mut BTreeMap<AstId, AstId>, x: AstId) -> AstId {
+            let mut r = x;
+            while let Some(&p) = rep.get(&r) {
+                if p == r {
+                    break;
+                }
+                r = p;
+            }
+            r
+        }
+        let touch = |rep: &mut BTreeMap<AstId, AstId>, x: AstId| {
+            rep.entry(x).or_insert(x);
+        };
+        // Strict edges `v → w` (v deeper than w).
+        let mut edges: Vec<(AstId, AstId)> = Vec::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let args = self.m.app_args(c);
+            if args.len() != 2 {
+                continue;
+            }
+            let (a, b) = (args[0], args[1]);
+            if is_dt_var(&self.m, a) && is_dt_var(&self.m, b) {
+                touch(&mut rep, a);
+                touch(&mut rep, b);
+                let (ra, rb) = (find(&mut rep, a), find(&mut rep, b));
+                if ra != rb {
+                    rep.insert(ra, rb);
+                }
+                continue;
+            }
+            // `v = C(… )`: every datatype variable in the constructor expression is
+            // strictly shallower than `v`.
+            for (v, expr) in [(a, b), (b, a)] {
+                if is_dt_var(&self.m, v) && is_ctor(&self.m, expr) {
+                    touch(&mut rep, v);
+                    for sub in self.m.postorder(expr) {
+                        if sub != v && is_dt_var(&self.m, sub) {
+                            touch(&mut rep, sub);
+                            edges.push((v, sub));
+                        }
+                    }
+                }
+            }
+        }
+        if edges.is_empty() {
+            return false;
+        }
+        // A strict cycle over the union-find components is unsatisfiable.
+        let comp_edges: Vec<(AstId, AstId)> = edges
+            .iter()
+            .map(|&(v, w)| (find(&mut rep, v), find(&mut rep, w)))
+            .collect();
+        // DFS cycle detection (including self-loops).
+        let mut nodes: Vec<AstId> = Vec::new();
+        for &(v, w) in &comp_edges {
+            for x in [v, w] {
+                if !nodes.contains(&x) {
+                    nodes.push(x);
+                }
+            }
+        }
+        let mut color: BTreeMap<AstId, u8> = BTreeMap::new();
+        fn dfs(
+            node: AstId,
+            comp_edges: &[(AstId, AstId)],
+            color: &mut BTreeMap<AstId, u8>,
+        ) -> bool {
+            color.insert(node, 1); // gray
+            for &(v, w) in comp_edges {
+                if v == node {
+                    match color.get(&w).copied().unwrap_or(0) {
+                        1 => return true, // back-edge → cycle
+                        0 if dfs(w, comp_edges, color) => return true,
+                        _ => {}
+                    }
+                }
+            }
+            color.insert(node, 2); // black
+            false
+        }
+        for &n in &nodes {
+            if color.get(&n).copied().unwrap_or(0) == 0 && dfs(n, &comp_edges, &mut color) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn datatype_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         if self.datatypes.is_empty() {
             return Vec::new();
@@ -9285,6 +9410,12 @@ impl Context {
 
     fn decide(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // Cyclic datatype equalities among variables (`p = cons(0,q) ∧
+        // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
+        // the depth axioms miss multi-variable cycles.
+        if self.datatype_occurs_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
         // Quantified formulas are not decided here (the instantiation engine ran
         // upstream); a residual quantifier sentinel ⇒ sound `unknown`.
         if !self.quant_atoms.is_empty()
