@@ -4785,6 +4785,46 @@ impl Context {
         // `seq.extract s i l` (concrete i,l) relates to `s` element-wise:
         // `i+j < len s ⇒ nth(extract, j) = nth(s, i+j)` for `0 ≤ j < l`, plus the
         // clamped length. Lets `extract s 1 1 = unit 3 ∧ nth s 1 = 2` refute.
+        // `seq.at s i = seq.unit(seq.nth s i)` when `0 ≤ i < len s`. Refutes
+        // `seq.at s 2 = seq.unit 5 ∧ seq.nth s 2 = 9`.
+        let seq_ats: Vec<AstId> = present
+            .iter()
+            .copied()
+            .filter(|&t| {
+                self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str) == Some("seq.at")
+            })
+            .collect();
+        for t in seq_ats {
+            let a = self.m.app_args(t).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            let Some(i) = self.int_arg(a[1]) else {
+                continue;
+            };
+            if i < 0 {
+                continue;
+            }
+            let zero0 = self.m.mk_int(0);
+            let (Ok(nth_at), Ok(nth_s), Ok(len_at), Ok(len_s)) = (
+                self.seq_op("seq.nth", &[t, zero0]),
+                self.seq_op("seq.nth", &[a[0], a[1]]),
+                self.seq_op("seq.len", &[t]),
+                self.seq_op("seq.len", &[a[0]]),
+            ) else {
+                continue;
+            };
+            let iv = self.m.mk_int(i);
+            let in_range = self.m.mk_lt(iv, len_s);
+            // In range: element equals `nth s i` and length is 1; else length 0.
+            let elem_eq = self.m.mk_eq(nth_at, nth_s);
+            ax.push(self.m.mk_implies(in_range, elem_eq));
+            let one = self.m.mk_int(1);
+            let zero = self.m.mk_int(0);
+            let clen = self.m.mk_ite(in_range, one, zero);
+            ax.push(self.m.mk_eq(len_at, clen));
+        }
         let extracts: Vec<AstId> = present
             .iter()
             .copied()
