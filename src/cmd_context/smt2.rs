@@ -1077,6 +1077,10 @@ struct Context {
     fp_sorts: BTreeMap<(u32, u32), AstId>,
     /// Opaque to_fp conversion markers -> (rm, x, eb, sb).
     fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
+    /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
+    /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
+    /// concrete non-NaN FP) invert to `x = bits(c)`.
+    fp_from_bv: BTreeMap<AstId, (AstId, u32, u32)>,
     /// The `RoundingMode` sort, once used.
     rm_sort: Option<AstId>,
     /// Floating-point constants: term → `(raw bits, eb, sb)`. Only `Float64`
@@ -1478,6 +1482,7 @@ impl Context {
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
+            fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
@@ -2952,6 +2957,49 @@ impl Context {
             }
         }
         false
+    }
+
+    /// Invert `((_ to_fp eb sb) x) = c` (x a symbolic BV, c a concrete non-NaN FP)
+    /// to the bit-pattern equality `x = bits(c)` — the reinterpretation is a
+    /// bijection on non-NaN values, so the biconditional is sound. NaN targets have
+    /// many bit patterns and are skipped.
+    fn fp_from_bv_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.fp_from_bv.is_empty() {
+            return Vec::new();
+        }
+        let mut ax = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            if a.len() != 2 {
+                continue;
+            }
+            for (fp, c) in [(a[0], a[1]), (a[1], a[0])] {
+                let Some(&(x, eb, sb)) = self.fp_from_bv.get(&fp) else {
+                    continue;
+                };
+                let Some(&(bits, ceb, csb)) = self.fp_of.get(&c) else {
+                    continue;
+                };
+                if ceb != eb || csb != sb || sb == 0 {
+                    continue;
+                }
+                let mant_mask = (1u64 << (sb - 1)) - 1;
+                let exp_mask = ((1u64 << eb) - 1) << (sb - 1);
+                let is_nan = (bits & exp_mask) == exp_mask && (bits & mant_mask) != 0;
+                if is_nan {
+                    continue;
+                }
+                let bv = self.m.mk_bv_numeral(Int::from(bits), eb + sb);
+                let x_eq = self.m.mk_eq(x, bv);
+                let fp_eq = self.m.mk_eq(fp, c);
+                // Boolean equality is the biconditional `fp_eq ⟺ x_eq`.
+                ax.push(self.m.mk_eq(fp_eq, x_eq));
+            }
+        }
+        ax
     }
 
     /// When integer bounds pin a variable to a single value (`0 < x < 2 ⇒ x = 1`)
@@ -12111,6 +12159,7 @@ impl Context {
         axioms.extend(self.square_axioms(lifted));
         axioms.extend(self.product_cancel_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
+        axioms.extend(self.fp_from_bv_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
@@ -14334,6 +14383,9 @@ impl Context {
                         if has_rm {
                             let rm = self.term(&l[1])?;
                             self.fp_conv.insert(t, (rm, x, eb, sb));
+                        } else if self.m.bv_sort_width(self.m.get_sort(x)) == Some(eb + sb) {
+                            // Symbolic bit-vector reinterpreted as FP: remember the link.
+                            self.fp_from_bv.insert(t, (x, eb, sb));
                         }
                         return Ok(t);
                     }
