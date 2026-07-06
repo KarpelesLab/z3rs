@@ -7856,9 +7856,21 @@ impl Context {
         let con = self.icp_atom(phi, false, &mut var_map)?;
         let yi = *var_map.get(&y)?;
         let poly = &con.poly;
-        // `y` must occur to degree exactly 2 with a nonzero constant leading
-        // coefficient (a genuine quadratic in `y`).
-        if poly.degree_of(yi) != 2 {
+        let dy = poly.degree_of(yi);
+        // An odd-degree polynomial in `y` with a nonzero *constant* leading
+        // coefficient is surjective in `y`, so `∃y. p(y) = 0` holds for every xs.
+        if con.rel == crate::nlsat::Rel::Eq
+            && dy % 2 == 1
+            && poly
+                .coeff_of_var(yi, dy)
+                .as_constant()
+                .is_some_and(|c| !c.is_zero())
+        {
+            return Some(true);
+        }
+        // Otherwise handle the genuine quadratic in `y` (degree exactly 2 with a
+        // nonzero constant leading coefficient).
+        if dy != 2 {
             return None;
         }
         let a = poly.coeff_of_var(yi, 2).as_constant()?;
