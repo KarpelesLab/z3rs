@@ -3413,6 +3413,16 @@ impl Context {
                     }
                 }
             }
+            // Pin an order marker between two string literals to its concrete
+            // (lexicographic) truth, so a transitivity-derived literal comparison
+            // (`"n" < "m"`) closes the contradiction. Refutes `x<"m" ∧ "n"<x`.
+            let lit_edges: Vec<(AstId, AstId, AstId)> =
+                edge.iter().map(|(&(a, b), &m)| (m, a, b)).collect();
+            for (m, a, b) in lit_edges {
+                if let (Some(va), Some(vb)) = (self.str_value(a), self.str_value(b)) {
+                    ax.push(if va < vb { m } else { self.m.mk_not(m) });
+                }
+            }
         }
         // `str.<=` is a total order: antisymmetry `(a≤b) ∧ (b≤a) ⇒ a=b`,
         // transitivity `(a≤b) ∧ (b≤c) ⇒ (a≤c)`, and reflexivity `a≤a`. Refutes
@@ -3486,6 +3496,14 @@ impl Context {
                         .entry((a, a))
                         .or_insert_with(|| self.m.mk_app(le_decl, &[a, a]));
                     ax.push(maa);
+                }
+                // Pin literal-literal `≤` markers to their concrete order.
+                let lit_edges: Vec<(AstId, AstId, AstId)> =
+                    edge.iter().map(|(&(a, b), &m)| (m, a, b)).collect();
+                for (m, a, b) in lit_edges {
+                    if let (Some(va), Some(vb)) = (self.str_value(a), self.str_value(b)) {
+                        ax.push(if va <= vb { m } else { self.m.mk_not(m) });
+                    }
                 }
             }
         }
