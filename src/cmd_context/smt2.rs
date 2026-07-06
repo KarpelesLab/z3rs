@@ -3520,6 +3520,7 @@ impl Context {
         let mut contains: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
         let mut neg_prefixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
         let mut neg_suffixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
+        let mut neg_contains: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
         let mut neg_eq: BTreeMap<AstId, BTreeSet<Vec<u32>>> = BTreeMap::new();
         for &c in &conj {
             // `x ≠ "lit"` (distinct/¬=): the literal words x is excluded from.
@@ -3568,6 +3569,23 @@ impl Context {
             {
                 neg_suffixof
                     .entry(self.m.app_args(inner)[1])
+                    .or_default()
+                    .push(q);
+            }
+            // `¬contains(x, Q)` with Q concrete: x must NOT contain Q.
+            if self.m.is_not(c)
+                && let inner = self.m.app_args(c)[0]
+                && self.m.is_app(inner)
+                && self
+                    .str_op_decls
+                    .get(&self.m.app_decl(inner))
+                    .map(String::as_str)
+                    == Some("str.contains")
+                && self.m.app_args(inner).len() == 2
+                && let Some(q) = self.str_value(self.m.app_args(inner)[1])
+            {
+                neg_contains
+                    .entry(self.m.app_args(inner)[0])
                     .or_default()
                     .push(q);
             }
@@ -3746,6 +3764,19 @@ impl Context {
                 if qs.iter().any(|q| {
                     !q.is_empty() && q.len() <= sfx.len() && sfx[sfx.len() - q.len()..] == q[..]
                 }) {
+                    return true;
+                }
+            }
+            // The regex forces a mandatory prefix/suffix P; a `¬contains(Q, x)` with Q
+            // a substring of P is a contradiction (every word contains P, hence Q).
+            // Refutes `x ∈ "ab"·(a-z)* ∧ ¬contains(x, "a")`.
+            if let Some(qs) = neg_contains.get(&x) {
+                let pfx = r.mandatory_prefix();
+                let sfx = r.mandatory_suffix();
+                let is_sub = |q: &[u32], p: &[u32]| {
+                    !q.is_empty() && p.len() >= q.len() && p.windows(q.len()).any(|w| w == q)
+                };
+                if qs.iter().any(|q| is_sub(q, &pfx) || is_sub(q, &sfx)) {
                     return true;
                 }
             }
@@ -6558,7 +6589,22 @@ impl Context {
                     && self.m.app_args(a).first() == Some(&v)
             }
         };
-        for t in self.m.postorder(goal) {
+        // Only TOP-LEVEL conjunct equalities count as asserted; a `len x = k` buried
+        // inside an implication/axiom (e.g. `len x = 1 ⇒ x = "x"`, added for a
+        // single-character `contains`) must NOT pin the length — combined with the
+        // finite-language refutation that was a fuzz-found unsoundness.
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        for t in top {
             if !self.m.is_eq(t) {
                 continue;
             }
