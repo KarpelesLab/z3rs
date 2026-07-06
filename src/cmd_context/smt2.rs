@@ -11627,9 +11627,40 @@ impl Context {
             if !self.m.is_eq(c) {
                 continue;
             }
-            let a = self.m.app_args(c);
+            let a = self.m.app_args(c).to_vec();
             if a.len() != 2 || !self.m.is_int_sort(self.m.get_sort(a[0])) {
                 continue;
+            }
+            // Sum of squares = 0 ⇒ each base is 0. `x² + y² = 0 ⇒ x = 0 ∧ y = 0`
+            // (a sum of non-negative terms is zero only if each is). Refutes
+            // `x²+y²=0 ∧ (x≠0 ∨ y≠0)` where `check_model` returned a spurious sat.
+            for (sum, zero) in [(a[0], a[1]), (a[1], a[0])] {
+                if !self.m.as_numeral(zero).is_some_and(|n| n.is_zero())
+                    || self.m.arith_op(sum) != Some(ArithOp::Add)
+                {
+                    continue;
+                }
+                let parts = self.m.app_args(sum).to_vec();
+                let pos = Rational::from_integer(Int::from(0));
+                let mut bases: Vec<AstId> = Vec::new();
+                let mut all_nonneg = true;
+                for p in parts {
+                    let (coeff, vars) = self.flatten_mul(p);
+                    if vars.len() == 2 && vars[0] == vars[1] && coeff > pos {
+                        bases.push(vars[0]);
+                    } else if vars.is_empty() && coeff >= pos {
+                        // a non-negative constant addend; zero contributes nothing
+                    } else {
+                        all_nonneg = false;
+                        break;
+                    }
+                }
+                if all_nonneg && !bases.is_empty() {
+                    let z = self.m.mk_int(0);
+                    for b in bases {
+                        ax.push(self.m.mk_eq(b, z));
+                    }
+                }
             }
             let (ca, va) = self.flatten_mul(a[0]);
             let (cb, vb) = self.flatten_mul(a[1]);
