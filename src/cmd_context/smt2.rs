@@ -5105,6 +5105,16 @@ impl Context {
                 None
             })
             .collect();
+        // `prefixof P x ∧ len x = |P|` (P covers the whole word) ⇒ `x = P`; same
+        // for a suffix. Refutes `prefixof "99" x ∧ len x = 2 ∧ str.to_int x ≠ 99`.
+        for (pm, pchars, px) in prefs.iter().chain(sufs.iter()) {
+            if self.str_exact_len(goal, *px) == Some(pchars.len()) {
+                let lit = self.mk_str_lit(&code_points_to_string(pchars));
+                extra_lits.insert(lit);
+                let eq = self.m.mk_eq(*px, lit);
+                ax.push(self.m.mk_implies(*pm, eq));
+            }
+        }
         // `prefixof P x ∧ suffixof S x ∧ len x = |P| + |S|` (prefix and suffix are
         // adjacent, covering the whole word) ⇒ `x = P·S`. Refutes
         // `prefixof "ab" x ∧ suffixof "cd" x ∧ len x = 4 ∧ x ≠ "abcd"`.
