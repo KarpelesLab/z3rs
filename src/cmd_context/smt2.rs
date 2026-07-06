@@ -1384,6 +1384,46 @@ impl Regex {
         }
     }
 
+    /// The complete finite set of words in the language, or `None` if it is
+    /// infinite or exceeds `budget` words. `("yes" | "no")` ⇒ `{yes, no}`.
+    fn all_words(&self, budget: usize) -> Option<Vec<Vec<u32>>> {
+        let out = match self {
+            Regex::None => Vec::new(),
+            Regex::Lit(l) => alloc::vec![l.clone()],
+            Regex::Range(lo, hi) => {
+                if (*hi as usize).saturating_sub(*lo as usize) >= budget {
+                    return None;
+                }
+                (*lo..=*hi).map(|c| alloc::vec![c]).collect()
+            }
+            Regex::Union(a, b) => {
+                let mut w = a.all_words(budget)?;
+                w.extend(b.all_words(budget)?);
+                w
+            }
+            Regex::Concat(a, b) => {
+                let (wa, wb) = (a.all_words(budget)?, b.all_words(budget)?);
+                if wa.len().checked_mul(wb.len())? > budget {
+                    return None;
+                }
+                let mut w = Vec::new();
+                for x in &wa {
+                    for y in &wb {
+                        let mut c = x.clone();
+                        c.extend_from_slice(y);
+                        w.push(c);
+                    }
+                }
+                w
+            }
+            _ => return None, // Star/All/AllChar/Inter/Comp: infinite or opaque
+        };
+        if out.len() > budget {
+            return None;
+        }
+        Some(out)
+    }
+
     /// Which lengths `0..=max` a matching word can have — *exact* for the
     /// supported constructors. `None` when the length set cannot be computed
     /// exactly (`re.inter`/`re.comp`), so callers fall back to a sound `unknown`.
@@ -3430,7 +3470,23 @@ impl Context {
         let mut last_char: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut contains: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
         let mut neg_prefixof: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
+        let mut neg_eq: BTreeMap<AstId, BTreeSet<Vec<u32>>> = BTreeMap::new();
         for &c in &conj {
+            // `x ≠ "lit"` (distinct/¬=): the literal words x is excluded from.
+            if self.m.is_not(c)
+                && let inner0 = self.m.app_args(c)[0]
+                && self.m.is_eq(inner0)
+                && self.m.app_args(inner0).len() == 2
+            {
+                let e = self.m.app_args(inner0);
+                for (v, lit) in [(e[0], e[1]), (e[1], e[0])] {
+                    if self.m.is_uninterp_const(v)
+                        && let Some(w) = self.str_value(lit)
+                    {
+                        neg_eq.entry(v).or_default().insert(w);
+                    }
+                }
+            }
             // `¬prefixof(Q, x)` with Q concrete: x must NOT start with Q.
             if self.m.is_not(c)
                 && let inner = self.m.app_args(c)[0]
@@ -3543,6 +3599,15 @@ impl Context {
         for (x, r) in in_re {
             // Membership in a provably-empty language (e.g. `(a-z)+ ∩ (0-9)+`).
             if r.is_empty_lang() {
+                return true;
+            }
+            // Finite-language membership `x ∈ {w0,…}` with every word excluded by an
+            // `x ≠ wᵢ` is UNSAT (`x ∈ ("yes"|"no") ∧ x≠"yes" ∧ x≠"no"`).
+            if let Some(excluded) = neg_eq.get(&x)
+                && let Some(words) = r.all_words(64)
+                && !words.is_empty()
+                && words.iter().all(|w| excluded.contains(w))
+            {
                 return true;
             }
             // The regex forces a mandatory prefix `P`; a `¬prefixof(Q, x)` with Q a
