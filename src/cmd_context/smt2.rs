@@ -145,6 +145,14 @@ fn code_points_to_string(cps: &[u32]) -> String {
     cps.iter().filter_map(|&c| char::from_u32(c)).collect()
 }
 
+/// An atom of a word equation for the Nielsen transformation: either a concrete
+/// character or a string variable (identified by a small stable id).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum WAtom {
+    Char(u32),
+    Var(u32),
+}
+
 /// Fold a Boolean string predicate over literal operands' code points.
 fn fold_string_pred(op: &str, parts: &[Vec<u32>]) -> bool {
     let (a, b) = (&parts[0], &parts[1]);
@@ -3164,8 +3172,173 @@ impl Context {
         {
             return Ok(Some(self.m.mk_false()));
         }
-        // General concat = concat with variables on both sides: gate to unknown.
+        // General concat = concat with variables on both sides: try the Nielsen
+        // transformation, which can refute periodicity-style equations
+        // (`x·b = a·x`) that the boundary-character test misses. It soundly proves
+        // *unsatisfiability*; satisfiable equations fall through to the witness
+        // search (gated to `unknown` here).
+        let mut vmap: BTreeMap<String, u32> = BTreeMap::new();
+        if let (Some(aw), Some(bw)) = (
+            Self::parts_to_atoms(pa, &mut vmap),
+            Self::parts_to_atoms(pb, &mut vmap),
+        ) && Self::nielsen_decide(&aw, &bw) == Some(false)
+        {
+            return Ok(Some(self.m.mk_false()));
+        }
         Ok(None)
+    }
+
+    /// Convert `str.++` parts (literals and plain variables) to a word of
+    /// [`WAtom`]s — characters for literals, a stable id per variable name from
+    /// the *shared* `vmap` (so the same variable on either side maps to one id).
+    /// `None` if any part is a compound term (e.g. `str.at`) Nielsen can't model.
+    fn parts_to_atoms(parts: &[SExpr], vmap: &mut BTreeMap<String, u32>) -> Option<Vec<WAtom>> {
+        let mut out = Vec::new();
+        for p in parts {
+            match p {
+                SExpr::Atom(a) if a.starts_with('"') => {
+                    for c in unquote_string(a).chars() {
+                        out.push(WAtom::Char(c as u32));
+                    }
+                }
+                SExpr::Atom(a) => {
+                    let n = vmap.len() as u32;
+                    let id = *vmap.entry(a.clone()).or_insert(n);
+                    out.push(WAtom::Var(id));
+                }
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    /// Cancel the common prefix and suffix of a word equation, then relabel its
+    /// variables by first appearance and orient the two sides canonically — so
+    /// equations equal up to renaming map to the same state (enabling cycle
+    /// detection).
+    fn nielsen_normalize(a: &[WAtom], b: &[WAtom]) -> (Vec<WAtom>, Vec<WAtom>) {
+        let mut a = a.to_vec();
+        let mut b = b.to_vec();
+        while !a.is_empty() && !b.is_empty() && a[0] == b[0] {
+            a.remove(0);
+            b.remove(0);
+        }
+        while !a.is_empty() && !b.is_empty() && a.last() == b.last() {
+            a.pop();
+            b.pop();
+        }
+        let mut ren: BTreeMap<u32, u32> = BTreeMap::new();
+        for at in a.iter_mut().chain(b.iter_mut()) {
+            if let WAtom::Var(v) = at {
+                let n = ren.len() as u32;
+                *at = WAtom::Var(*ren.entry(*v).or_insert(n));
+            }
+        }
+        if b < a { (b, a) } else { (a, b) }
+    }
+
+    /// Replace every `Var(x)` in `seq` by `rep`.
+    fn nielsen_subst(seq: &[WAtom], x: u32, rep: &[WAtom]) -> Vec<WAtom> {
+        let mut out = Vec::new();
+        for &at in seq {
+            match at {
+                WAtom::Var(v) if v == x => out.extend_from_slice(rep),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    /// The Nielsen successor equations of a normalized, both-sides-non-empty state
+    /// (empty result ⇒ a dead branch, e.g. a leading-character clash).
+    fn nielsen_branches(a: &[WAtom], b: &[WAtom]) -> Vec<(Vec<WAtom>, Vec<WAtom>)> {
+        let (a0, b0) = (a[0], b[0]);
+        let sub = |x: u32, rep: &[WAtom]| {
+            (
+                Self::nielsen_subst(a, x, rep),
+                Self::nielsen_subst(b, x, rep),
+            )
+        };
+        match (a0, b0) {
+            (WAtom::Char(_), WAtom::Char(_)) => Vec::new(), // clash (differ after normalize)
+            (WAtom::Var(x), WAtom::Char(c)) | (WAtom::Char(c), WAtom::Var(x)) => {
+                alloc::vec![sub(x, &[]), sub(x, &[WAtom::Char(c), WAtom::Var(x)])]
+            }
+            (WAtom::Var(x), WAtom::Var(y)) => alloc::vec![
+                sub(x, &[]),
+                sub(y, &[]),
+                sub(x, &[WAtom::Var(y), WAtom::Var(x)]),
+                sub(y, &[WAtom::Var(x), WAtom::Var(y)]),
+            ],
+        }
+    }
+
+    /// Decide a word equation by Nielsen transformation: enumerate the reachable
+    /// normalized states (closed under successors, bounded), mark those trivially
+    /// satisfiable, and propagate satisfiability backward to a fixpoint. If the
+    /// graph closes within the bound, the start state's mark is exact
+    /// (`Some(true)`/`Some(false)`); if the bound is hit, `None`. Sound in both
+    /// directions when it converges.
+    fn nielsen_decide(a0: &[WAtom], b0: &[WAtom]) -> Option<bool> {
+        const CAP: usize = 4000;
+        const SIZE: usize = 60;
+        let start = Self::nielsen_normalize(a0, b0);
+        let mut states: Vec<(Vec<WAtom>, Vec<WAtom>)> = alloc::vec![start.clone()];
+        let mut idx: BTreeMap<(Vec<WAtom>, Vec<WAtom>), usize> = BTreeMap::new();
+        idx.insert(start, 0);
+        let mut succ: Vec<Vec<usize>> = Vec::new();
+        let mut base_sat: Vec<bool> = Vec::new();
+        let mut i = 0;
+        while i < states.len() {
+            let (a, b) = states[i].clone();
+            // Base classification.
+            let (bsat, terminal) = if a.is_empty() && b.is_empty() {
+                (true, true)
+            } else if a.is_empty() || b.is_empty() {
+                let other = if a.is_empty() { &b } else { &a };
+                (!other.iter().any(|x| matches!(x, WAtom::Char(_))), true)
+            } else {
+                (false, false)
+            };
+            base_sat.push(bsat);
+            if terminal {
+                succ.push(Vec::new());
+                i += 1;
+                continue;
+            }
+            if a.len() + b.len() > SIZE {
+                return None; // a growing branch we can't close
+            }
+            let mut sids = Vec::new();
+            for (na, nb) in Self::nielsen_branches(&a, &b) {
+                let ns = Self::nielsen_normalize(&na, &nb);
+                let id = *idx.entry(ns.clone()).or_insert_with(|| {
+                    states.push(ns);
+                    states.len() - 1
+                });
+                sids.push(id);
+                if states.len() > CAP {
+                    return None;
+                }
+            }
+            succ.push(sids);
+            i += 1;
+        }
+        // Backward fixpoint: sat[i] = base_sat[i] ∨ ∃ successor sat.
+        let mut sat = base_sat;
+        loop {
+            let mut changed = false;
+            for i in 0..states.len() {
+                if !sat[i] && succ[i].iter().any(|&j| sat[j]) {
+                    sat[i] = true;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        Some(sat[0])
     }
 
     /// The disjunction over split points of `(str.++ parts…) = lit`.
