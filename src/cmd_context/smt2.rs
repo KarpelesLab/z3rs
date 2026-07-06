@@ -7229,7 +7229,7 @@ impl Context {
                 let pair = as_list(b).ok()?;
                 let nm = Self::sym(&pair[0]).ok()?.to_string();
                 let s = self.resolve_sort(&pair[1]).ok()?;
-                if !self.m.is_arith_sort(s) || self.m.is_int_sort(s) {
+                if !self.m.is_arith_sort(s) {
                     return None;
                 }
                 let c = self.fresh_const(s);
@@ -7289,12 +7289,20 @@ impl Context {
     /// would over-approximate). `None` if the body is not purely linear or a binder
     /// occurs inside a compound term.
     fn qe_exists(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
-        if !vars.iter().all(|&v| {
-            self.m.is_arith_sort(self.m.get_sort(v)) && !self.m.is_int_sort(self.m.get_sort(v))
-        }) {
+        if !vars
+            .iter()
+            .all(|&v| self.m.is_arith_sort(self.m.get_sort(v)))
+        {
             return None;
         }
-        let cubes = self.body_dnf(body, true)?;
+        let all_int = vars.iter().all(|&v| self.m.is_int_sort(self.m.get_sort(v)));
+        let all_real = vars
+            .iter()
+            .all(|&v| !self.m.is_int_sort(self.m.get_sort(v)));
+        if !all_int && !all_real {
+            return None; // mixed Int/Real binders unsupported
+        }
+        let mut cubes = self.body_dnf(body, true)?;
         let bound: BTreeSet<AstId> = vars.iter().copied().collect();
         for cube in &cubes {
             for c in cube {
@@ -7302,6 +7310,39 @@ impl Context {
                     if !bound.contains(&u) && self.m.postorder(u).iter().any(|t| bound.contains(t))
                     {
                         return None;
+                    }
+                }
+            }
+        }
+        // Fourier–Motzkin is exact for the reals; over the integers it is exact
+        // only for pure LIA where every binder appears with coefficient ±1 (real
+        // shadow = integer shadow). Otherwise decline (a divisibility-carrying
+        // projection would need Cooper) rather than risk an unsound elimination.
+        if all_int {
+            for cube in &cubes {
+                for c in cube {
+                    if !c.expr.const_term().is_integer()
+                        || c.expr.terms().any(|(_, k)| !k.is_integer())
+                    {
+                        return None;
+                    }
+                    for &v in vars {
+                        if let Some(k) = c
+                            .expr
+                            .terms()
+                            .find(|(u, _)| *u == v)
+                            .map(|(_, k)| k.clone())
+                            && k.abs() != rat(1)
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
+            for cube in &mut cubes {
+                for c in cube.iter_mut() {
+                    if c.rel == Rel::Lt {
+                        *c = Constraint::le(c.expr.integer_strict_tighten());
                     }
                 }
             }
@@ -7314,7 +7355,7 @@ impl Context {
             }
             let atoms: Vec<AstId> = cube
                 .iter()
-                .map(|c| self.constraint_atom(c, false))
+                .map(|c| self.constraint_atom(c, all_int))
                 .collect();
             disjuncts.push(match atoms.len() {
                 0 => self.m.mk_true(),
