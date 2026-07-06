@@ -4803,6 +4803,18 @@ impl Context {
                 contains_of.insert((a[0], a[1]), t);
             }
         }
+        // Mutual containment `contains(x, y) ∧ contains(y, x) ⇒ x = y` (each is a
+        // substring of the other, so equal length and equal). Refutes
+        // `contains x y ∧ contains y x ∧ x ≠ y`.
+        for (&(hx, hy), &m1) in &contains_of {
+            if hx.min(hy) == hx
+                && let Some(&m2) = contains_of.get(&(hy, hx))
+            {
+                let both = self.m.mk_and(&[m1, m2]);
+                let eq = self.m.mk_eq(hx, hy);
+                ax.push(self.m.mk_implies(both, eq));
+            }
+        }
         // `contains x P` (P concrete): `len x ≥ len P`, and if the length is exactly
         // `len P` then `x = P` (a length-`|P|` string containing `P` *is* `P`).
         // Refutes `contains x "ab" ∧ len x = 2 ∧ x ≠ "ab"`.
