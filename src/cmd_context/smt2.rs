@@ -2440,19 +2440,31 @@ impl Context {
         if self.datatypes.is_empty() {
             return false;
         }
+        // A datatype sort is either a multi-constructor datatype or a
+        // single-constructor record — both can be (mutually) recursive.
+        let is_dt_sort =
+            |s: AstId| self.datatypes.contains_key(&s) || self.records.contains_key(&s);
         let is_dt_var = |m: &AstManager, t: AstId| {
-            m.is_app(t) && m.app_args(t).is_empty() && self.datatypes.contains_key(&m.get_sort(t))
+            m.is_app(t) && m.app_args(t).is_empty() && is_dt_sort(m.get_sort(t))
         };
         let is_ctor = |m: &AstManager, t: AstId| {
             m.is_app(t)
-                && self
+                && (self
                     .datatypes
                     .get(&m.get_sort(t))
                     .is_some_and(|cs| cs.iter().any(|(cd, _, _)| *cd == m.app_decl(t)))
+                    || self
+                        .records
+                        .get(&m.get_sort(t))
+                        .is_some_and(|(cd, _)| *cd == m.app_decl(t)))
         };
-        // Collect the top-level conjuncts (asserted facts).
+        // Collect the top-level conjuncts (asserted facts) — from both the
+        // processed goal and the *raw* assertions, since preprocessing can
+        // eliminate a variable (`y = mkb x` folded into a selector) and hide a
+        // mutual-recursion cycle.
         let mut conj: Vec<AstId> = Vec::new();
         let mut stack = alloc::vec![goal];
+        stack.extend(self.assertions.iter().copied());
         while let Some(t) = stack.pop() {
             if self.m.is_and(t) {
                 for &a in self.m.app_args(t) {
@@ -2497,15 +2509,27 @@ impl Context {
                 }
                 continue;
             }
-            // `v = C(… )`: every datatype variable in the constructor expression is
-            // strictly shallower than `v`.
+            // `v = C(… )`: every datatype variable reached through *constructor*
+            // arguments (not selectors) is strictly shallower than `v` — including
+            // `v` itself (a genuine `v = C(… v …)` cycle, direct or via mutual
+            // recursion). We must NOT descend into selectors, so `v = C(sel₁ v, …)`
+            // (a tautology) is not mistaken for a cycle.
             for (v, expr) in [(a, b), (b, a)] {
                 if is_dt_var(&self.m, v) && is_ctor(&self.m, expr) {
                     touch(&mut rep, v);
-                    for sub in self.m.postorder(expr) {
-                        if sub != v && is_dt_var(&self.m, sub) {
-                            touch(&mut rep, sub);
-                            edges.push((v, sub));
+                    let mut cstack = alloc::vec![expr];
+                    let mut seen: BTreeSet<AstId> = BTreeSet::new();
+                    while let Some(cur) = cstack.pop() {
+                        if !seen.insert(cur) {
+                            continue;
+                        }
+                        for &arg in self.m.app_args(cur) {
+                            if is_dt_var(&self.m, arg) {
+                                touch(&mut rep, arg);
+                                edges.push((v, arg));
+                            } else if is_ctor(&self.m, arg) {
+                                cstack.push(arg);
+                            }
                         }
                     }
                 }
