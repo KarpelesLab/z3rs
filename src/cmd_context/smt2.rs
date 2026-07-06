@@ -1115,6 +1115,9 @@ struct Context {
     /// Symbolic `seq.nth s i` markers, cached by `(s, i)` so repeated reads are
     /// the *same* term (congruent) — `nth s 0 = 1 ∧ nth s 0 = 2` then refutes.
     seq_nth_sym: BTreeMap<(AstId, AstId), AstId>,
+    /// Symbolic `str.at x i` markers, cached by `(x, i)` so repeated reads at the
+    /// same position are congruent — `str.at x i = "a" ∧ str.at x i = "b"` refutes.
+    str_at_sym: BTreeMap<(AstId, AstId), AstId>,
     /// The operation name behind each symbolic sequence marker declaration, so a
     /// marker can be re-folded once its arguments become concrete (witness search).
     seqop_ops: BTreeMap<AstId, String>,
@@ -1359,6 +1362,7 @@ impl Context {
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
             seq_nth_sym: BTreeMap::new(),
+            str_at_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
         }
@@ -5313,6 +5317,16 @@ impl Context {
                     }
                     // `t` does not occur: `str.replace` returns `s` unchanged.
                     return Ok(self.mk_str_lit(&code_points_to_string(&s)));
+                }
+                // `str.at x i`: reuse one congruent marker per `(x, i)` so repeated
+                // reads at the same position are the same term.
+                if op == "str.at" && raw.len() == 2 {
+                    if let Some(&c) = self.str_at_sym.get(&(raw[0], raw[1])) {
+                        return Ok(c);
+                    }
+                    let c = self.symbolic_string(op, raw)?;
+                    self.str_at_sym.insert((raw[0], raw[1]), c);
+                    return Ok(c);
                 }
                 self.symbolic_string(op, raw)
             }
