@@ -4012,10 +4012,21 @@ impl Context {
                     self.m.mk_app(decl, &args)
                 }
             } else if let Some(op) = self.str_op_decls.get(&decl).cloned() {
-                self.string_op(&op, &args)
+                // Simplify arguments first so an index expression like
+                // `str.len x − 1` (now `3 − 1`) folds to `2`, letting `str.at`
+                // reduce to a concrete character.
+                let sa: Vec<AstId> = args
+                    .iter()
+                    .map(|&a| crate::rewriter::simplify(&mut self.m, a))
+                    .collect();
+                self.string_op(&op, &sa)
                     .unwrap_or_else(|_| self.m.mk_app(decl, &args))
             } else if let Some(op) = self.seqop_ops.get(&decl).cloned() {
-                self.seq_op(&op, &args)
+                let sa: Vec<AstId> = args
+                    .iter()
+                    .map(|&a| crate::rewriter::simplify(&mut self.m, a))
+                    .collect();
+                self.seq_op(&op, &sa)
                     .unwrap_or_else(|_| self.m.mk_app(decl, &args))
             } else if self.m.is_eq(t) && args.len() == 2 {
                 // Fold an equality of two now-concrete sequences (or strings) by
