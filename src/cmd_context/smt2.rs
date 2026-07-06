@@ -2794,6 +2794,71 @@ impl Context {
                 ax.push(self.m.mk_implies(inb, len_one));
             }
         }
+        // `str.substr x i n` length (constant `i ≥ 0`, `n`): the extracted length
+        // is `min(n, max(0, len x − i))`. Refutes `str.substr x 0 2 = "ab" ∧ len x = 1`.
+        let subs: Vec<(AstId, AstId, i64, i64)> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.substr")
+                {
+                    let a = self.m.app_args(t);
+                    let num = |u: AstId| {
+                        self.m
+                            .as_numeral(u)
+                            .and_then(|r| r.to_integer())
+                            .and_then(|i| i.to_i64())
+                    };
+                    if a.len() == 3
+                        && let (Some(i), Some(nn)) = (num(a[1]), num(a[2]))
+                    {
+                        return Some((t, a[0], i, nn));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (app, x, i, nn) in &subs {
+            let lenf = self.str_len_fn();
+            let lx = self.m.mk_app(lenf, &[*x]);
+            let sublen = self.m.mk_app(lenf, &[*app]);
+            let zero = self.m.mk_int(0);
+            if *i < 0 || *nn <= 0 {
+                let e = self.m.mk_eq(sublen, zero);
+                ax.push(e);
+                continue;
+            }
+            let iv = self.m.mk_int(*i);
+            let nv = self.m.mk_int(*nn);
+            // i ≥ len x ⇒ len(sub) = 0.
+            let oob = self.m.mk_ge(iv, lx);
+            let e0 = self.m.mk_eq(sublen, zero);
+            ax.push(self.m.mk_implies(oob, e0));
+            // i < len x ∧ len x − i ≥ n ⇒ len(sub) = n.
+            let iv2 = self.m.mk_int(*i);
+            let inb = self.m.mk_lt(iv2, lx);
+            let iv3 = self.m.mk_int(*i);
+            let avail = self.m.mk_sub(&[lx, iv3]); // len x − i
+            let enough = self.m.mk_ge(avail, nv);
+            let c1 = self.m.mk_and(&[inb, enough]);
+            let en = self.m.mk_eq(sublen, nv);
+            ax.push(self.m.mk_implies(c1, en));
+            // i < len x ∧ len x − i < n ⇒ len(sub) = len x − i.
+            let iv4 = self.m.mk_int(*i);
+            let inb2 = self.m.mk_lt(iv4, lx);
+            let iv5 = self.m.mk_int(*i);
+            let avail2 = self.m.mk_sub(&[lx, iv5]);
+            let iv6 = self.m.mk_int(*i);
+            let avail3 = self.m.mk_sub(&[lx, iv6]);
+            let short = self.m.mk_lt(avail2, nv);
+            let c2 = self.m.mk_and(&[inb2, short]);
+            let eavail = self.m.mk_eq(sublen, avail3);
+            ax.push(self.m.mk_implies(c2, eavail));
+        }
         // Constant length upper bounds (`str.len(marker) ≤ k`).
         let ubs = self.str_len_ub.clone();
         for (app, k) in ubs {
