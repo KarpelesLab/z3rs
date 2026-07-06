@@ -12486,6 +12486,28 @@ impl Context {
                     break;
                 }
             }
+            // Integer unit product: `x·y = ±1` (integers) ⇒ each factor is ±1.
+            for (coeff, vars, other) in [(&ca, &va, a[1]), (&cb, &vb, a[0])] {
+                if *coeff != Rational::from_integer(Int::from(1)) || vars.len() != 2 {
+                    continue;
+                }
+                if self
+                    .m
+                    .as_numeral(other)
+                    .and_then(|r| r.to_integer())
+                    .and_then(|i| i.to_i64())
+                    .is_some_and(|k| k.abs() == 1)
+                {
+                    let (one, negone) = (self.m.mk_int(1), self.m.mk_int(-1));
+                    for &v in vars {
+                        let e1 = self.m.mk_eq(v, one);
+                        let e2 = self.m.mk_eq(v, negone);
+                        let disj = self.m.mk_or(&[e1, e2]);
+                        ax.push(disj);
+                    }
+                    break;
+                }
+            }
             // Difference of squares: `c·a² = c·b²` ⇒ `a = b ∨ a = −b`.
             if ca == cb && va.len() == 2 && va[0] == va[1] && vb.len() == 2 && vb[0] == vb[1] {
                 let (av, bv) = (va[0], vb[0]);
