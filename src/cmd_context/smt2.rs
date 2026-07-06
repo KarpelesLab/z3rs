@@ -13182,6 +13182,47 @@ impl Context {
         }
     }
 
+    /// The residue `t mod n` (0 ≤ r < n) when every leaf of `t`'s +/−/· expression
+    /// tree is a numeral or a variable with an asserted residue in `residue`.
+    /// `None` otherwise. Constant result — no case-split.
+    fn mod_residue(&self, t: AstId, n: i64, residue: &BTreeMap<AstId, i64>) -> Option<i64> {
+        use crate::ast::ArithOp;
+        if let Some(k) = self.int_arg(t) {
+            return Some(k.rem_euclid(n));
+        }
+        if let Some(&r) = residue.get(&t) {
+            return Some(r);
+        }
+        match self.m.arith_op(t) {
+            Some(ArithOp::Mul) => {
+                let mut acc = 1i64;
+                for &f in self.m.app_args(t) {
+                    acc = (acc * self.mod_residue(f, n, residue)?).rem_euclid(n);
+                }
+                Some(acc)
+            }
+            Some(ArithOp::Add) => {
+                let mut acc = 0i64;
+                for &f in self.m.app_args(t) {
+                    acc = (acc + self.mod_residue(f, n, residue)?).rem_euclid(n);
+                }
+                Some(acc)
+            }
+            Some(ArithOp::Sub) => {
+                let args = self.m.app_args(t);
+                let mut acc = self.mod_residue(args[0], n, residue)?;
+                for &f in &args[1..] {
+                    acc = (acc - self.mod_residue(f, n, residue)?).rem_euclid(n);
+                }
+                Some(acc)
+            }
+            Some(ArithOp::Uminus) => {
+                Some((-self.mod_residue(self.m.app_args(t)[0], n, residue)?).rem_euclid(n))
+            }
+            _ => None,
+        }
+    }
+
     /// `mod(v, n) = 0` when `v` is (via an equality) a multiple of `n`
     /// (`2·x = y ⇒ mod y 2 = 0`).
     fn mod_multiple_axioms(&mut self, goal: AstId) -> Vec<AstId> {
@@ -13210,14 +13251,50 @@ impl Context {
                 }
             })
             .collect();
+        // Asserted residues `mod w k = r`, keyed by (w, k).
+        let mut residue: BTreeMap<(AstId, i64), i64> = BTreeMap::new();
+        for &c in &conj {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
+                    if let Some(rv) = self.int_arg(r)
+                        && self.m.arith_op(l) == Some(ArithOp::Mod)
+                        && let Some(k) = self.int_arg(self.m.app_args(l)[1])
+                        && k > 0
+                    {
+                        residue.insert((self.m.app_args(l)[0], k), rv.rem_euclid(k));
+                    }
+                }
+            }
+        }
         let mut ax = Vec::new();
         for (mt, v, n) in mods {
             if n == 0 {
                 continue;
             }
-            // Skip `mod(a+b, n)` — the mod-of-sum lifting is expensive and the
-            // axiom (though sound) doesn't prevent it; keep the fast `mod(c·x,n)` /
-            // `mod(v,n)` (v a bound multiple) cases.
+            // Constant residue of the whole +/−/· dividend (`mod(x·x,10)=9` given
+            // `mod x 10 = 7`; `mod(x−y,6)=0` given both ≡ 4). No case-split, so this
+            // is safe for `Add`/`Sub` dividends too.
+            // Only for a COMPOUND dividend — for a bare variable this just restates
+            // its own asserted residue and would short-circuit the multiple path.
+            if matches!(
+                self.m.arith_op(v),
+                Some(ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Uminus)
+            ) {
+                let res_n: BTreeMap<AstId, i64> = residue
+                    .iter()
+                    .filter(|((_, k), _)| *k == n)
+                    .map(|((w, _), &r)| (*w, r))
+                    .collect();
+                if let Some(r) = self.mod_residue(v, n, &res_n) {
+                    let rv = self.m.mk_int(r);
+                    ax.push(self.m.mk_eq(mt, rv));
+                    continue;
+                }
+            }
+            // Skip `mod(a+b, n)` for the multiple/zero-mod path — the mod-of-sum
+            // lifting is expensive and that axiom doesn't prevent it; keep the fast
+            // `mod(c·x,n)` / `mod(v,n)` (v a bound multiple) cases.
             if self.m.arith_op(v) == Some(ArithOp::Add) {
                 continue;
             }
@@ -13254,38 +13331,6 @@ impl Context {
             if mult {
                 let zero = self.m.mk_int(0);
                 ax.push(self.m.mk_eq(mt, zero));
-                continue;
-            }
-            // Residue product: `mod(f0·f1·…, n) = mod(∏ residue(fᵢ), n)` when every
-            // factor has an asserted residue `mod fᵢ n = rᵢ`. Refutes
-            // `mod x 10 = 7 ∧ mod(x·x, 10) ≠ 9`.
-            if self.m.arith_op(v) == Some(ArithOp::Mul) {
-                let mut residue: BTreeMap<AstId, i64> = BTreeMap::new();
-                for &c in &conj {
-                    if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
-                        let a = self.m.app_args(c);
-                        for (l, r) in [(a[0], a[1]), (a[1], a[0])] {
-                            if let Some(rv) = self.int_arg(r)
-                                && self.m.arith_op(l) == Some(ArithOp::Mod)
-                                && self.int_arg(self.m.app_args(l)[1]) == Some(n)
-                            {
-                                residue.insert(self.m.app_args(l)[0], rv.rem_euclid(n));
-                            }
-                        }
-                    }
-                }
-                let factors = self.m.app_args(v);
-                let prod: Option<i64> = factors.iter().try_fold(1i64, |acc, f| {
-                    let rf = self
-                        .int_arg(*f)
-                        .map(|k| k.rem_euclid(n))
-                        .or_else(|| residue.get(f).copied())?;
-                    Some((acc * rf).rem_euclid(n))
-                });
-                if let Some(p) = prod {
-                    let pv = self.m.mk_int(p);
-                    ax.push(self.m.mk_eq(mt, pv));
-                }
             }
         }
         ax
