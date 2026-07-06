@@ -12,13 +12,16 @@ testing against `/usr/bin/z3` (the methodology of ROADMAP §7).
 
 ## At a glance
 
+*Parity report v2 — reflects the completion of the theory roadmap (div/mod, the
+full floating-point theory, complete-projection CAD, and single + acyclic
+multi-predicate CHC).*
+
 | | |
 |---|---|
-| Phases at exit criterion | **11 / 11** (Phase 10 hardening exit met; performance/scale tuning is a continuous follow-on) |
-| Rust source | ~27k lines across 20 modules (`util … api`) |
-| Tests | 373 unit/integration `#[test]`s + 6 API doctests, all green |
-| Differential corpus | 146 curated cases (full response stream vs z3), green |
-| Cumulative fuzzing | ~77k random scripts vs z3 across all fragments, **0 unsound** after fixes |
+| Roadmap decision phases at exit | **all** — B (div/mod), C (floating-point), E (QF_NRA CAD), G (Horn/CHC), H (C ABI) met this cycle, joining the earlier fragments |
+| Tests | 390 unit/integration `#[test]`s + doctests, all green; CI green on Linux/macOS/Windows, MSRV 1.88, no_std, C-ABI |
+| Differential fuzzing | continuous vs `/usr/bin/z3`; a broad cross-theory sweep (LIA/LRA/BV/arrays/datatypes/strings/FP/NRA/quantifiers/CHC/pseudo-boolean) is **0 gap, 0 unsound** on both-definite cases |
+| Cumulative fuzzing | ~90k+ random scripts vs z3 across all fragments, **0 unsound** at final state |
 | Dependencies | `z3rs → puremp` only (enforced by a guard test) |
 
 ## Per-theory coverage
@@ -30,17 +33,17 @@ than guessing.
 | Theory | Decides | Declines (sound `unknown`) |
 |---|---|---|
 | **QF_UF** | congruence closure at every sort, `distinct`, uninterpreted functions | — |
-| **QF_LIA** | Fourier–Motzkin + branch-and-bound + Omega-test (GCD tightening, dark-shadow witness) | instances exceeding the work budget |
+| **QF_LIA** | Fourier–Motzkin + branch-and-bound + Omega-test (GCD tightening, dark-shadow witness), **disequality case-split into the dark shadow** (`x+y≥0 ∧ 2x≤0 ∧ x≠y`), free-variable-disequality elimination | instances exceeding the work budget |
 | **QF_LRA** | Fourier–Motzkin with witness reconstruction, strict/non-strict | budget exhaustion |
-| **QF_BV** | full core bit-blasting (arith/bitwise/shift/div/rem/compare/concat/extract/ext) over CDCL | conflict-budget exhaustion on hard instances |
+| **QF_BV** | full core bit-blasting (arith/bitwise/shift/div/rem/compare/concat/extract/ext) over CDCL with **gate constant-folding + structural hashing** | conflict-budget exhaustion on hard instances |
 | **QF_A / AX** | read-over-write + extensionality array axioms | array combinators (`map`, `as-array`) beyond folded forms |
 | **QF_DT** | datatypes: enums, records, recursive & mutually-recursive, parametric; `match`, selectors/testers | — |
-| **QF_S** | string constant folding, symbolic `str.len`, word equations vs literals, regex membership, **length-link refutation** (`contains`/`prefixof`/`suffixof`/`str.at`), **bounded witness search** (concrete `sat` models) | deep content constraints (combined prefix+suffix content, long word equations) |
-| **QF_FP** | Float64 folding; symbolic FP equality + classification via bit-blasting | symbolic FP arithmetic / ordered compares (circuits too slow for basic CDCL) |
-| **QF_NRA** | full CAD over real algebraic numbers (McCallum projection, `sign_at_point`) | degenerate/nullified projections, over-cap degree/dimension |
-| **QF_NIA** | linearization, univariate CAD, bounded-integer search, variable elimination | undecidable/unbounded nonlinear integer cases |
+| **QF_S** | string constant folding, symbolic `str.len`, regex membership, length-link refutation, **length-guided bounded witness** (fixed-length word equations `len x=4 ∧ x·y=y·x`) | deep content / unbounded word equations (periodicity refutation needs Nielsen) |
+| **QF_FP** | **the whole common surface bit-exact**: classification, ordered compares, `min`/`max`, `abs`/`neg`, exact `to_real`, **all arithmetic — `add`/`sub`/`mul`/`div`/`sqrt`/`fma`/`roundToIntegral`** (all 5 rounding modes), `to_fp(real/int/bv/fp-widening)`; concrete all-formats + symbolic Float16 decide | symbolic **Float32/64** circuits (performance-bound, like QF_BV); `rem`/`to_ubv`/`to_sbv`/`to_fp`-narrowing |
+| **QF_NRA** | full CAD over real algebraic numbers with **complete (subresultant) projection** + cofactor-determinant fallback: coupled/degenerate multivariate systems decide; crash-safe fallible resultant chain | over-cap degree/dimension; ∀/∃-over-NRA (real QE) |
+| **QF_NIA** | linearization, univariate CAD, bounded-integer search, variable elimination, **symbolic div/mod** (compound divisors, stable-tail UNSAT, `div(t,t)`/`mod(t,t)`) | undecidable/unbounded nonlinear integer cases |
 | **Quantified UF/LIA** | ground instantiation to a fixpoint, E-matching (recursive functions), finite Datalog/CHC | non-terminating instantiation, nested quantifiers, MBQI |
-| **CHC (HORN)** | single-predicate transition systems: BMC (`unsat`) + k-induction (`sat`) | multi-predicate systems, non-k-inductive invariants (need Spacer/PDR + MBP) |
+| **CHC (HORN)** | **single-predicate** transition systems (BMC + k-induction, property heads, non-bare args) **and acyclic multi-predicate** systems (exact topological inlining, both directions) | recursive/cyclic multi-predicate safe (needs model-based projection / Spacer-PDR) |
 
 ## Soundness validation
 
