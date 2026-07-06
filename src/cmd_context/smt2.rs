@@ -2377,6 +2377,98 @@ impl Context {
     /// constructors), pairwise tester exclusivity, and each tester's definition
     /// `is-Cᵢ(t) ⇒ t = Cᵢ(sel(t)…)`. For each constructor application `Cᵢ(a…)`:
     /// its own tester holds, the others fail, and `selᵢⱼ(Cᵢ(a…)) = aⱼ`.
+    /// Pigeonhole refutation: `n` pairwise-distinct integers each `≥ lo` have sum
+    /// `≥ n·lo + n(n−1)/2`; if the goal also bounds their sum `≤ hi < that`, it is
+    /// UNSAT. Reconstructs the distinct set from the pairwise `≠` that `distinct`
+    /// expands to. Sound (a lower bound on the true minimum sum).
+    fn distinct_sum_unsat(&self, goal: AstId) -> bool {
+        use crate::ast::ArithOp;
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let num = |u: AstId| {
+            self.m
+                .as_numeral(u)
+                .and_then(|r| r.to_integer())
+                .and_then(|i| i.to_i64())
+        };
+        let is_int_var =
+            |u: AstId| self.m.is_uninterp_const(u) && self.m.is_int_sort(self.m.get_sort(u));
+        // Pairwise disequalities, per-variable lower bounds, and sum upper bounds.
+        let mut diseq: BTreeSet<(AstId, AstId)> = BTreeSet::new();
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut sum_ub: Vec<(Vec<AstId>, i64)> = Vec::new();
+        for &c in &conj {
+            if self.m.is_not(c) {
+                let inner = self.m.app_args(c)[0];
+                if self.m.is_eq(inner) {
+                    let a = self.m.app_args(inner);
+                    if a.len() == 2 && is_int_var(a[0]) && is_int_var(a[1]) {
+                        let (x, y) = (a[0].min(a[1]), a[0].max(a[1]));
+                        diseq.insert((x, y));
+                    }
+                }
+                continue;
+            }
+            let Some(op) = self.m.arith_op(c) else {
+                continue;
+            };
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            match op {
+                ArithOp::Ge | ArithOp::Gt if is_int_var(a[0]) => {
+                    if let Some(k) = num(a[1]) {
+                        let lo = if op == ArithOp::Gt { k + 1 } else { k };
+                        let e = lower.entry(a[0]).or_insert(lo);
+                        *e = (*e).max(lo);
+                    }
+                }
+                ArithOp::Le | ArithOp::Lt if self.m.arith_op(a[0]) == Some(ArithOp::Add) => {
+                    let parts = self.m.app_args(a[0]).to_vec();
+                    if parts.iter().all(|&p| is_int_var(p))
+                        && let Some(k) = num(a[1])
+                    {
+                        let hi = if op == ArithOp::Lt { k - 1 } else { k };
+                        sum_ub.push((parts, hi));
+                    }
+                }
+                _ => {}
+            }
+        }
+        for (vars, hi) in &sum_ub {
+            let n = vars.len();
+            if n < 2 || !vars.iter().all(|v| lower.contains_key(v)) {
+                continue;
+            }
+            let pairwise = (0..n).all(|i| {
+                (i + 1..n).all(|j| {
+                    let (x, y) = (vars[i].min(vars[j]), vars[i].max(vars[j]));
+                    diseq.contains(&(x, y))
+                })
+            });
+            if !pairwise {
+                continue;
+            }
+            let lo = vars.iter().map(|v| lower[v]).min().unwrap();
+            let n = n as i64;
+            let min_sum = n * lo + n * (n - 1) / 2;
+            if *hi < min_sum {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Inline `v = <ground constructor term>` datatype bindings by substituting
     /// `v` with the term, so selectors/testers over `v` fold to concrete values
     /// (`l = cons 1 (cons 2 nl) ∧ is-nl (tl (tl l))` becomes decidable). Sound: `v`
@@ -10093,6 +10185,10 @@ impl Context {
         }
         // Array extensionality: `a ≠ b ∧ ∀i. a[i] = b[i]` is UNSAT.
         if self.extensionality_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Pigeonhole: `n` distinct integers `≥ lo` with sum `≤ hi < n·lo+n(n−1)/2`.
+        if self.distinct_sum_unsat(goal) {
             return (SmtResult::Unsat, None);
         }
         // Quantified formulas are not decided here (the instantiation engine ran
