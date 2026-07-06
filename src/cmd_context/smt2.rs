@@ -3897,6 +3897,39 @@ impl Context {
                 }
             }
         }
+        // Extensionality: two records with equal fields are equal — added
+        // directly because a *Bool*-field equality feeds propositional iff, not the
+        // EUF congruence through `mk` (`f p = f q ∧ p ≠ q` over `mk(f Bool)` was a
+        // spurious sat). `(⋀ selᵢ p = selᵢ q) ⇒ p = q` for each pair.
+        let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &t in &terms {
+            let s = self.m.get_sort(t);
+            if self.records.contains_key(&s) && self.m.is_uninterp_const(t) {
+                by_sort.entry(s).or_default().push(t);
+            }
+        }
+        for (s, vars) in by_sort {
+            let (_, selectors) = self.records[&s].clone();
+            for i in 0..vars.len() {
+                for j in i + 1..vars.len() {
+                    let field_eqs: Vec<AstId> = selectors
+                        .iter()
+                        .map(|&sd| {
+                            let pi = self.m.mk_app(sd, &[vars[i]]);
+                            let pj = self.m.mk_app(sd, &[vars[j]]);
+                            self.m.mk_eq(pi, pj)
+                        })
+                        .collect();
+                    let hyp = if field_eqs.len() == 1 {
+                        field_eqs[0]
+                    } else {
+                        self.m.mk_and(&field_eqs)
+                    };
+                    let concl = self.m.mk_eq(vars[i], vars[j]);
+                    ax.push(self.m.mk_implies(hyp, concl));
+                }
+            }
+        }
         ax
     }
 
