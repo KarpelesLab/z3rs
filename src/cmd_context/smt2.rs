@@ -10216,6 +10216,46 @@ impl Context {
                         subst.push((*r, *f));
                     }
                 }
+                // Ackermannize uninterpreted bit-vector function applications: a
+                // fresh bit-vector per application, congruent on equal argument
+                // tuples (only when the arguments are themselves bit-vectors, so
+                // the equality is bit-blastable).
+                for terms in self.free_uf_bv_groups(goal) {
+                    let bv_args = terms.iter().all(|&t| {
+                        self.m
+                            .app_args(t)
+                            .iter()
+                            .all(|&a| self.m.bv_sort_width(self.m.get_sort(a)).is_some())
+                    });
+                    if terms.len() > 1 && !bv_args {
+                        continue;
+                    }
+                    let fresh: Vec<AstId> = terms
+                        .iter()
+                        .map(|&r| self.fresh_const(self.m.get_sort(r)))
+                        .collect();
+                    for (a, b) in
+                        (0..terms.len()).flat_map(|i| (i + 1..terms.len()).map(move |j| (i, j)))
+                    {
+                        let args_a = self.m.app_args(terms[a]).to_vec();
+                        let args_b = self.m.app_args(terms[b]).to_vec();
+                        let eqs: Vec<AstId> = args_a
+                            .iter()
+                            .zip(&args_b)
+                            .map(|(&x, &y)| self.m.mk_eq(x, y))
+                            .collect();
+                        let all_eq = if eqs.len() == 1 {
+                            eqs[0]
+                        } else {
+                            self.m.mk_and(&eqs)
+                        };
+                        let val_eq = self.m.mk_eq(fresh[a], fresh[b]);
+                        axioms.push(self.m.mk_implies(all_eq, val_eq));
+                    }
+                    for (r, f) in terms.iter().zip(fresh.iter()) {
+                        subst.push((*r, *f));
+                    }
+                }
                 if !subst.is_empty() {
                     g = crate::rewriter::substitute(&mut self.m, goal, &subst);
                     if !axioms.is_empty() {
@@ -10424,6 +10464,32 @@ impl Context {
             .filter(|(arr, _)| self.m.is_uninterp_const(*arr) && !tainted.contains(arr))
             .map(|(_, terms)| terms)
             .collect()
+    }
+
+    /// Groups of uninterpreted, bit-vector-sorted function applications (arity ≥ 1)
+    /// keyed by their declaration — for Ackermannization in the bit-vector path:
+    /// each application becomes a fresh bit-vector, congruent when its arguments
+    /// coincide. Decides `∀x. g(x)=x+1 ∧ g(200)=0`.
+    fn free_uf_bv_groups(&self, goal: AstId) -> Vec<Vec<AstId>> {
+        let mut groups: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for t in self.m.postorder(goal) {
+            if let Some(app) = self.m.app(t)
+                && !app.args.is_empty()
+                && self.m.bv_sort_width(self.m.get_sort(t)).is_some()
+                && !self.m.is_select(t)
+                && !self.m.is_store(t)
+                && self
+                    .m
+                    .func_decl(app.decl)
+                    .is_some_and(|fd| fd.info.family_id == crate::ast::NULL_FAMILY_ID)
+            {
+                let bucket = groups.entry(app.decl).or_default();
+                if !bucket.contains(&t) {
+                    bucket.push(t);
+                }
+            }
+        }
+        groups.into_values().collect()
     }
 
     /// Bounded small-solution witness for a pure ≤2-variable integer nonlinear
