@@ -10370,7 +10370,56 @@ impl Context {
                 }
             }
         }
+        // Fallback: inline `a = (as const …) v` bindings so reads of `a` fold to `v`
+        // (`a = const 5 ∧ select a i = select a j` becomes trivially sat).
+        if res == SmtResult::Unknown {
+            let inlined = self.inline_const_array_bindings(goal);
+            if inlined != goal {
+                let (r2, m2) = self.decide_inner(inlined);
+                if r2 != SmtResult::Unknown {
+                    return (r2, m2);
+                }
+            }
+        }
         (res, model)
+    }
+
+    /// Inline `a = (as const …) v` bindings by substituting the const-array term,
+    /// so `select a i` folds to `v`.
+    fn inline_const_array_bindings(&mut self, goal: AstId) -> AstId {
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            for (v, ca) in [(a[0], a[1]), (a[1], a[0])] {
+                if self.m.is_uninterp_const(v) && self.m.is_const_array(ca) && !bound.contains(&v) {
+                    subst.push((v, ca));
+                    bound.insert(v);
+                }
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
     }
 
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
