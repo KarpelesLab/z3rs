@@ -4719,7 +4719,10 @@ impl Context {
             for (i, &e) in leading.iter().enumerate() {
                 let iv = self.m.mk_int(i as i64);
                 if let Ok(nth) = self.seq_op("seq.nth", &[u, iv]) {
-                    ax.push(self.m.mk_eq(nth, e));
+                    // Guard by the prefixof marker — the pin holds ONLY when prefixof
+                    // is true. Was UNSOUND unconditional: `¬prefixof([0],u) ∧ nth u 0 ≠ 0`.
+                    let eq = self.m.mk_eq(nth, e);
+                    ax.push(self.m.mk_implies(c, eq));
                 }
             }
         }
@@ -4780,7 +4783,9 @@ impl Context {
                 }
                 let iv = self.m.mk_int(pos);
                 if let Ok(nth) = self.seq_op("seq.nth", &[u, iv]) {
-                    ax.push(self.m.mk_eq(nth, e));
+                    // Guard by the suffixof marker (holds only when suffixof is true).
+                    let eq = self.m.mk_eq(nth, e);
+                    ax.push(self.m.mk_implies(c, eq));
                 }
             }
         }
