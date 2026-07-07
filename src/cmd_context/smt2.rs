@@ -5494,6 +5494,26 @@ impl Context {
         // `contains x P` (P concrete): `len x ≥ len P`, and if the length is exactly
         // `len P` then `x = P` (a length-`|P|` string containing `P` *is* `P`).
         // Refutes `contains x "ab" ∧ len x = 2 ∧ x ≠ "ab"`.
+        // A variable bound to a concat (`y = a·b`) so `contains y Q` can distribute
+        // over that concat's parts. Refutes `y = "a"·x ∧ contains y "z" ∧ ¬contains x "z"`.
+        let mut concat_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for &c in &present {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(v)
+                        && self.m.is_app(cc)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(cc))
+                            .map(String::as_str)
+                            == Some("str.++")
+                    {
+                        concat_bind.entry(v).or_insert(cc);
+                    }
+                }
+            }
+        }
         for &t in &present {
             if !self.m.is_app(t)
                 || self
@@ -5528,14 +5548,19 @@ impl Context {
             // 2-part `P·x` with P concrete, Q spans iff a non-empty proper prefix
             // of Q is a suffix of P — if none is, distribution is sound. Refutes
             // `contains("pre"·x,"zzz") ∧ ¬contains("pre","zzz") ∧ ¬contains(x,"zzz")`.
-            if self.m.is_app(x)
+            let concat_hay = if self.m.is_app(x)
                 && self
                     .str_op_decls
                     .get(&self.m.app_decl(x))
                     .map(String::as_str)
                     == Some("str.++")
             {
-                let parts = self.m.app_args(x).to_vec();
+                Some(x)
+            } else {
+                concat_bind.get(&x).copied()
+            };
+            if let Some(cx) = concat_hay {
+                let parts = self.m.app_args(cx).to_vec();
                 // Q spans the `p0|p1` boundary iff some split `Q = Q1·Q2` (both
                 // non-empty) has Q1 an achievable suffix of p0 and Q2 an achievable
                 // prefix of p1 (a concrete part constrains its piece; a symbolic
