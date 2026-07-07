@@ -5978,6 +5978,12 @@ impl Context {
                             .unwrap_or(elems[k] == pat[k])
                     })
             };
+            let plen_of = |slf: &Self, p: AstId| -> Option<usize> {
+                slf.seq_of
+                    .get(&p)
+                    .map(|v| v.len())
+                    .or_else(|| slf.str_exact_len(goal, p))
+            };
             if is_pre {
                 let mut lead: Vec<AstId> = Vec::new();
                 for &p in &parts {
@@ -5988,6 +5994,36 @@ impl Context {
                 }
                 if cmp(&lead, &pv) {
                     ax.push(t);
+                }
+                // Pin parts P covers from the front. Refutes
+                // `prefixof([1,2], [1]·s) ∧ len s = 1 ∧ nth s 0 ≠ 2`.
+                let mut off = 0usize;
+                for &p in &parts {
+                    if off >= pv.len() {
+                        break;
+                    }
+                    let Some(plen) = plen_of(self, p) else { break };
+                    let cov = (off + plen).min(pv.len());
+                    for (local, &pe) in pv[off..cov].iter().enumerate() {
+                        match self.seq_of.get(&p) {
+                            Some(v) => {
+                                if v[local] != pe
+                                    && self.seq_of.get(&v[local]) != self.seq_of.get(&pe)
+                                {
+                                    let f = self.m.mk_false();
+                                    ax.push(self.m.mk_implies(t, f));
+                                }
+                            }
+                            None => {
+                                let iv = self.m.mk_int(local as i64);
+                                if let Ok(nth) = self.seq_op("seq.nth", &[p, iv]) {
+                                    let eq = self.m.mk_eq(nth, pe);
+                                    ax.push(self.m.mk_implies(t, eq));
+                                }
+                            }
+                        }
+                    }
+                    off += plen;
                 }
             } else {
                 let mut trail: Vec<AstId> = Vec::new();
@@ -6003,6 +6039,38 @@ impl Context {
                 }
                 if trail.len() >= pv.len() && cmp(&trail[trail.len() - pv.len()..], &pv) {
                     ax.push(t);
+                }
+                // Pin parts P covers from the end. Refutes
+                // `suffixof([1,2], s·[2]) ∧ len s = 1 ∧ nth s 0 ≠ 1`.
+                let mut eoff = 0usize;
+                for &p in parts.iter().rev() {
+                    if eoff >= pv.len() {
+                        break;
+                    }
+                    let Some(plen) = plen_of(self, p) else { break };
+                    let cov_end = (eoff + plen).min(pv.len());
+                    for e in eoff..cov_end {
+                        let local = plen - 1 - (e - eoff);
+                        let pe = pv[pv.len() - 1 - e];
+                        match self.seq_of.get(&p) {
+                            Some(v) => {
+                                if v[local] != pe
+                                    && self.seq_of.get(&v[local]) != self.seq_of.get(&pe)
+                                {
+                                    let f = self.m.mk_false();
+                                    ax.push(self.m.mk_implies(t, f));
+                                }
+                            }
+                            None => {
+                                let iv = self.m.mk_int(local as i64);
+                                if let Ok(nth) = self.seq_op("seq.nth", &[p, iv]) {
+                                    let eq = self.m.mk_eq(nth, pe);
+                                    ax.push(self.m.mk_implies(t, eq));
+                                }
+                            }
+                        }
+                    }
+                    eoff += plen;
                 }
             }
         }
