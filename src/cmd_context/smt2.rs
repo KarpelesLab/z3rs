@@ -4678,6 +4678,48 @@ impl Context {
                 }
             }
         }
+        // `seq.prefixof(p, u)` where `p` begins with concrete elements pins the
+        // leading positions of `u`: `nth(u, i) = pᵢ`. Refutes
+        // `prefixof((unit 1)·s, u) ∧ nth u 0 ≠ 1`.
+        for &c in &present {
+            if !(self.m.is_app(c)
+                && self.seqop_ops.get(&self.m.app_decl(c)).map(String::as_str)
+                    == Some("seq.prefixof")
+                && self.m.app_args(c).len() == 2)
+            {
+                continue;
+            }
+            let (p, u) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+            // Flatten p's concat parts and read the leading concrete elements.
+            let mut leading: Vec<AstId> = Vec::new();
+            if let Some(v) = self.seq_of.get(&p) {
+                leading = v.clone();
+            } else if let Some((_, parts)) = seq_concat_of.iter().find(|(app, _)| *app == p) {
+                let mut fstack: Vec<AstId> = parts.iter().rev().copied().collect();
+                let mut flat: Vec<AstId> = Vec::new();
+                while let Some(q) = fstack.pop() {
+                    if let Some((_, sub)) = seq_concat_of.iter().find(|(a, _)| *a == q) {
+                        for &sp in sub.iter().rev() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        flat.push(q);
+                    }
+                }
+                for q in flat {
+                    match self.seq_of.get(&q) {
+                        Some(v) => leading.extend(v.clone()),
+                        None => break, // stop at the first non-concrete part
+                    }
+                }
+            }
+            for (i, &e) in leading.iter().enumerate() {
+                let iv = self.m.mk_int(i as i64);
+                if let Ok(nth) = self.seq_op("seq.nth", &[u, iv]) {
+                    ax.push(self.m.mk_eq(nth, e));
+                }
+            }
+        }
         // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
         // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
         let str_concats: Vec<(AstId, Vec<AstId>)> = present
