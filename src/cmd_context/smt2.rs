@@ -4883,11 +4883,33 @@ impl Context {
             }
             Some(flat)
         };
-        for &c in &present {
-            if !(self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2) {
-                continue;
+        // Pairs to align: top-level `A = B`, plus every pair of concats bound to the
+        // same variable (`u = M1 ∧ u = M2 ⇒ M1 = M2`, aligned directly since the
+        // emitted `M1 = M2` axiom isn't visible to this pass). Refutes
+        // `u = [2]·s ∧ u = [0]·s` (element 0: 2 ≠ 0).
+        let mut align_pairs: Vec<(AstId, AstId)> = Vec::new();
+        {
+            let mut vc: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            for &c in &present {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    align_pairs.push((a[0], a[1]));
+                    for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v)
+                            && seq_align.iter().any(|(app, _)| *app == cc)
+                        {
+                            vc.entry(v).or_default().push(cc);
+                        }
+                    }
+                }
             }
-            let (a, b) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+            for concats in vc.values() {
+                for w in concats.windows(2) {
+                    align_pairs.push((w[0], w[1]));
+                }
+            }
+        }
+        for (a, b) in align_pairs {
             let (Some(pa), Some(pb)) = (flatten_seq(a), flatten_seq(b)) else {
                 continue;
             };
