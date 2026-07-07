@@ -3642,6 +3642,243 @@ impl Context {
         axioms
     }
 
+    /// Evaluate an integer arithmetic term under a concrete assignment. `None` on any
+    /// non-arithmetic subterm, an unassigned variable, a non-positive modulus, or
+    /// integer overflow.
+    fn modular_eval_int(&self, t: AstId, asg: &BTreeMap<AstId, i128>) -> Option<i128> {
+        use crate::ast::ArithOp;
+        if let Some(n) = self.m.as_numeral(t) {
+            return n.to_i64().map(|v| v as i128);
+        }
+        if self.m.is_uninterp_const(t) {
+            return asg.get(&t).copied();
+        }
+        let op = self.m.arith_op(t)?;
+        let args = self.m.app_args(t);
+        match op {
+            ArithOp::Add => {
+                let mut s: i128 = 0;
+                for &a in args {
+                    s = s.checked_add(self.modular_eval_int(a, asg)?)?;
+                }
+                Some(s)
+            }
+            ArithOp::Sub if args.len() == 1 => self.modular_eval_int(args[0], asg)?.checked_neg(),
+            ArithOp::Uminus => self.modular_eval_int(args[0], asg)?.checked_neg(),
+            ArithOp::Sub => {
+                let mut s = self.modular_eval_int(args[0], asg)?;
+                for &a in &args[1..] {
+                    s = s.checked_sub(self.modular_eval_int(a, asg)?)?;
+                }
+                Some(s)
+            }
+            ArithOp::Mul => {
+                let mut p: i128 = 1;
+                for &a in args {
+                    p = p.checked_mul(self.modular_eval_int(a, asg)?)?;
+                }
+                Some(p)
+            }
+            ArithOp::Mod => {
+                let (a, b) = (
+                    self.modular_eval_int(args[0], asg)?,
+                    self.modular_eval_int(args[1], asg)?,
+                );
+                (b != 0).then(|| a.rem_euclid(b))
+            }
+            ArithOp::Idiv => {
+                let (a, b) = (
+                    self.modular_eval_int(args[0], asg)?,
+                    self.modular_eval_int(args[1], asg)?,
+                );
+                (b != 0).then(|| a.div_euclid(b))
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate a Boolean arithmetic formula under a concrete assignment. `None` on
+    /// any non-arithmetic atom (so the caller falls through to the general solver).
+    fn modular_eval_bool(&self, t: AstId, asg: &BTreeMap<AstId, i128>) -> Option<bool> {
+        use crate::ast::ArithOp;
+        if self.m.is_true(t) {
+            return Some(true);
+        }
+        if self.m.is_false(t) {
+            return Some(false);
+        }
+        if self.m.is_and(t) {
+            let mut r = true;
+            for &a in self.m.app_args(t) {
+                r &= self.modular_eval_bool(a, asg)?;
+            }
+            return Some(r);
+        }
+        if self.m.is_or(t) {
+            let mut r = false;
+            for &a in self.m.app_args(t) {
+                r |= self.modular_eval_bool(a, asg)?;
+            }
+            return Some(r);
+        }
+        if self.m.is_not(t) {
+            return Some(!self.modular_eval_bool(self.m.app_args(t)[0], asg)?);
+        }
+        if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+            let args = self.m.app_args(t);
+            let (a, b) = (
+                self.modular_eval_int(args[0], asg)?,
+                self.modular_eval_int(args[1], asg)?,
+            );
+            return Some(a == b);
+        }
+        if let Some(op) = self.m.arith_op(t)
+            && self.m.app_args(t).len() == 2
+        {
+            let args = self.m.app_args(t);
+            let (a, b) = (
+                self.modular_eval_int(args[0], asg)?,
+                self.modular_eval_int(args[1], asg)?,
+            );
+            return match op {
+                ArithOp::Le => Some(a <= b),
+                ArithOp::Lt => Some(a < b),
+                ArithOp::Ge => Some(a >= b),
+                ArithOp::Gt => Some(a > b),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// The integer variables that occur OUTSIDE any `mod` (so the goal's truth is not
+    /// determined by residues alone). `mod(E, const)` guards `E`'s variables; every
+    /// other operator (including `div`, whose value depends on the magnitude) leaves
+    /// them bare.
+    fn bare_int_vars(&self, t: AstId, out: &mut BTreeSet<AstId>) {
+        use crate::ast::ArithOp;
+        if self.m.arith_op(t) == Some(ArithOp::Mod)
+            && self.m.as_numeral(self.m.app_args(t)[1]).is_some()
+        {
+            return; // dividend guarded, divisor constant
+        }
+        if self.m.is_app(t)
+            && self.m.app_args(t).is_empty()
+            && self.m.is_uninterp_const(t)
+            && self.m.is_int_sort(self.m.get_sort(t))
+        {
+            out.insert(t);
+            return;
+        }
+        for &a in self.m.app_args(t) {
+            self.bare_int_vars(a, out);
+        }
+    }
+
+    /// Decide a purely-arithmetic goal by evaluating it over every residue combination
+    /// in `[0, lcm(moduli))`. COMPLETE (both SAT and UNSAT) when every integer variable
+    /// occurs only under `mod` — then the goal's truth depends solely on the residues,
+    /// and each class mod `lcm` has exactly one representative in the box. Otherwise a
+    /// SAT witness only (a found point is a genuine model; exhaustion concludes
+    /// nothing). Runs pre-lift, where the `mod` terms are still visible. Decides
+    /// `mod(2x+3y,m) = a ∧ mod x m = b` and its unsatisfiable siblings instantly.
+    fn try_modular_decide(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        use crate::ast::ArithOp;
+        let mut moduli: Vec<i128> = Vec::new();
+        let mut saw_mod = false;
+        for t in self.m.postorder(goal) {
+            if self.m.arith_op(t) == Some(ArithOp::Mod) {
+                saw_mod = true;
+                match self
+                    .m
+                    .as_numeral(self.m.app_args(t)[1])
+                    .and_then(|n| n.to_i64())
+                {
+                    Some(d) if d > 0 => moduli.push(d as i128),
+                    _ => return None,
+                }
+            }
+        }
+        if !saw_mod {
+            return None;
+        }
+        let mut vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t)
+                && self.m.app_args(t).is_empty()
+                && self.m.is_uninterp_const(t)
+                && self.m.is_int_sort(self.m.get_sort(t))
+                && !vars.contains(&t)
+            {
+                vars.push(t);
+            }
+        }
+        if vars.is_empty() || vars.len() > 4 {
+            return None;
+        }
+        let mut l: i128 = 1;
+        for &m in &moduli {
+            let g = {
+                let (mut a, mut b) = (l.abs(), m.abs());
+                while b != 0 {
+                    let r = a % b;
+                    a = b;
+                    b = r;
+                }
+                a.max(1)
+            };
+            l = l / g * m;
+            if l > 210 {
+                return None;
+            }
+        }
+        let mut combos: i128 = 1;
+        for _ in &vars {
+            combos = combos.saturating_mul(l);
+            if combos > 8192 {
+                return None;
+            }
+        }
+        let mut bare = BTreeSet::new();
+        self.bare_int_vars(goal, &mut bare);
+        let complete = bare.is_empty();
+        let n = vars.len();
+        let mut idx = alloc::vec![0i128; n];
+        loop {
+            let asg: BTreeMap<AstId, i128> =
+                vars.iter().copied().zip(idx.iter().copied()).collect();
+            match self.modular_eval_bool(goal, &asg) {
+                Some(true) => {
+                    // Materialise a model via the normal path on the ground instance.
+                    let subst: Vec<(AstId, AstId)> = vars
+                        .iter()
+                        .zip(&idx)
+                        .map(|(&v, &x)| (v, self.m.mk_int(x as i64)))
+                        .collect();
+                    let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+                    let lifted = self.lift(g);
+                    let (_, model) = self.decide_inner(lifted);
+                    return Some((SmtResult::Sat, model));
+                }
+                Some(false) => {}
+                None => return None, // non-arithmetic atom: cannot decide here
+            }
+            let mut k = 0;
+            loop {
+                if k == n {
+                    // Exhausted: UNSAT only if the goal is residue-invariant.
+                    return complete.then_some((SmtResult::Unsat, None));
+                }
+                idx[k] += 1;
+                if idx[k] < l {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
     /// SAT witness for nonlinear-mod goals: every variable inside a product that has
     /// a top-level `mod v m = aᵥ` is substituted by its residue `aᵥ`; if the resulting
     /// ground goal is SAT, so is the original (the residue satisfies the modular
@@ -13341,6 +13578,13 @@ impl Context {
             conj.extend(instances);
             self.m.mk_and(&conj)
         };
+        // Pure-modular decision on the raw goal (before any axioms with implications
+        // are added, which the evaluator can't read): evaluate over residue
+        // combinations in [0, lcm). Complete when every variable occurs only under
+        // `mod` — decides `mod(2x+3y,m) = a ∧ mod x m = b` (SAT and UNSAT) instantly.
+        if let Some(r) = self.try_modular_decide(combined) {
+            return r;
+        }
         // Function congruence for div/mod, added BEFORE lifting replaces the mod
         // terms by fresh remainders (which lose EUF congruence): equal dividends
         // (same divisor) ⇒ equal div/mod. Refutes `x = y ∧ mod x 5 = 2 ∧
