@@ -4812,6 +4812,88 @@ impl Context {
                 }
             }
         }
+        // Seq concat equality element alignment: `A = B` (both `seq.++`, all part
+        // lengths pinned, equal totals) ⇒ position-wise element equalities. Refutes
+        // `[1]·s = [0]·s` (1 ≠ 0) and `[1]·s = [1]·t ∧ len s = len t = 1 ∧ nth s 0 = 5
+        // ∧ nth t 0 ≠ 5`.
+        let seq_align = self.seq_concat.clone();
+        let flatten_seq = |cc: AstId| -> Option<Vec<AstId>> {
+            let parts0 = &seq_align.iter().find(|(app, _)| *app == cc)?.1;
+            let mut flat: Vec<AstId> = Vec::new();
+            let mut st: Vec<AstId> = parts0.iter().rev().copied().collect();
+            while let Some(q) = st.pop() {
+                if let Some((_, sub)) = seq_align.iter().find(|(a, _)| *a == q) {
+                    for &sp in sub.iter().rev() {
+                        st.push(sp);
+                    }
+                } else {
+                    flat.push(q);
+                }
+            }
+            Some(flat)
+        };
+        for &c in &present {
+            if !(self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2) {
+                continue;
+            }
+            let (a, b) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+            let (Some(pa), Some(pb)) = (flatten_seq(a), flatten_seq(b)) else {
+                continue;
+            };
+            let part_len = |slf: &Self, p: AstId| -> Option<usize> {
+                slf.seq_of
+                    .get(&p)
+                    .map(|v| v.len())
+                    .or_else(|| slf.str_exact_len(goal, p))
+            };
+            let la: Vec<Option<usize>> = pa.iter().map(|&p| part_len(self, p)).collect();
+            let lb: Vec<Option<usize>> = pb.iter().map(|&p| part_len(self, p)).collect();
+            // A = B ⇒ element i equal for every i within the known-length PREFIX of both
+            // sides — offsets match there regardless of the (unknown) tails.
+            let known_prefix = |lens: &[Option<usize>]| -> usize {
+                let mut s = 0;
+                for l in lens {
+                    match l {
+                        Some(n) => s += n,
+                        None => break,
+                    }
+                }
+                s
+            };
+            let align_len = known_prefix(&la).min(known_prefix(&lb));
+            if align_len == 0 || align_len > 32 {
+                continue;
+            }
+            // Element at absolute position i (i within a known-length prefix part).
+            let elem_at = |slf: &mut Self,
+                           parts: &[AstId],
+                           lens: &[Option<usize>],
+                           i: usize|
+             -> Option<AstId> {
+                let mut off = 0usize;
+                for (idx, &p) in parts.iter().enumerate() {
+                    let plen = lens[idx]?;
+                    if i < off + plen {
+                        let local = i - off;
+                        return if let Some(v) = slf.seq_of.get(&p) {
+                            Some(v[local])
+                        } else {
+                            let iv = slf.m.mk_int(local as i64);
+                            slf.seq_op("seq.nth", &[p, iv]).ok()
+                        };
+                    }
+                    off += plen;
+                }
+                None
+            };
+            for i in 0..align_len {
+                if let (Some(ea), Some(eb)) =
+                    (elem_at(self, &pa, &la, i), elem_at(self, &pb, &lb, i))
+                {
+                    ax.push(self.m.mk_eq(ea, eb));
+                }
+            }
+        }
         // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
         // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
         let str_concats: Vec<(AstId, Vec<AstId>)> = present
