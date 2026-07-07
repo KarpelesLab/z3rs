@@ -5881,6 +5881,44 @@ impl Context {
                 if pv.len() <= trail.len() && trail[trail.len() - pv.len()..] == pv[..] {
                     ax.push(t);
                 }
+                // Pin the parts P covers from the END (analog of the prefixof case).
+                // Refutes `suffixof "yz" (x·"z") ∧ len x = 2 ∧ str.at x 1 ≠ "y"`.
+                let mut eoff = 0usize; // offset from the end of the haystack
+                for &p in parts.iter().rev() {
+                    if eoff >= pv.len() {
+                        break;
+                    }
+                    let Some(plen) = self
+                        .str_value(p)
+                        .map(|v| v.len())
+                        .or_else(|| self.str_exact_len(goal, p))
+                    else {
+                        break;
+                    };
+                    let cov_end = (eoff + plen).min(pv.len());
+                    for e in eoff..cov_end {
+                        let local = plen - 1 - (e - eoff);
+                        let pch = pv[pv.len() - 1 - e];
+                        match self.str_value(p) {
+                            Some(v) => {
+                                if v[local] != pch {
+                                    let f = self.m.mk_false();
+                                    ax.push(self.m.mk_implies(t, f));
+                                }
+                            }
+                            None => {
+                                let iv = self.m.mk_int(local as i64);
+                                if let Ok(at) = self.string_op("str.at", &[p, iv]) {
+                                    let cl = self.mk_str_lit(&code_points_to_string(&[pch]));
+                                    extra_lits.insert(cl);
+                                    let eq = self.m.mk_eq(at, cl);
+                                    ax.push(self.m.mk_implies(t, eq));
+                                }
+                            }
+                        }
+                    }
+                    eoff += plen;
+                }
             }
         }
         // Seq analog: `seq.prefixof/suffixof(P, hay)` (P a concrete seq) where `hay` is
