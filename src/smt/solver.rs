@@ -1470,20 +1470,24 @@ fn round_lra_model(
         .copied()
         .filter(|v| !model.get(v).map(|r| r.is_integer()).unwrap_or(true))
         .collect();
-    if frac.len() > 6 {
-        return None; // 2^6 = 64 combinations cap
+    if frac.len() > 5 {
+        return None; // 4^5 = 1024 combinations cap
     }
+    // Try each fractional coordinate at floor + {-1, 0, 1, 2} — a wider neighborhood
+    // than plain floor/ceil, so thin integer regions a step off the LRA vertex are
+    // still reached without paying for branch-and-bound.
     let zero = rat_zero();
-    for mask in 0u32..(1u32 << frac.len()) {
+    let total: u32 = 4u32.saturating_pow(frac.len() as u32);
+    for combo in 0..total {
         let mut a = model.clone();
-        for (i, &v) in frac.iter().enumerate() {
+        let mut c = combo;
+        for &v in &frac {
             let val = model.get(&v).cloned().unwrap_or_else(rat_zero);
-            let rounded = if mask & (1 << i) != 0 {
-                val.ceil()
-            } else {
-                val.floor()
-            };
-            a.insert(v, Rational::from_integer(rounded));
+            let delta = (c % 4) as i64 - 1; // -1, 0, 1, 2
+            c /= 4;
+            let rounded =
+                &Rational::from_integer(val.floor()) + &Rational::from_integer(Int::from(delta));
+            a.insert(v, rounded);
         }
         let cons_ok = cons.iter().all(|c| {
             let e = c.expr.eval(&a);
