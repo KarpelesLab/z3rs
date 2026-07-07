@@ -4641,7 +4641,22 @@ impl Context {
         // in the part containing position i. Refutes `s = u·[9] ∧ len u = 2 ∧
         // nth s 2 ≠ 9`. Only for concats a variable is directly equated to.
         let seq_concat_of: Vec<(AstId, Vec<AstId>)> = self.seq_concat.clone();
-        for (app, parts) in &seq_concat_of {
+        for (app, parts0) in &seq_concat_of {
+            // Flatten nested `seq.++` so `nth([1]·([2]·s), 1)` resolves fully.
+            let mut parts: Vec<AstId> = Vec::new();
+            {
+                let mut st: Vec<AstId> = parts0.iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if let Some((_, sub)) = seq_concat_of.iter().find(|(a, _)| *a == q) {
+                        for &sp in sub.iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        parts.push(q);
+                    }
+                }
+            }
+            let parts = &parts;
             // Part lengths: a tracked concrete seq, or an asserted `len p = k`.
             let lens: Vec<Option<usize>> = parts
                 .iter()
