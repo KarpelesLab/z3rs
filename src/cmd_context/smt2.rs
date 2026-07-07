@@ -7335,7 +7335,39 @@ impl Context {
                 vars.push(t);
             }
         }
-        if vars.is_empty() || vars.len() > 2 {
+        // A `s = seq.++(parts)` seq variable is computed from its parts, not enumerated.
+        let mut derived: Vec<(AstId, Vec<AstId>)> = Vec::new();
+        {
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(t) = st.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        st.push(a);
+                    }
+                } else {
+                    top.push(t);
+                }
+            }
+            for t in top {
+                if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                    let a = self.m.app_args(t);
+                    for (v, c) in [(a[0], a[1]), (a[1], a[0])] {
+                        if vars.contains(&v)
+                            && !derived.iter().any(|(d, _)| *d == v)
+                            && self.m.is_app(c)
+                            && self.seqop_ops.get(&self.m.app_decl(c)).map(String::as_str)
+                                == Some("seq.++")
+                            && self.m.app_args(c).iter().all(|&p| p != v)
+                        {
+                            derived.push((v, self.m.app_args(c).to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+        vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
+        if (vars.is_empty() && derived.is_empty()) || vars.len() > 2 {
             return None;
         }
         // Integer element candidates: 0,1,2 plus any small integer literal in the
@@ -7393,7 +7425,7 @@ impl Context {
                 return None;
             }
             tries += 1;
-            let subst: Vec<(AstId, AstId)> = vars
+            let mut subst: Vec<(AstId, AstId)> = vars
                 .iter()
                 .enumerate()
                 .map(|(k, &v)| {
@@ -7401,6 +7433,29 @@ impl Context {
                     (v, self.mk_seq(es))
                 })
                 .collect();
+            // Compute each concat-determined seq variable from its substituted parts.
+            for (dv, parts) in &derived {
+                let mut elems: Vec<AstId> = Vec::new();
+                let mut ok = true;
+                for &p in parts {
+                    let term = subst
+                        .iter()
+                        .find(|(v, _)| *v == p)
+                        .map(|(_, t)| *t)
+                        .unwrap_or(p);
+                    match self.seq_of.get(&term) {
+                        Some(content) => elems.extend(content.clone()),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let sv = self.mk_seq(elems);
+                    subst.push((*dv, sv));
+                }
+            }
             let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let mut memo = BTreeMap::new();
             let g2 = self.refold_str_markers(g1, &mut memo);
