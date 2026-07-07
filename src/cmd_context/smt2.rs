@@ -5849,7 +5849,20 @@ impl Context {
                             let eq = self.m.mk_eq(p, lit);
                             ax.push(self.m.mk_implies(t, eq));
                         }
-                        None => {}
+                        None => {
+                            // Partially covered symbolic part: pin the covered leading
+                            // characters via str.at. Refutes `prefixof "xy" ("x"·x) ∧
+                            // len x = 2 ∧ str.at x 0 ≠ "y"`.
+                            for (local, &ch) in pv[off..cover_end].iter().enumerate() {
+                                let iv = self.m.mk_int(local as i64);
+                                if let Ok(at) = self.string_op("str.at", &[p, iv]) {
+                                    let cl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                                    extra_lits.insert(cl);
+                                    let eq = self.m.mk_eq(at, cl);
+                                    ax.push(self.m.mk_implies(t, eq));
+                                }
+                            }
+                        }
                     }
                     off += plen;
                 }
