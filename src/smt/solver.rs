@@ -1097,7 +1097,44 @@ fn dioph_witness(
             .map(|n| n as i128)
     };
     if eqs.is_empty() {
-        return verify(&BTreeMap::new()); // fully determined by the substitutions
+        // ±1-elimination consumed every equation. The remaining integer variables are
+        // free; search them over a bounded box so the inequalities can be met (the
+        // eliminated variables are back-substituted and checked for integrality inside
+        // `verify`). Witnesses `-4x+y+z = 0 ∧ 4x+2y+z ≤ -2` without slow b&b.
+        let free_vars: Vec<AstId> = int_vars
+            .iter()
+            .copied()
+            .filter(|v| !subs.iter().any(|(s, _)| s == v))
+            .collect();
+        if free_vars.is_empty() || free_vars.len() > 3 {
+            return verify(&BTreeMap::new()); // fully determined, or too many to box-search
+        }
+        let dims = free_vars.len();
+        let b: i128 = match dims {
+            1 => 10,
+            2 => 8,
+            _ => 4,
+        };
+        let mut t = alloc::vec![-b; dims];
+        loop {
+            let free: BTreeMap<AstId, i128> =
+                free_vars.iter().copied().zip(t.iter().copied()).collect();
+            if let Some(a) = verify(&free) {
+                return Some(a);
+            }
+            let mut d = 0;
+            loop {
+                if d == dims {
+                    return None;
+                }
+                t[d] += 1;
+                if t[d] <= b {
+                    break;
+                }
+                t[d] = -b;
+                d += 1;
+            }
+        }
     }
     let e = &eqs[0];
     let terms: Vec<(AstId, i128)> = e
@@ -1150,9 +1187,13 @@ fn dioph_witness(
                 v
             })
             .collect();
-        const B: i128 = 10;
         let dims = n - 1;
-        let mut t = alloc::vec![-B; dims];
+        let b: i128 = match dims {
+            1 => 10,
+            2 => 8,
+            _ => 4,
+        };
+        let mut t = alloc::vec![-b; dims];
         loop {
             let mut cand = part.clone();
             for (j, bv) in basis.iter().enumerate() {
@@ -1171,10 +1212,10 @@ fn dioph_witness(
                     return None;
                 }
                 t[d] += 1;
-                if t[d] <= B {
+                if t[d] <= b {
                     break;
                 }
-                t[d] = -B;
+                t[d] = -b;
                 d += 1;
             }
         }
