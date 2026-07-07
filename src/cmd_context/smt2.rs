@@ -6720,6 +6720,140 @@ impl Context {
                 }
             }
         }
+        // Word-equation alignment: `A = B` where A, B are `str.++` concats whose parts
+        // all have pinned lengths (a literal, or `len v = k`) and equal total length —
+        // emit the position-wise character equality. With the all-chars-pinned axiom
+        // this decides `"a"·x = x·"a" ∧ len x = 2 ∧ x ≠ "aa"`.
+        let is_concat = |slf: &Self, t: AstId| {
+            slf.m.is_app(t)
+                && slf.str_op_decls.get(&slf.m.app_decl(t)).map(String::as_str) == Some("str.++")
+        };
+        let part_len = |slf: &Self, p: AstId| -> Option<usize> {
+            slf.str_value(p)
+                .map(|v| v.len())
+                .or_else(|| slf.str_exact_len(goal, p))
+        };
+        let concat_eqs: Vec<(Vec<AstId>, Vec<AstId>)> = present
+            .iter()
+            .filter_map(|&c| {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    if is_concat(self, a[0]) && is_concat(self, a[1]) {
+                        return Some((
+                            self.m.app_args(a[0]).to_vec(),
+                            self.m.app_args(a[1]).to_vec(),
+                        ));
+                    }
+                }
+                None
+            })
+            .collect();
+        // A variable part's value: a str literal (`x = "ab"` binding), or its
+        // pinned length so its characters can be aligned symbolically.
+        let var_lit = |slf: &Self, p: AstId| -> Option<Vec<u32>> { slf.str_value(p) };
+        for (pa, pb) in concat_eqs {
+            // Derive a single unknown-length part when the other side is fully known.
+            let mut la: Vec<Option<usize>> = pa.iter().map(|&p| part_len(self, p)).collect();
+            let mut lb: Vec<Option<usize>> = pb.iter().map(|&p| part_len(self, p)).collect();
+            let known = |v: &[Option<usize>]| -> Option<usize> {
+                v.iter()
+                    .copied()
+                    .collect::<Option<Vec<_>>>()
+                    .map(|w| w.iter().sum())
+            };
+            let (ka, kb) = (known(&la), known(&lb));
+            let derive = |this: &mut Vec<Option<usize>>, other: Option<usize>| {
+                if let Some(tot) = other {
+                    let unknown: Vec<usize> = this
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, l)| l.is_none())
+                        .map(|(i, _)| i)
+                        .collect();
+                    if unknown.len() == 1 {
+                        let sum: usize = this.iter().flatten().sum();
+                        if tot >= sum {
+                            this[unknown[0]] = Some(tot - sum);
+                        }
+                    }
+                }
+            };
+            derive(&mut la, kb);
+            derive(&mut lb, ka);
+            let (Some(la), Some(lb)): (Option<Vec<usize>>, Option<Vec<usize>>) =
+                (la.into_iter().collect(), lb.into_iter().collect())
+            else {
+                continue;
+            };
+            let (ta, tb): (usize, usize) = (la.iter().sum(), lb.iter().sum());
+            if ta != tb || ta == 0 || ta > 24 {
+                continue;
+            }
+            // Position → (variable, local index) or a literal char, per side.
+            let resolve = |parts: &[AstId],
+                           lens: &[usize],
+                           i: usize|
+             -> Option<(AstId, usize, Option<u32>)> {
+                let mut off = 0usize;
+                for (idx, &p) in parts.iter().enumerate() {
+                    if i < off + lens[idx] {
+                        let local = i - off;
+                        let lit = var_lit(self, p).map(|v| v[local]);
+                        return Some((p, local, lit));
+                    }
+                    off += lens[idx];
+                }
+                None
+            };
+            // Each part variable's (derived) length, for sizing the pin vectors.
+            let mut vlen: BTreeMap<AstId, usize> = BTreeMap::new();
+            for (p, l) in pa.iter().zip(&la).chain(pb.iter().zip(&lb)) {
+                vlen.insert(*p, *l);
+            }
+            // Per-variable pinned characters (against a literal char), and a false flag.
+            let mut pins: BTreeMap<AstId, Vec<Option<u32>>> = BTreeMap::new();
+            let mut contradiction = false;
+            for i in 0..ta {
+                let (Some(a), Some(b)) = (resolve(&pa, &la, i), resolve(&pb, &lb, i)) else {
+                    continue;
+                };
+                match (a.2, b.2) {
+                    (Some(ca), Some(cb)) => {
+                        if ca != cb {
+                            contradiction = true;
+                        }
+                    }
+                    (Some(ca), None) => {
+                        let len = vlen.get(&b.0).copied().unwrap_or(0);
+                        if b.1 < len {
+                            pins.entry(b.0).or_insert_with(|| alloc::vec![None; len])[b.1] =
+                                Some(ca);
+                        }
+                    }
+                    (None, Some(cb)) => {
+                        let len = vlen.get(&a.0).copied().unwrap_or(0);
+                        if a.1 < len {
+                            pins.entry(a.0).or_insert_with(|| alloc::vec![None; len])[a.1] =
+                                Some(cb);
+                        }
+                    }
+                    (None, None) => {}
+                }
+            }
+            if contradiction {
+                ax.push(self.m.mk_false());
+                continue;
+            }
+            // A variable with every character pinned against a literal is determined.
+            for (v, chars) in pins {
+                if chars.iter().all(|c| c.is_some()) && !chars.is_empty() {
+                    let s: Vec<u32> = chars.into_iter().flatten().collect();
+                    let lit = self.mk_str_lit(&code_points_to_string(&s));
+                    extra_lits.insert(lit);
+                    ax.push(self.m.mk_eq(v, lit));
+                }
+            }
+        }
         ax
     }
 
