@@ -7693,7 +7693,21 @@ impl Context {
         // literal, so the search doesn't grind every alphabet string when a binding
         // already determines the value (`x = "b" ∧ str.at x 0 = "z"` refutes fast).
         let mut pinned: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
-        for t in self.m.postorder(goal) {
+        // Only TOP-LEVEL conjunct equalities pin a variable — a `= x "aba"` nested
+        // under `not` (`x ≠ "aba"`) must NOT pin x to the excluded value (that left
+        // the witness with only the forbidden candidate, a spurious decline).
+        let mut top: Vec<AstId> = Vec::new();
+        let mut pstack = alloc::vec![goal];
+        while let Some(t) = pstack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    pstack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        for t in top {
             if self.m.is_eq(t) {
                 let a = self.m.app_args(t);
                 if a.len() == 2 {
