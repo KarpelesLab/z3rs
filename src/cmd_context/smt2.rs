@@ -6494,9 +6494,21 @@ impl Context {
             if nv.len() != 1 {
                 continue;
             }
-            let Some((_, parts)) = seq_concat.iter().find(|(app, _)| *app == hay) else {
+            let Some((_, parts0)) = seq_concat.iter().find(|(app, _)| *app == hay) else {
                 continue;
             };
+            // Flatten nested concats so `(unit 1)·((unit 2)·s)` distributes fully.
+            let mut parts: Vec<AstId> = Vec::new();
+            let mut fstack: Vec<AstId> = parts0.iter().rev().copied().collect();
+            while let Some(p) = fstack.pop() {
+                if let Some((_, sub)) = seq_concat.iter().find(|(app, _)| *app == p) {
+                    for &sp in sub.iter().rev() {
+                        fstack.push(sp);
+                    }
+                } else {
+                    parts.push(p);
+                }
+            }
             let markers: Option<Vec<AstId>> = parts
                 .iter()
                 .map(|&p| {
