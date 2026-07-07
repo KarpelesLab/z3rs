@@ -4825,6 +4825,103 @@ impl Context {
                 ax.push(self.m.mk_eq(total, sum));
             }
         }
+        // `str.at(x·y·…, i)` (i concrete, parts before it of pinned length) resolves
+        // to the char in the part holding position i — directly or through a variable
+        // bound to the concat. Refutes `y = "ab"·x ∧ str.at y 0 ≠ "a"`.
+        let str_concat_map: BTreeMap<AstId, Vec<AstId>> = present
+            .iter()
+            .filter(|&&t| {
+                self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.++")
+                    && !self.m.app_args(t).is_empty()
+            })
+            .map(|&t| (t, self.m.app_args(t).to_vec()))
+            .collect();
+        if !str_concat_map.is_empty() {
+            let mut cbind: BTreeMap<AstId, AstId> = BTreeMap::new();
+            for &c in &present {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v) && str_concat_map.contains_key(&cc) {
+                            cbind.entry(v).or_insert(cc);
+                        }
+                    }
+                }
+            }
+            let at_markers: Vec<(AstId, AstId, i64)> = present
+                .iter()
+                .filter_map(|&t| {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some("str.at")
+                        && self.m.app_args(t).len() == 2
+                    {
+                        let a = self.m.app_args(t);
+                        self.int_arg(a[1]).map(|i| (t, a[0], i))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (t, hay, i) in at_markers {
+                if i < 0 {
+                    continue;
+                }
+                let concat = if str_concat_map.contains_key(&hay) {
+                    hay
+                } else if let Some(&cc) = cbind.get(&hay) {
+                    cc
+                } else {
+                    continue;
+                };
+                // Flatten the concat's parts.
+                let mut parts: Vec<AstId> = Vec::new();
+                let mut fstack: Vec<AstId> =
+                    str_concat_map[&concat].iter().rev().copied().collect();
+                while let Some(p) = fstack.pop() {
+                    if let Some(sub) = str_concat_map.get(&p) {
+                        for &sp in sub.iter().rev() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        parts.push(p);
+                    }
+                }
+                let mut off = 0usize;
+                for &p in &parts {
+                    let Some(plen) = self
+                        .str_value(p)
+                        .map(|v| v.len())
+                        .or_else(|| self.str_exact_len(goal, p))
+                    else {
+                        break;
+                    };
+                    if (i as usize) < off + plen {
+                        let local = i as usize - off;
+                        if let Some(v) = self.str_value(p) {
+                            let cl = self.mk_str_lit(&code_points_to_string(&[v[local]]));
+                            extra_lits.insert(cl);
+                            ax.push(self.m.mk_eq(t, cl));
+                        } else {
+                            let lv = self.m.mk_int(local as i64);
+                            if let Ok(at) = self.string_op("str.at", &[p, lv]) {
+                                ax.push(self.m.mk_eq(t, at));
+                            }
+                        }
+                        break;
+                    }
+                    off += plen;
+                }
+            }
+        }
         // Seq predicate length links: `seq.contains s t ⇒ len s ≥ len t` and
         // `seq.prefixof/suffixof s t ⇒ len s ≤ len t`. Refutes
         // `seq.contains s (seq.unit 3) ∧ len s = 0`.
