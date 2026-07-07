@@ -1129,8 +1129,55 @@ fn dioph_witness(
         }
         None
     } else {
-        let sol = solve_dioph(&coeffs, rhs)?;
-        verify(&vars.iter().copied().zip(sol).collect())
+        // General residual equation `Σ aᵢ xᵢ = rhs` with ≥3 variables: a single
+        // particular solution rarely satisfies the inequalities, so search the
+        // integer null space. Basis vectors pair coeff[0] with each other coeff
+        // (`aₖ·e₀ − a₀·eₖ`, divided by their gcd); walk a bounded box of integer
+        // combinations added to a particular solution. Witnesses
+        // `4x+y ≤ −1 ∧ 3x+2y−3z = 0` (the equality forces y ≡ 0 mod 3).
+        let n = coeffs.len();
+        let g_all = coeffs.iter().fold(0i128, |g, &c| gcd_i128(g, c));
+        if g_all == 0 || rhs % g_all != 0 {
+            return None;
+        }
+        let part = solve_dioph(&coeffs, rhs)?;
+        let basis: Vec<Vec<i128>> = (1..n)
+            .map(|k| {
+                let g = gcd_i128(coeffs[0], coeffs[k]).abs().max(1);
+                let mut v = alloc::vec![0i128; n];
+                v[0] = coeffs[k] / g;
+                v[k] = -coeffs[0] / g;
+                v
+            })
+            .collect();
+        const B: i128 = 10;
+        let dims = n - 1;
+        let mut t = alloc::vec![-B; dims];
+        loop {
+            let mut cand = part.clone();
+            for (j, bv) in basis.iter().enumerate() {
+                if t[j] != 0 {
+                    for i in 0..n {
+                        cand[i] += t[j] * bv[i];
+                    }
+                }
+            }
+            if let Some(a) = verify(&vars.iter().copied().zip(cand).collect()) {
+                return Some(a);
+            }
+            let mut d = 0;
+            loop {
+                if d == dims {
+                    return None;
+                }
+                t[d] += 1;
+                if t[d] <= B {
+                    break;
+                }
+                t[d] = -B;
+                d += 1;
+            }
+        }
     }
 }
 
