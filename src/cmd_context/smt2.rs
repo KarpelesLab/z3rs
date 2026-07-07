@@ -6789,6 +6789,62 @@ impl Context {
                 }
             }
         }
+        // `str.replace(S, x, R) = T` (S, R, T concrete, x symbolic): the replaced
+        // pattern is determined — `|x| = |S| − |T| + |R|`, located at the first index
+        // where S and T diverge — provided the reconstruction checks out. Refutes
+        // `str.replace "abc" x "Y" = "aYc" ∧ x ≠ "b"`.
+        let replace_eqs: Vec<(AstId, AstId)> = present
+            .iter()
+            .filter_map(|&c| {
+                if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+                    return None;
+                }
+                let a = self.m.app_args(c);
+                for (m, t) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_app(m)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(m))
+                            .map(String::as_str)
+                            == Some("str.replace")
+                        && self.m.app_args(m).len() == 3
+                        && self.m.is_uninterp_const(self.m.app_args(m)[1])
+                    {
+                        return Some((m, t));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (marker, t) in replace_eqs {
+            let ma = self.m.app_args(marker).to_vec();
+            let (Some(s), Some(r), Some(tv)) = (
+                self.str_value(ma[0]),
+                self.str_value(ma[2]),
+                self.str_value(t),
+            ) else {
+                continue;
+            };
+            let xvar = ma[1];
+            if s == tv {
+                continue; // no replacement happened — x underdetermined
+            }
+            let lx = s.len() as i64 - tv.len() as i64 + r.len() as i64;
+            if lx < 0 {
+                continue;
+            }
+            let lx = lx as usize;
+            let i = s.iter().zip(&tv).take_while(|(a, b)| a == b).count();
+            if i + lx > s.len() {
+                continue;
+            }
+            let cand = s[i..i + lx].to_vec();
+            if replace_first(&s, &cand, &r) == code_points_to_string(&tv) {
+                let lit = self.mk_str_lit(&code_points_to_string(&cand));
+                extra_lits.insert(lit);
+                ax.push(self.m.mk_eq(xvar, lit));
+            }
+        }
         // Word-equation alignment: `A = B` where A, B are `str.++` concats whose parts
         // all have pinned lengths (a literal, or `len v = k`) and equal total length —
         // emit the position-wise character equality. With the all-chars-pinned axiom
