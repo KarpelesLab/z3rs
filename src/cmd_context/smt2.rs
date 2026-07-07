@@ -5089,10 +5089,40 @@ impl Context {
                     }
                 }
             }
+            // Flatten a `str.++` to (sorted symbolic leaves, concrete char total).
+            let str_flat = |slf: &Self, cc: AstId| -> (Vec<AstId>, usize) {
+                let mut syms: Vec<AstId> = Vec::new();
+                let mut conc = 0usize;
+                let mut st: Vec<AstId> = slf.m.app_args(cc).iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if slf.m.is_app(q)
+                        && slf.str_op_decls.get(&slf.m.app_decl(q)).map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &sp in slf.m.app_args(q).iter().rev() {
+                            st.push(sp);
+                        }
+                    } else if let Some(v) = slf.str_value(q) {
+                        conc += v.len();
+                    } else {
+                        syms.push(q);
+                    }
+                }
+                syms.sort();
+                (syms, conc)
+            };
             for concats in var_concats.values() {
                 for w in concats.windows(2) {
                     if w[0] != w[1] {
                         ax.push(self.m.mk_eq(w[0], w[1]));
+                        // Same symbolic leaves but a different concrete-char total ⇒
+                        // different lengths ⇒ the two concats can't be equal. Refutes
+                        // `y = "a"·x ∧ y = "ab"·x` without relying on the int theory.
+                        let (s0, c0) = str_flat(self, w[0]);
+                        let (s1, c1) = str_flat(self, w[1]);
+                        if s0 == s1 && c0 != c1 {
+                            ax.push(self.m.mk_false());
+                        }
                     }
                 }
             }
