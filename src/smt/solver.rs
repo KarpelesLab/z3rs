@@ -1472,7 +1472,29 @@ fn origin_box_search(
     diseqs: &[LinExpr],
     int_vars: &[AstId],
 ) -> Option<Assignment> {
-    let nv = int_vars.len();
+    // A variable pinned to a constant by an equality (e.g. a mod-lifted remainder
+    // `r = a`) needs no searching — fix it and box-search only the rest, so lifted
+    // modular systems stay within the small-dimension budget instead of inflating it
+    // with quotient/remainder variables.
+    let mut pinned: Assignment = BTreeMap::new();
+    for c in cons {
+        if c.rel == Rel::Eq {
+            let terms: Vec<(AstId, Rational)> =
+                c.expr.terms().map(|(v, r)| (v, r.clone())).collect();
+            if terms.len() == 1 && !terms[0].1.is_zero() {
+                let val = (-c.expr.const_term().clone()).mul(&terms[0].1.recip());
+                if val.is_integer() {
+                    pinned.insert(terms[0].0, val);
+                }
+            }
+        }
+    }
+    let free: Vec<AstId> = int_vars
+        .iter()
+        .copied()
+        .filter(|v| !pinned.contains_key(v))
+        .collect();
+    let nv = free.len();
     if nv == 0 || nv > 4 {
         return None;
     }
@@ -1485,14 +1507,10 @@ fn origin_box_search(
     let zero = rat_zero();
     let mut t = alloc::vec![-d; nv];
     loop {
-        let a: Assignment = int_vars
-            .iter()
-            .copied()
-            .zip(
-                t.iter()
-                    .map(|&x| Rational::from_integer(Int::from(x as i64))),
-            )
-            .collect();
+        let mut a = pinned.clone();
+        for (&v, &x) in free.iter().zip(t.iter()) {
+            a.insert(v, Rational::from_integer(Int::from(x as i64)));
+        }
         let ok = cons.iter().all(|c| {
             let e = c.expr.eval(&a);
             match c.rel {
