@@ -4845,6 +4845,18 @@ impl Context {
             })
             .collect();
         for (app, x, r) in &in_res {
+            // `x ∈ re.inter(A, L)` with a literal L that the whole intersection
+            // matches: L is the language's only word, so `in_re ⇒ x = L` (pins x,
+            // giving a model). `x ∈ (a-z)+ ∩ "hi"` ⇒ x = "hi".
+            if let Some(regex) = self.regex_of.get(r).cloned()
+                && let Some(l) = regex.inter_literal()
+                && regex.matches(&l)
+            {
+                let lit = self.mk_str_lit(&code_points_to_string(&l));
+                extra_lits.insert(lit);
+                let eq = self.m.mk_eq(*x, lit);
+                ax.push(self.m.mk_implies(*app, eq));
+            }
             // Only refute against a length the goal pins `x` to (avoids a costly
             // membership disjunction): if `x ∈ r` yet `len x = k` is unachievable,
             // add `in_re(x,r) ⇒ len x ≠ k`.
