@@ -575,6 +575,8 @@ struct LiftCtx {
     dm: BTreeMap<(AstId, AstId), (AstId, AstId)>,
     /// Memo of `(to_int a)` arguments → their integer result constant.
     toint: BTreeMap<AstId, AstId>,
+    /// Memo of `(/ a b)` terms (symbolic divisor) → their quotient constant.
+    rdiv: BTreeMap<AstId, AstId>,
 }
 
 /// An s-expression.
@@ -2378,6 +2380,8 @@ impl Context {
                     Some(ArithOp::Idiv) => q,
                     _ => r,
                 }
+            } else if let Some(q) = self.realdiv_piece(rebuilt, ctx) {
+                q
             } else if let Some(k) = self.lift_to_int(rebuilt, ctx) {
                 k
             } else {
@@ -2490,6 +2494,49 @@ impl Context {
         }
         ctx.dm.insert((a, b), (q, r));
         Some((q, r))
+    }
+
+    /// If `t` is `(/ a b)` (real division) with a SYMBOLIC divisor `b`, return a fresh
+    /// quotient `q` with `b ≠ 0 → q·b = a` (real division is exact; `b = 0` is
+    /// unspecified, so `q` is then free). Refutes `b = 3 ∧ (/ a b)·b = 12 ∧ a ≠ 12`
+    /// and `a = 9 ∧ (/ a a) ≠ 1`. A constant nonzero divisor is linear (`(1/c)·a`), so
+    /// it is left to the arithmetic core (`None`).
+    fn realdiv_piece(&mut self, t: AstId, ctx: &mut LiftCtx) -> Option<AstId> {
+        if self.m.arith_op(t)? != ArithOp::Div {
+            return None;
+        }
+        if let Some(&q) = ctx.rdiv.get(&t) {
+            return Some(q);
+        }
+        let args = self.m.app_args(t).to_vec();
+        let (a, b) = (args[0], args[1]);
+        // A nonzero numeral divisor is linear — leave it to the arithmetic core.
+        if let Some(v) = self.m.as_numeral(b)
+            && !v.is_zero()
+        {
+            return None;
+        }
+        let sort = self.m.get_sort(t);
+        let q = self.fresh_const(sort);
+        // b = 0 leaves q free; otherwise q·b = a.
+        let zero = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(0)), false);
+        let beq0 = self.m.mk_eq(b, zero);
+        let bne0 = self.m.mk_not(beq0);
+        let qb = self.m.mk_mul(&[q, b]);
+        let eq = self.m.mk_eq(qb, a);
+        ctx.defs.push(self.m.mk_implies(bne0, eq));
+        // `(/ a a) = 1` for a ≠ 0 (the nonlinear identity alone doesn't pin it).
+        if a == b {
+            let one = self
+                .m
+                .mk_numeral(Rational::from_integer(Int::from(1)), false);
+            let q1 = self.m.mk_eq(q, one);
+            ctx.defs.push(self.m.mk_implies(bne0, q1));
+        }
+        ctx.rdiv.insert(t, q);
+        Some(q)
     }
 
     /// If `t` is `(to_int a)`, return a fresh integer `k` with `k ≤ a < k + 1`
@@ -13584,6 +13631,7 @@ impl Context {
             cache: BTreeMap::new(),
             dm: BTreeMap::new(),
             toint: BTreeMap::new(),
+            rdiv: BTreeMap::new(),
         };
         let lifted = self.lift_terms(base, &mut ctx);
         if ctx.defs.is_empty() {
