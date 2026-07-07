@@ -5618,6 +5618,42 @@ impl Context {
                 if pv.len() <= lead.len() && lead[..pv.len()] == pv[..] {
                     ax.push(t);
                 }
+                // A symbolic part the prefix fully covers is determined:
+                // `prefixof ⇒ p = P[off..off+len p]`, provided every earlier part has a
+                // known length. Refutes `y = x·"cd" ∧ prefixof "ab" y ∧ len x = 2 ∧ x ≠ "ab"`.
+                let mut off = 0usize;
+                for &p in &parts {
+                    if off >= pv.len() {
+                        break;
+                    }
+                    let Some(plen) = self
+                        .str_value(p)
+                        .map(|v| v.len())
+                        .or_else(|| self.str_exact_len(goal, p))
+                    else {
+                        break;
+                    };
+                    let cover_end = (off + plen).min(pv.len());
+                    match self.str_value(p) {
+                        Some(v) => {
+                            // Concrete part: the covered slice must equal P's slice, else
+                            // the prefix cannot hold. Refutes `prefixof "ab" (x·"cd")
+                            // ∧ len x = 1` (P[1]="b" ≠ "c").
+                            if v[..cover_end - off] != pv[off..cover_end] {
+                                let f = self.m.mk_false();
+                                ax.push(self.m.mk_implies(t, f));
+                            }
+                        }
+                        None if off + plen <= pv.len() => {
+                            let lit = self.mk_str_lit(&code_points_to_string(&pv[off..off + plen]));
+                            extra_lits.insert(lit);
+                            let eq = self.m.mk_eq(p, lit);
+                            ax.push(self.m.mk_implies(t, eq));
+                        }
+                        None => {}
+                    }
+                    off += plen;
+                }
             } else {
                 let mut trail: Vec<u32> = Vec::new();
                 for &p in parts.iter().rev() {
