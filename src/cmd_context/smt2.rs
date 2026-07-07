@@ -13556,6 +13556,33 @@ impl Context {
             }
         }
         let mut ax = Vec::new();
+        // A directly-asserted `mod(t, n) = v` with t a compound (+/−/·) expression
+        // can be re-derived from its parts' residues (excluding its own entry); a
+        // mismatch is UNSAT, decided here rather than via the opaque-x² lift.
+        // Refutes `mod x 10 = 7 ∧ mod(x²,10) = 5` and `mod x 6 = 4 ∧ mod(x+2,6) = 1`.
+        let asserted: Vec<(AstId, i64, i64)> = residue
+            .iter()
+            .filter(|((t, _), _)| {
+                matches!(
+                    self.m.arith_op(*t),
+                    Some(ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Uminus)
+                )
+            })
+            .map(|((t, n), &v)| (*t, *n, v))
+            .collect();
+        for (t, n, v) in asserted {
+            let res_n: BTreeMap<AstId, i64> = residue
+                .iter()
+                .filter(|((w, k), _)| *k == n && *w != t)
+                .map(|((w, _), &r)| (*w, r))
+                .collect();
+            if let Some(r) = self.mod_residue(t, n, &res_n)
+                && r != v
+            {
+                let f = self.m.mk_false();
+                ax.push(f);
+            }
+        }
         for (mt, v, n) in mods {
             if n == 0 {
                 continue;
