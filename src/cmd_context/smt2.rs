@@ -3465,10 +3465,29 @@ impl Context {
         let (lower, upper) = self.collect_int_bounds(goal);
         let mut ranges: Vec<(AstId, i64, i64)> = Vec::new();
         let mut combos: u64 = 1;
+        // A variable unbounded except for `mod v m = a` gets the single witness value
+        // `a`: since every constraint on such a variable factors through its residue,
+        // this witnesses SAT — but it can NOT prove UNSAT (other residue-class
+        // representatives are unexplored), so `residue_only` suppresses the Unsat
+        // conclusion below.
+        let mut residue_only = false;
         for &v in &nlvars {
-            let (&lo, &hi) = (lower.get(&v)?, upper.get(&v)?);
+            let (lo, hi) = match (lower.get(&v), upper.get(&v)) {
+                (Some(&lo), Some(&hi)) => (lo, hi),
+                _ => match self.modular_residue(goal, v) {
+                    Some(a) => {
+                        residue_only = true;
+                        (a, a)
+                    }
+                    None => return None,
+                },
+            };
             if hi < lo {
-                return Some((SmtResult::Unsat, None));
+                return if residue_only {
+                    None
+                } else {
+                    Some((SmtResult::Unsat, None))
+                };
             }
             ranges.push((v, lo, hi));
             combos = combos.checked_mul((hi - lo + 1) as u64)?;
@@ -3502,7 +3521,7 @@ impl Context {
                 }
                 idx[carry] = 0;
                 if carry == 0 {
-                    return if all_unsat {
+                    return if all_unsat && !residue_only {
                         Some((SmtResult::Unsat, None))
                     } else {
                         None
@@ -3510,6 +3529,194 @@ impl Context {
                 }
             }
         }
+    }
+
+    /// Modular congruence for polynomials: if every variable in `E` has a top-level
+    /// `mod v m = aᵥ`, then `mod(E, m) = (E(a) mod m)` — a polynomial preserves
+    /// congruences, so its value mod `m` depends only on each variable's residue.
+    /// Emitted as a guarded implication `(⋀ mod vᵢ m = aᵢ) ⇒ mod(E,m) = c`, which is
+    /// valid regardless of where the residue facts sit. Decides nonlinear-mod goals
+    /// like `mod x m = a ∧ mod y m = b ∧ mod(x·y, m) = d` without enumerating the
+    /// (unbounded) product variables.
+    fn modular_congruence_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut top: Vec<AstId> = Vec::new();
+        let mut st = alloc::vec![goal];
+        while let Some(t) = st.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    st.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        // Residue facts `mod v m = a` at top level: (v, m) → (residue, guard conjunct).
+        let mut res: BTreeMap<(AstId, i64), (i64, AstId)> = BTreeMap::new();
+        for &c in &top {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                for (mt, val) in [(l, r), (r, l)] {
+                    if self.m.arith_op(mt) == Some(ArithOp::Mod) {
+                        let args = self.m.app_args(mt);
+                        if let (Some(a), Some(mm)) = (
+                            self.m.as_numeral(val).and_then(|n| n.to_i64()),
+                            self.m.as_numeral(args[1]).and_then(|n| n.to_i64()),
+                        ) && mm > 0
+                            && self.m.is_uninterp_const(args[0])
+                        {
+                            res.insert((args[0], mm), (a.rem_euclid(mm), c));
+                        }
+                    }
+                }
+            }
+        }
+        if res.is_empty() {
+            return Vec::new();
+        }
+        let mut axioms: Vec<AstId> = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if self.m.arith_op(t) != Some(ArithOp::Mod) {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            let Some(mm) = self.m.as_numeral(args[1]).and_then(|n| n.to_i64()) else {
+                continue;
+            };
+            if mm <= 0 {
+                continue;
+            }
+            let e = args[0];
+            // `e` must be a polynomial (Add/Sub/Mul/numeral/var) whose every variable
+            // has a residue for this modulus — otherwise the congruence needn't hold.
+            let mut ok = true;
+            let mut vars: Vec<AstId> = Vec::new();
+            for s in self.m.postorder(e) {
+                if self.m.is_uninterp_const(s) && self.m.is_int_sort(self.m.get_sort(s)) {
+                    if !res.contains_key(&(s, mm)) {
+                        ok = false;
+                        break;
+                    }
+                    if !vars.contains(&s) {
+                        vars.push(s);
+                    }
+                } else if self.m.as_numeral(s).is_some() {
+                    // literal
+                } else if self.m.is_app(s) && !self.m.app_args(s).is_empty() {
+                    if !matches!(
+                        self.m.arith_op(s),
+                        Some(ArithOp::Add | ArithOp::Sub | ArithOp::Mul)
+                    ) {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if !ok || vars.is_empty() || !seen.insert(t) {
+                continue;
+            }
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .map(|&v| (v, self.m.mk_int(res[&(v, mm)].0)))
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, e, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            let Some(n) = self.m.as_numeral(g).and_then(|n| n.to_i64()) else {
+                continue;
+            };
+            let c = n.rem_euclid(mm);
+            let guards: Vec<AstId> = vars.iter().map(|&v| res[&(v, mm)].1).collect();
+            let guard = if guards.len() == 1 {
+                guards[0]
+            } else {
+                self.m.mk_and(&guards)
+            };
+            let cval = self.m.mk_int(c);
+            let concl = self.m.mk_eq(t, cval);
+            axioms.push(self.m.mk_implies(guard, concl));
+        }
+        axioms
+    }
+
+    /// SAT witness for nonlinear-mod goals: every variable inside a product that has
+    /// a top-level `mod v m = aᵥ` is substituted by its residue `aᵥ`; if the resulting
+    /// ground goal is SAT, so is the original (the residue satisfies the modular
+    /// constraint, and every constraint on such a variable factors through its
+    /// residue). Runs eagerly, before mod-lifting expands the product into fresh
+    /// quotient variables that hide the residue. SAT-only: a non-SAT ground result
+    /// falls through (other residue representatives are unexplored).
+    fn try_modular_sat_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        use crate::ast::ArithOp;
+        let mut nlvars: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
+                let (_, vars) = self.flatten_mul(t);
+                if vars.len() >= 2 {
+                    for v in vars {
+                        if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
+                            nlvars.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+        if nlvars.is_empty() {
+            return None;
+        }
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for &v in &nlvars {
+            let a = self.modular_residue(goal, v)?; // require every product var to have one
+            subst.push((v, self.m.mk_int(a)));
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        let lifted = self.lift(g);
+        match self.decide_inner(lifted) {
+            (SmtResult::Sat, model) => Some((SmtResult::Sat, model)),
+            _ => None, // residue witness failed: cannot conclude, fall through
+        }
+    }
+
+    /// The residue `a` of a top-level `mod v m = a` for variable `v` (the smallest
+    /// non-negative representative). Used as a witness value for an otherwise
+    /// unbounded variable inside a nonlinear product.
+    fn modular_residue(&self, goal: AstId, v: AstId) -> Option<i64> {
+        use crate::ast::ArithOp;
+        let mut top: Vec<AstId> = Vec::new();
+        let mut st = alloc::vec![goal];
+        while let Some(t) = st.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    st.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        for &c in &top {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                for (mt, val) in [(l, r), (r, l)] {
+                    if self.m.arith_op(mt) == Some(ArithOp::Mod)
+                        && self.m.app_args(mt)[0] == v
+                        && let (Some(a), Some(mm)) = (
+                            self.m.as_numeral(val).and_then(|n| n.to_i64()),
+                            self.m
+                                .as_numeral(self.m.app_args(mt)[1])
+                                .and_then(|n| n.to_i64()),
+                        )
+                        && mm > 0
+                    {
+                        return Some(a.rem_euclid(mm));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Whether a datatype/record sort transitively contains a `Bool` field. Only
@@ -13072,6 +13279,21 @@ impl Context {
     /// conjoining their defining constraints, so the theory solvers can reason
     /// about them.
     fn lift(&mut self, base: AstId) -> AstId {
+        // Modular congruence for nonlinear polynomials, added BEFORE lifting: each
+        // `mod(E,m)` in an emitted axiom then shares (via the `dm` memo) the exact
+        // remainder variable the constraint's own `mod(E,m)` lifts to, so
+        // `mod x m = a ∧ mod y m = b ⇒ mod(x·y,m) = c` reaches the linear engine
+        // instead of leaving the product opaque.
+        let base = {
+            let ax = self.modular_congruence_axioms(base);
+            if ax.is_empty() {
+                base
+            } else {
+                let mut parts = ax;
+                parts.push(base);
+                self.m.mk_and(&parts)
+            }
+        };
         let mut ctx = LiftCtx {
             defs: Vec::new(),
             cache: BTreeMap::new(),
@@ -13128,6 +13350,13 @@ impl Context {
         if !cong.is_empty() {
             cong.push(combined);
             combined = self.m.mk_and(&cong);
+        }
+        // Nonlinear-mod SAT witness on the pre-lift goal: substitute each product
+        // variable's residue and decide the ground instance, before lifting hides the
+        // residues behind fresh remainder variables. Witnesses
+        // `mod x m = a ∧ mod y m = b ∧ mod(x·y, m) = c`.
+        if let Some(r) = self.try_modular_sat_witness(combined) {
+            return r;
         }
         let lifted = self.lift(combined);
         // Fold ground selector/tester chains before the datatype axioms are built,
