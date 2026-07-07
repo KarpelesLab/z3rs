@@ -4679,6 +4679,54 @@ impl Context {
     /// Array extensionality refutation: an asserted `∀i. select a i = select b i`
     /// forces `a = b`, so a co-asserted `a ≠ b` is UNSAT. Instantiation alone can't
     /// see this (extensionality is not a ground-instance rule).
+    /// The constant default value of an array term: follow the `store` chain to its
+    /// base and, if that base is `(as const v)`, return `v`. `None` otherwise.
+    fn array_const_default(&self, mut t: AstId) -> Option<AstId> {
+        loop {
+            if self.m.is_const_array(t) {
+                return Some(self.m.app_args(t)[0]);
+            } else if self.m.is_store(t) {
+                t = self.m.app_args(t)[0];
+            } else {
+                return None;
+            }
+        }
+    }
+
+    /// A top-level `A = B` between arrays whose const-array bases carry different
+    /// numeral defaults, over an INFINITE (Int) index sort, is UNSAT: the finitely many
+    /// stores cannot cover the domain, so at some index both arrays fall back to their
+    /// differing defaults. Refutes `store(const 0,2,3) = store(const 1,2,3)`.
+    fn const_array_default_conflict(&self, goal: AstId) -> bool {
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        for c in top {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let (a, b) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                if self.m.is_array_sort(self.m.get_sort(a))
+                    && let Some((idx_sort, _)) = self.m.array_sort_params(self.m.get_sort(a))
+                    && self.m.is_int_sort(idx_sort)
+                    && let (Some(da), Some(db)) =
+                        (self.array_const_default(a), self.array_const_default(b))
+                    && let (Some(va), Some(vb)) = (self.m.as_numeral(da), self.m.as_numeral(db))
+                    && va != vb
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn extensionality_unsat(&self, goal: AstId) -> bool {
         // Array pairs forced equal by a `∀i. a[i] = b[i]` assertion.
         let mut pairs: Vec<(AstId, AstId)> = Vec::new();
@@ -17766,6 +17814,11 @@ impl Context {
         // Contradictory bounds on a single-valued int term/marker (`str.to_int x ≥ 50
         // ∧ str.to_int x < 10`) — the marker is opaque to the LIA.
         if self.int_bound_conflict(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Two arrays with different const-array defaults over an infinite index are
+        // unequal — `store(const 0,2,3) = store(const 1,2,3)` is UNSAT.
+        if self.const_array_default_conflict(goal) {
             return (SmtResult::Unsat, None);
         }
         // Array extensionality: `a ≠ b ∧ ∀i. a[i] = b[i]` is UNSAT.
