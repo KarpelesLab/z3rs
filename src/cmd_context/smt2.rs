@@ -4606,6 +4606,42 @@ impl Context {
             let eq = self.m.mk_eq(lenu, nv);
             ax.push(eq);
         }
+        // `len(seq.extract(s, i, n))` with i, n concrete and len s pinned: 0 if the
+        // window starts outside `[0, len s]` or n ≤ 0, else `min(n, len s − i)`.
+        // Refutes `len s = 5 ∧ len(extract s 1 3) ≠ 3`.
+        let extract_markers: Vec<(AstId, AstId, i64, i64)> = present
+            .iter()
+            .filter_map(|&t| {
+                (self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.extract")
+                    && self.m.app_args(t).len() == 3)
+                    .then(|| {
+                        let a = self.m.app_args(t);
+                        Some((t, a[0], self.int_arg(a[1])?, self.int_arg(a[2])?))
+                    })
+                    .flatten()
+            })
+            .collect();
+        for (t, s, i, n) in extract_markers {
+            let Some(ls) = self
+                .seq_of
+                .get(&s)
+                .map(|v| v.len() as i64)
+                .or_else(|| self.str_exact_len(goal, s).map(|k| k as i64))
+            else {
+                continue;
+            };
+            let elen = if i < 0 || i > ls || n <= 0 {
+                0
+            } else {
+                n.min(ls - i)
+            };
+            if let Ok(len_e) = self.seq_op("seq.len", &[t]) {
+                let ev = self.m.mk_int(elen);
+                ax.push(self.m.mk_eq(len_e, ev));
+            }
+        }
         // Additive length for symbolic concatenation: `len(s ++ t) = len s + len t`.
         // Refutes `s ++ t = seq.unit(x) ∧ len s > 0 ∧ len t > 0` (a unit has length 1).
         for (app, parts) in self.seq_concat.clone() {
