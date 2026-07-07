@@ -4614,6 +4614,70 @@ impl Context {
             let eq = self.m.mk_eq(total, sum);
             ax.push(eq);
         }
+        // `nth(u·v·…, i)` (i concrete, parts of pinned length) resolves to the read
+        // in the part containing position i. Refutes `s = u·[9] ∧ len u = 2 ∧
+        // nth s 2 ≠ 9`. Only for concats a variable is directly equated to.
+        let seq_concat_of: Vec<(AstId, Vec<AstId>)> = self.seq_concat.clone();
+        for (app, parts) in &seq_concat_of {
+            // Part lengths: a tracked concrete seq, or an asserted `len p = k`.
+            let lens: Option<Vec<usize>> = parts
+                .iter()
+                .map(|&p| {
+                    self.seq_of
+                        .get(&p)
+                        .map(|v| v.len())
+                        .or_else(|| self.str_exact_len(goal, p))
+                })
+                .collect();
+            let Some(lens) = lens else { continue };
+            // Variables `s` with `s = app` (so `nth s i` refers to the concat).
+            let mut targets: Vec<AstId> = alloc::vec![*app];
+            for &c in &present {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    if a[0] == *app && self.m.is_uninterp_const(a[1]) {
+                        targets.push(a[1]);
+                    } else if a[1] == *app && self.m.is_uninterp_const(a[0]) {
+                        targets.push(a[0]);
+                    }
+                }
+            }
+            for &t in &present {
+                if !(self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.nth")
+                    && self.m.app_args(t).len() == 2)
+                {
+                    continue;
+                }
+                let na = self.m.app_args(t).to_vec();
+                if !targets.contains(&na[0]) {
+                    continue;
+                }
+                let Some(i) = self.int_arg(na[1]) else {
+                    continue;
+                };
+                if i < 0 {
+                    continue;
+                }
+                let mut off = 0usize;
+                for (idx, &p) in parts.iter().enumerate() {
+                    if (i as usize) < off + lens[idx] {
+                        let local = (i as usize - off) as i64;
+                        if let Some(content) = self.seq_of.get(&p) {
+                            ax.push(self.m.mk_eq(t, content[local as usize]));
+                        } else {
+                            let lv = self.m.mk_int(local);
+                            if let Ok(pn) = self.seq_op("seq.nth", &[p, lv]) {
+                                ax.push(self.m.mk_eq(t, pn));
+                            }
+                        }
+                        break;
+                    }
+                    off += lens[idx];
+                }
+            }
+        }
         // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
         // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
         let str_concats: Vec<(AstId, Vec<AstId>)> = present
