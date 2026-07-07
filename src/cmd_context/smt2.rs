@@ -6900,6 +6900,42 @@ impl Context {
                 ax.push(self.m.mk_implies(t, eq));
             }
         }
+        // `s = u` ⇒ `nth(s,i) = nth(u,i)` for every concrete index. seq.nth markers
+        // are minted fresh per `(seq, index)`, so EUF never sees `nth(s,0)` and
+        // `nth(u,0)` as congruent under `s = u`. Was UNSOUND (spurious sat) on
+        // `s = u ∧ nth s 0 = 5 ∧ nth u 0 ≠ 5`. Only TOP-LEVEL asserted equalities.
+        {
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(t) = st.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        st.push(a);
+                    }
+                } else {
+                    top.push(t);
+                }
+            }
+            for t in top {
+                if !self.m.is_eq(t) || self.m.app_args(t).len() != 2 {
+                    continue;
+                }
+                let (s, u) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+                if s == u || self.seq_elem_sort(self.m.get_sort(s)).is_none() {
+                    continue;
+                }
+                for &i in &nth_idxs {
+                    let iv = self.m.mk_int(i);
+                    if let (Ok(ns), Ok(nu)) = (
+                        self.seq_op("seq.nth", &[s, iv]),
+                        self.seq_op("seq.nth", &[u, iv]),
+                    ) {
+                        let eq = self.m.mk_eq(ns, nu);
+                        ax.push(eq);
+                    }
+                }
+            }
+        }
         // `seq.at s i = seq.unit(seq.nth s i)` when `0 ≤ i < len s`. Refutes
         // `seq.at s 2 = seq.unit 5 ∧ seq.nth s 2 = 9`.
         let seq_ats: Vec<AstId> = present
