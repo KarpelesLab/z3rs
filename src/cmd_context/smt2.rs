@@ -6477,26 +6477,75 @@ impl Context {
                 concat_bind.get(&x).copied()
             };
             if let Some(cx) = concat_hay {
-                let parts = self.m.app_args(cx).to_vec();
-                // Q spans the `p0|p1` boundary iff some split `Q = Q1·Q2` (both
-                // non-empty) has Q1 an achievable suffix of p0 and Q2 an achievable
-                // prefix of p1 (a concrete part constrains its piece; a symbolic
-                // part admits any). No spanning split ⇒ distribution is sound.
+                // Flatten nested `str.++` to leaves so `"a"·("b"·x)` distributes.
+                let mut parts: Vec<AstId> = Vec::new();
+                let mut st: Vec<AstId> = self.m.app_args(cx).iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if self.m.is_app(q)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(q))
+                            .map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &sp in self.m.app_args(q).iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        parts.push(q);
+                    }
+                }
+                // Rigorous span-freeness over N parts: Q spans boundary b iff some
+                // split `Q = Q1·Q2` (both non-empty) has Q1 achievable as a suffix of
+                // parts[0..b] AND Q2 achievable as a prefix of parts[b..]. Walking
+                // outward, a concrete part must match its piece, a symbolic part
+                // absorbs the remainder (so spans THROUGH short middle parts are
+                // detected). No spanning boundary ⇒ the distribution is sound.
+                let pvals: Vec<Option<Vec<u32>>> =
+                    parts.iter().map(|&p| self.str_value(p)).collect();
+                // Q2 (a needle suffix) achievable as a prefix of parts[b..].
+                let right_ok = |b: usize, q2: &[u32]| -> bool {
+                    let mut pos = 0usize;
+                    for pc in &pvals[b..] {
+                        if pos >= q2.len() {
+                            return true;
+                        }
+                        match pc {
+                            Some(v) => {
+                                let take = v.len().min(q2.len() - pos);
+                                if v[..take] != q2[pos..pos + take] {
+                                    return false;
+                                }
+                                pos += take;
+                            }
+                            None => return true,
+                        }
+                    }
+                    pos >= q2.len()
+                };
+                // Q1 (a needle prefix) achievable as a suffix of parts[0..b].
+                let left_ok = |b: usize, q1: &[u32]| -> bool {
+                    let mut rem = q1.len();
+                    for pc in pvals[..b].iter().rev() {
+                        if rem == 0 {
+                            return true;
+                        }
+                        match pc {
+                            Some(v) => {
+                                let take = v.len().min(rem);
+                                if v[v.len() - take..] != q1[rem - take..rem] {
+                                    return false;
+                                }
+                                rem -= take;
+                            }
+                            None => return true,
+                        }
+                    }
+                    rem == 0
+                };
                 let span_free = pv.len() == 1
-                    || (parts.len() == 2 && {
-                        let p0c = self.str_value(parts[0]);
-                        let p1c = self.str_value(parts[1]);
-                        !(1..pv.len()).any(|s| {
-                            let q1_ok = p0c
-                                .as_ref()
-                                .map(|p| p.len() >= s && p[p.len() - s..] == pv[..s])
-                                .unwrap_or(true);
-                            let q2_ok = p1c
-                                .as_ref()
-                                .map(|p| p.len() >= pv.len() - s && p[..pv.len() - s] == pv[s..])
-                                .unwrap_or(true);
-                            q1_ok && q2_ok
-                        })
+                    || (1..parts.len()).all(|b| {
+                        !(1..pv.len()).any(|s| left_ok(b, &pv[..s]) && right_ok(b, &pv[s..]))
                     });
                 // A concrete part that already contains Q makes the whole concat
                 // contain Q — sound regardless of spanning. Refutes
