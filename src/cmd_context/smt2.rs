@@ -4945,6 +4945,53 @@ impl Context {
                 }
             }
         }
+        // Seq concat = concrete seq: `s·u·w = [1,2,3] ∧ len s = 1 ∧ len u = 1` splits
+        // at the pinned part lengths (the single unknown-length part gets the
+        // remainder), determining each part. Refutes `… ∧ nth w 0 ≠ 3`.
+        for &c in &present {
+            if !(self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2) {
+                continue;
+            }
+            let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+            for (cc, lit) in [(l, r), (r, l)] {
+                let (Some(parts), Some(cv)) = (flatten_seq(cc), self.seq_of.get(&lit).cloned())
+                else {
+                    continue;
+                };
+                if parts.len() < 2 {
+                    continue;
+                }
+                // Part lengths; at most one may be unknown (it takes the remainder).
+                let lens: Vec<Option<usize>> = parts
+                    .iter()
+                    .map(|&p| {
+                        self.seq_of
+                            .get(&p)
+                            .map(|v| v.len())
+                            .or_else(|| self.str_exact_len(goal, p))
+                    })
+                    .collect();
+                let known: usize = lens.iter().flatten().sum();
+                let unknown = lens.iter().filter(|l| l.is_none()).count();
+                if unknown > 1 || known > cv.len() || (unknown == 0 && known != cv.len()) {
+                    continue;
+                }
+                let mut off = 0usize;
+                for (idx, &p) in parts.iter().enumerate() {
+                    let plen = lens[idx].unwrap_or(cv.len().saturating_sub(known));
+                    if off + plen > cv.len() {
+                        break;
+                    }
+                    // Only pin symbolic parts (a concrete part either matches or
+                    // conflicts, handled elsewhere).
+                    if self.seq_of.get(&p).is_none() {
+                        let sv = self.mk_seq(cv[off..off + plen].to_vec());
+                        ax.push(self.m.mk_eq(p, sv));
+                    }
+                    off += plen;
+                }
+            }
+        }
         // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
         // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
         let str_concats: Vec<(AstId, Vec<AstId>)> = present
