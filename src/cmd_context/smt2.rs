@@ -7917,6 +7917,83 @@ impl Context {
             })
             .filter(|&i| (0..=64).contains(&i))
             .collect();
+        // `extract(s,i,n) = extract(t,j,n)` ⇒ `nth(s,i+k) = nth(t,j+k)` for k < n (in
+        // bounds). Emitted ONLY for `nth` markers already in the goal — no new markers,
+        // so the seq witness doesn't explode (the reason the general version was slow).
+        // Refutes `len s = 4 ∧ extract s 1 2 = extract s 2 2 ∧ nth s 1 = 5 ∧ nth s 2 ≠ 5`.
+        let nth_present: BTreeMap<(AstId, i64), AstId> = present
+            .iter()
+            .filter_map(|&t| {
+                if self.m.is_app(t)
+                    && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                        == Some("seq.nth")
+                    && self.m.app_args(t).len() == 2
+                {
+                    let a = self.m.app_args(t);
+                    self.int_arg(a[1]).map(|i| ((a[0], i), t))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        {
+            let extract_of = |slf: &Self, e: AstId| -> Option<(AstId, i64, i64)> {
+                if slf.m.is_app(e)
+                    && slf.seqop_ops.get(&slf.m.app_decl(e)).map(String::as_str)
+                        == Some("seq.extract")
+                    && slf.m.app_args(e).len() == 3
+                {
+                    let a = slf.m.app_args(e);
+                    Some((a[0], slf.int_arg(a[1])?, slf.int_arg(a[2])?))
+                } else {
+                    None
+                }
+            };
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(x) = st.pop() {
+                if self.m.is_and(x) {
+                    for &y in self.m.app_args(x) {
+                        st.push(y);
+                    }
+                } else {
+                    top.push(x);
+                }
+            }
+            for c in top {
+                if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+                    continue;
+                }
+                let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                let (Some((s1, i1, n1)), Some((s2, i2, n2))) =
+                    (extract_of(self, l), extract_of(self, r))
+                else {
+                    continue;
+                };
+                if i1 < 0 || i2 < 0 {
+                    continue;
+                }
+                for k in 0..n1.min(n2).min(64) {
+                    let (Some(&m1), Some(&m2)) = (
+                        nth_present.get(&(s1, i1 + k)),
+                        nth_present.get(&(s2, i2 + k)),
+                    ) else {
+                        continue;
+                    };
+                    let (Ok(len1), Ok(len2)) =
+                        (self.seq_op("seq.len", &[s1]), self.seq_op("seq.len", &[s2]))
+                    else {
+                        continue;
+                    };
+                    let (p1, p2) = (self.m.mk_int(i1 + k), self.m.mk_int(i2 + k));
+                    let g1 = self.m.mk_lt(p1, len1);
+                    let g2 = self.m.mk_lt(p2, len2);
+                    let hyp = self.m.mk_and(&[g1, g2]);
+                    let eq = self.m.mk_eq(m1, m2);
+                    ax.push(self.m.mk_implies(hyp, eq));
+                }
+            }
+        }
         for t in seq_prefs {
             let a = self.m.app_args(t).to_vec();
             let (s, u) = (a[0], a[1]);
