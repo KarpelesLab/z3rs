@@ -6225,6 +6225,71 @@ impl Context {
             let x_eq_p = self.m.mk_eq(x, pl);
             let hyp = self.m.mk_and(&[t, len_eq]);
             ax.push(self.m.mk_implies(hyp, x_eq_p));
+            // If the haystack is a concat whose total length equals |Q|, containment
+            // is equality: pin symbolic parts / clash concrete parts against Q (under
+            // the contains guard). Refutes `contains("a"·x, "ab") ∧ len x = 1 ∧ x ≠ "b"`.
+            let hay_concat = if self.m.is_app(x)
+                && self
+                    .str_op_decls
+                    .get(&self.m.app_decl(x))
+                    .map(String::as_str)
+                    == Some("str.++")
+            {
+                Some(x)
+            } else {
+                concat_bind.get(&x).copied()
+            };
+            if let Some(hc) = hay_concat {
+                let mut hparts: Vec<AstId> = Vec::new();
+                let mut st: Vec<AstId> = self.m.app_args(hc).iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if self.m.is_app(q)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(q))
+                            .map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &sp in self.m.app_args(q).iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        hparts.push(q);
+                    }
+                }
+                let plens: Option<Vec<usize>> = hparts
+                    .iter()
+                    .map(|&p| {
+                        self.str_value(p)
+                            .map(|v| v.len())
+                            .or_else(|| self.str_exact_len(goal, p))
+                    })
+                    .collect();
+                if let Some(plens) = plens
+                    && plens.iter().sum::<usize>() == pv.len()
+                {
+                    let mut off = 0usize;
+                    for (idx, &p) in hparts.iter().enumerate() {
+                        let plen = plens[idx];
+                        match self.str_value(p) {
+                            Some(v) => {
+                                if v[..] != pv[off..off + plen] {
+                                    let f = self.m.mk_false();
+                                    ax.push(self.m.mk_implies(t, f));
+                                }
+                            }
+                            None => {
+                                let lit =
+                                    self.mk_str_lit(&code_points_to_string(&pv[off..off + plen]));
+                                extra_lits.insert(lit);
+                                let eq = self.m.mk_eq(p, lit);
+                                ax.push(self.m.mk_implies(t, eq));
+                            }
+                        }
+                        off += plen;
+                    }
+                }
+            }
             // `contains(u·v·…, Q)` distributes to `⋁ contains(partᵢ, Q)` when Q
             // cannot span a boundary. A single character never spans. For a
             // 2-part `P·x` with P concrete, Q spans iff a non-empty proper prefix
