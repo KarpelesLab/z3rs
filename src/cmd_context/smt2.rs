@@ -9325,6 +9325,10 @@ impl Context {
                 per_var.push(alloc::vec![alloc::vec![0i64; exact.unwrap_or(0)]]);
                 continue;
             }
+            if exact == Some(0) {
+                per_var.push(alloc::vec![Vec::new()]); // the empty sequence
+                continue;
+            }
             let target = exact.unwrap_or(default_len).min(6);
             let mut all: Vec<Vec<i64>> = if exact.is_some() {
                 Vec::new()
