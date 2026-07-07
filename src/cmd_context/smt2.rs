@@ -5498,6 +5498,160 @@ impl Context {
                 }
             }
         }
+        // `prefixof(P, hay)` / `suffixof(P, hay)` (P concrete) where `hay` is a concat
+        // (direct or variable-bound) whose leading/trailing concrete chars already
+        // start/end with P is TRUE. Refutes `y = "ab"·x ∧ ¬prefixof("ab", y)`.
+        let mut cc_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for &c in &present {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(v) && str_concat_parts(self, cc).is_some() {
+                        cc_bind.entry(v).or_insert(cc);
+                    }
+                }
+            }
+        }
+        for &t in &present {
+            if !self.m.is_app(t) || self.m.app_args(t).len() != 2 {
+                continue;
+            }
+            let is_pre = match self
+                .str_op_decls
+                .get(&self.m.app_decl(t))
+                .map(String::as_str)
+            {
+                Some("str.prefixof") => true,
+                Some("str.suffixof") => false,
+                _ => continue,
+            };
+            let (pat, hay) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+            let Some(pv) = self.str_value(pat) else {
+                continue;
+            };
+            let concat = if str_concat_parts(self, hay).is_some() {
+                hay
+            } else if let Some(&cc) = cc_bind.get(&hay) {
+                cc
+            } else {
+                continue;
+            };
+            let Some(parts) = str_concat_parts(self, concat) else {
+                continue;
+            };
+            if is_pre {
+                let mut lead: Vec<u32> = Vec::new();
+                for &p in &parts {
+                    match self.str_value(p) {
+                        Some(v) => lead.extend(v),
+                        None => break,
+                    }
+                }
+                if pv.len() <= lead.len() && lead[..pv.len()] == pv[..] {
+                    ax.push(t);
+                }
+            } else {
+                let mut trail: Vec<u32> = Vec::new();
+                for &p in parts.iter().rev() {
+                    match self.str_value(p) {
+                        Some(v) => {
+                            let mut nv = v.clone();
+                            nv.extend(trail);
+                            trail = nv;
+                        }
+                        None => break,
+                    }
+                }
+                if pv.len() <= trail.len() && trail[trail.len() - pv.len()..] == pv[..] {
+                    ax.push(t);
+                }
+            }
+        }
+        // Seq analog: `seq.prefixof/suffixof(P, hay)` (P a concrete seq) where `hay` is
+        // a seq concat (direct or bound) whose leading/trailing concrete elements
+        // start/end with P is TRUE. Refutes `u = s·[3] ∧ ¬suffixof([3], u)`.
+        let seq_ccb = self.seq_concat.clone();
+        let mut seq_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for &c in &present {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(v) && seq_ccb.iter().any(|(app, _)| *app == cc) {
+                        seq_bind.entry(v).or_insert(cc);
+                    }
+                }
+            }
+        }
+        for &t in &present {
+            if !self.m.is_app(t) || self.m.app_args(t).len() != 2 {
+                continue;
+            }
+            let is_pre = match self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str) {
+                Some("seq.prefixof") => true,
+                Some("seq.suffixof") => false,
+                _ => continue,
+            };
+            let (pat, hay) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+            let Some(pv) = self.seq_of.get(&pat).cloned() else {
+                continue;
+            };
+            let concat = if seq_ccb.iter().any(|(app, _)| *app == hay) {
+                hay
+            } else if let Some(&cc) = seq_bind.get(&hay) {
+                cc
+            } else {
+                continue;
+            };
+            let parts0 = &seq_ccb.iter().find(|(app, _)| *app == concat).unwrap().1;
+            let mut parts: Vec<AstId> = Vec::new();
+            let mut fstack: Vec<AstId> = parts0.iter().rev().copied().collect();
+            while let Some(p) = fstack.pop() {
+                if let Some((_, sub)) = seq_ccb.iter().find(|(a, _)| *a == p) {
+                    for &sp in sub.iter().rev() {
+                        fstack.push(sp);
+                    }
+                } else {
+                    parts.push(p);
+                }
+            }
+            let cmp = |elems: &[AstId], pat: &[AstId]| -> bool {
+                elems.len() >= pat.len()
+                    && (0..pat.len()).all(|k| {
+                        self.seq_of
+                            .get(&elems[k])
+                            .zip(self.seq_of.get(&pat[k]))
+                            .map(|(a, b)| a == b)
+                            .unwrap_or(elems[k] == pat[k])
+                    })
+            };
+            if is_pre {
+                let mut lead: Vec<AstId> = Vec::new();
+                for &p in &parts {
+                    match self.seq_of.get(&p) {
+                        Some(v) => lead.extend(v.clone()),
+                        None => break,
+                    }
+                }
+                if cmp(&lead, &pv) {
+                    ax.push(t);
+                }
+            } else {
+                let mut trail: Vec<AstId> = Vec::new();
+                for &p in parts.iter().rev() {
+                    match self.seq_of.get(&p) {
+                        Some(v) => {
+                            let mut nv = v.clone();
+                            nv.extend(trail);
+                            trail = nv;
+                        }
+                        None => break,
+                    }
+                }
+                if trail.len() >= pv.len() && cmp(&trail[trail.len() - pv.len()..], &pv) {
+                    ax.push(t);
+                }
+            }
+        }
         // Variable → literal value bindings (`y = "abcd"`), so a predicate whose
         // container is a literal-bound variable still resolves.
         let mut str_bind: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
