@@ -634,10 +634,17 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // draining branch-and-bound (which is ~100× slower on `4x+3y > 2`).
     {
         let mut b = *budget;
-        if let SolveOutcome::Sat(m) = model_with_diseqs_budgeted(&cons, &kept_diseqs, &mut b)
-            && let Some(a) = round_lra_model(&m, &cons, &kept_diseqs, &int_vars)
-        {
-            return Feas::Sat(finish(a));
+        if let SolveOutcome::Sat(m) = model_with_diseqs_budgeted(&cons, &kept_diseqs, &mut b) {
+            if let Some(a) = round_lra_model(&m, &cons, &kept_diseqs, &int_vars) {
+                return Feas::Sat(finish(a));
+            }
+            // Rounding the LRA vertex failed but the system is real-feasible: try a
+            // bounded box around the origin. A satisfiable integer system almost always
+            // has a small-coordinate solution that a far LRA vertex hides from
+            // branch-and-bound (which would otherwise churn ~2s on 3-4 variable cases).
+            if let Some(a) = origin_box_search(&cons, &kept_diseqs, &int_vars) {
+                return Feas::Sat(finish(a));
+            }
         }
     }
     // Branch-and-bound runs on a *copy* of the budget: on an unbounded system it
@@ -1453,6 +1460,63 @@ fn integer_feasible(
 
 fn rat_zero() -> Rational {
     Rational::from_integer(Int::from(0))
+}
+
+/// Search a bounded integer box around the origin for a point satisfying every
+/// constraint and disequality. A cheap fallback for real-feasible systems whose
+/// LRA vertex is far from any integer point (so rounding fails) — most satisfiable
+/// integer systems still have a small-coordinate solution. Box size shrinks with
+/// the variable count to bound the (exhausted-case) cost.
+fn origin_box_search(
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+) -> Option<Assignment> {
+    let nv = int_vars.len();
+    if nv == 0 || nv > 4 {
+        return None;
+    }
+    let d: i128 = match nv {
+        1 => 60,
+        2 => 25,
+        3 => 8,
+        _ => 4,
+    };
+    let zero = rat_zero();
+    let mut t = alloc::vec![-d; nv];
+    loop {
+        let a: Assignment = int_vars
+            .iter()
+            .copied()
+            .zip(
+                t.iter()
+                    .map(|&x| Rational::from_integer(Int::from(x as i64))),
+            )
+            .collect();
+        let ok = cons.iter().all(|c| {
+            let e = c.expr.eval(&a);
+            match c.rel {
+                Rel::Le => e <= zero,
+                Rel::Lt => e < zero,
+                Rel::Eq => e == zero,
+            }
+        }) && diseqs.iter().all(|dd| !dd.eval(&a).is_zero());
+        if ok {
+            return Some(a);
+        }
+        let mut i = 0;
+        loop {
+            if i == nv {
+                return None;
+            }
+            t[i] += 1;
+            if t[i] <= d {
+                break;
+            }
+            t[i] = -d;
+            i += 1;
+        }
+    }
 }
 
 /// Round the fractional integer coordinates of an LRA relaxation model to nearby
