@@ -5089,10 +5089,10 @@ impl Context {
                     }
                 }
             }
-            // Flatten a `str.++` to (sorted symbolic leaves, concrete char total).
-            let str_flat = |slf: &Self, cc: AstId| -> (Vec<AstId>, usize) {
-                let mut syms: Vec<AstId> = Vec::new();
-                let mut conc = 0usize;
+            // Flatten a `str.++` to (ordered leaves, sorted symbolic leaves,
+            // concrete char total, leading concrete chars, trailing concrete chars).
+            let str_info = |slf: &Self, cc: AstId| -> (Vec<AstId>, usize, Vec<u32>, Vec<u32>) {
+                let mut leaves: Vec<AstId> = Vec::new();
                 let mut st: Vec<AstId> = slf.m.app_args(cc).iter().rev().copied().collect();
                 while let Some(q) = st.pop() {
                     if slf.m.is_app(q)
@@ -5102,25 +5102,57 @@ impl Context {
                         for &sp in slf.m.app_args(q).iter().rev() {
                             st.push(sp);
                         }
-                    } else if let Some(v) = slf.str_value(q) {
-                        conc += v.len();
                     } else {
-                        syms.push(q);
+                        leaves.push(q);
+                    }
+                }
+                let mut syms: Vec<AstId> = Vec::new();
+                let mut conc = 0usize;
+                let (mut lead, mut trail) = (Vec::new(), Vec::new());
+                let mut lead_open = true;
+                for &p in &leaves {
+                    match slf.str_value(p) {
+                        Some(v) => {
+                            conc += v.len();
+                            if lead_open {
+                                lead.extend(&v);
+                            }
+                        }
+                        None => {
+                            syms.push(p);
+                            lead_open = false;
+                        }
+                    }
+                }
+                let mut trail_open = true;
+                for &p in leaves.iter().rev() {
+                    match slf.str_value(p) {
+                        Some(v) if trail_open => {
+                            let mut nv = v.clone();
+                            nv.extend(trail);
+                            trail = nv;
+                        }
+                        None => trail_open = false,
+                        _ => {}
                     }
                 }
                 syms.sort();
-                (syms, conc)
+                (syms, conc, lead, trail)
             };
             for concats in var_concats.values() {
                 for w in concats.windows(2) {
                     if w[0] != w[1] {
                         ax.push(self.m.mk_eq(w[0], w[1]));
+                        let (s0, c0, l0, t0) = str_info(self, w[0]);
+                        let (s1, c1, l1, t1) = str_info(self, w[1]);
                         // Same symbolic leaves but a different concrete-char total ⇒
-                        // different lengths ⇒ the two concats can't be equal. Refutes
-                        // `y = "a"·x ∧ y = "ab"·x` without relying on the int theory.
-                        let (s0, c0) = str_flat(self, w[0]);
-                        let (s1, c1) = str_flat(self, w[1]);
-                        if s0 == s1 && c0 != c1 {
+                        // different lengths (`y = "a"·x ∧ y = "ab"·x`); or the leading /
+                        // trailing concrete chars disagree at a shared position (`y =
+                        // "a"·x ∧ y = "b"·x`). Either way the concats can't be equal.
+                        let lead_clash = (0..l0.len().min(l1.len())).any(|i| l0[i] != l1[i]);
+                        let trail_clash = (0..t0.len().min(t1.len()))
+                            .any(|i| t0[t0.len() - 1 - i] != t1[t1.len() - 1 - i]);
+                        if (s0 == s1 && c0 != c1) || lead_clash || trail_clash {
                             ax.push(self.m.mk_false());
                         }
                     }
