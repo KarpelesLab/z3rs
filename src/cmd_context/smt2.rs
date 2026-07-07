@@ -2370,7 +2370,15 @@ impl Context {
             let rebuilt = if new_args == args {
                 t
             } else {
-                self.m.mk_app(decl, &new_args)
+                // Rebuild commutative arithmetic through the normalizing constructors so
+                // a lifted `(* (div x y) y)` becomes the same canonical product as the
+                // identity's `(* y q)` — otherwise the two are distinct opaque nonlinear
+                // terms and `mod x y = x − (div x y)·y` isn't refuted.
+                match self.m.arith_op(t) {
+                    Some(ArithOp::Mul) => self.m.mk_mul(&new_args),
+                    Some(ArithOp::Add) => self.m.mk_add(&new_args),
+                    _ => self.m.mk_app(decl, &new_args),
+                }
             };
             if self.m.is_ite(rebuilt) && !self.m.is_bool_sort(self.m.get_sort(rebuilt)) {
                 self.lift_ite(rebuilt, &mut ctx.defs)
@@ -9602,6 +9610,104 @@ impl Context {
     /// pinned to its stable value (leaving `r` linearly determined), is a
     /// *complete* decision. Returns `true` only when **every** case is definitely
     /// (and linearly, hence trustworthily) unsatisfiable; otherwise it bails.
+    /// Unconditional Euclidean identities `a = d·q + r` for every lifted symbolic
+    /// div/mod whose divisor `d` the goal proves nonzero (a top-level `d ≠ 0`,
+    /// `d > 0`, `d < 0`, or a comparison to a constant that excludes 0). Sound because
+    /// the guard `d ≠ 0` provably holds; needed because the guarded implication's
+    /// nonlinear `d·q` is opaque and isn't discharged by the linear engine.
+    fn divmod_nonzero_identity(&mut self, goal: AstId) -> Vec<AstId> {
+        if self.symbolic_divmod.is_empty() {
+            return Vec::new();
+        }
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        // Restrict to div/mod terms of THIS goal — `symbolic_divmod` accumulates
+        // across every check-sat in the file, so stale entries would bloat the goal.
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let sdm = self.symbolic_divmod.clone();
+        let mut axioms = Vec::new();
+        let mut nonzero: BTreeMap<AstId, bool> = BTreeMap::new();
+        for (a, d, q, r) in sdm {
+            if !present.contains(&q) || !present.contains(&r) {
+                continue;
+            }
+            if !*nonzero
+                .entry(d)
+                .or_insert_with(|| self.divisor_nonzero(d, &top))
+            {
+                continue;
+            }
+            let dq = self.m.mk_mul(&[d, q]);
+            let sum = self.m.mk_add(&[dq, r]);
+            axioms.push(self.m.mk_eq(a, sum));
+        }
+        axioms
+    }
+
+    /// Whether the goal's top-level conjuncts prove `d ≠ 0` (a nonzero numeral, an
+    /// explicit `d ≠ 0`, or a comparison to a constant that excludes 0).
+    fn divisor_nonzero(&self, d: AstId, top: &[AstId]) -> bool {
+        use crate::ast::ArithOp;
+        if let Some(v) = self.m.as_numeral(d) {
+            return !v.is_zero();
+        }
+        let num = |slf: &Self, t: AstId| slf.m.as_numeral(t).and_then(|r| r.to_i64());
+        for &c in top {
+            if self.m.is_not(c)
+                && self.m.app_args(c).len() == 1
+                && self.m.is_eq(self.m.app_args(c)[0])
+            {
+                let e = self.m.app_args(c)[0];
+                let a = self.m.app_args(e);
+                if a.len() == 2
+                    && ((a[0] == d && num(self, a[1]) == Some(0))
+                        || (a[1] == d && num(self, a[0]) == Some(0)))
+                {
+                    return true;
+                }
+            }
+            if let Some(op) = self.m.arith_op(c)
+                && self.m.app_args(c).len() == 2
+            {
+                let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                // `d op k` with a numeral `k` that forces d away from 0.
+                if l == d
+                    && let Some(k) = num(self, r)
+                {
+                    match op {
+                        ArithOp::Gt if k >= 0 => return true,
+                        ArithOp::Ge if k >= 1 => return true,
+                        ArithOp::Lt if k <= 0 => return true,
+                        ArithOp::Le if k <= -1 => return true,
+                        _ => {}
+                    }
+                }
+                // `k op d` (reversed).
+                if r == d
+                    && let Some(k) = num(self, l)
+                {
+                    match op {
+                        ArithOp::Lt if k >= 0 => return true,
+                        ArithOp::Le if k >= 1 => return true,
+                        ArithOp::Gt if k <= 0 => return true,
+                        ArithOp::Ge if k <= -1 => return true,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn divmod_complete_unsat(&mut self, goal: AstId) -> bool {
         // The single symbolic divisor present in the goal.
         let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
@@ -13699,6 +13805,21 @@ impl Context {
             return r;
         }
         let lifted = self.lift(combined);
+        // For a divisor the goal proves nonzero, add the Euclidean identity
+        // `a = d·q + r` UNCONDITIONALLY: the lifted form only guards it by `d ≠ 0`
+        // (division by zero is unspecified), and the guarded implication is not
+        // discharged through the opaque nonlinear product `d·q`. Refutes
+        // `y ≠ 0 ∧ mod x y ≠ x − (div x y)·y`.
+        let lifted = {
+            let id = self.divmod_nonzero_identity(lifted);
+            if id.is_empty() {
+                lifted
+            } else {
+                let mut parts = id;
+                parts.push(lifted);
+                self.m.mk_and(&parts)
+            }
+        };
         // Fold ground selector/tester chains before the datatype axioms are built,
         // so the eager eta/selector instantiation doesn't unfold over an unreduced
         // selector tower (`v(l(l(node …))) = 9`). Sound on the pre-axiom goal — it
