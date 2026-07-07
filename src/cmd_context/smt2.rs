@@ -7299,12 +7299,27 @@ impl Context {
                     || uv.len() != n
                     || self.str_exact_len(goal, *x1) != Some(n)
                     || lv[..n - 1] != uv[..n - 1]
-                    || uv[n - 1] != lv[n - 1] + 1
+                    || uv[n - 1] <= lv[n - 1]
                 {
                     continue;
                 }
                 let both = self.m.mk_and(&[*m1, *m2]);
-                ax.push(self.m.mk_not(both));
+                match uv[n - 1] - lv[n - 1] {
+                    // Adjacent bounds: no word strictly between. Refutes
+                    // `"abc" < x ∧ x < "abd" ∧ len x = 3`.
+                    1 => ax.push(self.m.mk_not(both)),
+                    // Gap of two: the only word between is L with its last char + 1.
+                    // Refutes `"a" < x ∧ x < "c" ∧ len x = 1 ∧ x ≠ "b"`.
+                    2 => {
+                        let mut w = lv.clone();
+                        w[n - 1] += 1;
+                        let lit = self.mk_str_lit(&code_points_to_string(&w));
+                        extra_lits.insert(lit);
+                        let eq = self.m.mk_eq(*x1, lit);
+                        ax.push(self.m.mk_implies(both, eq));
+                    }
+                    _ => {}
+                }
             }
         }
         if !lts.is_empty() {
