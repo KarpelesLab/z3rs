@@ -6710,6 +6710,19 @@ impl Context {
             })
             .collect();
         let seq_concat = self.seq_concat.clone();
+        // A variable bound to a concat (`u = a·b`), so `contains u [c]` distributes
+        // over that concat. Refutes `u = (unit 1)·s ∧ contains u [9] ∧ ¬contains s [9]`.
+        let mut seq_cbind: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for &c in &present {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(v) && seq_concat.iter().any(|(app, _)| *app == cc) {
+                        seq_cbind.entry(v).or_insert(cc);
+                    }
+                }
+            }
+        }
         let contains_markers: Vec<(AstId, Vec<AstId>, AstId)> = seq_contains_by_val
             .iter()
             .map(|((hay, nv), &t)| (*hay, nv.clone(), t))
@@ -6718,7 +6731,14 @@ impl Context {
             if nv.len() != 1 {
                 continue;
             }
-            let Some((_, parts0)) = seq_concat.iter().find(|(app, _)| *app == hay) else {
+            let concat_hay = if seq_concat.iter().any(|(app, _)| *app == hay) {
+                hay
+            } else if let Some(&cc) = seq_cbind.get(&hay) {
+                cc
+            } else {
+                continue;
+            };
+            let Some((_, parts0)) = seq_concat.iter().find(|(app, _)| *app == concat_hay) else {
                 continue;
             };
             // Flatten nested concats so `(unit 1)·((unit 2)·s)` distributes fully.
