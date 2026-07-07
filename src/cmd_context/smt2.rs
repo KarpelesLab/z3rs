@@ -4525,6 +4525,23 @@ impl Context {
     fn string_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         let present: Vec<AstId> = self.m.postorder(goal);
         let present_set: BTreeSet<AstId> = present.iter().copied().collect();
+        // TOP-LEVEL conjuncts only — an equality nested under `¬`/`⇒` is NOT asserted,
+        // so a `v = concat` there must never seed a binding (else spurious unsat, e.g.
+        // `¬(y = "ab"·x) ∧ str.at y 0 = "z"`). Every binding map below gates on this.
+        let top_eqs: BTreeSet<AstId> = {
+            let mut set = BTreeSet::new();
+            let mut stack = alloc::vec![goal];
+            while let Some(t) = stack.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        stack.push(a);
+                    }
+                } else {
+                    set.insert(t);
+                }
+            }
+            set
+        };
         let mut ax = Vec::new();
         // Literals synthesised by axioms below (e.g. the prefix/suffix a variable
         // is pinned to) that must join the literal-distinctness set even though
@@ -4632,7 +4649,7 @@ impl Context {
             // Variables `s` with `s = app` (so `nth s i` refers to the concat).
             let mut targets: Vec<AstId> = alloc::vec![*app];
             for &c in &present {
-                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                     let a = self.m.app_args(c);
                     if a[0] == *app && self.m.is_uninterp_const(a[1]) {
                         targets.push(a[1]);
@@ -4830,7 +4847,7 @@ impl Context {
                 ax.push(self.m.mk_eq(total, sum));
                 // Also link `len(v)` for every variable bound to this concat.
                 for &c in &present {
-                    if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                         let a = self.m.app_args(c);
                         for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                             if cc == app && self.m.is_uninterp_const(v) {
@@ -4848,7 +4865,7 @@ impl Context {
         {
             let mut var_concats: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
             for &c in &present {
-                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                     let a = self.m.app_args(c);
                     for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                         if self.m.is_uninterp_const(v)
@@ -4891,7 +4908,7 @@ impl Context {
         if !str_concat_map.is_empty() {
             let mut cbind: BTreeMap<AstId, AstId> = BTreeMap::new();
             for &c in &present {
-                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                     let a = self.m.app_args(c);
                     for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                         if self.m.is_uninterp_const(v) && str_concat_map.contains_key(&cc) {
@@ -5041,7 +5058,7 @@ impl Context {
         // forces every symbolic part empty, so `u = C0·C1·…`. Refutes
         // `u = "a"·s ∧ len u = 1 ∧ u ≠ "a"`.
         for &c in &present {
-            if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+            if !self.m.is_eq(c) || !top_eqs.contains(&c) || self.m.app_args(c).len() != 2 {
                 continue;
             }
             let ca = self.m.app_args(c);
@@ -5086,7 +5103,7 @@ impl Context {
         // Seq analog: `u = [3]·s ∧ len u = 1 ⇒ u = [3]` (the tail is forced empty).
         let seq_cc = self.seq_concat.clone();
         for &c in &present {
-            if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+            if !self.m.is_eq(c) || !top_eqs.contains(&c) || self.m.app_args(c).len() != 2 {
                 continue;
             }
             let ca = self.m.app_args(c);
@@ -5618,7 +5635,7 @@ impl Context {
         // start/end with P is TRUE. Refutes `y = "ab"·x ∧ ¬prefixof("ab", y)`.
         let mut cc_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
         for &c in &present {
-            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+            if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                 let a = self.m.app_args(c);
                 for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                     if self.m.is_uninterp_const(v) && str_concat_parts(self, cc).is_some() {
@@ -5724,7 +5741,7 @@ impl Context {
         let seq_ccb = self.seq_concat.clone();
         let mut seq_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
         for &c in &present {
-            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+            if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                 let a = self.m.app_args(c);
                 for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                     if self.m.is_uninterp_const(v) && seq_ccb.iter().any(|(app, _)| *app == cc) {
@@ -5807,7 +5824,7 @@ impl Context {
         // container is a literal-bound variable still resolves.
         let mut str_bind: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
         for &c in &present {
-            if self.m.is_eq(c) {
+            if self.m.is_eq(c) && top_eqs.contains(&c) {
                 let a = self.m.app_args(c);
                 if a.len() == 2 {
                     for (v, lit) in [(a[0], a[1]), (a[1], a[0])] {
@@ -6039,7 +6056,7 @@ impl Context {
         // over that concat's parts. Refutes `y = "a"·x ∧ contains y "z" ∧ ¬contains x "z"`.
         let mut concat_bind: BTreeMap<AstId, AstId> = BTreeMap::new();
         for &c in &present {
-            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+            if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                 let a = self.m.app_args(c);
                 for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                     if self.m.is_uninterp_const(v)
@@ -7273,7 +7290,7 @@ impl Context {
         // over that concat. Refutes `u = (unit 1)·s ∧ contains u [9] ∧ ¬contains s [9]`.
         let mut seq_cbind: BTreeMap<AstId, AstId> = BTreeMap::new();
         for &c in &present {
-            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+            if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                 let a = self.m.app_args(c);
                 for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
                     if self.m.is_uninterp_const(v) && seq_concat.iter().any(|(app, _)| *app == cc) {
@@ -7788,7 +7805,7 @@ impl Context {
         let concat_eqs: Vec<(Vec<AstId>, Vec<AstId>)> = present
             .iter()
             .filter_map(|&c| {
-                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
                     let a = self.m.app_args(c);
                     if is_concat(self, a[0]) && is_concat(self, a[1]) {
                         return Some((
