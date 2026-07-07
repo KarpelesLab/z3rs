@@ -5235,14 +5235,11 @@ impl Context {
                 if !self.m.is_uninterp_const(u) || !seq_cc.iter().any(|(app, _)| *app == capp) {
                     continue;
                 }
-                let Some(ulen) = self
+                let ulen = self
                     .seq_of
                     .get(&u)
                     .map(|v| v.len())
-                    .or_else(|| self.str_exact_len(goal, u))
-                else {
-                    continue;
-                };
+                    .or_else(|| self.str_exact_len(goal, u));
                 let parts0 = &seq_cc.iter().find(|(app, _)| *app == capp).unwrap().1;
                 let mut parts: Vec<AstId> = Vec::new();
                 let mut fstack: Vec<AstId> = parts0.iter().rev().copied().collect();
@@ -5258,17 +5255,31 @@ impl Context {
                 let mut val: Vec<AstId> = Vec::new();
                 let mut concrete_sum = 0usize;
                 let mut has_sym = false;
+                // For the zero-length-part inference: every part is concrete or
+                // provably empty (`len p = 0`), so the whole concat is determined
+                // regardless of `len u`. Refutes `s = u·[3] ∧ len u = 0 ∧ s ≠ [3]`.
+                let mut all_concrete_or_empty = true;
+                let mut val2: Vec<AstId> = Vec::new();
                 for &p in &parts {
                     match self.seq_of.get(&p) {
                         Some(v) => {
                             concrete_sum += v.len();
                             val.extend(v.clone());
+                            val2.extend(v.clone());
                         }
-                        None => has_sym = true,
+                        None => {
+                            has_sym = true;
+                            if self.str_exact_len(goal, p) != Some(0) {
+                                all_concrete_or_empty = false;
+                            }
+                        }
                     }
                 }
-                if has_sym && concrete_sum == ulen {
+                if has_sym && ulen == Some(concrete_sum) {
                     let sv = self.mk_seq(val);
+                    ax.push(self.m.mk_eq(u, sv));
+                } else if has_sym && all_concrete_or_empty {
+                    let sv = self.mk_seq(val2);
                     ax.push(self.m.mk_eq(u, sv));
                 }
             }
