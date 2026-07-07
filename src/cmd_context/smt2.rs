@@ -4614,6 +4614,47 @@ impl Context {
             let eq = self.m.mk_eq(total, sum);
             ax.push(eq);
         }
+        // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
+        // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
+        let str_concats: Vec<(AstId, Vec<AstId>)> = present
+            .iter()
+            .filter(|&&t| {
+                self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.++")
+                    && !self.m.app_args(t).is_empty()
+            })
+            .map(|&t| (t, self.m.app_args(t).to_vec()))
+            .collect();
+        if !str_concats.is_empty()
+            && let Some(lenf) = self.str_len_decl
+        {
+            let zero = self.m.mk_int(0);
+            for (app, parts) in str_concats {
+                let total = self.m.mk_app(lenf, &[app]);
+                let part_lens: Vec<AstId> = parts
+                    .iter()
+                    .map(|&p| {
+                        self.str_value(p)
+                            .map(|v| self.m.mk_int(v.len() as i64))
+                            .unwrap_or_else(|| self.m.mk_app(lenf, &[p]))
+                    })
+                    .collect();
+                for &pl in &part_lens {
+                    let ge = self.m.mk_ge(pl, zero);
+                    ax.push(ge);
+                }
+                let sum = if part_lens.len() == 1 {
+                    part_lens[0]
+                } else {
+                    self.m.mk_add(&part_lens)
+                };
+                ax.push(self.m.mk_eq(total, sum));
+            }
+        }
         // Seq predicate length links: `seq.contains s t ⇒ len s ≥ len t` and
         // `seq.prefixof/suffixof s t ⇒ len s ≤ len t`. Refutes
         // `seq.contains s (seq.unit 3) ∧ len s = 0`.
