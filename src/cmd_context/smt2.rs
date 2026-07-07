@@ -4624,20 +4624,20 @@ impl Context {
             })
             .collect();
         for (t, s, i, n) in extract_markers {
-            let Some(ls) = self
+            let Ok(len_e) = self.seq_op("seq.len", &[t]) else {
+                continue;
+            };
+            if let Some(ls) = self
                 .seq_of
                 .get(&s)
                 .map(|v| v.len() as i64)
                 .or_else(|| self.str_exact_len(goal, s).map(|k| k as i64))
-            else {
-                continue;
-            };
-            let elen = if i < 0 || i > ls || n <= 0 {
-                0
-            } else {
-                n.min(ls - i)
-            };
-            if let Ok(len_e) = self.seq_op("seq.len", &[t]) {
+            {
+                let elen = if i < 0 || i > ls || n <= 0 {
+                    0
+                } else {
+                    n.min(ls - i)
+                };
                 let ev = self.m.mk_int(elen);
                 ax.push(self.m.mk_eq(len_e, ev));
             }
@@ -5619,17 +5619,21 @@ impl Context {
             let lx = self.m.mk_app(lenf, &[*x]);
             let atlen = self.m.mk_app(lenf, &[*app]);
             let zero = self.m.mk_int(0);
+            let empty = self.mk_str_lit("");
+            extra_lits.insert(empty);
             if *k < 0 {
-                // Negative index ⇒ empty ⇒ `len(app) = 0`.
+                // Negative index ⇒ empty. Refutes `str.at x (-1) ≠ ""`.
                 let e = self.m.mk_eq(atlen, zero);
                 ax.push(e);
+                ax.push(self.m.mk_eq(*app, empty));
             } else {
                 let kv = self.m.mk_int(*k);
-                // Out of bounds `k ≥ len x ⇒ len(app) = 0` (a non-empty `str.at x k`
-                // then contradicts by length congruence).
+                // Out of bounds `k ≥ len x ⇒ app = ""` (and `len(app) = 0`).
                 let oob = self.m.mk_ge(kv, lx);
                 let empty_len = self.m.mk_eq(atlen, zero);
                 ax.push(self.m.mk_implies(oob, empty_len));
+                let at_empty = self.m.mk_eq(*app, empty);
+                ax.push(self.m.mk_implies(oob, at_empty));
                 // In bounds `k < len x ⇒ len(app) = 1`.
                 let kv2 = self.m.mk_int(*k);
                 let inb = self.m.mk_lt(kv2, lx);
