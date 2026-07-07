@@ -4720,6 +4720,67 @@ impl Context {
                 }
             }
         }
+        // `seq.suffixof(p, u)` where `p` ends with concrete elements and `len u` is
+        // pinned: `nth(u, len u − 1 − k) = trailing_kᵗʰ`. Refutes
+        // `suffixof(s·[3], u) ∧ len u = 2 ∧ nth u 1 ≠ 3`.
+        for &c in &present {
+            if !(self.m.is_app(c)
+                && self.seqop_ops.get(&self.m.app_decl(c)).map(String::as_str)
+                    == Some("seq.suffixof")
+                && self.m.app_args(c).len() == 2)
+            {
+                continue;
+            }
+            let (p, u) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+            let Some(ulen) = self
+                .seq_of
+                .get(&u)
+                .map(|v| v.len())
+                .or_else(|| self.str_exact_len(goal, u))
+            else {
+                continue;
+            };
+            // Trailing concrete elements of p (flattened), from the end.
+            let mut trailing: Vec<AstId> = Vec::new();
+            if let Some(v) = self.seq_of.get(&p) {
+                trailing = v.clone();
+            } else if let Some((_, parts)) = seq_concat_of.iter().find(|(app, _)| *app == p) {
+                let mut fstack: Vec<AstId> = parts.to_vec();
+                let mut flat: Vec<AstId> = Vec::new();
+                while let Some(q) = fstack.pop() {
+                    if let Some((_, sub)) = seq_concat_of.iter().find(|(a, _)| *a == q) {
+                        for &sp in sub.iter() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        flat.push(q); // built in reverse order
+                    }
+                }
+                for q in flat {
+                    // flat is right-to-left; a concrete part contributes its elements.
+                    match self.seq_of.get(&q) {
+                        Some(v) => {
+                            let mut prefix = v.clone();
+                            prefix.extend(trailing);
+                            trailing = prefix;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            let tl = trailing.len();
+            for (k, &e) in trailing.iter().enumerate() {
+                // element at distance (tl-1-k) from the end of p → same distance from end of u
+                let pos = ulen as i64 - (tl as i64 - k as i64);
+                if pos < 0 {
+                    continue;
+                }
+                let iv = self.m.mk_int(pos);
+                if let Ok(nth) = self.seq_op("seq.nth", &[u, iv]) {
+                    ax.push(self.m.mk_eq(nth, e));
+                }
+            }
+        }
         // Additive length for symbolic `str.++`: `len(x·y·…) = len x + len y + …`
         // (each ≥ 0). Refutes `x = y·y ∧ len y = 2 ∧ len x ≠ 4`.
         let str_concats: Vec<(AstId, Vec<AstId>)> = present
