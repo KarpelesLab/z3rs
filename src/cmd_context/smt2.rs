@@ -6747,6 +6747,101 @@ impl Context {
                 ax.push(self.m.mk_implies(hyp, concl));
             }
         }
+        // Refutation-only `str.at` char-chain: propagate a pinned char through
+        // TOP-LEVEL `at = at` chains; if that forces a length-pinned `x` to a literal
+        // a top-level `x ≠ L` (or `x = L' ≠ L`) forbids, the goal is unsat. Emits ONLY
+        // `false` — never a pinning — so the witness is unaffected (the pinning version
+        // was 15× slower). Refutes `at x 0 = at x 1 ∧ at x 1 = at x 2 ∧ at x 0 = "a"
+        // ∧ len x = 3 ∧ x ≠ "aaa"`.
+        {
+            let is_at = |m: AstId| ats.iter().any(|&(am, _, _)| am == m);
+            let mut mark_char: BTreeMap<AstId, u32> = BTreeMap::new();
+            let mut adj: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            let mut forbidden: BTreeMap<AstId, BTreeSet<Vec<u32>>> = BTreeMap::new();
+            let mut bound: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
+            for &c in &top_eqs {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let (a0, a1) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                    for (am, lit) in [(a0, a1), (a1, a0)] {
+                        if is_at(am)
+                            && let Some(cv) = self.str_value(lit)
+                            && cv.len() == 1
+                        {
+                            mark_char.insert(am, cv[0]);
+                        }
+                        if self.m.is_uninterp_const(am)
+                            && let Some(lv) = self.str_value(lit)
+                        {
+                            bound.entry(am).or_insert(lv);
+                        }
+                    }
+                    if is_at(a0) && is_at(a1) {
+                        adj.entry(a0).or_default().push(a1);
+                        adj.entry(a1).or_default().push(a0);
+                    }
+                } else if self.m.is_not(c)
+                    && self.m.app_args(c).len() == 1
+                    && self.m.is_eq(self.m.app_args(c)[0])
+                    && self.m.app_args(self.m.app_args(c)[0]).len() == 2
+                {
+                    let ne = self.m.app_args(c)[0];
+                    let (a0, a1) = (self.m.app_args(ne)[0], self.m.app_args(ne)[1]);
+                    for (v, lit) in [(a0, a1), (a1, a0)] {
+                        if self.m.is_uninterp_const(v)
+                            && let Some(lv) = self.str_value(lit)
+                        {
+                            forbidden.entry(v).or_default().insert(lv);
+                        }
+                    }
+                }
+            }
+            let mut queue: Vec<AstId> = mark_char.keys().copied().collect();
+            while let Some(m) = queue.pop() {
+                let ch = mark_char[&m];
+                if let Some(nbs) = adj.get(&m).cloned() {
+                    for nb in nbs {
+                        if let alloc::collections::btree_map::Entry::Vacant(e) = mark_char.entry(nb)
+                        {
+                            e.insert(ch);
+                            queue.push(nb);
+                        }
+                    }
+                }
+            }
+            let at_vars2: BTreeSet<AstId> = ats.iter().map(|&(_, x, _)| x).collect();
+            for x in at_vars2 {
+                let Some(n) = self.str_exact_len(goal, x) else {
+                    continue;
+                };
+                if n == 0 || n > 16 {
+                    continue;
+                }
+                let mut lit: Vec<u32> = Vec::new();
+                let mut complete = true;
+                for i in 0..n as i64 {
+                    match ats.iter().find(|&&(_, vx, vi)| vx == x && vi == i) {
+                        Some(&(am, _, _)) => match mark_char.get(&am) {
+                            Some(&ch) => lit.push(ch),
+                            None => {
+                                complete = false;
+                                break;
+                            }
+                        },
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete
+                    && !lit.is_empty()
+                    && (forbidden.get(&x).is_some_and(|s| s.contains(&lit))
+                        || bound.get(&x).is_some_and(|b| *b != lit))
+                {
+                    ax.push(self.m.mk_false());
+                }
+            }
+        }
         // Prefix/suffix character overlap over a length-pinned `x`: pin each
         // character position with a *congruent* `str.at` marker (shared decl) so a
         // prefix and a suffix that disagree at a shared position conflict. Refutes
