@@ -627,6 +627,19 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     if let Some(a) = dioph_witness(&cons, &kept_diseqs, &int_vars) {
         return Feas::Sat(finish(a));
     }
+    // Fast integer witness for INEQUALITY systems: take the LRA relaxation's real
+    // model and round its fractional integer coordinates (try floor/ceil
+    // combinations, capped), verifying against every constraint. This decides most
+    // unbounded 2+-variable integer inequality systems immediately, instead of
+    // draining branch-and-bound (which is ~100× slower on `4x+3y > 2`).
+    {
+        let mut b = *budget;
+        if let SolveOutcome::Sat(m) = model_with_diseqs_budgeted(&cons, &kept_diseqs, &mut b)
+            && let Some(a) = round_lra_model(&m, &cons, &kept_diseqs, &int_vars)
+        {
+            return Feas::Sat(finish(a));
+        }
+    }
     // Branch-and-bound runs on a *copy* of the budget: on an unbounded system it
     // can otherwise drain the shared budget the Nelson–Oppen interface phase
     // needs, turning an Omega-decided `sat` into a spurious `unknown`. Per-call
@@ -1352,6 +1365,51 @@ fn integer_feasible(
 
 fn rat_zero() -> Rational {
     Rational::from_integer(Int::from(0))
+}
+
+/// Round the fractional integer coordinates of an LRA relaxation model to nearby
+/// integers (trying every floor/ceil combination, capped) and return the first
+/// combination that satisfies every constraint and disequality — a fast integer
+/// witness that avoids branch-and-bound on the common unbounded-satisfiable case.
+fn round_lra_model(
+    model: &Assignment,
+    cons: &[Constraint],
+    diseqs: &[LinExpr],
+    int_vars: &[AstId],
+) -> Option<Assignment> {
+    let frac: Vec<AstId> = int_vars
+        .iter()
+        .copied()
+        .filter(|v| !model.get(v).map(|r| r.is_integer()).unwrap_or(true))
+        .collect();
+    if frac.len() > 6 {
+        return None; // 2^6 = 64 combinations cap
+    }
+    let zero = rat_zero();
+    for mask in 0u32..(1u32 << frac.len()) {
+        let mut a = model.clone();
+        for (i, &v) in frac.iter().enumerate() {
+            let val = model.get(&v).cloned().unwrap_or_else(rat_zero);
+            let rounded = if mask & (1 << i) != 0 {
+                val.ceil()
+            } else {
+                val.floor()
+            };
+            a.insert(v, Rational::from_integer(rounded));
+        }
+        let cons_ok = cons.iter().all(|c| {
+            let e = c.expr.eval(&a);
+            match c.rel {
+                Rel::Le => e <= zero,
+                Rel::Lt => e < zero,
+                Rel::Eq => e == zero,
+            }
+        });
+        if cons_ok && diseqs.iter().all(|d| !d.eval(&a).is_zero()) {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// The linear constraint for `(op a b)` (with `diff = a - b`) at truth `holds`.
