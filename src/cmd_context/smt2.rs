@@ -7875,7 +7875,7 @@ impl Context {
             .map(|((hay, nv), &t)| (*hay, nv.clone(), t))
             .collect();
         for (hay, nv, t) in contains_markers {
-            if nv.len() != 1 {
+            if nv.is_empty() {
                 continue;
             }
             let concat_hay = if seq_concat.iter().any(|(app, _)| *app == hay) {
@@ -7900,11 +7900,62 @@ impl Context {
                     parts.push(p);
                 }
             }
+            // Rigorous span-freeness for a multi-element needle (elements compared by
+            // AstId; symbolic parts absorb). Single element never spans.
+            let pvals: Vec<Option<Vec<AstId>>> = parts
+                .iter()
+                .map(|&p| self.seq_of.get(&p).cloned())
+                .collect();
+            let right_ok = |b: usize, q2: &[AstId]| -> bool {
+                let mut pos = 0usize;
+                for pc in &pvals[b..] {
+                    if pos >= q2.len() {
+                        return true;
+                    }
+                    match pc {
+                        Some(v) => {
+                            let take = v.len().min(q2.len() - pos);
+                            if v[..take] != q2[pos..pos + take] {
+                                return false;
+                            }
+                            pos += take;
+                        }
+                        None => return true,
+                    }
+                }
+                pos >= q2.len()
+            };
+            let left_ok = |b: usize, q1: &[AstId]| -> bool {
+                let mut rem = q1.len();
+                for pc in pvals[..b].iter().rev() {
+                    if rem == 0 {
+                        return true;
+                    }
+                    match pc {
+                        Some(v) => {
+                            let take = v.len().min(rem);
+                            if v[v.len() - take..] != q1[rem - take..rem] {
+                                return false;
+                            }
+                            rem -= take;
+                        }
+                        None => return true,
+                    }
+                }
+                rem == 0
+            };
+            let span_free = nv.len() == 1
+                || (1..parts.len())
+                    .all(|b| !(1..nv.len()).any(|s| left_ok(b, &nv[..s]) && right_ok(b, &nv[s..])));
+            if !span_free {
+                continue;
+            }
             let markers: Option<Vec<AstId>> = parts
                 .iter()
                 .map(|&p| {
                     if let Some(pv) = self.seq_of.get(&p) {
-                        let has = pv.iter().any(|&e| e == nv[0]);
+                        let has = pv.len() >= nv.len()
+                            && pv.windows(nv.len()).any(|w| w == nv.as_slice());
                         Some(if has {
                             self.m.mk_true()
                         } else {
