@@ -1122,6 +1122,10 @@ struct Context {
     /// Symbolic `seq.nth s i` markers, cached by `(s, i)` so repeated reads are
     /// the *same* term (congruent) — `nth s 0 = 1 ∧ nth s 0 = 2` then refutes.
     seq_nth_sym: BTreeMap<(AstId, AstId), AstId>,
+    /// Symbolic `seq.at s i` markers, cached by `(s, i)` (congruent, like seq_nth_sym).
+    seq_at_sym: BTreeMap<(AstId, AstId), AstId>,
+    /// `seq.unit e` markers, cached by element so equal-element units are one term.
+    seq_unit_cache: BTreeMap<AstId, AstId>,
     /// Symbolic `str.at x i` markers, cached by `(x, i)` so repeated reads at the
     /// same position are congruent — `str.at x i = "a" ∧ str.at x i = "b"` refutes.
     str_at_sym: BTreeMap<(AstId, AstId), AstId>,
@@ -1713,6 +1717,8 @@ impl Context {
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
             seq_nth_sym: BTreeMap::new(),
+            seq_at_sym: BTreeMap::new(),
+            seq_unit_cache: BTreeMap::new(),
             str_at_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
@@ -4888,6 +4894,27 @@ impl Context {
                     }
                 }
             }
+            // Seq analog: `u = M1 ∧ u = M2` (seq.++) ⇒ `M1 = M2`. Was UNSOUND on
+            // `u = [1]·s ∧ u = [0]·s` (spurious sat).
+            let seq_cc = self.seq_concat.clone();
+            let mut var_seq: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            for &c in &present {
+                if self.m.is_eq(c) && top_eqs.contains(&c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v) && seq_cc.iter().any(|(app, _)| *app == cc) {
+                            var_seq.entry(v).or_default().push(cc);
+                        }
+                    }
+                }
+            }
+            for concats in var_seq.values() {
+                for w in concats.windows(2) {
+                    if w[0] != w[1] {
+                        ax.push(self.m.mk_eq(w[0], w[1]));
+                    }
+                }
+            }
         }
         // `str.at(x·y·…, i)` (i concrete, parts before it of pinned length) resolves
         // to the char in the part holding position i — directly or through a variable
@@ -7504,6 +7531,19 @@ impl Context {
         // `nth(u,0)` as congruent under `s = u`. Was UNSOUND (spurious sat) on
         // `s = u ∧ nth s 0 = 5 ∧ nth u 0 ≠ 5`. Only TOP-LEVEL asserted equalities.
         {
+            // Also seq.at indices (now cached, so the regenerated marker matches).
+            let at_idxs: BTreeSet<i64> = present
+                .iter()
+                .filter_map(|&t| {
+                    (self.m.is_app(t)
+                        && self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str)
+                            == Some("seq.at")
+                        && self.m.app_args(t).len() == 2)
+                        .then(|| self.int_arg(self.m.app_args(t)[1]))
+                        .flatten()
+                })
+                .filter(|&i| (0..=64).contains(&i))
+                .collect();
             let mut top: Vec<AstId> = Vec::new();
             let mut st = alloc::vec![goal];
             while let Some(t) = st.pop() {
@@ -7530,6 +7570,16 @@ impl Context {
                         self.seq_op("seq.nth", &[u, iv]),
                     ) {
                         let eq = self.m.mk_eq(ns, nu);
+                        ax.push(eq);
+                    }
+                }
+                for &i in &at_idxs {
+                    let iv = self.m.mk_int(i);
+                    if let (Ok(ats), Ok(atu)) = (
+                        self.seq_op("seq.at", &[s, iv]),
+                        self.seq_op("seq.at", &[u, iv]),
+                    ) {
+                        let eq = self.m.mk_eq(ats, atu);
                         ax.push(eq);
                     }
                 }
@@ -11639,10 +11689,16 @@ impl Context {
             args.iter().map(|a| self.seq_of.get(a).cloned()).collect();
         match op {
             "seq.unit" => {
+                // Cache by element so two `seq.unit e` are the SAME term (congruent) —
+                // `at s 0 = seq.unit 5 ∧ at u 0 ≠ seq.unit 5 ∧ s = u` then refutes.
+                if let Some(&c) = self.seq_unit_cache.get(&args[0]) {
+                    return Ok(c);
+                }
                 let elem = self.m.get_sort(args[0]);
                 let sort = self.seq_sort(elem);
                 let t = self.fresh_const(sort);
                 self.seq_of.insert(t, alloc::vec![args[0]]);
+                self.seq_unit_cache.insert(args[0], t);
                 Ok(t)
             }
             "seq.++" => {
@@ -11702,7 +11758,14 @@ impl Context {
                     };
                     return Ok(self.mk_seq(out));
                 }
-                self.symbolic_seq(op, args)
+                // Symbolic `seq.at s i`: reuse one congruent marker per (s, i) so
+                // `s = u ⇒ at(s,i) = at(u,i)` can be emitted against the goal's marker.
+                if let Some(&c) = self.seq_at_sym.get(&(args[0], args[1])) {
+                    return Ok(c);
+                }
+                let c = self.symbolic_seq(op, args)?;
+                self.seq_at_sym.insert((args[0], args[1]), c);
+                Ok(c)
             }
             "seq.extract" => {
                 if let (Some(l), Some(i), Some(n)) = (
