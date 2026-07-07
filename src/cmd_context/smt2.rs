@@ -7527,7 +7527,47 @@ impl Context {
                 vars.push(t);
             }
         }
-        if vars.is_empty() || vars.len() > 3 {
+        // A variable determined by `x = str.++(parts)` (a top-level concat equality)
+        // is computed from its parts, not enumerated — else the search misses its
+        // (longer) value. Refutes/witnesses `x = y·y ∧ len y = 2`.
+        let mut derived: Vec<(AstId, Vec<AstId>)> = Vec::new();
+        {
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(t) = st.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        st.push(a);
+                    }
+                } else {
+                    top.push(t);
+                }
+            }
+            for t in top {
+                if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                    let a = self.m.app_args(t);
+                    for (v, c) in [(a[0], a[1]), (a[1], a[0])] {
+                        if vars.contains(&v)
+                            && !derived.iter().any(|(d, _)| *d == v)
+                            && self.m.is_app(c)
+                            && self
+                                .str_op_decls
+                                .get(&self.m.app_decl(c))
+                                .map(String::as_str)
+                                == Some("str.++")
+                            && self.m.app_args(c).iter().all(|&p| p != v)
+                        {
+                            derived.push((v, self.m.app_args(c).to_vec()));
+                        }
+                    }
+                }
+            }
+        }
+        vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
+        if vars.is_empty() && derived.is_empty() {
+            return None;
+        }
+        if vars.len() > 3 {
             return None;
         }
         // Alphabet: characters occurring in string literals, plus two fresh ones.
@@ -7806,11 +7846,34 @@ impl Context {
                 return None;
             }
             tries += 1;
-            let subst: Vec<(AstId, AstId)> = all_vars
+            let mut subst: Vec<(AstId, AstId)> = all_vars
                 .iter()
                 .enumerate()
                 .map(|(k, &v)| (v, per_term[k][idx[k]]))
                 .collect();
+            // Compute each concat-determined variable from its (now-substituted) parts.
+            for (dv, parts) in &derived {
+                let mut val: Vec<u32> = Vec::new();
+                let mut ok = true;
+                for &p in parts {
+                    let pv = subst
+                        .iter()
+                        .find(|(v, _)| *v == p)
+                        .and_then(|(_, term)| self.str_value(*term))
+                        .or_else(|| self.str_value(p));
+                    match pv {
+                        Some(v) => val.extend(v),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok {
+                    let lit = self.mk_str_lit(&code_points_to_string(&val));
+                    subst.push((*dv, lit));
+                }
+            }
             let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let mut memo = BTreeMap::new();
             let g2 = self.refold_str_markers(g1, &mut memo);
