@@ -4922,6 +4922,101 @@ impl Context {
                 }
             }
         }
+        // `u = C0·x·C1·…` (u a variable, len u pinned to the concrete parts' total)
+        // forces every symbolic part empty, so `u = C0·C1·…`. Refutes
+        // `u = "a"·s ∧ len u = 1 ∧ u ≠ "a"`.
+        for &c in &present {
+            if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+                continue;
+            }
+            let ca = self.m.app_args(c);
+            for (u, capp) in [(ca[0], ca[1]), (ca[1], ca[0])] {
+                if !self.m.is_uninterp_const(u) || !str_concat_map.contains_key(&capp) {
+                    continue;
+                }
+                let Some(ulen) = self.str_exact_len(goal, u) else {
+                    continue;
+                };
+                // Flatten the concat's parts.
+                let mut parts: Vec<AstId> = Vec::new();
+                let mut fstack: Vec<AstId> = str_concat_map[&capp].iter().rev().copied().collect();
+                while let Some(p) = fstack.pop() {
+                    if let Some(sub) = str_concat_map.get(&p) {
+                        for &sp in sub.iter().rev() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        parts.push(p);
+                    }
+                }
+                let mut val: Vec<u32> = Vec::new();
+                let mut concrete_sum = 0usize;
+                let mut has_sym = false;
+                for &p in &parts {
+                    match self.str_value(p) {
+                        Some(v) => {
+                            concrete_sum += v.len();
+                            val.extend(v);
+                        }
+                        None => has_sym = true,
+                    }
+                }
+                if has_sym && concrete_sum == ulen {
+                    let lit = self.mk_str_lit(&code_points_to_string(&val));
+                    extra_lits.insert(lit);
+                    ax.push(self.m.mk_eq(u, lit));
+                }
+            }
+        }
+        // Seq analog: `u = [3]·s ∧ len u = 1 ⇒ u = [3]` (the tail is forced empty).
+        let seq_cc = self.seq_concat.clone();
+        for &c in &present {
+            if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+                continue;
+            }
+            let ca = self.m.app_args(c);
+            for (u, capp) in [(ca[0], ca[1]), (ca[1], ca[0])] {
+                if !self.m.is_uninterp_const(u) || !seq_cc.iter().any(|(app, _)| *app == capp) {
+                    continue;
+                }
+                let Some(ulen) = self
+                    .seq_of
+                    .get(&u)
+                    .map(|v| v.len())
+                    .or_else(|| self.str_exact_len(goal, u))
+                else {
+                    continue;
+                };
+                let parts0 = &seq_cc.iter().find(|(app, _)| *app == capp).unwrap().1;
+                let mut parts: Vec<AstId> = Vec::new();
+                let mut fstack: Vec<AstId> = parts0.iter().rev().copied().collect();
+                while let Some(p) = fstack.pop() {
+                    if let Some((_, sub)) = seq_cc.iter().find(|(a, _)| *a == p) {
+                        for &sp in sub.iter().rev() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        parts.push(p);
+                    }
+                }
+                let mut val: Vec<AstId> = Vec::new();
+                let mut concrete_sum = 0usize;
+                let mut has_sym = false;
+                for &p in &parts {
+                    match self.seq_of.get(&p) {
+                        Some(v) => {
+                            concrete_sum += v.len();
+                            val.extend(v.clone());
+                        }
+                        None => has_sym = true,
+                    }
+                }
+                if has_sym && concrete_sum == ulen {
+                    let sv = self.mk_seq(val);
+                    ax.push(self.m.mk_eq(u, sv));
+                }
+            }
+        }
         // Seq predicate length links: `seq.contains s t ⇒ len s ≥ len t` and
         // `seq.prefixof/suffixof s t ⇒ len s ≤ len t`. Refutes
         // `seq.contains s (seq.unit 3) ∧ len s = 0`.
