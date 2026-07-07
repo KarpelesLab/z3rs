@@ -7495,21 +7495,48 @@ impl Context {
                     continue;
                 }
                 let both = self.m.mk_and(&[*m1, *m2]);
-                match uv[n - 1] - lv[n - 1] {
-                    // Adjacent bounds: no word strictly between. Refutes
-                    // `"abc" < x ∧ x < "abd" ∧ len x = 3`.
-                    1 => ax.push(self.m.mk_not(both)),
-                    // Gap of two: the only word between is L with its last char + 1.
-                    // Refutes `"a" < x ∧ x < "c" ∧ len x = 1 ∧ x ≠ "b"`.
-                    2 => {
-                        let mut w = lv.clone();
-                        w[n - 1] += 1;
-                        let lit = self.mk_str_lit(&code_points_to_string(&w));
+                // The words strictly between L and U (differing only in the last char)
+                // are L with last char +1 … +(diff−1). Drop any the goal forbids via a
+                // top-level `x ≠ w`; if none remain the bounds are contradictory, if one
+                // remains x is determined. Refutes `"a"<x ∧ x<"d" ∧ len x=1 ∧ x≠"b" ∧
+                // x≠"c"` and `"a"<x ∧ x<"c" ∧ x≠"b"`.
+                let diff = uv[n - 1] - lv[n - 1];
+                if diff <= 16 {
+                    let forbidden: BTreeSet<Vec<u32>> = top_eqs
+                        .iter()
+                        .filter_map(|&c| {
+                            if self.m.is_not(c)
+                                && self.m.app_args(c).len() == 1
+                                && self.m.is_eq(self.m.app_args(c)[0])
+                                && self.m.app_args(self.m.app_args(c)[0]).len() == 2
+                            {
+                                let ne = self.m.app_args(c)[0];
+                                let (e0, e1) = (self.m.app_args(ne)[0], self.m.app_args(ne)[1]);
+                                for (v, lit) in [(e0, e1), (e1, e0)] {
+                                    if v == *x1 {
+                                        return self.str_value(lit);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    let allowed: Vec<Vec<u32>> = (1..diff)
+                        .map(|d| {
+                            let mut w = lv.clone();
+                            w[n - 1] += d;
+                            w
+                        })
+                        .filter(|w| !forbidden.contains(w))
+                        .collect();
+                    if allowed.is_empty() {
+                        ax.push(self.m.mk_not(both));
+                    } else if allowed.len() == 1 {
+                        let lit = self.mk_str_lit(&code_points_to_string(&allowed[0]));
                         extra_lits.insert(lit);
                         let eq = self.m.mk_eq(*x1, lit);
                         ax.push(self.m.mk_implies(both, eq));
                     }
-                    _ => {}
                 }
             }
         }
