@@ -1,5 +1,7 @@
 .*.swp
 /z3/
+/z3test/
+*.produced.out
 /target/
 /.claude/
 
