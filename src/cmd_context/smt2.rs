@@ -1067,6 +1067,9 @@ struct Context {
     /// so a candidate assignment can *re-fold* it concretely during the bounded
     /// string-witness search (the `sat` direction).
     str_op_decls: BTreeMap<AstId, String>,
+    /// Congruence cache for symbolic string/seq op markers: the same `(op, args)`
+    /// reuses one marker, so `str.to_int x` reads the same value everywhere.
+    str_marker_cache: BTreeMap<(String, alloc::vec::Vec<AstId>), AstId>,
     /// The interned `RegLan` (regular language) sort, once used.
     reglan_sort: Option<AstId>,
     /// Regex terms whose structure is fully constant, for `str.in_re` folding.
@@ -1674,6 +1677,7 @@ impl Context {
             str_pred_len: Vec::new(),
             str_len_ub: Vec::new(),
             str_op_decls: BTreeMap::new(),
+            str_marker_cache: BTreeMap::new(),
             reglan_sort: None,
             regex_of: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
@@ -3274,6 +3278,83 @@ impl Context {
 
     /// Collect per-variable integer `[lower, upper]` bounds from the top-level
     /// literals of `goal` (both argument orders).
+    /// True if any int-sorted TERM (a variable, or a deterministic marker like
+    /// `str.to_int x` / `str.indexof …`) has an asserted lower bound above its upper
+    /// bound — a single-valued term can't straddle. Refutes
+    /// `str.to_int x ≥ 50 ∧ str.to_int x < 10` (the marker isn't fed to the LIA).
+    fn int_bound_conflict(&self, goal: AstId) -> bool {
+        use crate::ast::ArithOp;
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut upper: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let num = |u: AstId| self.m.as_numeral(u).and_then(|r| r.to_integer())?.to_i64();
+        // A deterministic int term: int-sorted and not itself a numeral.
+        let it =
+            |u: AstId| self.m.is_int_sort(self.m.get_sort(u)) && self.m.as_numeral(u).is_none();
+        for &c in &top {
+            let a = self.m.app_args(c);
+            if a.len() != 2 {
+                continue;
+            }
+            // `t = k` pins both bounds.
+            if self.m.is_eq(c) {
+                for (t, k) in [(a[0], a[1]), (a[1], a[0])] {
+                    if it(t)
+                        && let Some(kv) = num(k)
+                    {
+                        *lower.entry(t).or_insert(kv) =
+                            lower.get(&t).copied().unwrap_or(kv).max(kv);
+                        *upper.entry(t).or_insert(kv) =
+                            upper.get(&t).copied().unwrap_or(kv).min(kv);
+                    }
+                }
+                continue;
+            }
+            let Some(op) = self.m.arith_op(c) else {
+                continue;
+            };
+            let (v, k, dir) = if it(a[0]) && num(a[1]).is_some() {
+                (a[0], num(a[1]).unwrap(), 1)
+            } else if it(a[1]) && num(a[0]).is_some() {
+                (a[1], num(a[0]).unwrap(), -1)
+            } else {
+                continue;
+            };
+            match (op, dir) {
+                (ArithOp::Ge, 1) | (ArithOp::Le, -1) => {
+                    let e = lower.entry(v).or_insert(k);
+                    *e = (*e).max(k);
+                }
+                (ArithOp::Gt, 1) | (ArithOp::Lt, -1) => {
+                    let e = lower.entry(v).or_insert(k + 1);
+                    *e = (*e).max(k + 1);
+                }
+                (ArithOp::Le, 1) | (ArithOp::Ge, -1) => {
+                    let e = upper.entry(v).or_insert(k);
+                    *e = (*e).min(k);
+                }
+                (ArithOp::Lt, 1) | (ArithOp::Gt, -1) => {
+                    let e = upper.entry(v).or_insert(k - 1);
+                    *e = (*e).min(k - 1);
+                }
+                _ => {}
+            }
+        }
+        lower
+            .iter()
+            .any(|(t, &lo)| upper.get(t).is_some_and(|&hi| lo > hi))
+    }
+
     fn collect_int_bounds(&self, goal: AstId) -> (BTreeMap<AstId, i64>, BTreeMap<AstId, i64>) {
         use crate::ast::ArithOp;
         let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
@@ -10468,11 +10549,18 @@ impl Context {
             }
             _ => self.string_sort(),
         };
+        // Congruent: reuse the marker for an identical `(op, args)`, so `str.to_int x`
+        // (and other markers) reads one value — its bounds/equalities then interact.
+        let key = (op.to_string(), args.to_vec());
+        if let Some(&cached) = self.str_marker_cache.get(&key) {
+            return Ok(cached);
+        }
         let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
         let name = alloc::format!("!strop!{}!{}", op, self.fresh_counter);
         self.fresh_counter += 1;
         let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
         let app = self.m.mk_app(d, args);
+        self.str_marker_cache.insert(key, app);
         self.str_symbolic.insert(app);
         self.str_op_decls.insert(d, op.to_string());
         // Record a length link so `pred ⇒ len(longer) ≥ len(shorter)` can be
@@ -14797,6 +14885,11 @@ impl Context {
         // q = cons(0,p)`) are UNSAT by acyclicity — caught structurally here since
         // the depth axioms miss multi-variable cycles.
         if self.datatype_occurs_unsat(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Contradictory bounds on a single-valued int term/marker (`str.to_int x ≥ 50
+        // ∧ str.to_int x < 10`) — the marker is opaque to the LIA.
+        if self.int_bound_conflict(goal) {
             return (SmtResult::Unsat, None);
         }
         // Array extensionality: `a ≠ b ∧ ∀i. a[i] = b[i]` is UNSAT.
