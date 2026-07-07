@@ -16674,7 +16674,7 @@ impl Context {
                 conj.push(t);
             }
         }
-        let concats: Vec<(AstId, Vec<AstId>)> = self
+        let concat_apps: Vec<AstId> = self
             .m
             .postorder(goal)
             .into_iter()
@@ -16687,7 +16687,30 @@ impl Context {
                         == Some("str.++")
                     && self.m.app_args(t).len() >= 2
             })
-            .map(|t| (t, self.m.app_args(t).to_vec()))
+            .collect();
+        // Flatten each concat's parts to leaves so `x·(y·z) = "abcd"` splits fully.
+        let concats: Vec<(AstId, Vec<AstId>)> = concat_apps
+            .iter()
+            .map(|&t| {
+                let mut flat: Vec<AstId> = Vec::new();
+                let mut st: Vec<AstId> = self.m.app_args(t).iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if self.m.is_app(q)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(q))
+                            .map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &sp in self.m.app_args(q).iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        flat.push(q);
+                    }
+                }
+                (t, flat)
+            })
             .collect();
         let mut subst: Vec<(AstId, AstId)> = Vec::new();
         let mut bound: BTreeSet<AstId> = BTreeSet::new();
