@@ -8113,9 +8113,26 @@ impl Context {
                             && self.m.is_app(c)
                             && self.seqop_ops.get(&self.m.app_decl(c)).map(String::as_str)
                                 == Some("seq.++")
-                            && self.m.app_args(c).iter().all(|&p| p != v)
                         {
-                            derived.push((v, self.m.app_args(c).to_vec()));
+                            // Flatten nested `seq.++` to leaves so `x = a·(b·c)` works.
+                            let mut leaves: Vec<AstId> = Vec::new();
+                            let mut fs: Vec<AstId> =
+                                self.m.app_args(c).iter().rev().copied().collect();
+                            while let Some(p) = fs.pop() {
+                                if self.m.is_app(p)
+                                    && self.seqop_ops.get(&self.m.app_decl(p)).map(String::as_str)
+                                        == Some("seq.++")
+                                {
+                                    for &sp in self.m.app_args(p).iter().rev() {
+                                        fs.push(sp);
+                                    }
+                                } else {
+                                    leaves.push(p);
+                                }
+                            }
+                            if leaves.iter().all(|&p| p != v) {
+                                derived.push((v, leaves));
+                            }
                         }
                     }
                 }
@@ -8365,9 +8382,29 @@ impl Context {
                                 .get(&self.m.app_decl(c))
                                 .map(String::as_str)
                                 == Some("str.++")
-                            && self.m.app_args(c).iter().all(|&p| p != v)
                         {
-                            derived.push((v, self.m.app_args(c).to_vec()));
+                            // Flatten nested `str.++` to leaves so `x = a·(b·c)` works.
+                            let mut leaves: Vec<AstId> = Vec::new();
+                            let mut fs: Vec<AstId> =
+                                self.m.app_args(c).iter().rev().copied().collect();
+                            while let Some(p) = fs.pop() {
+                                if self.m.is_app(p)
+                                    && self
+                                        .str_op_decls
+                                        .get(&self.m.app_decl(p))
+                                        .map(String::as_str)
+                                        == Some("str.++")
+                                {
+                                    for &sp in self.m.app_args(p).iter().rev() {
+                                        fs.push(sp);
+                                    }
+                                } else {
+                                    leaves.push(p);
+                                }
+                            }
+                            if leaves.iter().all(|&p| p != v) {
+                                derived.push((v, leaves));
+                            }
                         }
                     }
                 }
