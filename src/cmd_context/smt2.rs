@@ -5169,6 +5169,99 @@ impl Context {
                 ax.push(self.m.mk_eq(pm, f));
             }
         }
+        // `prefixof(C·y, x)` / `suffixof(y·C, x)` with the *pattern* starting/ending
+        // with concrete characters pins x's leading / (with len x pinned) trailing
+        // characters via `str.at`. Refutes `prefixof("ab"·y, x) ∧ str.at x 0 ≠ "a"`.
+        let str_concat_parts = |slf: &Self, p: AstId| -> Option<Vec<AstId>> {
+            (slf.m.is_app(p)
+                && slf.str_op_decls.get(&slf.m.app_decl(p)).map(String::as_str) == Some("str.++"))
+            .then(|| {
+                let mut flat: Vec<AstId> = Vec::new();
+                let mut st: Vec<AstId> = slf.m.app_args(p).iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if slf.m.is_app(q)
+                        && slf.str_op_decls.get(&slf.m.app_decl(q)).map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &sp in slf.m.app_args(q).iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        flat.push(q);
+                    }
+                }
+                flat
+            })
+        };
+        let affix_markers: Vec<(bool, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_app(t) || self.m.app_args(t).len() != 2 {
+                    return None;
+                }
+                match self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                {
+                    Some("str.prefixof") => {
+                        Some((true, self.m.app_args(t)[0], self.m.app_args(t)[1]))
+                    }
+                    Some("str.suffixof") => {
+                        Some((false, self.m.app_args(t)[0], self.m.app_args(t)[1]))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        for (is_pre, pat, x) in affix_markers {
+            let Some(parts) = str_concat_parts(self, pat) else {
+                continue;
+            };
+            if is_pre {
+                let mut lead: Vec<u32> = Vec::new();
+                for &p in &parts {
+                    match self.str_value(p) {
+                        Some(v) => lead.extend(v),
+                        None => break,
+                    }
+                }
+                for (i, &ch) in lead.iter().enumerate() {
+                    let iv = self.m.mk_int(i as i64);
+                    let cl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                    if let Ok(at) = self.string_op("str.at", &[x, iv]) {
+                        ax.push(self.m.mk_eq(at, cl));
+                    }
+                }
+            } else {
+                let Some(xlen) = self.str_exact_len(goal, x) else {
+                    continue;
+                };
+                let mut trail: Vec<u32> = Vec::new();
+                for &p in parts.iter().rev() {
+                    match self.str_value(p) {
+                        Some(v) => {
+                            let mut nv = v.clone();
+                            nv.extend(trail);
+                            trail = nv;
+                        }
+                        None => break,
+                    }
+                }
+                let tl = trail.len();
+                for (k, &ch) in trail.iter().enumerate() {
+                    let pos = xlen as i64 - (tl as i64 - k as i64);
+                    if pos < 0 {
+                        continue;
+                    }
+                    let iv = self.m.mk_int(pos);
+                    let cl = self.mk_str_lit(&code_points_to_string(&[ch]));
+                    if let Ok(at) = self.string_op("str.at", &[x, iv]) {
+                        ax.push(self.m.mk_eq(at, cl));
+                    }
+                }
+            }
+        }
         // Variable → literal value bindings (`y = "abcd"`), so a predicate whose
         // container is a literal-bound variable still resolves.
         let mut str_bind: BTreeMap<AstId, Vec<u32>> = BTreeMap::new();
