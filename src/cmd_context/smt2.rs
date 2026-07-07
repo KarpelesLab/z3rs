@@ -8004,6 +8004,9 @@ impl Context {
                 continue;
             };
             if i < 0 {
+                // Negative index ⇒ empty. Refutes `at s (-1) ≠ empty`.
+                let empty = self.seq_empty_of(self.m.get_sort(t));
+                ax.push(self.m.mk_eq(t, empty));
                 continue;
             }
             let zero0 = self.m.mk_int(0);
@@ -8024,6 +8027,12 @@ impl Context {
             let zero = self.m.mk_int(0);
             let clen = self.m.mk_ite(in_range, one, zero);
             ax.push(self.m.mk_eq(len_at, clen));
+            // Out of range (k ≥ len s) ⇒ the empty sequence. Refutes
+            // `len s = 2 ∧ at s 5 ≠ empty`.
+            let empty = self.seq_empty_of(self.m.get_sort(t));
+            let oob = self.m.mk_ge(iv, len_s);
+            let at_empty = self.m.mk_eq(t, empty);
+            ax.push(self.m.mk_implies(oob, at_empty));
         }
         // Element congruence between seq.at markers: `at_i = at_j ⇒ nth(at_i,0) =
         // nth(at_j,0)` (seq equality is not fed to element congruence). With the
