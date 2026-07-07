@@ -5175,6 +5175,47 @@ impl Context {
                 None
             })
             .collect();
+        // `x = y` ⇒ `str.at(x,i) = str.at(y,i)` for every concrete index. str.at
+        // markers are fresh per `(x, index)`, so EUF doesn't see them as congruent
+        // under a plain equality. Refutes `x = y ∧ at x 0 = "a" ∧ at y 0 ≠ "a"`.
+        // Only TOP-LEVEL asserted equalities between strings.
+        {
+            let at_idxs: BTreeSet<i64> =
+                ats.iter().map(|&(_, _, k)| k).filter(|&k| k >= 0).collect();
+            if !at_idxs.is_empty() {
+                let mut top: Vec<AstId> = Vec::new();
+                let mut st = alloc::vec![goal];
+                while let Some(t) = st.pop() {
+                    if self.m.is_and(t) {
+                        for &a in self.m.app_args(t) {
+                            st.push(a);
+                        }
+                    } else {
+                        top.push(t);
+                    }
+                }
+                let sstr = self.string_sort;
+                for t in top {
+                    if !self.m.is_eq(t) || self.m.app_args(t).len() != 2 {
+                        continue;
+                    }
+                    let (x, y) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+                    if x == y || Some(self.m.get_sort(x)) != sstr {
+                        continue;
+                    }
+                    for &i in &at_idxs {
+                        let iv = self.m.mk_int(i);
+                        if let (Ok(ax0), Ok(ay0)) = (
+                            self.string_op("str.at", &[x, iv]),
+                            self.string_op("str.at", &[y, iv]),
+                        ) {
+                            let eq = self.m.mk_eq(ax0, ay0);
+                            ax.push(eq);
+                        }
+                    }
+                }
+            }
+        }
         for (app, x, k) in &ats {
             let lenf = self.str_len_fn();
             let lx = self.m.mk_app(lenf, &[*x]);
