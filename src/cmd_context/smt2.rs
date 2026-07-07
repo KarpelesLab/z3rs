@@ -4984,7 +4984,7 @@ impl Context {
                     }
                     // Only pin symbolic parts (a concrete part either matches or
                     // conflicts, handled elsewhere).
-                    if self.seq_of.get(&p).is_none() {
+                    if !self.seq_of.contains_key(&p) {
                         let sv = self.mk_seq(cv[off..off + plen].to_vec());
                         ax.push(self.m.mk_eq(p, sv));
                     }
