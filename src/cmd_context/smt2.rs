@@ -4921,6 +4921,74 @@ impl Context {
                     off += plen;
                 }
             }
+            // `str.substr(x·y·…, i, n)` whose window [i, i+n) lies entirely within
+            // concrete parts resolves to that substring. Refutes
+            // `x = "ab"·y ∧ substr(x,0,2) ≠ "ab"`.
+            let substr_markers: Vec<(AstId, AstId, i64, i64)> = present
+                .iter()
+                .filter_map(|&t| {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some("str.substr")
+                        && self.m.app_args(t).len() == 3
+                    {
+                        let a = self.m.app_args(t);
+                        Some((t, a[0], self.int_arg(a[1])?, self.int_arg(a[2])?))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            for (t, hay, i, n) in substr_markers {
+                if i < 0 || n < 0 {
+                    continue;
+                }
+                let concat = if str_concat_map.contains_key(&hay) {
+                    hay
+                } else if let Some(&cc) = cbind.get(&hay) {
+                    cc
+                } else {
+                    continue;
+                };
+                let mut parts: Vec<AstId> = Vec::new();
+                let mut fstack: Vec<AstId> =
+                    str_concat_map[&concat].iter().rev().copied().collect();
+                while let Some(p) = fstack.pop() {
+                    if let Some(sub) = str_concat_map.get(&p) {
+                        for &sp in sub.iter().rev() {
+                            fstack.push(sp);
+                        }
+                    } else {
+                        parts.push(p);
+                    }
+                }
+                // Build the flattened concrete-char view up to the window's end,
+                // bailing at the first symbolic part that the window reaches.
+                let mut chars: Vec<u32> = Vec::new();
+                let end = (i + n) as usize;
+                let mut ok = true;
+                for &p in &parts {
+                    if chars.len() >= end {
+                        break;
+                    }
+                    match self.str_value(p) {
+                        Some(v) => chars.extend(v),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && chars.len() >= end {
+                    let sub = &chars[i as usize..end];
+                    let lit = self.mk_str_lit(&code_points_to_string(sub));
+                    extra_lits.insert(lit);
+                    ax.push(self.m.mk_eq(t, lit));
+                }
+            }
         }
         // `u = C0·x·C1·…` (u a variable, len u pinned to the concrete parts' total)
         // forces every symbolic part empty, so `u = C0·C1·…`. Refutes
