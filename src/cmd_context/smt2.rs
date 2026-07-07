@@ -1234,6 +1234,23 @@ impl Regex {
         self.ends(s, 0).contains(&s.len())
     }
 
+    /// A literal operand of a (possibly nested) `re.inter` — the language is then a
+    /// subset of `{that literal}`, so membership pins the word.
+    fn inter_literal(&self) -> Option<Vec<u32>> {
+        match self {
+            Regex::Inter(a, b) => {
+                if let Regex::Lit(l) = a.as_ref() {
+                    Some(l.clone())
+                } else if let Regex::Lit(l) = b.as_ref() {
+                    Some(l.clone())
+                } else {
+                    a.inter_literal().or_else(|| b.inter_literal())
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Does the language contain the empty string?
     fn nullable(&self) -> bool {
         match self {
@@ -3963,6 +3980,17 @@ impl Context {
             // `(a-m)* ∩ (n-z)*`, matching only `""`) is UNSAT.
             if pos_len.contains(&x) && r.nonempty_impossible() {
                 return true;
+            }
+            // `x ∈ re.inter(A, L)` (L a literal): the language ⊆ {L}, so it is empty
+            // if the intersection doesn't actually match L, or `x ≠ L` excludes the
+            // only word. Refutes `x ∈ (a-z)+ ∩ "hi" ∧ x ≠ "hi"`.
+            if let Some(l) = r.inter_literal() {
+                if !r.matches(&l) {
+                    return true;
+                }
+                if neg_eq.get(&x).is_some_and(|s| s.contains(&l)) {
+                    return true;
+                }
             }
             if let Some(&fc) = first_char.get(&x)
                 && !r.can_start_with(fc)
