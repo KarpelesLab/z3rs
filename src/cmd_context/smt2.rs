@@ -8129,6 +8129,73 @@ impl Context {
                 }
             })
             .collect();
+        // A length-pinned seq with EVERY `nth` pinned to a concrete value equals that
+        // concrete sequence — refutation-only (emit `false` when a top-level `s ≠ L`
+        // or `s = L' ≠ L` forbids it), so the witness is untouched. Refutes
+        // `len s = 2 ∧ nth s 0 = 5 ∧ nth s 1 = 5 ∧ s ≠ [5,5]`.
+        {
+            let mut nth_val: BTreeMap<(AstId, i64), AstId> = BTreeMap::new();
+            let mut forbidden: BTreeMap<AstId, BTreeSet<Vec<AstId>>> = BTreeMap::new();
+            let mut bound: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            for &c in &top_eqs {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let (a0, a1) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                    for (m, v) in [(a0, a1), (a1, a0)] {
+                        if let Some((s, i)) =
+                            nth_present.iter().find(|kv| *kv.1 == m).map(|kv| *kv.0)
+                            && self.m.as_numeral(v).is_some()
+                        {
+                            nth_val.insert((s, i), v);
+                        }
+                        if self.m.is_uninterp_const(m)
+                            && let Some(sv) = self.seq_of.get(&v)
+                        {
+                            bound.entry(m).or_insert_with(|| sv.clone());
+                        }
+                    }
+                } else if self.m.is_not(c)
+                    && self.m.app_args(c).len() == 1
+                    && self.m.is_eq(self.m.app_args(c)[0])
+                    && self.m.app_args(self.m.app_args(c)[0]).len() == 2
+                {
+                    let ne = self.m.app_args(c)[0];
+                    let (a0, a1) = (self.m.app_args(ne)[0], self.m.app_args(ne)[1]);
+                    for (v, sq) in [(a0, a1), (a1, a0)] {
+                        if self.m.is_uninterp_const(v)
+                            && let Some(sv) = self.seq_of.get(&sq)
+                        {
+                            forbidden.entry(v).or_default().insert(sv.clone());
+                        }
+                    }
+                }
+            }
+            let nth_vars: BTreeSet<AstId> = nth_val.keys().map(|&(s, _)| s).collect();
+            for s in nth_vars {
+                let Some(n) = self.str_exact_len(goal, s) else {
+                    continue;
+                };
+                if n == 0 || n > 32 {
+                    continue;
+                }
+                let mut lit: Vec<AstId> = Vec::new();
+                let mut complete = true;
+                for i in 0..n as i64 {
+                    match nth_val.get(&(s, i)) {
+                        Some(&v) => lit.push(v),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                if complete
+                    && (forbidden.get(&s).is_some_and(|set| set.contains(&lit))
+                        || bound.get(&s).is_some_and(|b| *b != lit))
+                {
+                    ax.push(self.m.mk_false());
+                }
+            }
+        }
         {
             let extract_of = |slf: &Self, e: AstId| -> Option<(AstId, i64, i64)> {
                 if slf.m.is_app(e)
