@@ -4823,6 +4823,48 @@ impl Context {
                     self.m.mk_add(&part_lens)
                 };
                 ax.push(self.m.mk_eq(total, sum));
+                // Also link `len(v)` for every variable bound to this concat.
+                for &c in &present {
+                    if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                        let a = self.m.app_args(c);
+                        for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                            if cc == app && self.m.is_uninterp_const(v) {
+                                let lv = self.m.mk_app(lenf, &[v]);
+                                ax.push(self.m.mk_eq(lv, sum));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Two concats bound to the same variable are equal: `y = M1 ∧ y = M2 ⇒
+        // M1 = M2`, letting the concat machinery refute a length/char conflict.
+        // Was UNSOUND (spurious sat) on `y = "a"·x ∧ y = "b"·x`.
+        {
+            let mut var_concats: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+            for &c in &present {
+                if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                    let a = self.m.app_args(c);
+                    for (v, cc) in [(a[0], a[1]), (a[1], a[0])] {
+                        if self.m.is_uninterp_const(v)
+                            && self.m.is_app(cc)
+                            && self
+                                .str_op_decls
+                                .get(&self.m.app_decl(cc))
+                                .map(String::as_str)
+                                == Some("str.++")
+                        {
+                            var_concats.entry(v).or_default().push(cc);
+                        }
+                    }
+                }
+            }
+            for concats in var_concats.values() {
+                for w in concats.windows(2) {
+                    if w[0] != w[1] {
+                        ax.push(self.m.mk_eq(w[0], w[1]));
+                    }
+                }
             }
         }
         // `str.at(x·y·…, i)` (i concrete, parts before it of pinned length) resolves
@@ -7157,8 +7199,11 @@ impl Context {
                 continue;
             }
             let c = needle[0];
-            // Converse: a matching element at *any* existing `nth(s, k)` implies
-            // containment. Refutes `¬contains(s, [5]) ∧ nth s k = 5`.
+            // Converse: a matching element at an IN-BOUNDS `nth(s, k)` implies
+            // containment. Refutes `¬contains(s, [5]) ∧ len s = 2 ∧ nth s 0 = 5`. The
+            // `0 ≤ k < len s` guard is essential — an out-of-bounds `nth` returns a
+            // default value (e.g. 0), which does NOT prove membership (was UNSOUND:
+            // `nth s 1 = 0 ∧ ¬contains(s,[0])` is SAT via an empty/short s).
             for &nth in &present {
                 if self.m.is_app(nth)
                     && self
@@ -7168,9 +7213,15 @@ impl Context {
                         == Some("seq.nth")
                     && self.m.app_args(nth).len() == 2
                     && self.m.app_args(nth)[0] == a[0]
+                    && let Ok(len_s) = self.seq_op("seq.len", &[a[0]])
                 {
+                    let idx = self.m.app_args(nth)[1];
+                    let zero = self.m.mk_int(0);
+                    let lb = self.m.mk_ge(idx, zero);
+                    let ub = self.m.mk_lt(idx, len_s);
                     let eq = self.m.mk_eq(nth, c);
-                    ax.push(self.m.mk_implies(eq, t));
+                    let hyp = self.m.mk_and(&[eq, lb, ub]);
+                    ax.push(self.m.mk_implies(hyp, t));
                 }
             }
             let Some(n) = self.str_exact_len(goal, a[0]) else {
