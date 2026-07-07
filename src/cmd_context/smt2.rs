@@ -5817,6 +5817,18 @@ impl Context {
                             q1_ok && q2_ok
                         })
                     });
+                // A concrete part that already contains Q makes the whole concat
+                // contain Q — sound regardless of spanning. Refutes
+                // `y = "abc"·x ∧ ¬contains(y, "b")`.
+                if !pv.is_empty()
+                    && parts.iter().any(|&p| {
+                        self.str_value(p).is_some_and(|v| {
+                            v.len() >= pv.len() && v.windows(pv.len()).any(|w| w == pv.as_slice())
+                        })
+                    })
+                {
+                    ax.push(t);
+                }
                 // Each part's `contains(partᵢ, Q)`: a concrete part folds to a
                 // true/false constant (its `contains` marker was eliminated at
                 // parse), a symbolic part uses its goal marker.
