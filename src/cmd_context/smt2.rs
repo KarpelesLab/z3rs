@@ -9307,22 +9307,54 @@ impl Context {
                 }
             }
         }
-        let max_len = if vars.len() == 1 { 4 } else { 2 };
-        let mut cands: Vec<Vec<i64>> = alloc::vec![Vec::new()];
-        let mut frontier: Vec<Vec<i64>> = alloc::vec![Vec::new()];
-        for _ in 0..max_len {
-            let mut next = Vec::new();
-            for base in &frontier {
-                for &e in &elems {
-                    let mut s = base.clone();
-                    s.push(e);
-                    next.push(s);
+        // A variable that appears only as the argument of `seq.len` is content-free:
+        // fix it to zeros of its pinned length (or empty), so only content-constrained
+        // variables are enumerated — and each enumerated variable respects its own
+        // pinned length (so `len s = 3 ∧ contains u [3]` finds s=[0,0,0], u=[3]).
+        let is_content_free = |slf: &Self, v: AstId| -> bool {
+            slf.m.postorder(goal).iter().all(|&t| {
+                !(slf.m.is_app(t) && slf.m.app_args(t).contains(&v))
+                    || slf.seqop_ops.get(&slf.m.app_decl(t)).map(String::as_str) == Some("seq.len")
+            })
+        };
+        let default_len = if vars.len() == 1 { 4 } else { 3 };
+        let mut per_var: Vec<Vec<Vec<i64>>> = Vec::new();
+        for &v in &vars {
+            let exact = self.str_exact_len(goal, v);
+            if is_content_free(self, v) {
+                per_var.push(alloc::vec![alloc::vec![0i64; exact.unwrap_or(0)]]);
+                continue;
+            }
+            let target = exact.unwrap_or(default_len).min(6);
+            let mut all: Vec<Vec<i64>> = if exact.is_some() {
+                Vec::new()
+            } else {
+                alloc::vec![Vec::new()]
+            };
+            let mut frontier: Vec<Vec<i64>> = alloc::vec![Vec::new()];
+            for len in 1..=target {
+                let mut next = Vec::new();
+                for base in &frontier {
+                    for &e in &elems {
+                        let mut s = base.clone();
+                        s.push(e);
+                        next.push(s);
+                    }
+                }
+                if exact.is_none() || len == target {
+                    all.extend(next.iter().cloned());
+                }
+                frontier = next;
+                if all.len() > 4000 {
+                    break;
                 }
             }
-            cands.extend(next.iter().cloned());
-            frontier = next;
+            per_var.push(all);
         }
-        const MAX_TRIES: usize = 900;
+        if per_var.iter().any(|c| c.is_empty()) {
+            return None;
+        }
+        const MAX_TRIES: usize = 5000;
         let mut idx = alloc::vec![0usize; vars.len()];
         let mut tries = 0;
         loop {
@@ -9334,7 +9366,10 @@ impl Context {
                 .iter()
                 .enumerate()
                 .map(|(k, &v)| {
-                    let es: Vec<AstId> = cands[idx[k]].iter().map(|&n| self.m.mk_int(n)).collect();
+                    let es: Vec<AstId> = per_var[k][idx[k]]
+                        .iter()
+                        .map(|&n| self.m.mk_int(n))
+                        .collect();
                     (v, self.mk_seq(es))
                 })
                 .collect();
@@ -9405,7 +9440,7 @@ impl Context {
                     return None;
                 }
                 idx[k] += 1;
-                if idx[k] < cands.len() {
+                if idx[k] < per_var[k].len() {
                     break;
                 }
                 idx[k] = 0;
