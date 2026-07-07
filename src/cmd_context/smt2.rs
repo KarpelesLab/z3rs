@@ -5348,12 +5348,65 @@ impl Context {
             .collect();
         // `prefixof P x ∧ len x = |P|` (P covers the whole word) ⇒ `x = P`; same
         // for a suffix. Refutes `prefixof "99" x ∧ len x = 2 ∧ str.to_int x ≠ 99`.
-        for (pm, pchars, px) in prefs.iter().chain(sufs.iter()) {
-            if self.str_exact_len(goal, *px) == Some(pchars.len()) {
-                let lit = self.mk_str_lit(&code_points_to_string(pchars));
-                extra_lits.insert(lit);
-                let eq = self.m.mk_eq(*px, lit);
-                ax.push(self.m.mk_implies(*pm, eq));
+        let determining: Vec<(AstId, Vec<u32>, AstId)> = prefs
+            .iter()
+            .chain(sufs.iter())
+            .filter(|(_, pchars, px)| self.str_exact_len(goal, *px) == Some(pchars.len()))
+            .map(|(pm, pchars, px)| (*pm, pchars.clone(), *px))
+            .collect();
+        for (pm, lval, px) in determining {
+            let lit = self.mk_str_lit(&code_points_to_string(&lval));
+            extra_lits.insert(lit);
+            let eq = self.m.mk_eq(px, lit);
+            ax.push(self.m.mk_implies(pm, eq));
+            // Fold string predicates/functions over the now-determined x, gated on
+            // the determining condition, so they decide too (`prefixof "ab" x ∧
+            // len x = 2 ∧ contains x "z"` → unsat; `prefixof "99" x ∧ len x = 2 ∧
+            // str.to_int x ≠ 99` → unsat).
+            let contains_over_x: Vec<(AstId, AstId)> = contains_of
+                .iter()
+                .filter(|((h, _), _)| *h == px)
+                .map(|((_, q), &cm)| (*q, cm))
+                .collect();
+            for (q, cm) in contains_over_x {
+                if let Some(qv) = self.str_value(q) {
+                    let has = qv.is_empty()
+                        || (lval.len() >= qv.len()
+                            && lval.windows(qv.len()).any(|w| w == qv.as_slice()));
+                    let v = if has {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    };
+                    let ce = self.m.mk_eq(cm, v);
+                    ax.push(self.m.mk_implies(pm, ce));
+                }
+            }
+            // str.to_int(x): the numeric value of the determined literal.
+            let toint_over_x: Vec<AstId> = present
+                .iter()
+                .copied()
+                .filter(|&t| {
+                    self.m.is_app(t)
+                        && matches!(
+                            self.str_op_decls
+                                .get(&self.m.app_decl(t))
+                                .map(String::as_str),
+                            Some("str.to_int") | Some("str.to-int")
+                        )
+                        && self.m.app_args(t).first() == Some(&px)
+                })
+                .collect();
+            for ti in toint_over_x {
+                let s: String = code_points_to_string(&lval);
+                let val: i64 = if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+                    s.parse().unwrap_or(-1)
+                } else {
+                    -1
+                };
+                let vv = self.m.mk_int(val);
+                let te = self.m.mk_eq(ti, vv);
+                ax.push(self.m.mk_implies(pm, te));
             }
         }
         // `prefixof P x ∧ suffixof S x ∧ len x = |P| + |S|` (prefix and suffix are
