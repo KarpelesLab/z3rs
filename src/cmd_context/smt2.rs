@@ -13509,6 +13509,39 @@ impl Context {
                     continue;
                 }
             }
+            // Modulus scaling: `mod(c·rest, c·m) = c · mod(rest, m)` (c a positive
+            // numeral factor of the dividend, c | n). Refutes
+            // `mod x 6 = 4 ∧ mod(2·x, 12) ≠ 8`.
+            if self.m.arith_op(v) == Some(ArithOp::Mul) {
+                let factors = self.m.app_args(v).to_vec();
+                for (idx, &f) in factors.iter().enumerate() {
+                    let Some(c) = self.int_arg(f) else { continue };
+                    if c <= 1 || n % c != 0 {
+                        continue;
+                    }
+                    let m = n / c;
+                    let rest: Vec<AstId> = factors
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| *i != idx)
+                        .map(|(_, &x)| x)
+                        .collect();
+                    let rest_t = if rest.len() == 1 {
+                        rest[0]
+                    } else {
+                        self.m.mk_mul(&rest)
+                    };
+                    let res_m: BTreeMap<AstId, i64> = residue
+                        .iter()
+                        .filter(|((_, k), _)| *k == m)
+                        .map(|((w, _), &r)| (*w, r))
+                        .collect();
+                    if let Some(r) = self.mod_residue(rest_t, m, &res_m) {
+                        let rv = self.m.mk_int((c * r).rem_euclid(n));
+                        ax.push(self.m.mk_eq(mt, rv));
+                    }
+                }
+            }
             // Skip `mod(a+b, n)` for the multiple/zero-mod path — the mod-of-sum
             // lifting is expensive and that axiom doesn't prevent it; keep the fast
             // `mod(c·x,n)` / `mod(v,n)` (v a bound multiple) cases.
