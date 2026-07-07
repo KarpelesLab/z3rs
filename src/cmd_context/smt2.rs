@@ -4620,7 +4620,7 @@ impl Context {
         let seq_concat_of: Vec<(AstId, Vec<AstId>)> = self.seq_concat.clone();
         for (app, parts) in &seq_concat_of {
             // Part lengths: a tracked concrete seq, or an asserted `len p = k`.
-            let lens: Option<Vec<usize>> = parts
+            let lens: Vec<Option<usize>> = parts
                 .iter()
                 .map(|&p| {
                     self.seq_of
@@ -4629,7 +4629,6 @@ impl Context {
                         .or_else(|| self.str_exact_len(goal, p))
                 })
                 .collect();
-            let Some(lens) = lens else { continue };
             // Variables `s` with `s = app` (so `nth s i` refers to the concat).
             let mut targets: Vec<AstId> = alloc::vec![*app];
             for &c in &present {
@@ -4662,7 +4661,11 @@ impl Context {
                 }
                 let mut off = 0usize;
                 for (idx, &p) in parts.iter().enumerate() {
-                    if (i as usize) < off + lens[idx] {
+                    // Only lengths of parts *before* the one holding i are needed;
+                    // an unknown length before it blocks resolution (`nth((unit 5)·s,0)`
+                    // resolves regardless of `len s`).
+                    let Some(plen) = lens[idx] else { break };
+                    if (i as usize) < off + plen {
                         let local = (i as usize - off) as i64;
                         if let Some(content) = self.seq_of.get(&p) {
                             ax.push(self.m.mk_eq(t, content[local as usize]));
@@ -4674,7 +4677,7 @@ impl Context {
                         }
                         break;
                     }
-                    off += lens[idx];
+                    off += plen;
                 }
             }
         }
