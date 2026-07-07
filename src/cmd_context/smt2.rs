@@ -13415,6 +13415,15 @@ impl Context {
             if n == 0 {
                 continue;
             }
+            // Modulus chain: `mod v m = r ∧ n | m ⇒ mod v n = r mod n` (a coarser
+            // modulus is determined by a finer one). Refutes
+            // `mod x 12 = 5 ∧ mod x 4 ≠ 1`.
+            for (&(w, m), &r) in &residue {
+                if w == v && m != n && m % n == 0 {
+                    let rv = self.m.mk_int(r.rem_euclid(n));
+                    ax.push(self.m.mk_eq(mt, rv));
+                }
+            }
             // Constant residue of the whole +/−/· dividend (`mod(x·x,10)=9` given
             // `mod x 10 = 7`; `mod(x−y,6)=0` given both ≡ 4). No case-split, so this
             // is safe for `Add`/`Sub` dividends too.
