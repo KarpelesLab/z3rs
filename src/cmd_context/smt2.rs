@@ -6213,6 +6213,71 @@ impl Context {
                 ax.push(self.m.mk_implies(t, d));
             }
         }
+        // Seq predicate congruence under equality: `s = u ⇒ pred(s) ⟺ pred(u)` (seq
+        // markers aren't fed to EUF). Refutes `s = u ∧ contains(s,[5]) ∧ ¬contains(u,[5])`.
+        let mut seq_eqs: Vec<(AstId, AstId)> = Vec::new();
+        {
+            let mut stack = alloc::vec![goal];
+            while let Some(t) = stack.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        stack.push(a);
+                    }
+                } else if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                    let a = self.m.app_args(t);
+                    if self.m.is_uninterp_const(a[0])
+                        && self.m.is_uninterp_const(a[1])
+                        && self.seq_elem_sort(self.m.get_sort(a[0])).is_some()
+                    {
+                        seq_eqs.push((a[0], a[1]));
+                        seq_eqs.push((a[1], a[0]));
+                    }
+                }
+            }
+        }
+        if !seq_eqs.is_empty() {
+            let seq_pred_markers: Vec<(String, Vec<AstId>, AstId)> = present
+                .iter()
+                .filter_map(|&t| {
+                    if self.m.is_app(t) && self.m.app_args(t).len() == 2 {
+                        self.seqop_ops.get(&self.m.app_decl(t)).and_then(|op| {
+                            matches!(
+                                op.as_str(),
+                                "seq.contains" | "seq.prefixof" | "seq.suffixof"
+                            )
+                            .then(|| (op.clone(), self.m.app_args(t).to_vec(), t))
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            // Two args match if identical, or both concrete seqs of equal value
+            // (`seq.unit` mints a fresh constant per parse).
+            let arg_eq = |a: AstId, b: AstId| -> bool {
+                a == b
+                    || matches!((self.seq_of.get(&a), self.seq_of.get(&b)), (Some(x), Some(y)) if x == y)
+            };
+            for (x, y) in &seq_eqs {
+                for (op1, args1, m1) in &seq_pred_markers {
+                    let new_args: Vec<AstId> = args1
+                        .iter()
+                        .map(|&a| if a == *x { *y } else { a })
+                        .collect();
+                    if new_args == *args1 {
+                        continue;
+                    }
+                    for (op2, args2, m2) in &seq_pred_markers {
+                        if op2 == op1
+                            && args2.len() == new_args.len()
+                            && args2.iter().zip(&new_args).all(|(&p, &q)| arg_eq(p, q))
+                        {
+                            ax.push(self.m.mk_eq(*m1, *m2));
+                        }
+                    }
+                }
+            }
+        }
         // `seq.prefixof s u ⇒ (i < len s ⇒ nth(s,i) = nth(u,i))`. Refutes
         // `prefixof s u ∧ len s = 2 ∧ nth u 0 = 5 ∧ nth s 0 ≠ 5`.
         let seq_prefs: Vec<AstId> = present
