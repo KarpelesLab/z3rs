@@ -7336,11 +7336,64 @@ impl Context {
                     && self.m.app_args(t).len() == 2
             })
             .collect();
+        let seq_cc_len = self.seq_concat.clone();
         for t in seq_contains {
             let a = self.m.app_args(t).to_vec();
             let Some(needle) = self.seq_of.get(&a[1]).cloned() else {
                 continue;
             };
+            // `contains(H, N)` with `len H = len N` (both known) ⇒ H = N elementwise:
+            // `contains ⇒ Hᵢ = Nᵢ`. Refutes `contains([1]·s, [1,2]) ∧ len s = 1 ∧
+            // nth s 0 ≠ 2`. Flatten H (concat of pinned parts) and resolve each position.
+            let mut hflat: Vec<AstId> = alloc::vec![a[0]];
+            if let Some((_, parts)) = seq_cc_len.iter().find(|(app, _)| *app == a[0]) {
+                hflat.clear();
+                let mut st: Vec<AstId> = parts.iter().rev().copied().collect();
+                while let Some(q) = st.pop() {
+                    if let Some((_, sub)) = seq_cc_len.iter().find(|(x, _)| *x == q) {
+                        for &sp in sub.iter().rev() {
+                            st.push(sp);
+                        }
+                    } else {
+                        hflat.push(q);
+                    }
+                }
+            }
+            let hlens: Option<Vec<usize>> = hflat
+                .iter()
+                .map(|&p| {
+                    self.seq_of
+                        .get(&p)
+                        .map(|v| v.len())
+                        .or_else(|| self.str_exact_len(goal, p))
+                })
+                .collect();
+            if let Some(hlens) = hlens
+                && hlens.iter().sum::<usize>() == needle.len()
+                && !needle.is_empty()
+            {
+                for (i, &e) in needle.iter().enumerate() {
+                    // Resolve position i to the element AstId / nth(part, local).
+                    let mut off = 0usize;
+                    for (idx, &p) in hflat.iter().enumerate() {
+                        if i < off + hlens[idx] {
+                            let local = i - off;
+                            let hi = if let Some(v) = self.seq_of.get(&p) {
+                                Some(v[local])
+                            } else {
+                                let iv = self.m.mk_int(local as i64);
+                                self.seq_op("seq.nth", &[p, iv]).ok()
+                            };
+                            if let Some(hi) = hi {
+                                let eq = self.m.mk_eq(hi, e);
+                                ax.push(self.m.mk_implies(t, eq));
+                            }
+                            break;
+                        }
+                        off += hlens[idx];
+                    }
+                }
+            }
             if needle.len() != 1 {
                 continue;
             }
