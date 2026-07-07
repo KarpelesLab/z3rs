@@ -5904,6 +5904,33 @@ impl Context {
                 None
             })
             .collect();
+        // Consecutive lex bounds: `L < x ∧ x < U ∧ len x = n`, with L, U length-n
+        // literals differing only in the last character by 1, admits no word — the
+        // successor of L at length n is U. Refutes `"abc" < x ∧ x < "abd" ∧ len x = 3`.
+        for (m1, l, x1) in &lts {
+            let Some(lv) = self.str_value(*l) else {
+                continue;
+            };
+            for (m2, x2, u) in &lts {
+                if x2 != x1 {
+                    continue;
+                }
+                let Some(uv) = self.str_value(*u) else {
+                    continue;
+                };
+                let n = lv.len();
+                if n == 0
+                    || uv.len() != n
+                    || self.str_exact_len(goal, *x1) != Some(n)
+                    || lv[..n - 1] != uv[..n - 1]
+                    || uv[n - 1] != lv[n - 1] + 1
+                {
+                    continue;
+                }
+                let both = self.m.mk_and(&[*m1, *m2]);
+                ax.push(self.m.mk_not(both));
+            }
+        }
         if !lts.is_empty() {
             // Each `str.<` occurrence is a content-fresh marker, so reuse the goal's
             // marker for an existing edge and build a *consistent* one (shared decl,
