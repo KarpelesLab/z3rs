@@ -1209,6 +1209,9 @@ struct Context {
     fp_sorts: BTreeMap<(u32, u32), AstId>,
     /// Opaque to_fp conversion markers -> (rm, x, eb, sb).
     fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
+    /// Opaque `fp.rem` markers -> (x, y, eb, sb). Folded once both operands are
+    /// pinned to concrete FP constants by top-level equalities.
+    fp_rem_markers: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2108,6 +2111,7 @@ impl Context {
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
+            fp_rem_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
@@ -3401,6 +3405,146 @@ impl Context {
         // Eliminate the pinned constant variables from the goal (so no leftover
         // integer binding makes it a mixed query) and fold the conversion markers.
         subst.extend(fold_subst);
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let mut memo = BTreeMap::new();
+        let g = self.blast_fp_equalities(g, &mut memo);
+        Some(crate::rewriter::simplify(&mut self.m, g))
+    }
+
+    /// Evaluate a bit-vector term to a concrete `u64` when every leaf is a
+    /// numeral (widths ≤ 64). Handles the structural mask constructors that
+    /// appear in blasted FP terms; returns `None` for a symbolic leaf or an
+    /// unsupported op / oversized width.
+    fn bv_eval(&self, t: AstId) -> Option<u64> {
+        use crate::ast::bv::BvOp;
+        let w = self.m.bv_sort_width(self.m.get_sort(t))?;
+        if w > 64 {
+            return None;
+        }
+        if let Some(val) = self.m.bv_numeral_value(t) {
+            let mut bits = 0u64;
+            for i in 0..w {
+                if val.bit(i) {
+                    bits |= 1u64 << i;
+                }
+            }
+            return Some(bits);
+        }
+        let op = self.m.bv_op(t)?;
+        let args = self.m.app_args(t).to_vec();
+        let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+        match op {
+            BvOp::Concat if args.len() == 2 => {
+                let hi = self.bv_eval(args[0])?;
+                let lo = self.bv_eval(args[1])?;
+                let lw = self.m.bv_sort_width(self.m.get_sort(args[1]))?;
+                Some(((hi << lw) | lo) & mask)
+            }
+            BvOp::BNot if args.len() == 1 => Some((!self.bv_eval(args[0])?) & mask),
+            BvOp::BAnd => args
+                .iter()
+                .try_fold(mask, |acc, &a| Some(acc & self.bv_eval(a)?)),
+            BvOp::BOr => args
+                .iter()
+                .try_fold(0u64, |acc, &a| Some(acc | self.bv_eval(a)?)),
+            BvOp::BXor => args
+                .iter()
+                .try_fold(0u64, |acc, &a| Some(acc ^ self.bv_eval(a)?)),
+            BvOp::ZeroExt if args.len() == 1 => self.bv_eval(args[0]),
+            _ => None,
+        }
+    }
+
+    /// Re-fold `fp.rem(x, y)` markers once both operands are pinned to concrete
+    /// FP constants by top-level `v = literal` equalities. The remainder is
+    /// exact, so the marker is replaced by the computed constant and the goal
+    /// re-decided (mirrors `fold_fp_conversions`). Returns the rewritten goal.
+    fn fold_fp_rem(&mut self, goal: AstId) -> Option<AstId> {
+        if self.fp_rem_markers.is_empty() {
+            return None;
+        }
+        // Flatten the top-level conjunction.
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        // An FP-const equality `(= a lit)` is lowered to a bit-vector equality
+        // `(= fp_to_bv(a) numeral)` at parse time, so collect pins at the BV
+        // level: bit-vector term → its pinned numeral bits. Also invert a sign
+        // flip (`fp.neg` blasts to `bvxor t mask`) / `bvnot`.
+        let mut bvpin: BTreeMap<AstId, u64> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            for (t, k) in [(a[0], a[1]), (a[1], a[0])] {
+                let Some(kb) = self.bv_eval(k) else {
+                    continue;
+                };
+                bvpin.insert(t, kb);
+                // Invert `t = bvxor(p, q)` / `t = bvnot(p)` when the other
+                // operand evaluates to a constant.
+                match self.m.bv_op(t) {
+                    Some(crate::ast::bv::BvOp::BXor) if self.m.app_args(t).len() == 2 => {
+                        let (p, q) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+                        if let Some(cb) = self.bv_eval(p) {
+                            bvpin.insert(q, kb ^ cb);
+                        } else if let Some(cb) = self.bv_eval(q) {
+                            bvpin.insert(p, kb ^ cb);
+                        }
+                    }
+                    Some(crate::ast::bv::BvOp::BNot) if self.m.app_args(t).len() == 1 => {
+                        let p = self.m.app_args(t)[0];
+                        let w = self.m.bv_sort_width(self.m.get_sort(t)).unwrap_or(64);
+                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        bvpin.insert(p, (!kb) & mask);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Resolve the concrete bits of an FP operand: a folded constant, or a
+        // symbolic term whose bit-vector representation is pinned to a numeral.
+        let operand_bits = |s: &Self, x: AstId, eb: u32, sb: u32| -> Option<u64> {
+            if let Some(&(b, e, sbn)) = s.fp_of.get(&x) {
+                return (e == eb && sbn == sb).then_some(b);
+            }
+            let bv = s.fp_bv.get(&x)?;
+            s.bv_eval(*bv).or_else(|| bvpin.get(bv).copied())
+        };
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let markers: Vec<(AstId, AstId, AstId, u32, u32)> = self
+            .fp_rem_markers
+            .iter()
+            .filter(|(t, _)| present.contains(t))
+            .map(|(&t, &(x, y, eb, sb))| (t, x, y, eb, sb))
+            .collect();
+        let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
+        for (t, x, y, eb, sb) in &markers {
+            if let (Some(xb), Some(yb)) = (
+                operand_bits(self, *x, *eb, *sb),
+                operand_bits(self, *y, *eb, *sb),
+            ) && let Some(bits) = Self::fp_rem_bits(xb, yb, *eb, *sb)
+            {
+                let fv = self.mk_fp(bits, *eb, *sb);
+                fold_subst.push((*t, fv));
+            }
+        }
+        if fold_subst.is_empty() {
+            return None;
+        }
+        let subst = fold_subst;
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
         let g = self.blast_fp_equalities(g, &mut memo);
@@ -12761,6 +12905,61 @@ impl Context {
         Some(rounded)
     }
 
+    /// Exact IEEE-754 `fp.rem(x, y)` on concrete bit patterns of format
+    /// `(eb, sb)` (≤ 64 bits). The remainder `x − y·n`, where `n` is `x/y`
+    /// rounded to the nearest integer (ties to even), is always exact and
+    /// representable, so the result needs no rounding. Returns the packed bits.
+    fn fp_rem_bits(xbits: u64, ybits: u64, eb: u32, sb: u32) -> Option<u64> {
+        let w = eb + sb;
+        let mant_bits = sb - 1;
+        let exp_mask = (1u64 << eb) - 1;
+        let classify = |bits: u64| {
+            let exp = (bits >> mant_bits) & exp_mask;
+            let mant = bits & ((1u64 << mant_bits) - 1);
+            let sign = (bits >> (w - 1)) & 1;
+            let is_inf = exp == exp_mask && mant == 0;
+            let is_nan = exp == exp_mask && mant != 0;
+            let is_zero = exp == 0 && mant == 0;
+            (is_nan, is_inf, is_zero, sign)
+        };
+        let (x_nan, x_inf, x_zero, _x_sgn) = classify(xbits);
+        let (y_nan, y_inf, y_zero, _y_sgn) = classify(ybits);
+        // Canonical qNaN for this format (mk_fp canonicalises anyway).
+        let nan = (exp_mask << mant_bits) | (1u64 << (mant_bits - 1));
+        // (x is NaN) | (y is NaN) | (x is ±inf) | (y is ±0) -> NaN.
+        if x_nan || y_nan || x_inf || y_zero {
+            return Some(nan);
+        }
+        // (y is ±inf) -> x ; (x is ±0) -> x (sign preserved).
+        if y_inf || x_zero {
+            return Some(xbits);
+        }
+        // General case: both finite, non-zero. Compute the exact remainder.
+        let x_val = Self::fp_real_value(xbits, eb, sb)?;
+        let y_val = Self::fp_real_value(ybits, eb, sb)?;
+        let q = x_val.div(&y_val);
+        let floor_q = q.floor();
+        let frac = q.sub(&Rational::from_integer(floor_q.clone()));
+        let two_frac = frac.mul(&Rational::from_integer(Int::from_i64(2)));
+        let one_i = Int::from_i64(1);
+        let n = if two_frac < Rational::ONE {
+            floor_q
+        } else if two_frac > Rational::ONE {
+            floor_q.add(&one_i)
+        } else if floor_q.is_even() {
+            floor_q
+        } else {
+            floor_q.add(&one_i)
+        };
+        let r = x_val.sub(&y_val.mul(&Rational::from_integer(n)));
+        if r.is_zero() {
+            // Zero result takes the sign of x.
+            return Some(xbits & (1u64 << (w - 1)));
+        }
+        // r is exactly representable, so any rounding mode yields the exact bits.
+        Self::real_to_fp_bits(&r, eb, sb, 0)
+    }
+
     /// Round a real (rational) constant to the `(eb, sb)` floating-point format
     /// under rounding mode `rm` (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ), returning the
     /// packed bit pattern. Handles zero, normals, subnormals, and overflow→inf/
@@ -14085,6 +14284,24 @@ impl Context {
                     return Ok(t);
                 }
                 self.symbolic_fp(op, args)
+            }
+            "fp.rem" if args.len() == 2 => {
+                // Exact remainder for concrete operands (the bit-blast circuit
+                // z3 uses is prohibitively large for wide formats). Symbolic
+                // operands stay opaque → the goal keeps its `unknown` gate.
+                if let (Some(&(xb, eb, sb)), Some(&(yb, eb2, sb2))) =
+                    (self.fp_of.get(&args[0]), self.fp_of.get(&args[1]))
+                    && eb == eb2
+                    && sb == sb2
+                    && let Some(bits) = Self::fp_rem_bits(xb, yb, eb, sb)
+                {
+                    return Ok(self.mk_fp(bits, eb, sb));
+                }
+                let t = self.symbolic_fp(op, args)?;
+                if let Some((eb, sb)) = self.fp_format_of(self.m.get_sort(args[0])) {
+                    self.fp_rem_markers.insert(t, (args[0], args[1], eb, sb));
+                }
+                Ok(t)
             }
             _ => self.symbolic_fp(op, args),
         }
@@ -18288,6 +18505,16 @@ impl Context {
         if res == SmtResult::Unknown
             && !self.fp_conv.is_empty()
             && let Some(g) = self.fold_fp_conversions(goal)
+        {
+            let (r2, m2) = self.decide_inner(g);
+            if r2 != SmtResult::Unknown {
+                return (r2, m2);
+            }
+        }
+        // Fallback: re-fold `fp.rem(x, y)` once both operands are pinned to
+        // concrete FP constants by top-level equalities.
+        if res == SmtResult::Unknown
+            && let Some(g) = self.fold_fp_rem(goal)
         {
             let (r2, m2) = self.decide_inner(g);
             if r2 != SmtResult::Unknown {
