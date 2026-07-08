@@ -14020,8 +14020,19 @@ impl Context {
         if (fe, fs) == (to_eb, to_sb) {
             return Some(x); // identity
         }
-        if fe < 2 || fs < 2 || to_eb < 2 || to_sb < 2 || to_eb > to_sb || fe >= to_eb + 2 {
-            return None; // narrowing exponent (or bad format) — gate
+        // Gate bad/oversized formats: keep every intermediate literal within the
+        // u64 the FP-literal helpers use, and steer clear of z3rs's pre-existing
+        // large-format (width-79, sbits-64) classification bug — a source/target
+        // total width ≤ 64 covers all handled Float16/32/64 conversions.
+        if fe < 2
+            || fs < 2
+            || to_eb < 2
+            || to_sb < 2
+            || to_eb > to_sb
+            || fe + fs > 64
+            || to_eb + to_sb > 64
+        {
+            return None;
         }
         let rm_c = self.rm_code(rm)?;
         let rm3 = self.m.mk_bv(rm_c as i64, 3);
@@ -14084,9 +14095,38 @@ impl Context {
             sig // to_sb+3
         };
         let res_sig = self.m.mk_bv_zero_extend(1, res_sig3); // to_sb+4
-        let res_exp0 = self.m.mk_bv_sign_extend(to_eb - fe + 2, exp); // to_eb+2
-        let lz_ext = self.m.mk_bv_zero_extend(to_eb - fe + 2, lz);
-        let res_exp = self.m.mk_bvsub(res_exp0, lz_ext);
+        // Exponent resize to to_eb+2 bits (port of z3's mk_to_fp_float). Widening
+        // exponent sign-extends and subtracts the leading-zero count; narrowing
+        // (from_ebits ≥ to_ebits+2) must detect over/underflow *before* truncating,
+        // since the source unbiased exponent can exceed the target's range.
+        let res_exp = if fe < to_eb + 2 {
+            let res_exp0 = self.m.mk_bv_sign_extend(to_eb - fe + 2, exp); // to_eb+2
+            let lz_ext = self.m.mk_bv_zero_extend(to_eb - fe + 2, lz);
+            self.m.mk_bvsub(res_exp0, lz_ext)
+        } else {
+            let ebits_diff = fe - (to_eb + 2);
+            // exp − lz in from_ebits+2 bits (signed).
+            let se_exp = self.m.mk_bv_sign_extend(2, exp); // fe+2
+            let se_lz = self.m.mk_bv_sign_extend(2, lz); // fe+2
+            let exp_sub_lz = self.m.mk_bvsub(se_exp, se_lz); // fe+2
+            // max_exp = 2^(to_eb+1) − 2  (concat of 1^to_eb·0 with a low 0 bit).
+            let max_exp = self.m.mk_bv((1i64 << (to_eb + 1)) - 2, to_eb + 2);
+            // min_exp = −2^(to_eb+1) + 2.
+            let min_exp = self.fp_ilit(-(1i64 << (to_eb + 1)) + 2, to_eb + 2);
+            // First exponent that overflows to +∞ / underflows to 0.
+            let first_ovf_exp = self.m.mk_bv((1i64 << (to_eb + 1)) - 1, fe + 2);
+            let hi_ones = {
+                let z = self.m.mk_bv(0, ebits_diff + 3);
+                self.m.mk_bvnot(z)
+            };
+            let lo_one = self.m.mk_bv(1, to_eb + 1);
+            let first_udf_exp = self.m.mk_bv_concat(hi_ones, lo_one); // fe+2
+            let exp_in_range = self.m.mk_bv_extract(to_eb + 1, 0, exp_sub_lz); // to_eb+2
+            let ovf_cond = self.m.mk_bvsle(first_ovf_exp, exp_sub_lz);
+            let udf_cond = self.m.mk_bvsle(exp_sub_lz, first_udf_exp);
+            let r = self.m.mk_ite(ovf_cond, max_exp, exp_in_range);
+            self.m.mk_ite(udf_cond, min_exp, r)
+        };
         let v6 = self.fp_round(rm3, res_sgn, res_sig, res_exp, to_eb, to_sb);
 
         let r = self.m.mk_ite(c5, v5, v6);
