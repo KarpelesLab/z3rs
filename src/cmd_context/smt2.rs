@@ -2460,6 +2460,12 @@ impl Context {
                 let t = self.term(&list[1])?;
                 let folded = self.dt_fold(t);
                 let s = crate::rewriter::simplify(&mut self.m, folded);
+                // A ground bit-vector term folds to a concrete numeral (the
+                // th_rewriter itself does not constant-fold bit-vector ops).
+                if self.m.bv_sort_width(self.m.get_sort(s)).is_some() && self.is_fully_concrete(s) {
+                    let mut model = Model::from_bv(BTreeMap::new());
+                    return Ok(Some(model.value_string(&self.m, s)));
+                }
                 Ok(Some(self.m.pp(s)))
             }
             "apply" => {
@@ -20017,6 +20023,27 @@ impl Context {
 
     /// `(get-value (t1 t2 …))` — evaluate each term under the current model and
     /// return `((t1 v1) (t2 v2) …)`.
+    /// True if every leaf reachable from `id` is a concrete value (a numeral or
+    /// `true`/`false`) — i.e. the term is ground and can be constant-folded.
+    fn is_fully_concrete(&self, id: AstId) -> bool {
+        for &n in &self.m.postorder(id) {
+            match self.m.app(n) {
+                Some(app) if app.args.is_empty() => {
+                    let leaf_ok = self.m.bv_numeral_value(n).is_some()
+                        || self.m.as_numeral(n).is_some()
+                        || self.m.is_true(n)
+                        || self.m.is_false(n);
+                    if !leaf_ok {
+                        return false;
+                    }
+                }
+                Some(_) => {}
+                None => return false, // a bound variable
+            }
+        }
+        true
+    }
+
     fn get_value(&mut self, list: &[SExpr]) -> Result<String, String> {
         let queries = match list.get(1) {
             Some(SExpr::List(q)) => q,
