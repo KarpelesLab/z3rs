@@ -14780,6 +14780,28 @@ impl Context {
                 }
                 self.symbolic_fp(op, args)
             }
+            "fp.to_ieee_bv" if args.len() == 1 => {
+                // The IEEE-754 packed bit-vector of an FP value. z3rs already
+                // represents every FP term by exactly this packed bit-vector
+                // (`fp_to_bv`), so for a finite/∞ value or a *symbolic* term the
+                // result is that bit-vector — sound in QF_BV. A concrete NaN
+                // literal is the one exception: z3 leaves `fp.to_ieee_bv` of a
+                // NaN *unspecified* (any NaN significand), so folding it to a
+                // fixed pattern could be unsound; keep it uninterpreted.
+                if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0]) {
+                    let exp_mask = ((1u64 << eb) - 1) << (sb - 1);
+                    let sig_mask = (1u64 << (sb - 1)) - 1;
+                    let is_nan = (bits & exp_mask) == exp_mask && (bits & sig_mask) != 0;
+                    if !is_nan {
+                        return Ok(self.m.mk_bv_numeral(Int::from(bits as i64), eb + sb));
+                    }
+                    return self.symbolic_fp(op, args);
+                }
+                if let Some(bv) = self.fp_to_bv(args[0]) {
+                    return Ok(bv);
+                }
+                self.symbolic_fp(op, args)
+            }
             "fp.min" | "fp.max" if args.len() == 2 => {
                 if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
                     let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
@@ -21858,6 +21880,10 @@ impl Context {
                 }
                 if head.starts_with("fp.") {
                     return self.fp_op(&head, &args);
+                }
+                // Legacy alias for `fp.to_ieee_bv`.
+                if head == "to_ieee_bv" && args.len() == 1 {
+                    return self.fp_op("fp.to_ieee_bv", &args);
                 }
                 if head == "fp" && args.len() == 3 {
                     return self.mk_fp_literal(&args);
