@@ -2317,7 +2317,21 @@ impl Context {
             // check-sat-using (tactic …) picks a solving strategy but yields the
             // same verdict; the tactic argument is advisory, so run a plain check.
             "check-sat" | "check-sat-using" => {
-                let (res, model) = if self.objectives.is_empty() && self.soft.is_empty() {
+                // z3 accepts `(check-sat a b …)` as an extension of the SMT-LIB
+                // `(check-sat)`: the trailing atoms are assumption literals decided
+                // together with the assertion stack for this check only (they do NOT
+                // persist to later checks). `check-sat-using (tactic …)` takes a
+                // single tactic argument that is advisory, so a plain check yields
+                // the same verdict. Route assumptions through `check_with` so the
+                // full decision pipeline (and model recording) applies.
+                let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
+                let (res, model) = if !is_using && list.len() > 1 {
+                    let mut assumptions = Vec::with_capacity(list.len() - 1);
+                    for a in &list[1..] {
+                        assumptions.push(self.term(a)?);
+                    }
+                    self.check_with(&assumptions)
+                } else if self.objectives.is_empty() && self.soft.is_empty() {
                     self.check_sat()
                 } else {
                     self.optimize()
@@ -2333,13 +2347,11 @@ impl Context {
                     Some(SExpr::List(a)) => a.clone(),
                     _ => return Err("check-sat-assuming: expected a literal list".to_string()),
                 };
-                let mut conj = alloc::vec![self.conjunction()];
+                let mut terms = Vec::with_capacity(assumptions.len());
                 for a in &assumptions {
-                    conj.push(self.term(a)?);
+                    terms.push(self.term(a)?);
                 }
-                let base = self.m.mk_and(&conj);
-                let goal = self.lift(base);
-                let (res, model) = self.decide(goal);
+                let (res, model) = self.check_with(&terms);
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
