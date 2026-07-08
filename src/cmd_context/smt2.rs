@@ -397,6 +397,13 @@ fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
     }
     let (int_part, frac_part) = s.split_once('.')?;
     let ip = if int_part.is_empty() { "0" } else { int_part };
+    // z3 leniently accepts a trailing-dot decimal such as `0.` (= `0.0`); the
+    // fractional part may be empty as long as the integer part is present.
+    let frac_part = if frac_part.is_empty() && !int_part.is_empty() {
+        "0"
+    } else {
+        frac_part
+    };
     if !is_digits(ip) || !is_digits(frac_part) {
         return None;
     }
@@ -1318,6 +1325,15 @@ struct Context {
     /// Opaque `fp.rem` markers -> (x, y, eb, sb). Folded once both operands are
     /// pinned to concrete FP constants by top-level equalities.
     fp_rem_markers: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
+    /// Unspecified `fp.to_ubv`/`fp.to_sbv` results (NaN/∞/out-of-range constant
+    /// input, constant rounding mode), cached by `(signed, m, rm, x)` so identical
+    /// applications share one free bit-vector (z3 congruence: the result is an
+    /// uninterpreted value distinguished by the full application).
+    fp_to_bv_unspec: BTreeMap<(bool, u32, AstId, AstId), AstId>,
+    /// Gated `fp.to_ubv`/`fp.to_sbv` markers over a *symbolic* FP `x` (constant
+    /// rounding mode): marker BV → `(signed, m, rm_code, rm, x)`. Re-folded once
+    /// `x` is pinned to a concrete FP constant by a top-level equality.
+    fp_to_bv_markers: BTreeMap<AstId, (bool, u32, u32, AstId, AstId)>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2225,6 +2241,8 @@ impl Context {
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
+            fp_to_bv_unspec: BTreeMap::new(),
+            fp_to_bv_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
@@ -3773,6 +3791,99 @@ impl Context {
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
         let g = self.blast_fp_equalities(g, &mut memo);
+        Some(crate::rewriter::simplify(&mut self.m, g))
+    }
+
+    /// Re-fold `fp.to_ubv`/`fp.to_sbv` markers once their FP argument is pinned to
+    /// a concrete constant by a top-level `v = literal` equality: an in-range
+    /// rounded value replaces the marker by that numeral; an out-of-range/NaN/∞
+    /// value is UNSPECIFIED, so the (previously gated) marker is replaced by a
+    /// congruent free bit-vector (see the parse-time constant case). Returns the
+    /// rewritten goal, or `None` if nothing folded.
+    fn fold_fp_to_bv(&mut self, goal: AstId) -> Option<AstId> {
+        if self.fp_to_bv_markers.is_empty() {
+            return None;
+        }
+        // Collect FP-constant pins from top-level equalities (bit-vector level, as
+        // `fold_fp_rem` does): a pinned bit-vector term → its numeral bits.
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut bvpin: BTreeMap<AstId, u64> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            for (t, k) in [(a[0], a[1]), (a[1], a[0])] {
+                if let Some(kb) = self.bv_eval(k) {
+                    bvpin.insert(t, kb);
+                }
+            }
+        }
+        let operand_bits = |s: &Self, x: AstId, eb: u32, sb: u32| -> Option<u64> {
+            if let Some(&(b, e, sbn)) = s.fp_of.get(&x) {
+                return (e == eb && sbn == sb).then_some(b);
+            }
+            let bv = s.fp_bv.get(&x)?;
+            s.bv_eval(*bv).or_else(|| bvpin.get(bv).copied())
+        };
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let markers: Vec<(AstId, bool, u32, u32, AstId, AstId)> = self
+            .fp_to_bv_markers
+            .iter()
+            .filter(|(t, _)| present.contains(t))
+            .map(|(&t, &(signed, m, rmc, rm, x))| (t, signed, m, rmc, rm, x))
+            .collect();
+        let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
+        for (t, signed, m, rmc, rm, x) in &markers {
+            let Some((eb, sb)) = self.fp_format_of(self.m.get_sort(*x)) else {
+                continue;
+            };
+            let Some(bits) = operand_bits(self, *x, eb, sb) else {
+                continue;
+            };
+            let folded = Self::fp_real_value(bits, eb, sb)
+                .and_then(|r| Self::round_rational_to_int(&r, *rmc))
+                .filter(|&v| {
+                    if *signed {
+                        let hi = 1i64 << (*m - 1);
+                        v >= -hi && v < hi
+                    } else {
+                        v >= 0 && (*m == 64 || v < (1i64 << *m))
+                    }
+                });
+            let repl = if let Some(v) = folded {
+                self.m.mk_bv_numeral(Int::from(v), *m)
+            } else {
+                // Unspecified: a congruent free bit-vector by `(signed, m, rm, x)`.
+                let key = (*signed, *m, *rm, *x);
+                if let Some(&u) = self.fp_to_bv_unspec.get(&key) {
+                    u
+                } else {
+                    let s = self.m.mk_bv_sort(*m);
+                    let u = self.fresh_const(s);
+                    self.fp_to_bv_unspec.insert(key, u);
+                    u
+                }
+            };
+            fold_subst.push((*t, repl));
+        }
+        if fold_subst.is_empty() {
+            return None;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &fold_subst);
         Some(crate::rewriter::simplify(&mut self.m, g))
     }
 
@@ -14780,6 +14891,28 @@ impl Context {
                 }
                 self.symbolic_fp(op, args)
             }
+            "fp.to_ieee_bv" if args.len() == 1 => {
+                // The IEEE-754 packed bit-vector of an FP value. z3rs already
+                // represents every FP term by exactly this packed bit-vector
+                // (`fp_to_bv`), so for a finite/∞ value or a *symbolic* term the
+                // result is that bit-vector — sound in QF_BV. A concrete NaN
+                // literal is the one exception: z3 leaves `fp.to_ieee_bv` of a
+                // NaN *unspecified* (any NaN significand), so folding it to a
+                // fixed pattern could be unsound; keep it uninterpreted.
+                if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0]) {
+                    let exp_mask = ((1u64 << eb) - 1) << (sb - 1);
+                    let sig_mask = (1u64 << (sb - 1)) - 1;
+                    let is_nan = (bits & exp_mask) == exp_mask && (bits & sig_mask) != 0;
+                    if !is_nan {
+                        return Ok(self.m.mk_bv_numeral(Int::from(bits as i64), eb + sb));
+                    }
+                    return self.symbolic_fp(op, args);
+                }
+                if let Some(bv) = self.fp_to_bv(args[0]) {
+                    return Ok(bv);
+                }
+                self.symbolic_fp(op, args)
+            }
             "fp.min" | "fp.max" if args.len() == 2 => {
                 if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
                     let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
@@ -15473,6 +15606,7 @@ impl Context {
         // (same divisor) ⇒ equal div/mod. Refutes `x = y ∧ mod x 5 = 2 ∧
         // mod y 5 ≠ 2`.
         let mut cong = self.divmod_congruence_axioms(combined);
+        cong.extend(self.realdiv_congruence_axioms(combined));
         cong.extend(self.mod_multiple_axioms(combined));
         if !cong.is_empty() {
             cong.push(combined);
@@ -18549,6 +18683,42 @@ impl Context {
         ax
     }
 
+    /// EUF congruence for real division `/`, generated on the PRE-lift goal
+    /// (lifting later replaces `(/ a b)` by a fresh quotient, losing it): for any
+    /// two `/` terms, `dividend1 = dividend2 ∧ divisor1 = divisor2 ⇒ term1 =
+    /// term2`. Unlike `div`/`mod` congruence, the divisor may *differ*
+    /// syntactically — needed so `(/ a b)` and `(/ a 0)` unify when `b = 0`
+    /// (division by zero is unspecified but *functional*). Refutes
+    /// `b = 0 ∧ (/ a b) ≠ (/ a 0)`. Sound: `/` is a total function.
+    fn realdiv_congruence_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut terms: Vec<(AstId, AstId, AstId)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.arith_op(t) == Some(ArithOp::Div) {
+                let a = self.m.app_args(t);
+                terms.push((t, a[0], a[1]));
+            }
+        }
+        let mut ax = Vec::new();
+        if terms.len() <= 16 {
+            for i in 0..terms.len() {
+                for j in i + 1..terms.len() {
+                    let (t1, a1, b1) = terms[i];
+                    let (t2, a2, b2) = terms[j];
+                    if t1 == t2 || (a1 == a2 && b1 == b2) {
+                        continue;
+                    }
+                    let aeq = self.m.mk_eq(a1, a2);
+                    let beq = self.m.mk_eq(b1, b2);
+                    let pre = self.m.mk_and(&[aeq, beq]);
+                    let req = self.m.mk_eq(t1, t2);
+                    ax.push(self.m.mk_implies(pre, req));
+                }
+            }
+        }
+        ax
+    }
+
     /// Whether every coefficient (and the constant) of the integer linear form of
     /// `e` is divisible by `n` — so `e ≡ 0 (mod n)`. Conservative (a bare variable
     /// or a non-linear/unknown subterm ⇒ `false`).
@@ -19142,6 +19312,16 @@ impl Context {
         // concrete FP constants by top-level equalities.
         if res == SmtResult::Unknown
             && let Some(g) = self.fold_fp_rem(goal)
+        {
+            let (r2, m2) = self.decide_inner(g);
+            if r2 != SmtResult::Unknown {
+                return (r2, m2);
+            }
+        }
+        // Fallback: re-fold `fp.to_ubv`/`fp.to_sbv` once the FP argument is pinned
+        // to a concrete constant by a top-level equality.
+        if res == SmtResult::Unknown
+            && let Some(g) = self.fold_fp_to_bv(goal)
         {
             let (r2, m2) = self.decide_inner(g);
             if r2 != SmtResult::Unknown {
@@ -21676,23 +21856,52 @@ impl Context {
                         if (1..=63).contains(&m)
                             && let Some(rmc) = self.rm_code(rm)
                             && let Some(&(bits, eb, sb)) = self.fp_of.get(&x)
-                            && let Some(r) = Self::fp_real_value(bits, eb, sb)
-                            && let Some(v) = Self::round_rational_to_int(&r, rmc)
                         {
-                            let in_range = if signed {
-                                let hi = 1i64 << (m - 1);
-                                v >= -hi && v < hi
-                            } else {
-                                v >= 0 && (m == 64 || v < (1i64 << m))
-                            };
-                            if in_range {
+                            // Constant FP input and constant rounding mode: either an
+                            // exact in-range integer (folded), or an UNSPECIFIED result
+                            // (NaN/∞ ⇒ no real value, or a finite value out of range).
+                            // z3 models the unspecified case as an uninterpreted value
+                            // distinguished by the full application, so cache a free
+                            // bit-vector by `(signed, m, rm, x)` — congruent, and free to
+                            // take any value (matching z3, yielding a real `sat`).
+                            let folded = Self::fp_real_value(bits, eb, sb)
+                                .and_then(|r| Self::round_rational_to_int(&r, rmc))
+                                .filter(|&v| {
+                                    if signed {
+                                        let hi = 1i64 << (m - 1);
+                                        v >= -hi && v < hi
+                                    } else {
+                                        v >= 0 && (m == 64 || v < (1i64 << m))
+                                    }
+                                });
+                            if let Some(v) = folded {
                                 return Ok(self.m.mk_bv_numeral(Int::from(v), m));
                             }
+                            let key = (signed, m, rm, x);
+                            if let Some(&t) = self.fp_to_bv_unspec.get(&key) {
+                                return Ok(t);
+                            }
+                            let s = self.m.mk_bv_sort(m);
+                            let t = self.fresh_const(s);
+                            self.fp_to_bv_unspec.insert(key, t);
+                            return Ok(t);
                         }
-                        // Could not fold: a fresh, gated bit-vector → sound unknown.
+                        // Symbolic input (or symbolic rounding mode): a genuine
+                        // conversion whose value we cannot fold. Gate to a sound
+                        // `unknown` (a free bit-vector would be unsound — it must equal
+                        // the real conversion of the eventual FP value).
                         let s = self.m.mk_bv_sort(m);
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
+                        // If only the FP input is symbolic (width in range, constant
+                        // rounding mode), record a marker so the conversion can be
+                        // re-folded once `x` is pinned to a concrete FP by a top-level
+                        // equality (mirrors `fold_fp_rem`).
+                        if (1..=63).contains(&m)
+                            && let Some(rmc) = self.rm_code(rm)
+                        {
+                            self.fp_to_bv_markers.insert(t, (signed, m, rmc, rm, x));
+                        }
                         return Ok(t);
                     }
                     return Err("unsupported qualified application".to_string());
@@ -21858,6 +22067,10 @@ impl Context {
                 }
                 if head.starts_with("fp.") {
                     return self.fp_op(&head, &args);
+                }
+                // Legacy alias for `fp.to_ieee_bv`.
+                if head == "to_ieee_bv" && args.len() == 1 {
+                    return self.fp_op("fp.to_ieee_bv", &args);
                 }
                 if head == "fp" && args.len() == 3 {
                     return self.mk_fp_literal(&args);
