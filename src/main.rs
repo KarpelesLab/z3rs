@@ -165,6 +165,23 @@ fn run_smt2_file(path: &str) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Deeply nested SMT-LIB terms — fuzz-generated benchmarks routinely nest
+    // 1000+ `let`s — are built by recursive descent, so the parser/term-builder
+    // recurses proportionally to the nesting depth. The default 8 MiB main-thread
+    // stack overflows (a hard crash). Run the whole program on a worker thread
+    // with a large stack instead; note `RUST_MIN_STACK` does not affect the main
+    // thread, only spawned ones, so an explicit `stack_size` is required.
+    match std::thread::Builder::new()
+        .stack_size(1usize << 30) // 1 GiB of virtual address space (lazily committed)
+        .spawn(run_main)
+    {
+        Ok(child) => child.join().unwrap_or(ExitCode::from(1)),
+        // If the thread cannot be spawned, fall back to running inline.
+        Err(_) => run_main(),
+    }
+}
+
+fn run_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.is_empty() {

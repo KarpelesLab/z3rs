@@ -2230,10 +2230,20 @@ impl Context {
             SExpr::List(l) if !l.is_empty() => {
                 // Parametric sort application, e.g. (Array I E) or (_ BitVec n).
                 match Self::sym(&l[0])? {
-                    "Array" if l.len() == 3 => {
-                        let index = self.resolve_sort(&l[1])?;
-                        let elem = self.resolve_sort(&l[2])?;
-                        Ok(self.m.mk_array_sort(index, elem))
+                    "Array" if l.len() >= 3 => {
+                        // Multi-dimensional arrays curry right-associatively:
+                        // `(Array A B C)` ≡ `(Array A (Array B C))` (z3). The last
+                        // sort is the codomain; all preceding sorts are indices.
+                        let sorts: Vec<AstId> = l[1..]
+                            .iter()
+                            .map(|s| self.resolve_sort(s))
+                            .collect::<Result<_, _>>()?;
+                        let (elem, indices) = sorts.split_last().unwrap();
+                        let mut acc = *elem;
+                        for &idx in indices.iter().rev() {
+                            acc = self.m.mk_array_sort(idx, acc);
+                        }
+                        Ok(acc)
                     }
                     "_" if l.len() == 3 && Self::sym(&l[1])? == "BitVec" => {
                         let w: u32 = Self::sym(&l[2])?
@@ -5674,7 +5684,13 @@ impl Context {
             let s = self.m.get_sort(t);
             if let Some(ctors) = self.enums.get(&s).cloned() {
                 let eqs: Vec<AstId> = ctors.iter().map(|&c| self.m.mk_eq(t, c)).collect();
-                ax.push(self.m.mk_or(&eqs));
+                // A single-constructor enum (e.g. `(declare-datatypes () ((U unit)))`)
+                // yields one disjunct; `mk_or` requires ≥2, so emit the bare equality.
+                match eqs.as_slice() {
+                    [] => {}
+                    [one] => ax.push(*one),
+                    _ => ax.push(self.m.mk_or(&eqs)),
+                }
             }
         }
         ax
@@ -20455,6 +20471,17 @@ impl Context {
                         .funcs
                         .get(name)
                         .ok_or_else(|| alloc::format!("unknown symbol {name:?}"))?;
+                    // A function symbol used as a bare value (e.g. `f` passed to a
+                    // higher-order combinator like `seq.foldl`/`seq.mapi`) is not a
+                    // constant. z3rs has no higher-order support — a graceful error
+                    // rather than an `mk_const` arity-mismatch panic.
+                    let arity = self.m.func_decl(d).map(|fd| fd.arity()).unwrap_or(0);
+                    if arity != 0 {
+                        return Err(alloc::format!(
+                            "{name:?} is a function of arity {arity}, not a constant \
+                             (higher-order function reference unsupported)"
+                        ));
+                    }
                     Ok(self.m.mk_const(d))
                 }
             },
@@ -21250,6 +21277,23 @@ impl Context {
     }
 
     fn apply(&mut self, head: &str, mut args: Vec<AstId>) -> Result<AstId, String> {
+        // Legacy/alternate operator spellings z3's parser accepts as builtins
+        // (arith_decl_plugin / ast.cpp op_names). Normalize to the canonical
+        // operator, unless a user function of the same name is in scope (a later
+        // `declare-fun`/`define-fun` shadows the builtin). Verified against z3:
+        // `iff`→OP_EQ, `implies`→OP_IMPLIES, `if`→OP_ITE, `~`→OP_UMINUS
+        // (arithmetic negation — NOT bit-wise not).
+        let head: &str = if self.funcs.contains_key(head) {
+            head
+        } else {
+            match head {
+                "iff" => "=",
+                "implies" => "=>",
+                "if" | "if_then_else" if args.len() == 3 => "ite",
+                "~" if args.len() == 1 => "-",
+                other => other,
+            }
+        };
         // A numeric operator with a mix of `Int`- and `Real`-sorted operands is
         // promoted to all-`Real` (z3's coercion). Must run before the operators
         // are built: an n-ary `*`/`+` takes its result sort from its first
@@ -21356,8 +21400,32 @@ impl Context {
                 Ok(acc)
             }
             "ite" => Ok(m.mk_ite(args[0], args[1], args[2])),
-            "select" => Ok(m.mk_select(args[0], args[1])),
-            "store" => Ok(m.mk_store(args[0], args[1], args[2])),
+            // Multi-dimensional (curried) array access:
+            //   (select a i j …)  ≡ (select (select a i) j …)
+            //   (store  a i j v)  ≡ (store a i (store (select a i) j v))
+            "select" if args.len() >= 2 => {
+                let mut acc = args[0];
+                for &idx in &args[1..] {
+                    acc = m.mk_select(acc, idx);
+                }
+                Ok(acc)
+            }
+            "store" if args.len() >= 3 => {
+                let v = *args.last().unwrap();
+                let indices = &args[1..args.len() - 1];
+                // Prefix `select` chain: selects[k] = a[i1]…[ik] (selects[0] = a).
+                let mut selects = alloc::vec![args[0]];
+                for &idx in indices {
+                    let s = m.mk_select(*selects.last().unwrap(), idx);
+                    selects.push(s);
+                }
+                // Fold the update from the innermost dimension outward.
+                let mut val = v;
+                for k in (0..indices.len()).rev() {
+                    val = m.mk_store(selects[k], indices[k], val);
+                }
+                Ok(val)
+            }
             "distinct" => {
                 // Expand to pairwise disequality so the theory solvers see it
                 // (a bare `distinct` node would be an opaque Boolean atom).
@@ -21436,6 +21504,15 @@ impl Context {
                     let prod = ns.iter().fold(rat(1), |a, b| &a * b);
                     return Ok(m.mk_numeral(prod, all_int(m, &args)));
                 }
+                // A literal `0` factor annihilates the product. Sound, and it keeps
+                // a `(* x 0)` from being handed to the (potentially non-terminating
+                // on trivial products) nonlinear reasoner.
+                if args
+                    .iter()
+                    .any(|&a| m.as_numeral(a).is_some_and(|v| v.is_zero()))
+                {
+                    return Ok(m.mk_numeral(rat(0), all_int(m, &args)));
+                }
                 Ok(match args.len() {
                     0 => m.mk_int(1),
                     1 => args[0],
@@ -21468,6 +21545,23 @@ impl Context {
                     Ok(m.mk_numeral(Rational::from_integer(r), true))
                 }
                 _ => Ok(m.mk_mod(args[0], args[1])),
+            },
+            // z3's integer `rem`: rem(a,b) = if b >= 0 then (mod a b) else -(mod a b),
+            // where `mod` is the SMT-LIB Euclidean remainder (0 ≤ mod < |b|).
+            // See arith_rewriter::mk_rem_core.
+            "rem" if args.len() == 2 => match int_pair(m, args[0], args[1]) {
+                Some((a, b)) if !b.is_zero() => {
+                    let (_, r) = euclid_div_mod(&a, &b);
+                    let r = if b.is_negative() { r.neg() } else { r };
+                    Ok(m.mk_numeral(Rational::from_integer(r), true))
+                }
+                _ => {
+                    let md = m.mk_mod(args[0], args[1]);
+                    let zero = m.mk_int(0);
+                    let bnonneg = m.mk_ge(args[1], zero);
+                    let neg = m.mk_uminus(md);
+                    Ok(m.mk_ite(bnonneg, md, neg))
+                }
             },
             "^" => {
                 // Exponentiation: fold a constant base to a non-negative integer
@@ -21543,6 +21637,33 @@ impl Context {
                 }
             }
             // --- bit-vectors ---
+            // `(mkbv b0 b1 … b_{n-1})` builds a `(_ BitVec n)` from Boolean bits,
+            // with `b0` the least-significant bit (bv_decl_plugin::mk_mkbv).
+            "mkbv" if !args.is_empty() => {
+                let n = args.len() as u32;
+                // Constant-fold when every bit is a Boolean literal.
+                if args.iter().all(|&a| m.is_true(a) || m.is_false(a)) {
+                    let mut val = Int::from(0);
+                    for (i, &a) in args.iter().enumerate() {
+                        if m.is_true(a) {
+                            val = &val + &Int::from(2).pow(i as u32);
+                        }
+                    }
+                    return Ok(m.mk_bv_numeral(val, n));
+                }
+                // Symbolic: concat 1-bit vectors, most-significant bit first.
+                let one = m.mk_bv_numeral(Int::from(1), 1);
+                let zero = m.mk_bv_numeral(Int::from(0), 1);
+                let mut acc: Option<AstId> = None;
+                for &b in args.iter().rev() {
+                    let bit = m.mk_ite(b, one, zero);
+                    acc = Some(match acc {
+                        Some(a) => m.mk_bv_concat(a, bit),
+                        None => bit,
+                    });
+                }
+                Ok(acc.unwrap())
+            }
             "bvnot" => Ok(m.mk_bvnot(args[0])),
             "bvneg" => Ok(m.mk_bvneg(args[0])),
             // bvand/bvor/bvxor/bvadd/bvmul are left-associative and variadic.
