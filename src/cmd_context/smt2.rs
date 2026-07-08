@@ -2514,6 +2514,11 @@ impl Context {
                     let mut model = Model::from_bv(BTreeMap::new());
                     return Ok(Some(model.value_string(&self.m, s)));
                 }
+                // A string-literal result renders as its quoted text, not the
+                // internal `!str!N` constant name.
+                if let Some(cps) = self.str_value(s) {
+                    return Ok(Some(smt_string_literal(&cps)));
+                }
                 Ok(Some(self.m.pp(s)))
             }
             "apply" => {
@@ -3274,7 +3279,19 @@ impl Context {
                 return Some(smt_string_literal(&cps));
             }
         }
+        // A string not pinned to any literal and absent from every assertion is
+        // unconstrained; z3's model gives it the empty string.
+        if !self.occurs_in_assertions(id) {
+            return Some(smt_string_literal(&[]));
+        }
         None
+    }
+
+    /// Does `id` occur as a subterm of any asserted formula?
+    fn occurs_in_assertions(&self, id: AstId) -> bool {
+        self.assertions
+            .iter()
+            .any(|&a| self.m.postorder(a).contains(&id))
     }
 
     /// If `id` is a floating-point term, render its concrete value under `model`
