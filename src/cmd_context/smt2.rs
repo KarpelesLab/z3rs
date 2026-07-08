@@ -2619,7 +2619,8 @@ impl Context {
                 let id = self.term(&list[1])?;
                 let mut model = self.last_model.take().unwrap();
                 let v = self
-                    .enum_value_name(&mut model, id)
+                    .eval_array_value(id)
+                    .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
@@ -5521,6 +5522,181 @@ impl Context {
                 return None;
             }
         }
+    }
+
+    /// True if `x` is a user-declared 0-ary constant (not a value/builtin).
+    fn is_decl_const(&self, x: AstId) -> bool {
+        if !self.m.is_app(x) || !self.m.app_args(x).is_empty() {
+            return false;
+        }
+        let d = self.m.app_decl(x);
+        self.m.func_decl(d).is_some_and(|fd| fd.domain.is_empty())
+            && self.funcs.values().any(|&fd| fd == d)
+    }
+
+    /// Top-level `const = definition` equalities (over the assertion conjuncts),
+    /// with `const` a declared 0-ary constant not occurring in its own body —
+    /// used to inline constants when evaluating a term against the model.
+    fn inline_const_defs(&self) -> Vec<(AstId, AstId)> {
+        let mut defs: Vec<(AstId, AstId)> = Vec::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend_from_slice(self.m.app_args(t));
+                continue;
+            }
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            if args.len() != 2 {
+                continue;
+            }
+            let (l, r) = (args[0], args[1]);
+            for (x, d) in [(l, r), (r, l)] {
+                if self.is_decl_const(x)
+                    && x != d
+                    && !self.m.postorder(d).contains(&x)
+                    && !defs.iter().any(|(c, _)| *c == x)
+                {
+                    defs.push((x, d));
+                }
+            }
+        }
+        defs
+    }
+
+    /// Compare two terms as concrete values: `Some(true)`/`Some(false)` when both
+    /// fully fold to concrete values, `None` when either is still symbolic.
+    fn same_concrete(&mut self, a: AstId, b: AstId) -> Option<bool> {
+        let a = crate::rewriter::simplify(&mut self.m, a);
+        let b = crate::rewriter::simplify(&mut self.m, b);
+        if a == b {
+            return Some(true);
+        }
+        (self.is_fully_concrete(a) && self.is_fully_concrete(b)).then_some(false)
+    }
+
+    /// The value read from ground array term `arr` at concrete index `idx`,
+    /// folding `store`/`(as const)`/`(_ map f)`; `None` if it cannot be resolved.
+    fn arr_read(&mut self, arr: AstId, idx: AstId) -> Option<AstId> {
+        if self.m.is_const_array(arr) {
+            return Some(self.m.app_args(arr)[0]);
+        }
+        if self.m.is_store(arr) {
+            let a = self.m.app_args(arr).to_vec();
+            match self.same_concrete(idx, a[1])? {
+                true => return Some(a[2]),
+                false => return self.arr_read(a[0], idx),
+            }
+        }
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let mut vals = Vec::with_capacity(arrays.len());
+            for a in arrays {
+                vals.push(self.arr_read(a, idx)?);
+            }
+            let applied = self.apply(&fname, vals).ok()?;
+            return Some(crate::rewriter::simplify(&mut self.m, applied));
+        }
+        None
+    }
+
+    /// The default value of ground array term `arr` (its value at almost every
+    /// index): the const base, threaded through `store` and `(_ map f)`.
+    fn arr_default(&mut self, arr: AstId) -> Option<AstId> {
+        if self.m.is_const_array(arr) {
+            return Some(self.m.app_args(arr)[0]);
+        }
+        if self.m.is_store(arr) {
+            let base = self.m.app_args(arr)[0];
+            return self.arr_default(base);
+        }
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let mut vals = Vec::with_capacity(arrays.len());
+            for a in arrays {
+                vals.push(self.arr_default(a)?);
+            }
+            let applied = self.apply(&fname, vals).ok()?;
+            return Some(crate::rewriter::simplify(&mut self.m, applied));
+        }
+        None
+    }
+
+    /// Concrete `store` indices occurring in ground array term `arr` (and its
+    /// `(_ map f)` sources) — the finite support to compare for array equality.
+    fn arr_support(&self, arr: AstId, out: &mut Vec<AstId>) {
+        if self.m.is_store(arr) {
+            let a = self.m.app_args(arr);
+            let (base, idx) = (a[0], a[1]);
+            if !out.contains(&idx) {
+                out.push(idx);
+            }
+            self.arr_support(base, out);
+        } else if let Some((_, arrays)) = self.maps.get(&arr) {
+            for a in arrays.clone() {
+                self.arr_support(a, out);
+            }
+        }
+    }
+
+    /// Decide equality of two ground array terms by comparing their default and
+    /// every finite-support index; `None` if a read cannot be resolved.
+    fn arr_eq(&mut self, a: AstId, b: AstId) -> Option<bool> {
+        let da = self.arr_default(a)?;
+        let db = self.arr_default(b)?;
+        if !self.same_concrete(da, db)? {
+            return Some(false);
+        }
+        let mut indices = Vec::new();
+        self.arr_support(a, &mut indices);
+        self.arr_support(b, &mut indices);
+        for i in indices {
+            let va = self.arr_read(a, i)?;
+            let vb = self.arr_read(b, i)?;
+            if !self.same_concrete(va, vb)? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Evaluate `id` against the model by inlining top-level constant definitions
+    /// and folding ground `select`/array-equality; `None` if it doesn't reduce to
+    /// a concrete value. Genuine: the inlined equalities hold in every model.
+    fn eval_array_value(&mut self, id: AstId) -> Option<String> {
+        let defs = self.inline_const_defs();
+        if defs.is_empty() {
+            return None;
+        }
+        let mut t = id;
+        for _ in 0..4 {
+            let next = crate::rewriter::substitute(&mut self.m, t, &defs);
+            if next == t {
+                break;
+            }
+            t = next;
+        }
+        let folded = if self.m.is_select(t) {
+            let a = self.m.app_args(t).to_vec();
+            let idx = crate::rewriter::simplify(&mut self.m, a[1]);
+            self.arr_read(a[0], idx)?
+        } else if self.m.is_eq(t) {
+            let a = self.m.app_args(t).to_vec();
+            if a.len() == 2 && self.m.is_array_sort(self.m.get_sort(a[0])) {
+                let eq = self.arr_eq(a[0], a[1])?;
+                if eq {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        let folded = crate::rewriter::simplify(&mut self.m, folded);
+        self.is_fully_concrete(folded).then(|| self.m.pp(folded))
     }
 
     /// A top-level `A = B` between arrays whose const-array bases carry different
