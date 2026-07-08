@@ -114,6 +114,19 @@ fn fp_format(name: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// The canonical short spelling of a `RoundingMode` constant, so the long and
+/// short names (e.g. `RNE` / `roundNearestTiesToEven`) intern to one constant.
+fn rm_canonical(name: &str) -> &str {
+    match name {
+        "roundNearestTiesToEven" => "RNE",
+        "roundNearestTiesToAway" => "RNA",
+        "roundTowardPositive" => "RTP",
+        "roundTowardNegative" => "RTN",
+        "roundTowardZero" => "RTZ",
+        other => other,
+    }
+}
+
 /// Whether `name` is a `RoundingMode` constant.
 fn is_rm_name(name: &str) -> bool {
     matches!(
@@ -709,6 +722,9 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
         if let Some(resp) = ctx.command(&form)? {
             out.push(resp);
         }
+        if ctx.exited {
+            break;
+        }
     }
     Ok(out)
 }
@@ -743,6 +759,9 @@ impl Session {
         for form in forms {
             if let Some(resp) = self.ctx.command(&form)? {
                 out.push(resp);
+            }
+            if self.ctx.exited {
+                break;
             }
         }
         Ok(out)
@@ -1093,6 +1112,8 @@ struct Context {
     assert_names: Vec<Option<String>>,
     /// The verdict of the most recent `check-sat`.
     last_verdict: Option<SmtResult>,
+    /// Set by `(exit)`: subsequent commands in the script are ignored.
+    exited: bool,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -2045,6 +2066,7 @@ impl Context {
             assertions: Vec::new(),
             assert_names: Vec::new(),
             last_verdict: None,
+            exited: false,
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -2141,11 +2163,17 @@ impl Context {
                 let (eb, sb) = fp_format(name).unwrap();
                 Ok(self.fp_sort(eb, sb))
             }
+            // Bare `FloatingPoint` (no indices) defaults to the double format, as
+            // z3 accepts it (e.g. `(define-sort a () (FloatingPoint))`).
+            SExpr::Atom(name) if name == "FloatingPoint" => Ok(self.fp_sort(11, 53)),
             SExpr::Atom(name) => self
                 .sorts
                 .get(name)
                 .copied()
                 .ok_or_else(|| alloc::format!("unknown sort {name:?}")),
+            // A parenthesised nullary sort `(S)` is just the sort `S`, e.g.
+            // `(Float64)` or `(FloatingPoint)`.
+            SExpr::List(l) if l.len() == 1 => self.resolve_sort(&l[0]),
             SExpr::List(l) if !l.is_empty() => {
                 // Parametric sort application, e.g. (Array I E) or (_ BitVec n).
                 match Self::sym(&l[0])? {
@@ -2271,11 +2299,20 @@ impl Context {
                     .collect::<String>();
                 Ok(Some(alloc::format!("({body})")))
             }
-            "set-logic" | "set-info" | "exit" => Ok(None),
+            "exit" => {
+                self.exited = true;
+                Ok(None)
+            }
+            "set-logic" | "set-info" => Ok(None),
             "echo" => Ok(Some(match list.get(1) {
                 Some(SExpr::Atom(a)) => unquote_string(a),
                 _ => String::new(),
             })),
+            // (display e): parse `e` and echo it back in normalised form.
+            "display" if list.len() == 2 => {
+                let t = self.term(&list[1])?;
+                Ok(Some(self.m.pp(t)))
+            }
             "get-info" => match list.get(1) {
                 Some(SExpr::Atom(k)) if k == ":version" => Ok(Some(alloc::format!(
                     "(:version \"{}\")",
@@ -12600,6 +12637,54 @@ impl Context {
         (sgn, sig, exp)
     }
 
+    /// Round a rational to an integer under FP rounding mode `rm`
+    /// (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ). Used by `fp.to_ubv`/`fp.to_sbv`
+    /// constant folding. Returns `None` if the result does not fit `i64`.
+    fn round_rational_to_int(r: &Rational, rm: u32) -> Option<i64> {
+        if r.is_integer() {
+            return r.to_integer().and_then(|i| i.to_i64());
+        }
+        let floor_i = r.floor();
+        let floor = floor_i.to_i64()?;
+        let rounded = match rm {
+            3 => floor,                 // RTN (floor)
+            2 => floor.checked_add(1)?, // RTP (ceil)
+            4 => {
+                if r.is_negative() {
+                    floor.checked_add(1)?
+                } else {
+                    floor
+                }
+            } // RTZ
+            0 | 1 => {
+                // frac = r - floor ∈ (0, 1); compare 2*frac to 1.
+                let frac = r.sub(&Rational::from_integer(floor_i.clone()));
+                let two_frac = frac.mul(&Rational::from(2i64));
+                if two_frac < Rational::ONE {
+                    floor
+                } else if two_frac > Rational::ONE {
+                    floor.checked_add(1)?
+                } else if rm == 1 {
+                    // RNA: ties away from zero.
+                    if r.is_negative() {
+                        floor
+                    } else {
+                        floor.checked_add(1)?
+                    }
+                } else {
+                    // RNE: ties to even.
+                    if floor % 2 == 0 {
+                        floor
+                    } else {
+                        floor.checked_add(1)?
+                    }
+                }
+            }
+            _ => return None,
+        };
+        Some(rounded)
+    }
+
     /// Round a real (rational) constant to the `(eb, sb)` floating-point format
     /// under rounding mode `rm` (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ), returning the
     /// packed bit pattern. Handles zero, normals, subnormals, and overflow→inf/
@@ -20025,10 +20110,13 @@ impl Context {
                 name if name.starts_with("re.") && self.lookup_bound(name).is_none() => {
                     self.regex_op(name, &[])
                 }
-                // RoundingMode constants (RNE, RTP, …) as named constants.
+                // RoundingMode constants (RNE, RTP, …) as named constants. The
+                // long and short spellings denote the *same* value, so canonicalise
+                // to one representative decl (else `RNE = roundNearestTiesToEven`
+                // would be two distinct constants — an unsoundness).
                 name if is_rm_name(name) && self.lookup_bound(name).is_none() => {
                     let s = self.rm_sort();
-                    let d = self.m.mk_func_decl(Symbol::new(name), &[], s);
+                    let d = self.m.mk_func_decl(Symbol::new(rm_canonical(name)), &[], s);
                     Ok(self.m.mk_const(d))
                 }
                 name => {
@@ -20325,9 +20413,56 @@ impl Context {
                             self.m.mk_le(sum, kk)
                         });
                     }
+                    // ((_ fp.to_ubv m) RM x) / ((_ fp.to_sbv m) RM x): convert an
+                    // FP to an m-bit (un)signed bit-vector. Constant-fold when x is
+                    // a finite FP constant, RM is a constant rounding mode, and the
+                    // rounded integer lies in range; otherwise gate to a sound
+                    // `unknown` (out-of-range/NaN/inf is unspecified in SMT-LIB).
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "fp.to_ubv" || a == "fp.to_sbv")
+                        && l.len() == 3
+                    {
+                        let signed = Self::sym(&qid[1])? == "fp.to_sbv";
+                        let m: u32 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "fp.to_ubv/sbv: bad width".to_string())?;
+                        let rm = self.term(&l[1])?;
+                        let x = self.term(&l[2])?;
+                        if (1..=63).contains(&m)
+                            && let Some(rmc) = self.rm_code(rm)
+                            && let Some(&(bits, eb, sb)) = self.fp_of.get(&x)
+                            && let Some(r) = Self::fp_real_value(bits, eb, sb)
+                            && let Some(v) = Self::round_rational_to_int(&r, rmc)
+                        {
+                            let in_range = if signed {
+                                let hi = 1i64 << (m - 1);
+                                v >= -hi && v < hi
+                            } else {
+                                v >= 0 && (m == 64 || v < (1i64 << m))
+                            };
+                            if in_range {
+                                return Ok(self.m.mk_bv_numeral(Int::from(v), m));
+                            }
+                        }
+                        // Could not fold: a fresh, gated bit-vector → sound unknown.
+                        let s = self.m.mk_bv_sort(m);
+                        let t = self.fresh_const(s);
+                        self.str_symbolic.insert(t);
+                        return Ok(t);
+                    }
                     return Err("unsupported qualified application".to_string());
                 }
                 let head = Self::sym(&l[0])?.to_string();
+                // z3 accepts deprecated dotted spellings of the string/regex
+                // built-ins as aliases of their standard `_`-separated names.
+                let head = match head.as_str() {
+                    "int.to.str" => "str.from_int".to_string(),
+                    "str.to.int" => "str.to_int".to_string(),
+                    "str.in.re" => "str.in_re".to_string(),
+                    "str.to.re" => "str.to_re".to_string(),
+                    _ => head,
+                };
                 if head == "let" {
                     return self.term_let(&l[1], &l[2]);
                 }
@@ -21051,12 +21186,48 @@ impl Context {
                 let d = m.mk_func_decl(Symbol::new(head), &[bvs], int);
                 Ok(m.mk_app(d, &args))
             }
+            // Transcendental real functions (sin/cos/exp/…): z3 reasons about
+            // them specially; we abstract them as uninterpreted Real→Real and mark
+            // the application symbolic so the goal is gated to a sound `unknown`
+            // (an unsat under the abstraction is still a real unsat). This never
+            // yields a wrong verdict, only a possible completeness gap.
+            "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh"
+            | "asinh" | "acosh" | "atanh" | "exp" | "log"
+                if args.len() == 1 && !self.funcs.contains_key(head) =>
+            {
+                let real = self.m.mk_real_sort();
+                let s0 = self.m.get_sort(args[0]);
+                let d = self.m.mk_func_decl(Symbol::new(head), &[s0], real);
+                let app = self.m.mk_app(d, &args);
+                self.str_symbolic.insert(app);
+                Ok(app)
+            }
+            "atan2" if args.len() == 2 && !self.funcs.contains_key(head) => {
+                let real = self.m.mk_real_sort();
+                let s0 = self.m.get_sort(args[0]);
+                let s1 = self.m.get_sort(args[1]);
+                let d = self.m.mk_func_decl(Symbol::new(head), &[s0, s1], real);
+                let app = self.m.mk_app(d, &args);
+                self.str_symbolic.insert(app);
+                Ok(app)
+            }
             name => {
-                let d = *self
-                    .funcs
-                    .get(name)
-                    .ok_or_else(|| alloc::format!("unknown function {name:?}"))?;
-                Ok(self.m.mk_app(d, &args))
+                if let Some(d) = self.funcs.get(name).copied() {
+                    return Ok(self.m.mk_app(d, &args));
+                }
+                // z3's internal datatype tester spelling `(is-C x)` (equivalent to
+                // `((_ is C) x)`), used when models/goals are echoed back.
+                if let Some(cname) = name.strip_prefix("is-")
+                    && args.len() == 1
+                {
+                    if let Some(&tdecl) = self.tester_of.get(cname) {
+                        return Ok(self.m.mk_app(tdecl, &args));
+                    }
+                    if self.records.contains_key(&self.m.get_sort(args[0])) {
+                        return Ok(self.m.mk_true());
+                    }
+                }
+                Err(alloc::format!("unknown function {name:?}"))
             }
         }
     }
