@@ -1334,6 +1334,12 @@ struct Context {
     /// rounding mode): marker BV → `(signed, m, rm_code, rm, x)`. Re-folded once
     /// `x` is pinned to a concrete FP constant by a top-level equality.
     fp_to_bv_markers: BTreeMap<AstId, (bool, u32, u32, AstId, AstId)>,
+    /// Opaque FP classification-predicate markers (`fp.isNaN`/`isNormal`/… whose
+    /// operand could not be bit-blasted, e.g. a `to_fp` conversion of a symbolic
+    /// real/int) -> (op name, FP operand). Resolved once the operand's value is
+    /// pinned to a concrete FP constant (via `fold_fp_conversions`), so the
+    /// predicate does not stay a free Boolean (a fuzz-found spurious `sat`).
+    fp_class_markers: BTreeMap<AstId, (alloc::string::String, AstId)>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2240,6 +2246,7 @@ impl Context {
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
+            fp_class_markers: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
             fp_to_bv_unspec: BTreeMap::new(),
             fp_to_bv_markers: BTreeMap::new(),
@@ -3541,8 +3548,12 @@ impl Context {
                 && args.len() == 2
                 && self.fp_format_of(self.m.get_sort(args[0])).is_some()
             {
-                if let (Some(ba), Some(bb)) = (self.fp_to_bv(args[0]), self.fp_to_bv(args[1])) {
-                    self.m.mk_eq(ba, bb)
+                // Core `=` on FloatingPoint is *element* equality with a single NaN
+                // value (see `fp_core_eq`): bit equality alone is too strong —
+                // `(= x (fp.neg x))` with `x = NaN` is sat, and `distinct` over a
+                // commuting r2i/neg pair is otherwise a spurious sat.
+                if let Some(r) = self.fp_core_eq(args[0], args[1]) {
+                    r
                 } else {
                     self.m.mk_app(decl, &args)
                 }
@@ -3603,6 +3614,9 @@ impl Context {
             .map(|(&t, &(rm, x, eb, sb, uns))| (t, rm, x, eb, sb, uns))
             .collect();
         let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
+        // Concrete FP value (raw bits + format) of each folded conversion marker,
+        // so an `fp.is*` classification over it can be resolved below.
+        let mut bits_of: BTreeMap<AstId, (u64, u32, u32)> = BTreeMap::new();
         for (t, rm, x, eb, sb, uns) in &convs {
             let xs = crate::rewriter::substitute(&mut self.m, *x, &input_subst);
             let xs = crate::rewriter::simplify(&mut self.m, xs);
@@ -3640,6 +3654,28 @@ impl Context {
             {
                 let fv = self.mk_fp(bits, *eb, *sb);
                 fold_subst.push((*t, fv));
+                bits_of.insert(*t, (bits, *eb, *sb));
+            }
+        }
+        // Resolve `fp.is*` classification markers whose operand is now a concrete
+        // FP value (a just-folded conversion, or a literal), so the predicate does
+        // not stay a free Boolean → a spurious `sat`.
+        let class_markers: Vec<(AstId, alloc::string::String, AstId)> = self
+            .fp_class_markers
+            .iter()
+            .filter(|(app, _)| present.contains(app))
+            .map(|(&app, (op, arg))| (app, op.clone(), *arg))
+            .collect();
+        for (app, op, arg) in &class_markers {
+            let val = bits_of
+                .get(arg)
+                .copied()
+                .or_else(|| self.fp_of.get(arg).copied());
+            if let Some((bits, eb, sb)) = val
+                && let Some(b) = Self::fp_classify_const(op, bits, eb, sb)
+            {
+                let bv = self.mk_bool(b);
+                fold_subst.push((*app, bv));
             }
         }
         if fold_subst.is_empty() {
@@ -12905,6 +12941,46 @@ impl Context {
         }
     }
 
+    /// The value of an `fp.is*` classification predicate on a concrete `eb+sb`-bit
+    /// FP pattern. `None` for a non-classification op.
+    fn fp_classify_const(op: &str, bits: u64, eb: u32, sb: u32) -> Option<bool> {
+        if sb == 0 {
+            return None;
+        }
+        let exp_mask = (1u64 << eb) - 1;
+        let sign = (bits >> (eb + sb - 1)) & 1;
+        let exp = (bits >> (sb - 1)) & exp_mask;
+        let mant = bits & ((1u64 << (sb - 1)) - 1);
+        let is_nan = exp == exp_mask && mant != 0;
+        let is_inf = exp == exp_mask && mant == 0;
+        let is_zero = exp == 0 && mant == 0;
+        let is_subnormal = exp == 0 && mant != 0;
+        let is_normal = exp != 0 && exp != exp_mask;
+        Some(match op {
+            "fp.isNaN" => is_nan,
+            "fp.isInfinite" => is_inf,
+            "fp.isZero" => is_zero,
+            "fp.isSubnormal" => is_subnormal,
+            "fp.isNormal" => is_normal,
+            "fp.isNegative" => sign == 1 && !is_nan,
+            "fp.isPositive" => sign == 0 && !is_nan,
+            _ => return None,
+        })
+    }
+
+    /// Whether a raw `eb+sb`-bit FP pattern is a NaN (exponent all ones,
+    /// significand nonzero). SMT-LIB's FP sort has a single NaN element, so any
+    /// two NaN patterns are the *same* value.
+    fn fp_is_nan_bits(bits: u64, eb: u32, sb: u32) -> bool {
+        if sb == 0 {
+            return false;
+        }
+        let exp_mask = (1u64 << eb) - 1;
+        let exp = (bits >> (sb - 1)) & exp_mask;
+        let mant = bits & ((1u64 << (sb - 1)) - 1);
+        exp == exp_mask && mant != 0
+    }
+
     /// Exact real value of a finite IEEE-754 constant of format `(eb, sb)` from its
     /// bits, as a dyadic rational. `None` for ±inf / NaN.
     fn fp_real_value(bits: u64, eb: u32, sb: u32) -> Option<Rational> {
@@ -13106,6 +13182,59 @@ impl Context {
         // signs differ ⇒ a<b iff a is the negative one (= sa1)
         let inner = self.m.mk_ite(both_pos, pos_lt, sa1);
         self.m.mk_ite(both_neg, neg_lt, inner)
+    }
+
+    /// `is-NaN` predicate directly over a `w = eb+sb` bit-vector: exponent all
+    /// ones and significand nonzero. Requires `sb >= 2`.
+    fn bv_is_nan(&mut self, bv: AstId, eb: u32, sb: u32) -> AstId {
+        let w = eb + sb;
+        let exp = self.m.mk_bv_extract(w - 2, sb - 1, bv);
+        let mant = self.m.mk_bv_extract(sb - 2, 0, bv);
+        let exp_zero = self.m.mk_bv(0, eb);
+        let exp_ones = self.m.mk_bvnot(exp_zero);
+        let mant_zero = self.m.mk_bv(0, sb - 1);
+        let is_exp_ones = self.m.mk_eq(exp, exp_ones);
+        let is_mant_zero = self.m.mk_eq(mant, mant_zero);
+        let mant_nz = self.m.mk_not(is_mant_zero);
+        self.m.mk_and(&[is_exp_ones, mant_nz])
+    }
+
+    /// Core `=` on two FloatingPoint terms, lowered to QF_BV. Element equality:
+    /// the bit-vectors match, *or* both are NaN (the FP sort has a single NaN
+    /// value, so `x` vs `fp.neg x` at `x = NaN` are equal despite the sign bit).
+    /// A concrete non-NaN operand collapses the NaN disjunct back to plain bit
+    /// equality — keeping `(= fp_to_bv(x) numeral)` a clean top-level pin for the
+    /// `fold_fp_rem` / `fold_fp_conversions` re-blast passes.
+    fn fp_core_eq(&mut self, a: AstId, b: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(a))?;
+        let ba = self.fp_to_bv(a)?;
+        let bb = self.fp_to_bv(b)?;
+        let bits_eq = self.m.mk_eq(ba, bb);
+        if sb < 2 {
+            return Some(bits_eq);
+        }
+        let a_nan_c = self
+            .fp_of
+            .get(&a)
+            .map(|&(bits, e, s)| Self::fp_is_nan_bits(bits, e, s));
+        let b_nan_c = self
+            .fp_of
+            .get(&b)
+            .map(|&(bits, e, s)| Self::fp_is_nan_bits(bits, e, s));
+        // A concretely-non-NaN operand makes `both NaN` unsatisfiable.
+        if a_nan_c == Some(false) || b_nan_c == Some(false) {
+            return Some(bits_eq);
+        }
+        let nan_a = match a_nan_c {
+            Some(true) => self.m.mk_true(),
+            _ => self.bv_is_nan(ba, eb, sb),
+        };
+        let nan_b = match b_nan_c {
+            Some(true) => self.m.mk_true(),
+            _ => self.bv_is_nan(bb, eb, sb),
+        };
+        let both_nan = self.m.mk_and(&[nan_a, nan_b]);
+        Some(self.m.mk_or(&[bits_eq, both_nan]))
     }
 
     /// A classification predicate (`fp.isNaN` …) as a Boolean over the bits of
@@ -14964,7 +15093,15 @@ impl Context {
                 if let Some(t) = self.fp_classify_bv(op, args[0]) {
                     return Ok(t);
                 }
-                self.symbolic_fp(op, args)
+                // Un-blastable operand (e.g. a `to_fp` of a symbolic real/int).
+                // Emit an opaque marker but record it, so `fold_fp_conversions`
+                // can resolve the predicate once the operand's value is pinned —
+                // otherwise the classification stays a free Boolean and the goal
+                // is a spurious `sat` (check_model decides it before the fold runs).
+                let app = self.symbolic_fp(op, args)?;
+                self.fp_class_markers
+                    .insert(app, (alloc::string::String::from(op), args[0]));
+                Ok(app)
             }
             "fp.rem" if args.len() == 2 => {
                 // Exact remainder for concrete operands (the bit-blast circuit
@@ -20078,6 +20215,17 @@ impl Context {
 
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // Fold `to_fp` conversions of arithmetic-pinned reals/ints (and the
+        // `fp.is*` classification markers over them) EAGERLY — check_model would
+        // otherwise treat the conversion / classification as a free term and
+        // return a spurious `sat` before the (Unknown-gated) fallback fold runs.
+        // The fold substitutes only sound consequences of top-level `v = k` pins,
+        // so the rewritten goal is equisatisfiable.
+        let goal = if self.fp_conv.is_empty() {
+            goal
+        } else {
+            self.fold_fp_conversions(goal).unwrap_or(goal)
+        };
         // Lower every FP structural equality to a bit-vector equality (including
         // ones nested under `not`, as `distinct` expands to), so a bit-blasted FP
         // op result (`fp.add`/`fp.roundToIntegral`/…) is decided by QF_BV rather
@@ -22075,22 +22223,26 @@ impl Context {
                 if head == "fp" && args.len() == 3 {
                     return self.mk_fp_literal(&args);
                 }
-                // Structural equality of two FP constants compares their bits.
+                // Structural equality of two FP constants compares their bits —
+                // except that all NaN patterns denote the single NaN element.
                 if head == "="
                     && args.len() == 2
-                    && let (Some(&(ba, _, _)), Some(&(bb, _, _))) =
+                    && let (Some(&(ba, eb, sb)), Some(&(bb, _, _))) =
                         (self.fp_of.get(&args[0]), self.fp_of.get(&args[1]))
                 {
-                    return Ok(self.mk_bool(ba == bb));
+                    let eq = ba == bb
+                        || (Self::fp_is_nan_bits(ba, eb, sb) && Self::fp_is_nan_bits(bb, eb, sb));
+                    return Ok(self.mk_bool(eq));
                 }
                 // Structural equality of FP terms (at least one symbolic) →
-                // bit-vector equality of their representations (QF_BV).
+                // bit-vector equality of their representations (QF_BV), with the
+                // single-NaN correction (see `fp_core_eq`).
                 if head == "="
                     && args.len() == 2
                     && self.fp_format_of(self.m.get_sort(args[0])).is_some()
-                    && let (Some(a), Some(b)) = (self.fp_to_bv(args[0]), self.fp_to_bv(args[1]))
+                    && let Some(t) = self.fp_core_eq(args[0], args[1])
                 {
-                    return Ok(self.m.mk_eq(a, b));
+                    return Ok(t);
                 }
                 // Int↔BV bridge: (= (bv2int a) c) / (= (int2bv x) c).
                 if head == "="
@@ -22328,8 +22480,17 @@ impl Context {
             let fps: Option<Vec<(u64, u32, u32)>> =
                 args.iter().map(|a| self.fp_of.get(a).copied()).collect();
             if let Some(fps) = fps {
-                let any_eq = (0..fps.len()).any(|i| (i + 1..fps.len()).any(|j| fps[i] == fps[j]));
-                let all_eq = fps.iter().all(|&f| f == fps[0]);
+                // Element equality: identical bits, or both NaN (single NaN value).
+                let elem_eq = |a: (u64, u32, u32), b: (u64, u32, u32)| {
+                    a == b
+                        || (a.1 == b.1
+                            && a.2 == b.2
+                            && Self::fp_is_nan_bits(a.0, a.1, a.2)
+                            && Self::fp_is_nan_bits(b.0, b.1, b.2))
+                };
+                let any_eq =
+                    (0..fps.len()).any(|i| (i + 1..fps.len()).any(|j| elem_eq(fps[i], fps[j])));
+                let all_eq = fps.iter().all(|&f| elem_eq(f, fps[0]));
                 return Ok(if head == "distinct" {
                     if any_eq {
                         self.m.mk_false()
