@@ -136,12 +136,19 @@ fn run_dimacs(path: &str) -> ExitCode {
 
 /// Run an SMT-LIB2 script file, printing one response line per `(check-sat)`.
 fn run_smt2_file(path: &str) -> ExitCode {
-    let text = match std::fs::read_to_string(path) {
-        Ok(t) => t,
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
         Err(e) => {
             eprintln!("z3rs: cannot read {path:?}: {e}");
             return ExitCode::from(1);
         }
+    };
+    // z3 reads scripts as raw bytes; fall back to a latin-1 decoding when the
+    // input is not valid UTF-8 (non-UTF8 bytes usually appear only in comments
+    // or string literals), so such files still parse.
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
     };
     match run_smt2(&text) {
         Ok(responses) => {
