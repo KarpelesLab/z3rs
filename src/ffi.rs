@@ -1011,18 +1011,38 @@ pub unsafe extern "C" fn Z3_solver_get_model(
 /// `(name, sort)` pairs for the 0-ary constants, in order.
 fn parse_model_consts(text: &str) -> alloc::vec::Vec<(String, Sort)> {
     let mut out = alloc::vec::Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with("(define-fun ") {
-            continue;
+    // Each definition is a balanced `(define-fun name () Sort body)` block that may
+    // span several lines (z3 puts the body on its own indented line), so scan for
+    // balanced blocks rather than parsing line-by-line.
+    let mut search = 0;
+    while let Some(rel) = text[search..].find("(define-fun") {
+        let start = search + rel;
+        let mut depth = 0i32;
+        let mut end = start;
+        for (j, c) in text[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + j;
+                        break;
+                    }
+                }
+                _ => {}
+            }
         }
-        // Peel exactly one outer paren pair, then split respecting nesting:
-        // ["define-fun", name, "()", <sort tokens...>, value].
-        let Some(inner) = line.strip_prefix('(').and_then(|r| r.strip_suffix(')')) else {
+        search = end + 1;
+        let Some(inner) = text[start..=end]
+            .strip_prefix('(')
+            .and_then(|r| r.strip_suffix(')'))
+        else {
             continue;
         };
-        let parts = crate::api::build::top_level_parts(inner);
-        // parts[0] = "define-fun", [1] = name, [2] = "()", then sort..., value.
+        // Collapse whitespace (including the body's newline) so token splitting is
+        // line-independent; parts = ["define-fun", name, "()", <sort…>, value].
+        let normalized = inner.split_whitespace().collect::<alloc::vec::Vec<_>>().join(" ");
+        let parts = crate::api::build::top_level_parts(&normalized);
         if parts.len() < 5 || parts[2] != "()" {
             continue; // not a 0-ary constant we can render
         }
