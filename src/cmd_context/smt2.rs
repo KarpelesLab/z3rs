@@ -319,6 +319,57 @@ fn render_fp(bits: u64, eb: u32, sb: u32) -> String {
     )
 }
 
+/// Render a dyadic rational `num / 2^k` as an exact decimal string (`"1.0"`,
+/// `"1.5"`, …). Dyadic rationals terminate, so this is exact.
+fn dyadic_decimal(num: &Int, k: u32) -> String {
+    if k == 0 {
+        return alloc::format!("{num}.0");
+    }
+    // num / 2^k = (num · 5^k) / 10^k.
+    let mut five_k = Int::from(1);
+    let five = Int::from(5);
+    for _ in 0..k {
+        five_k = five_k.mul(&five);
+    }
+    let scaled = num.mul(&five_k);
+    let mut digits = alloc::format!("{scaled}");
+    let k = k as usize;
+    while digits.len() <= k {
+        digits.insert(0, '0');
+    }
+    let point = digits.len() - k;
+    let int_part = &digits[..point];
+    let frac = digits[point..].trim_end_matches('0');
+    let frac = if frac.is_empty() { "0" } else { frac };
+    alloc::format!("{int_part}.{frac}")
+}
+
+/// Render a finite floating-point value in z3's `pp.fp_real_literals` form:
+/// `((_ to_fp eb sb) RTZ <significand> <exponent>)`, value = significand·2^exp.
+/// `None` for special values (NaN/±oo/±zero) and subnormals, which keep the
+/// canonical form.
+fn render_fp_real(bits: u64, eb: u32, sb: u32) -> Option<String> {
+    let mant = sb - 1;
+    let sign = (bits >> (eb + mant)) & 1;
+    let exp = (bits >> mant) & ((1u64 << eb) - 1);
+    let sig = bits & ((1u64 << mant) - 1);
+    let exp_ones = (1u64 << eb) - 1;
+    if exp == exp_ones || exp == 0 {
+        return None; // special value or subnormal: leave to render_fp
+    }
+    let bias = (1i64 << (eb - 1)) - 1;
+    // Normalized significand in [1,2): 1 + sig/2^mant; exponent = exp − bias.
+    let num = Int::from((1u64 << mant) + sig);
+    let e = exp as i64 - bias;
+    let decimal = dyadic_decimal(&num, mant);
+    let signed = if sign == 1 {
+        alloc::format!("-{decimal}")
+    } else {
+        decimal
+    };
+    Some(alloc::format!("((_ to_fp {eb} {sb}) RTZ {signed} {e})"))
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -3410,6 +3461,11 @@ impl Context {
             }
             bits
         };
+        if self.params.get_bool(":pp.fp_real_literals", false)
+            && let Some(r) = render_fp_real(bits, eb, sb)
+        {
+            return Some(r);
+        }
         Some(render_fp(bits, eb, sb))
     }
 
