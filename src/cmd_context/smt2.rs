@@ -1218,6 +1218,11 @@ struct Context {
     /// Soft constraints (`assert-soft`) as `(penalty indicator bool, weight)`;
     /// `check-sat` minimizes the total weight of the violated ones (MaxSAT).
     soft: Vec<(AstId, i64)>,
+    /// The `:id` group name shared by the `assert-soft` constraints (empty when
+    /// none is given), and the minimized total penalty after the last optimize —
+    /// reported by `get-objectives` as an anonymous MaxSAT objective.
+    soft_id: String,
+    penalty_value: Option<String>,
     /// The interned `String` sort, once used.
     string_sort: Option<AstId>,
     /// String literal text → its distinct constant of the `String` sort.
@@ -2145,6 +2150,8 @@ impl Context {
             objectives: Vec::new(),
             objective_values: Vec::new(),
             soft: Vec::new(),
+            soft_id: String::new(),
+            penalty_value: None,
             string_sort: None,
             str_lits: BTreeMap::new(),
             str_len_decl: None,
@@ -2811,6 +2818,13 @@ impl Context {
                 // total weight of the softs whose pᵢ is forced true.
                 let f = self.term(&list[1])?;
                 let weight = attr_int(list, ":weight").unwrap_or(1);
+                if let Some(pos) = list
+                    .iter()
+                    .position(|s| matches!(s, SExpr::Atom(a) if a == ":id"))
+                    && let Some(SExpr::Atom(id)) = list.get(pos + 1)
+                {
+                    self.soft_id = id.clone();
+                }
                 let name = alloc::format!("!soft!{}", self.fresh_counter);
                 self.fresh_counter += 1;
                 let b = self.m.mk_bool_sort();
@@ -16090,6 +16104,18 @@ impl Context {
         for (i, (obj, maximize, _)) in objs.iter().enumerate() {
             let (obj, maximize) = (*obj, *maximize);
             let osort = self.m.get_sort(obj);
+            if let Some(w) = self.m.bv_sort_width(osort) {
+                // Bit-vector objective: optimize the unsigned value by bisection
+                // over the fixed range [0, 2^w − 1]. z3 renders it as a decimal.
+                if let Some(v) = self.opt_bv_search(obj, maximize, w, &fixed) {
+                    values[i] = render_int(&v);
+                    let bv = self.m.mk_bv_numeral(v, w);
+                    let eq = self.m.mk_eq(obj, bv);
+                    fixed.push(eq);
+                    model = self.check_with(&fixed).1;
+                }
+                continue;
+            }
             if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
                 // Real objective: Fourier–Motzkin optimum, then verify it.
                 match self.real_optimize(obj, maximize, &fixed) {
@@ -16144,8 +16170,10 @@ impl Context {
                 OptResult::Unknown => {}
             }
         }
-        // `get-objectives` reports only the user objectives, not the penalty.
+        // The MaxSAT penalty is reported as an anonymous objective, the user
+        // objectives after it.
         self.objective_values = values.split_off(user_start);
+        self.penalty_value = (user_start > 0).then(|| values[0].clone());
         (SmtResult::Sat, model)
     }
 
@@ -16305,9 +16333,74 @@ impl Context {
         OptResult::Optimum(lo)
     }
 
+    /// Optimize the **unsigned** value of a bit-vector objective by bisection
+    /// over the fixed range `[0, 2^w − 1]`. Returns the optimal value, or `None`
+    /// on budget exhaustion. `fixed` is asserted alongside the base assertions.
+    fn opt_bv_search(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        w: u32,
+        fixed: &[AstId],
+    ) -> Option<Int> {
+        let mut budget = 2 * w as i32 + 8;
+        // `obj ≥ k` (maximize) / `obj ≤ k` (minimize), both unsigned.
+        let sat_bound = |ctx: &mut Self, k: &Int, budget: &mut i32| -> Option<bool> {
+            if *budget <= 0 {
+                return None;
+            }
+            *budget -= 1;
+            let kv = ctx.m.mk_bv_numeral(k.clone(), w);
+            let c = if maximize {
+                ctx.m.mk_bvule(kv, obj)
+            } else {
+                ctx.m.mk_bvule(obj, kv)
+            };
+            let mut ex = fixed.to_vec();
+            ex.push(c);
+            Some(ctx.check_with(&ex).0 == SmtResult::Sat)
+        };
+        let two = Int::from(2);
+        let maxval = pow2(w).sub(&Int::from(1));
+        let (mut lo, mut hi) = (Int::from(0), maxval);
+        while lo < hi {
+            let sum = lo.add(&hi);
+            let mid = if maximize {
+                // ceil((lo+hi)/2) to make progress toward hi
+                sum.add(&Int::from(1))
+                    .div_rem(&two)
+                    .map(|(q, _)| q)
+                    .unwrap()
+            } else {
+                sum.div_rem(&two).map(|(q, _)| q).unwrap()
+            };
+            match sat_bound(self, &mid, &mut budget)? {
+                true => {
+                    if maximize {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                false => {
+                    if maximize {
+                        hi = mid.sub(&Int::from(1));
+                    } else {
+                        lo = mid.add(&Int::from(1));
+                    }
+                }
+            }
+        }
+        Some(lo)
+    }
+
     /// The `(objectives …)` response after an optimizing `check-sat`.
     fn get_objectives(&self) -> String {
         let mut out = String::from("(objectives");
+        if let Some(pen) = &self.penalty_value {
+            // The MaxSAT penalty is an anonymous objective (its `:id`, or empty).
+            out.push_str(&alloc::format!("\n ({} {pen})", self.soft_id));
+        }
         for ((_, _, text), val) in self.objectives.iter().zip(&self.objective_values) {
             out.push_str(&alloc::format!("\n ({text} {val})"));
         }
@@ -20591,7 +20684,12 @@ impl Context {
         if let Some(w) = self.m.bv_sort_width(sort) {
             return alloc::format!("(_ BitVec {w})");
         }
-        if let Some(&(eb, sb)) = self.fp_sorts.iter().find(|&(_, &s)| s == sort).map(|(k, _)| k) {
+        if let Some(&(eb, sb)) = self
+            .fp_sorts
+            .iter()
+            .find(|&(_, &s)| s == sort)
+            .map(|(k, _)| k)
+        {
             return alloc::format!("(_ FloatingPoint {eb} {sb})");
         }
         self.m
