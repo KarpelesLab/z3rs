@@ -10135,6 +10135,210 @@ impl Context {
         axioms
     }
 
+    /// Sets of terms the top-level conjuncts prove strictly positive / strictly
+    /// negative. Seeded from comparisons against a numeral (`0 < a`, `a ≥ 1`, …)
+    /// and closed under order chaining (`x ≤ y ∧ x > 0 ⇒ y > 0`) to a fixpoint.
+    /// Sound (only definite strict-sign facts are inserted); used to orient the
+    /// sign-aware division-comparison linearization.
+    fn sign_sets(&self, top: &[AstId]) -> (BTreeSet<AstId>, BTreeSet<AstId>) {
+        use crate::ast::ArithOp;
+        let num = |t: AstId| self.m.as_numeral(t);
+        let mut pos: BTreeSet<AstId> = BTreeSet::new();
+        let mut neg: BTreeSet<AstId> = BTreeSet::new();
+        for _ in 0..(top.len() + 2) {
+            let mut changed = false;
+            for &c in top {
+                let Some(op) = self.m.arith_op(c) else {
+                    continue;
+                };
+                if self.m.app_args(c).len() != 2 {
+                    continue;
+                }
+                let (l, r) = (self.m.app_args(c)[0], self.m.app_args(c)[1]);
+                // Normalise every comparison to `lo <(=) hi`.
+                let (lo, hi, strict) = match op {
+                    ArithOp::Lt => (l, r, true),
+                    ArithOp::Le => (l, r, false),
+                    ArithOp::Gt => (r, l, true),
+                    ArithOp::Ge => (r, l, false),
+                    _ => continue,
+                };
+                // `hi > 0`: from `lo <(=) hi` with `lo` known `≥ 0` (strict) or
+                // `> 0` (non-strict).
+                let lo_pos = pos.contains(&lo) || num(lo).is_some_and(|v| v.is_positive());
+                let lo_nonneg = lo_pos || num(lo).is_some_and(|v| !v.is_negative());
+                if !pos.contains(&hi) && ((strict && lo_nonneg) || (!strict && lo_pos)) {
+                    pos.insert(hi);
+                    changed = true;
+                }
+                // `lo < 0`: from `lo <(=) hi` with `hi` known `≤ 0` (strict) or
+                // `< 0` (non-strict).
+                let hi_neg = neg.contains(&hi) || num(hi).is_some_and(|v| v.is_negative());
+                let hi_nonpos = hi_neg || num(hi).is_some_and(|v| !v.is_positive());
+                if !neg.contains(&lo) && ((strict && hi_nonpos) || (!strict && hi_neg)) {
+                    neg.insert(lo);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        (pos, neg)
+    }
+
+    /// `Some(true)`/`Some(false)` if `d` is a positive/negative numeral or is in
+    /// the proven positive/negative set; `None` if its sign is unknown.
+    fn div_sign(
+        m: &AstManager,
+        pos: &BTreeSet<AstId>,
+        neg: &BTreeSet<AstId>,
+        d: AstId,
+    ) -> Option<bool> {
+        if let Some(v) = m.as_numeral(d) {
+            return if v.is_positive() {
+                Some(true)
+            } else if v.is_negative() {
+                Some(false)
+            } else {
+                None
+            };
+        }
+        if pos.contains(&d) {
+            Some(true)
+        } else if neg.contains(&d) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Sign-aware linearization of comparisons that involve a real-division
+    /// quotient with a provably-signed divisor. For each comparison atom in the
+    /// goal that mentions a lifted `(/ p d)` whose divisor `d` is provably `> 0`
+    /// or `< 0`, emit the equivalent cleared-denominator atom as an `iff`
+    /// (`q ⋈ e ⟺ p ⋈' e·d`, direction flipped for a negative `d`) — but only when
+    /// the cleared form is linear (a constant numerator/threshold cancels the
+    /// opaque product). This lets the linear engine divide an inequality by the
+    /// signed divisor, which it can't do across the opaque `q·d`. Refutes
+    /// `0<a<b ∧ ¬(1<b/a)` (nl52) and `0<x≤y ∧ ¬(1/y ≤ 1/x)` (t196). Every emitted
+    /// `iff` is a valid consequence (sound); a comparison whose cleared form is
+    /// nonlinear or whose divisor sign is unknown is skipped.
+    fn realdiv_compare_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        if self.symbolic_realdiv.is_empty() {
+            return Vec::new();
+        }
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        // q -> (numerator p, divisor d)
+        let mut qmap: BTreeMap<AstId, (AstId, AstId)> = BTreeMap::new();
+        for &(p, d, q) in &self.symbolic_realdiv {
+            if present.contains(&q) {
+                qmap.insert(q, (p, d));
+            }
+        }
+        if qmap.is_empty() {
+            return Vec::new();
+        }
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let (pos, neg) = self.sign_sets(&top);
+        let flip = |op: ArithOp| match op {
+            ArithOp::Lt => ArithOp::Gt,
+            ArithOp::Le => ArithOp::Ge,
+            ArithOp::Gt => ArithOp::Lt,
+            _ => ArithOp::Le,
+        };
+        let mut axioms = Vec::new();
+        for t in self.m.postorder(goal) {
+            let Some(op) = self.m.arith_op(t) else {
+                continue;
+            };
+            if !matches!(op, ArithOp::Lt | ArithOp::Le | ArithOp::Gt | ArithOp::Ge) {
+                continue;
+            }
+            if self.m.app_args(t).len() != 2 {
+                continue;
+            }
+            let (l, r) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+            let lq = qmap.get(&l).copied();
+            let rq = qmap.get(&r).copied();
+            // Divisor signs (immutable read; released before any construction).
+            let sl = lq.and_then(|(_, dl)| Self::div_sign(&self.m, &pos, &neg, dl));
+            let sr = rq.and_then(|(_, dr)| Self::div_sign(&self.m, &pos, &neg, dr));
+            // (out_op, left, right) of the cleared-denominator comparison. `lin_mul`
+            // folds the scalar factor (`1·x → x`) so the cleared side is a clean
+            // linear term — a residual `(* 1 x)` is not recognised by the LRA as
+            // the leaf `x`, which would break the atom sharing the emitted `iff`
+            // depends on to propagate.
+            let cleared: Option<(ArithOp, AstId, AstId)> = match (lq, rq) {
+                (Some((pl, dl)), None) => sl.map(|s| {
+                    let ed = self.lin_mul(r, dl);
+                    (if s { op } else { flip(op) }, pl, ed)
+                }),
+                (None, Some((pr, dr))) => sr.map(|s| {
+                    let ed = self.lin_mul(l, dr);
+                    (if s { op } else { flip(op) }, ed, pr)
+                }),
+                (Some((pl, dl)), Some((pr, dr))) => match (sl, sr) {
+                    (Some(s_l), Some(s_r)) => {
+                        let left = self.lin_mul(pl, dr);
+                        let right = self.lin_mul(pr, dl);
+                        // Sign of the multiplier `dl·dr`: preserve if equal, flip
+                        // if opposite.
+                        let out = if s_l == s_r { op } else { flip(op) };
+                        Some((out, left, right))
+                    }
+                    _ => None,
+                },
+                (None, None) => None,
+            };
+            let Some((out_op, left, right)) = cleared else {
+                continue;
+            };
+            let cross = match out_op {
+                ArithOp::Lt => self.m.mk_lt(left, right),
+                ArithOp::Le => self.m.mk_le(left, right),
+                ArithOp::Gt => self.m.mk_gt(left, right),
+                _ => self.m.mk_ge(left, right),
+            };
+            // Only useful (and only emitted) when the cleared form is linear — a
+            // residual product of two variables gains nothing.
+            if self.arith_nonlinear(cross) {
+                continue;
+            }
+            axioms.push(self.m.mk_eq(t, cross));
+        }
+        axioms
+    }
+
+    /// `a·b` with the scalar factor folded away when one operand is a numeral
+    /// (`1·x → x`, `c·k → ck`, `0·x → 0`), so the result is a leaf/monomial the
+    /// LRA recognises rather than an opaque `(* 1 x)` product.
+    fn lin_mul(&mut self, a: AstId, b: AstId) -> AstId {
+        match (self.m.as_numeral(a), self.m.as_numeral(b)) {
+            (Some(x), Some(y)) => {
+                let is_int = self.m.is_int_sort(self.m.get_sort(a))
+                    && self.m.is_int_sort(self.m.get_sort(b));
+                self.m.mk_numeral(&x * &y, is_int)
+            }
+            (Some(x), None) if x.is_zero() => a,
+            (None, Some(y)) if y.is_zero() => b,
+            (Some(x), None) if x == rat(1) => b,
+            (None, Some(y)) if y == rat(1) => a,
+            _ => self.m.mk_mul(&[a, b]),
+        }
+    }
+
     /// Whether the goal's top-level conjuncts prove `d ≠ 0` (a nonzero numeral, an
     /// explicit `d ≠ 0`, or a comparison to a constant that excludes 0).
     fn divisor_nonzero(&self, d: AstId, top: &[AstId]) -> bool {
@@ -14364,6 +14568,7 @@ impl Context {
         let lifted = {
             let mut id = self.divmod_nonzero_identity(lifted);
             id.extend(self.realdiv_nonzero_identity(lifted));
+            id.extend(self.realdiv_compare_axioms(lifted));
             if id.is_empty() {
                 lifted
             } else {
