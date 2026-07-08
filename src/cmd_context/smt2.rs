@@ -1325,6 +1325,11 @@ struct Context {
     /// Opaque `fp.rem` markers -> (x, y, eb, sb). Folded once both operands are
     /// pinned to concrete FP constants by top-level equalities.
     fp_rem_markers: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
+    /// Unspecified `fp.to_ubv`/`fp.to_sbv` results (NaN/∞/out-of-range constant
+    /// input, constant rounding mode), cached by `(signed, m, rm, x)` so identical
+    /// applications share one free bit-vector (z3 congruence: the result is an
+    /// uninterpreted value distinguished by the full application).
+    fp_to_bv_unspec: BTreeMap<(bool, u32, AstId, AstId), AstId>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2232,6 +2237,7 @@ impl Context {
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
+            fp_to_bv_unspec: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
@@ -21742,20 +21748,40 @@ impl Context {
                         if (1..=63).contains(&m)
                             && let Some(rmc) = self.rm_code(rm)
                             && let Some(&(bits, eb, sb)) = self.fp_of.get(&x)
-                            && let Some(r) = Self::fp_real_value(bits, eb, sb)
-                            && let Some(v) = Self::round_rational_to_int(&r, rmc)
                         {
-                            let in_range = if signed {
-                                let hi = 1i64 << (m - 1);
-                                v >= -hi && v < hi
-                            } else {
-                                v >= 0 && (m == 64 || v < (1i64 << m))
-                            };
-                            if in_range {
+                            // Constant FP input and constant rounding mode: either an
+                            // exact in-range integer (folded), or an UNSPECIFIED result
+                            // (NaN/∞ ⇒ no real value, or a finite value out of range).
+                            // z3 models the unspecified case as an uninterpreted value
+                            // distinguished by the full application, so cache a free
+                            // bit-vector by `(signed, m, rm, x)` — congruent, and free to
+                            // take any value (matching z3, yielding a real `sat`).
+                            let folded = Self::fp_real_value(bits, eb, sb)
+                                .and_then(|r| Self::round_rational_to_int(&r, rmc))
+                                .filter(|&v| {
+                                    if signed {
+                                        let hi = 1i64 << (m - 1);
+                                        v >= -hi && v < hi
+                                    } else {
+                                        v >= 0 && (m == 64 || v < (1i64 << m))
+                                    }
+                                });
+                            if let Some(v) = folded {
                                 return Ok(self.m.mk_bv_numeral(Int::from(v), m));
                             }
+                            let key = (signed, m, rm, x);
+                            if let Some(&t) = self.fp_to_bv_unspec.get(&key) {
+                                return Ok(t);
+                            }
+                            let s = self.m.mk_bv_sort(m);
+                            let t = self.fresh_const(s);
+                            self.fp_to_bv_unspec.insert(key, t);
+                            return Ok(t);
                         }
-                        // Could not fold: a fresh, gated bit-vector → sound unknown.
+                        // Symbolic input (or symbolic rounding mode): a genuine
+                        // conversion whose value we cannot fold. Gate to a sound
+                        // `unknown` (a free bit-vector would be unsound — it must equal
+                        // the real conversion of the eventual FP value).
                         let s = self.m.mk_bv_sort(m);
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
