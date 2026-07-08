@@ -1346,6 +1346,12 @@ struct Context {
     /// pinned to a concrete FP constant (via `fold_fp_conversions`), so the
     /// predicate does not stay a free Boolean (a fuzz-found spurious `sat`).
     fp_class_markers: BTreeMap<AstId, (alloc::string::String, AstId)>,
+    /// Opaque FP comparison-predicate markers (`fp.eq`/`fp.lt`/`fp.leq`/`fp.gt`/
+    /// `fp.geq` whose operands could not be bit-blasted, e.g. `to_fp` conversions
+    /// of symbolic reals/ints) -> (op name, lhs, rhs). Resolved once both operands
+    /// are pinned to concrete FP constants (via `fold_fp_conversions`), so the
+    /// predicate does not stay a free Boolean (a fuzz-found spurious `sat`).
+    fp_cmp_markers: BTreeMap<AstId, (alloc::string::String, AstId, AstId)>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2253,6 +2259,7 @@ impl Context {
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
             fp_class_markers: BTreeMap::new(),
+            fp_cmp_markers: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
             fp_to_bv_unspec: BTreeMap::new(),
             fp_minmax_zero_sign: BTreeMap::new(),
@@ -3682,6 +3689,32 @@ impl Context {
                 && let Some(b) = Self::fp_classify_const(op, bits, eb, sb)
             {
                 let bv = self.mk_bool(b);
+                fold_subst.push((*app, bv));
+            }
+        }
+        // Resolve `fp.eq`/`fp.lt`/… comparison markers whose *both* operands are
+        // now concrete FP values, so the predicate does not stay a free Boolean.
+        let cmp_markers: Vec<(AstId, alloc::string::String, AstId, AstId)> = self
+            .fp_cmp_markers
+            .iter()
+            .filter(|(app, _)| present.contains(app))
+            .map(|(&app, (op, a, b))| (app, op.clone(), *a, *b))
+            .collect();
+        for (app, op, a, b) in &cmp_markers {
+            let va = bits_of
+                .get(a)
+                .copied()
+                .or_else(|| self.fp_of.get(a).copied());
+            let vb = bits_of
+                .get(b)
+                .copied()
+                .or_else(|| self.fp_of.get(b).copied());
+            if let (Some((xb, eb, sb)), Some((yb, eb2, sb2))) = (va, vb)
+                && eb == eb2
+                && sb == sb2
+                && let Some(r) = Self::fp_compare_const(op, xb, yb, eb, sb)
+            {
+                let bv = self.mk_bool(r);
                 fold_subst.push((*app, bv));
             }
         }
@@ -12975,6 +13008,65 @@ impl Context {
         })
     }
 
+    /// Concrete IEEE-754 ordered/`fp.eq` comparison of two raw bit patterns of
+    /// format `(eb, sb)`. Any comparison involving NaN is `false`; `+0` and `-0`
+    /// compare equal; ±inf order against finite/each other as extended reals.
+    /// `None` for an unsupported predicate.
+    fn fp_compare_const(op: &str, xb: u64, yb: u64, eb: u32, sb: u32) -> Option<bool> {
+        use core::cmp::Ordering;
+        if sb == 0 {
+            return None;
+        }
+        let exp_mask = (1u64 << eb) - 1;
+        let classify = |bits: u64| -> (u64, bool, bool) {
+            let sign = (bits >> (eb + sb - 1)) & 1;
+            let exp = (bits >> (sb - 1)) & exp_mask;
+            let mant = bits & ((1u64 << (sb - 1)) - 1);
+            (
+                sign,
+                exp == exp_mask && mant != 0,
+                exp == exp_mask && mant == 0,
+            )
+        };
+        let (sx, nx, ix) = classify(xb);
+        let (sy, ny, iy) = classify(yb);
+        if nx || ny {
+            // Every ordered/equality comparison with NaN is false.
+            return Some(false);
+        }
+        // Extended-real ordering: -inf < finite < +inf, `-0 == +0`.
+        let cmp = match (ix, iy) {
+            (true, true) => (sy as i32).cmp(&(sx as i32)), // -inf(sign1)<+inf(sign0)
+            (true, false) => {
+                if sx == 1 {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                }
+            }
+            (false, true) => {
+                if sy == 1 {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            (false, false) => {
+                let a = Self::fp_real_value(xb, eb, sb)?;
+                let b = Self::fp_real_value(yb, eb, sb)?;
+                a.cmp(&b)
+            }
+        };
+        Some(match op {
+            "fp.eq" => cmp == Ordering::Equal,
+            "fp.lt" => cmp == Ordering::Less,
+            "fp.leq" => cmp != Ordering::Greater,
+            "fp.gt" => cmp == Ordering::Greater,
+            "fp.geq" => cmp != Ordering::Less,
+            _ => return None,
+        })
+    }
+
     /// Whether a raw `eb+sb`-bit FP pattern is a NaN (exponent all ones,
     /// significand nonzero). SMT-LIB's FP sort has a single NaN element, so any
     /// two NaN patterns are the *same* value.
@@ -13037,8 +13129,11 @@ impl Context {
         // An opaque symbolic FP operation (e.g. fp.fma/fp.sqrt we cannot fold)
         // has a *determined* value we don't know; representing it as a free
         // bit-vector would be unsound (it would satisfy any equality). Refuse it
-        // so the surrounding goal keeps the `unknown` gate instead.
-        if self.str_symbolic.contains(&t) {
+        // so the surrounding goal keeps the `unknown` gate instead. The structural
+        // `is_opaque_fp_marker` check also refuses a marker whose arguments a fold
+        // pass substituted (dropping it from `str_symbolic`) — otherwise its result
+        // would become a free bit-vector and a spurious `sat`.
+        if self.str_symbolic.contains(&t) || self.is_opaque_fp_marker(t) {
             return None;
         }
         // `ite(c, a, b)` over FP: blast to a bit-vector `ite` of the branches, so
@@ -15097,7 +15192,16 @@ impl Context {
                 if let Some(t) = self.fp_compare_bv(op, args[0], args[1]) {
                     return Ok(t);
                 }
-                self.symbolic_fp(op, args)
+                // Un-blastable operand(s) (e.g. `to_fp` of a symbolic real/int).
+                // Emit an opaque marker but record it, so `fold_fp_conversions` can
+                // resolve the predicate once both operands are pinned to concrete
+                // FP constants — otherwise it stays a free Boolean and a fold that
+                // substitutes a pinned operand *into* the marker's arguments (which
+                // drops it from `str_symbolic`) yields a spurious `sat`.
+                let app = self.symbolic_fp(op, args)?;
+                self.fp_cmp_markers
+                    .insert(app, (alloc::string::String::from(op), args[0], args[1]));
+                Ok(app)
             }
             "fp.isNaN" | "fp.isInfinite" | "fp.isZero" | "fp.isNormal" | "fp.isSubnormal"
             | "fp.isNegative" | "fp.isPositive"
@@ -20380,12 +20484,16 @@ impl Context {
                 return (SmtResult::Unknown, None);
             }
         }
+        // Every `!fpop!`/`!fpr2i!` marker is inserted into `str_symbolic` when
+        // created, so a non-empty `str_symbolic` is a necessary precondition for
+        // any (even a fold-substituted) opaque FP marker to be present — keep it as
+        // a cheap short-circuit before the structural postorder scan.
         let has_symbolic_str = !self.str_symbolic.is_empty()
             && self
                 .m
                 .postorder(goal)
                 .iter()
-                .any(|t| self.str_symbolic.contains(t));
+                .any(|t| self.str_symbolic.contains(t) || self.is_opaque_fp_marker(*t));
         if has_symbolic_str {
             let (res0, model0) = check_model(&self.m, goal);
             if res0 == SmtResult::Unsat {
@@ -22332,6 +22440,27 @@ impl Context {
     /// The declaration name of a function/constant.
     fn decl_name(&self, decl: AstId) -> Option<String> {
         Some(self.m.func_decl(decl)?.name.as_str()?.to_string())
+    }
+
+    /// A term that is an application of a symbolic FP-operation marker decl
+    /// (`!fpop!…` from `symbolic_fp`, `!fpr2i!…` from a symbolic-rounding-mode
+    /// `roundToIntegral`). Such an application denotes a *determined but unknown*
+    /// floating-point value/predicate: check_model treats it as a free term.
+    ///
+    /// The parse-time markers are recorded in `str_symbolic` by their exact
+    /// `AstId`, but an eager fold pass (`fold_fp_conversions`/`fold_fp_rem`/…)
+    /// substitutes a pinned operand *inside* such a marker's arguments, producing
+    /// a fresh application that is no longer in `str_symbolic`. Recognising the
+    /// marker structurally by its decl name keeps the `unknown` gate sound across
+    /// those substitutions (otherwise the fresh app is a free term → spurious sat).
+    fn is_opaque_fp_marker(&self, t: AstId) -> bool {
+        self.m.is_app(t)
+            && !self.m.app_args(t).is_empty()
+            && self
+                .m
+                .func_decl(self.m.app_decl(t))
+                .and_then(|d| d.name.as_str())
+                .is_some_and(|n| n.starts_with("!fpop!") || n.starts_with("!fpr2i!"))
     }
 
     /// For a datatype `sort` and constructor name `cname`, the tester guard
