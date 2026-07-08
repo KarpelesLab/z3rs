@@ -2668,6 +2668,13 @@ impl Context {
                     return Err("eval requires a preceding satisfiable check-sat".to_string());
                 }
                 let id = self.term(&list[1])?;
+                // An asserted formula (a top-level conjunct of the assertions)
+                // holds in every satisfying model, so its value is `true`
+                // regardless of the concrete model recorded — and `(not …)` of one
+                // is `false`. Genuine: the check-sat returned `sat`.
+                if let Some(b) = self.asserted_truth(id) {
+                    return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                }
                 let mut model = self.last_model.take().unwrap();
                 let v = self
                     .eval_array_value(id)
@@ -5578,6 +5585,31 @@ impl Context {
                 return None;
             }
         }
+    }
+
+    /// If `id` is a top-level conjunct of the assertions, it holds in every model
+    /// → `Some(true)`; if it is `(not c)` for such a conjunct `c`, `Some(false)`.
+    /// `None` otherwise. Sound only after a `sat` verdict.
+    fn asserted_truth(&self, id: AstId) -> Option<bool> {
+        let mut conjuncts: BTreeSet<AstId> = BTreeSet::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend_from_slice(self.m.app_args(t));
+            } else {
+                conjuncts.insert(t);
+            }
+        }
+        if conjuncts.contains(&id) {
+            return Some(true);
+        }
+        if self.m.is_not(id) {
+            let inner = self.m.app_args(id)[0];
+            if conjuncts.contains(&inner) {
+                return Some(false);
+            }
+        }
+        None
     }
 
     /// True if `x` is a user-declared 0-ary constant (not a value/builtin).
