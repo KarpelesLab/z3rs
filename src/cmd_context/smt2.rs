@@ -1311,8 +1311,10 @@ struct Context {
     sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
     /// Floating-point sorts `(_ FloatingPoint eb sb)`, keyed by `(eb, sb)`.
     fp_sorts: BTreeMap<(u32, u32), AstId>,
-    /// Opaque to_fp conversion markers -> (rm, x, eb, sb).
-    fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
+    /// Opaque to_fp conversion markers -> (rm, x, eb, sb, unsigned). `unsigned`
+    /// records whether the source was `to_fp_unsigned` (only meaningful when `x`
+    /// is a bit-vector, where the sign of the top bit changes the numeric value).
+    fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32, bool)>,
     /// Opaque `fp.rem` markers -> (x, y, eb, sb). Folded once both operands are
     /// pinned to concrete FP constants by top-level equalities.
     fp_rem_markers: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
@@ -3542,32 +3544,43 @@ impl Context {
                 conj.push(t);
             }
         }
+        // `subst`: arithmetic-numeral pins, safe to eliminate from the whole goal.
+        // `input_subst`: additionally carries bit-vector pins (`x = #x…`), used
+        // *only* to evaluate each conversion's input operand — never substituted
+        // into the goal at large, since a blasted-FP binding (`!fpbv!k = #x…`) is
+        // also a bit-vector pin, and eliminating it would drop a real constraint.
         let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        let mut input_subst: Vec<(AstId, AstId)> = Vec::new();
         for &c in &conj {
             if self.m.is_eq(c) {
                 let a = self.m.app_args(c);
                 if a.len() == 2 {
                     for (v, k) in [(a[0], a[1]), (a[1], a[0])] {
-                        if self.m.is_uninterp_const(v) && self.m.as_numeral(k).is_some() {
-                            subst.push((v, k));
+                        if self.m.is_uninterp_const(v) {
+                            if self.m.as_numeral(k).is_some() {
+                                subst.push((v, k));
+                                input_subst.push((v, k));
+                            } else if self.m.bv_numeral_value(k).is_some() {
+                                input_subst.push((v, k));
+                            }
                         }
                     }
                 }
             }
         }
-        if subst.is_empty() {
+        if input_subst.is_empty() {
             return None;
         }
         let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
-        let convs: Vec<(AstId, AstId, AstId, u32, u32)> = self
+        let convs: Vec<(AstId, AstId, AstId, u32, u32, bool)> = self
             .fp_conv
             .iter()
             .filter(|(t, _)| present.contains(t))
-            .map(|(&t, &(rm, x, eb, sb))| (t, rm, x, eb, sb))
+            .map(|(&t, &(rm, x, eb, sb, uns))| (t, rm, x, eb, sb, uns))
             .collect();
         let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
-        for (t, rm, x, eb, sb) in &convs {
-            let xs = crate::rewriter::substitute(&mut self.m, *x, &subst);
+        for (t, rm, x, eb, sb, uns) in &convs {
+            let xs = crate::rewriter::substitute(&mut self.m, *x, &input_subst);
             let xs = crate::rewriter::simplify(&mut self.m, xs);
             let val = self.m.as_numeral(xs).or_else(|| {
                 if self.m.is_app(xs)
@@ -3575,6 +3588,25 @@ impl Context {
                     && self.decl_name(self.m.app_decl(xs)).as_deref() == Some("to_real")
                 {
                     self.m.as_numeral(self.m.app_args(xs)[0])
+                } else if let (Some(w), Some(bv)) = (
+                    self.m.bv_sort_width(self.m.get_sort(xs)),
+                    self.m.bv_numeral_value(xs),
+                ) {
+                    // `((_ to_fp eb sb) RM bv)` / `to_fp_unsigned`: interpret the
+                    // pinned bit-vector as a signed/unsigned machine integer.
+                    let two = Int::from(2);
+                    let mut uval = Int::from(0);
+                    for i in 0..w {
+                        if bv.bit(i) {
+                            uval = uval.add(&two.pow(i));
+                        }
+                    }
+                    let ival = if !uns && w > 0 && bv.bit(w - 1) {
+                        uval.sub(&two.pow(w))
+                    } else {
+                        uval
+                    };
+                    Some(Rational::from_integer(ival))
                 } else {
                     None
                 }
@@ -21513,7 +21545,9 @@ impl Context {
                         self.str_symbolic.insert(t);
                         if has_rm {
                             let rm = self.term(&l[1])?;
-                            self.fp_conv.insert(t, (rm, x, eb, sb));
+                            let is_unsigned =
+                                matches!(&qid[1], SExpr::Atom(a) if a == "to_fp_unsigned");
+                            self.fp_conv.insert(t, (rm, x, eb, sb, is_unsigned));
                         } else if self.m.bv_sort_width(self.m.get_sort(x)) == Some(eb + sb) {
                             // Symbolic bit-vector reinterpreted as FP: remember the link.
                             self.fp_from_bv.insert(t, (x, eb, sb));

@@ -1041,7 +1041,10 @@ fn parse_model_consts(text: &str) -> alloc::vec::Vec<(String, Sort)> {
         };
         // Collapse whitespace (including the body's newline) so token splitting is
         // line-independent; parts = ["define-fun", name, "()", <sort…>, value].
-        let normalized = inner.split_whitespace().collect::<alloc::vec::Vec<_>>().join(" ");
+        let normalized = inner
+            .split_whitespace()
+            .collect::<alloc::vec::Vec<_>>()
+            .join(" ");
         let parts = crate::api::build::top_level_parts(&normalized);
         if parts.len() < 5 || parts[2] != "()" {
             continue; // not a 0-ary constant we can render
