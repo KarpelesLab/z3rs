@@ -43,6 +43,29 @@ fn pp_numeral(r: &Rational, is_int: bool, out: &mut String) {
     }
 }
 
+/// Render a bit-vector numeral like z3: `#x…` when the width is a multiple of 4,
+/// otherwise `#b…`.
+fn pp_bv(v: &Int, width: u32, out: &mut String) {
+    let v = v.mod_2k(width);
+    if width > 0 && width.is_multiple_of(4) {
+        out.push_str("#x");
+        for nibble in (0..width / 4).rev() {
+            let mut d = 0u8;
+            for b in 0..4 {
+                if v.bit(nibble * 4 + b) {
+                    d |= 1 << b;
+                }
+            }
+            out.push(char::from_digit(d as u32, 16).unwrap());
+        }
+    } else {
+        out.push_str("#b");
+        for i in (0..width).rev() {
+            out.push(if v.bit(i) { '1' } else { '0' });
+        }
+    }
+}
+
 impl AstManager {
     /// Render `id` as an s-expression string.
     pub fn pp(&self, id: AstId) -> String {
@@ -75,6 +98,12 @@ impl AstManager {
                 if let Some(r) = self.as_numeral(id) {
                     let is_int = self.is_int_sort(self.get_sort(id));
                     pp_numeral(&r, is_int, out);
+                    return;
+                }
+                // Bit-vector numeral: `#x…` (width multiple of 4) or `#b…`.
+                if let Some(v) = self.bv_numeral_value(id) {
+                    let width = self.bv_sort_width(self.get_sort(id)).unwrap_or(0);
+                    pp_bv(&v, width, out);
                     return;
                 }
                 // Unary minus prints as `(* (- 1) x)`, matching z3's arith pp.

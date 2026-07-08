@@ -521,7 +521,7 @@ mod tests {
         let one = m.mk_bv(1, 8);
         let sum = m.mk_bvadd(x, one);
         assert_eq!(m.bv_sort_width(m.get_sort(sum)), Some(8));
-        assert_eq!(m.pp(sum), "(bvadd x bv1)");
+        assert_eq!(m.pp(sum), "(bvadd x #x01)");
         let cmp = m.mk_bvult(x, sum);
         assert_eq!(m.get_sort(cmp), m.mk_bool_sort());
     }
