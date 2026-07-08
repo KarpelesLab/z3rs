@@ -3199,6 +3199,39 @@ impl Context {
         Some(q)
     }
 
+    /// Apply the unary declaration `decl` to `arg`, distributing over any `ite`
+    /// in the argument: `f(ite(c,a,b)) = ite(c, f(a), f(b))` (sound for every
+    /// `f`). Used for datatype selectors/testers so they fold against the
+    /// constructor rebuilt inside an `update-field` `ite` chain.
+    fn apply_unary_over_ite(&mut self, decl: AstId, arg: AstId) -> AstId {
+        if self.m.is_ite(arg) {
+            let a = self.m.app_args(arg);
+            let (c, t, e) = (a[0], a[1], a[2]);
+            let ft = self.apply_unary_over_ite(decl, t);
+            let fe = self.apply_unary_over_ite(decl, e);
+            return self.m.mk_ite(c, ft, fe);
+        }
+        self.m.mk_app(decl, &[arg])
+    }
+
+    /// Distribute an equality over an `ite` operand:
+    /// `t = ite(c,a,b)` ⟺ `ite(c, t=a, t=b)` (sound for any `t`), recursively
+    /// so nested `ite`s (and both operands being `ite`) are handled. Leaf
+    /// equalities are built with `mk_eq` and fold via the datatype axioms.
+    fn eq_distrib_ite(&mut self, a: AstId, b: AstId) -> AstId {
+        if self.m.is_ite(b) {
+            let ar = self.m.app_args(b);
+            let (c, t, e) = (ar[0], ar[1], ar[2]);
+            let et = self.eq_distrib_ite(a, t);
+            let ee = self.eq_distrib_ite(a, e);
+            return self.m.mk_ite(c, et, ee);
+        }
+        if self.m.is_ite(a) {
+            return self.eq_distrib_ite(b, a);
+        }
+        self.m.mk_eq(a, b)
+    }
+
     /// If `t` is `(to_int a)`, return a fresh integer `k` with `k ≤ a < k + 1`
     /// (i.e. `k = ⌊a⌋`), memoized per argument. Constant arguments are folded
     /// earlier, so this handles the symbolic case.
@@ -5912,6 +5945,74 @@ impl Context {
             return Some(crate::rewriter::simplify(&mut self.m, applied));
         }
         None
+    }
+
+    /// Rewrite `select(arr, idx)` pushing through `(_ map f)` layers:
+    /// `select((_ map f) a…, i) → f(select(a, i)…)`, recursively, leaving a
+    /// select over a non-map array (plain variable, store, const) symbolic. This
+    /// is the AST-level analogue of the parser's map-select fold, needed for the
+    /// fresh index the extensionality axiom introduces (which never passes
+    /// through the parser). Sound: it is exactly the defining equation of `map`.
+    fn select_expand_map(&mut self, arr: AstId, idx: AstId) -> AstId {
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let selects: Vec<AstId> = arrays
+                .iter()
+                .map(|&a| self.select_expand_map(a, idx))
+                .collect();
+            if let Ok(applied) = self.apply(&fname, selects) {
+                return applied;
+            }
+        }
+        self.m.mk_select(arr, idx)
+    }
+
+    /// Decide `(_ map f)` array **equalities** pointwise and replace them with a
+    /// constant. For `(= A B)` with a map-array operand, expand both at a fresh
+    /// index `k` (pushing through the map layers) and check the resulting scalar
+    /// equation: if `A[k] = B[k]` is a tautology the arrays agree at every index,
+    /// so the equality is `true` (extensionality); if it is unsatisfiable they
+    /// differ at the arbitrary `k`, so the equality is `false`. Otherwise it is
+    /// left symbolic (and the map-array gate keeps a sound `unknown`). Sound:
+    /// only `k`-independent (constant) verdicts are used. Refutes the De Morgan
+    /// identity `(_ map and) a b = (_ map not) ((_ map or) …)`.
+    fn fold_map_equalities(&mut self, goal: AstId) -> AstId {
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let args = self.m.app_args(t).to_vec();
+            if args.len() != 2 {
+                continue;
+            }
+            let (a, b) = (args[0], args[1]);
+            if !self.m.is_array_sort(self.m.get_sort(a)) {
+                continue;
+            }
+            if !self.maps.contains_key(&a) && !self.maps.contains_key(&b) {
+                continue;
+            }
+            let Some((idx_sort, _)) = self.m.array_sort_params(self.m.get_sort(a)) else {
+                continue;
+            };
+            let k = self.fresh_const(idx_sort);
+            let la = self.select_expand_map(a, k);
+            let lb = self.select_expand_map(b, k);
+            let eq = self.m.mk_eq(la, lb);
+            let neq = self.m.mk_not(eq);
+            if check_model(&self.m, neq).0 == SmtResult::Unsat {
+                let tt = self.m.mk_true();
+                subst.push((t, tt));
+            } else if check_model(&self.m, eq).0 == SmtResult::Unsat {
+                let ff = self.m.mk_false();
+                subst.push((t, ff));
+            }
+        }
+        if subst.is_empty() {
+            return goal;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
     }
 
     /// The default value of ground array term `arr` (its value at almost every
@@ -18760,6 +18861,48 @@ impl Context {
         (Rational::from_integer(Int::from(1)), alloc::vec![t])
     }
 
+    /// Exponentiation with a zero exponent over a *symbolic* base: `(^ b 0) = 1`
+    /// whenever `b ≠ 0` (verified against z3 for both Int and Real). z3 leaves
+    /// `0^0` unspecified, so we emit only the sound disjunction
+    /// `b = 0 ∨ (^ b 0) = 1`. Combined with the rest of the goal this lets the
+    /// engine finish, e.g. `x > 0 ∧ y = x^0 ∧ y ≠ 1 → unsat`. The concrete
+    /// literal `(^ 0 0)` is left fully unconstrained (z3 itself is inconsistent
+    /// on it), so we skip numeral bases here.
+    fn power_zero_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let mut axioms = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            if self.decl_name(self.m.app_decl(t)).as_deref() != Some("^") {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            if args.len() != 2 {
+                continue;
+            }
+            let (base, exp) = (args[0], args[1]);
+            // Exponent must be the integer 0, base must be symbolic (a numeral
+            // base is either already folded — nonzero — or the pathological
+            // literal `0^0` that z3 leaves unconstrained).
+            let exp_is_zero = self
+                .m
+                .as_numeral(exp)
+                .is_some_and(|e| e.is_integer() && e.is_zero());
+            if !exp_is_zero || self.m.as_numeral(base).is_some() || !seen.insert(t) {
+                continue;
+            }
+            let is_int = self.m.is_int_sort(self.m.get_sort(t));
+            let zero = self.m.mk_numeral(rat(0), is_int);
+            let one = self.m.mk_numeral(rat(1), is_int);
+            let base_zero = self.m.mk_eq(base, zero);
+            let pow_one = self.m.mk_eq(t, one);
+            axioms.push(self.m.mk_or(&[base_zero, pow_one]));
+        }
+        axioms
+    }
+
     /// Product-cancellation: `x·y = k·x` (a shared variable factor) implies
     /// `x = 0 ∨ y = k` — a sound consequence that lets the linear engine finish
     /// (`x·y = 2·x ∧ x > 0 ∧ y ≠ 2` → unsat). Emitted per equality with a common
@@ -19301,6 +19444,7 @@ impl Context {
         axioms.extend(self.string_axioms(lifted));
         axioms.extend(self.square_axioms(lifted));
         axioms.extend(self.product_cancel_axioms(lifted));
+        axioms.extend(self.power_zero_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.fp_from_bv_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
@@ -19364,8 +19508,11 @@ impl Context {
                 .expect("array equality over a non-array sort");
             let k = self.fresh_const(idx_sort);
             let eq_ab = self.m.mk_eq(a, b);
-            let sel_a = self.m.mk_select(a, k);
-            let sel_b = self.m.mk_select(b, k);
+            // Push the fresh index through any `(_ map f)` layers so a map-array
+            // equality (e.g. the De Morgan identity `(_ map and) a b =
+            // (_ map not) …`) reduces to a per-index boolean tautology.
+            let sel_a = self.select_expand_map(a, k);
+            let sel_b = self.select_expand_map(b, k);
             let eq_reads = self.m.mk_eq(sel_a, sel_b);
             let neq_reads = self.m.mk_not(eq_reads);
             axioms.push(self.m.mk_or(&[eq_ab, neq_reads])); // a=b ∨ a[k]≠b[k]
@@ -20375,7 +20522,11 @@ impl Context {
         let goal = if self.maps.is_empty() {
             goal
         } else {
-            self.inline_map_bindings(goal)
+            let g = self.inline_map_bindings(goal);
+            // Decide any map-array *equality* pointwise (extensionality), so the
+            // De Morgan / commutativity identities over `(_ map f)` don't hit the
+            // conservative map-array `unknown` gate below.
+            self.fold_map_equalities(g)
         };
         // Eager UNSAT check for variable-bound ground datatype selector chains:
         // inline `v = <ground ctor>` to a fixpoint and fold the selector towers, then
@@ -21119,7 +21270,18 @@ impl Context {
                         && let Some(ei) = e.to_i64()
                         && ei <= 8
                     {
-                        return self.icp_to_poly(args[0], var_map).pow(ei as u32);
+                        // `x^0 = 1` is only valid for a base known to be nonzero:
+                        // z3 leaves `0^0` unspecified (`(distinct (^ 0 0) 1)` is
+                        // sat), so folding `x^0 → 1` unconditionally is unsound.
+                        // Fold only when the base is a nonzero numeral; otherwise
+                        // fall through to a fresh opaque variable.
+                        if ei == 0 {
+                            if self.m.as_numeral(args[0]).is_some_and(|b| !b.is_zero()) {
+                                return Polynomial::constant(Rational::from_integer(1.into()));
+                            }
+                        } else {
+                            return self.icp_to_poly(args[0], var_map).pow(ei as u32);
+                        }
                     }
                     // Non-constant / large exponent: fall through to a fresh var.
                 }
@@ -21736,7 +21898,7 @@ impl Context {
                         let x = self.term(&l[1])?;
                         // General multi-constructor datatype: apply the predicate.
                         if let Some(&tdecl) = self.tester_of.get(&cname) {
-                            return Ok(self.m.mk_app(tdecl, &[x]));
+                            return Ok(self.apply_unary_over_ite(tdecl, x));
                         }
                         // A record has a single constructor, so its tester is true.
                         if self.records.contains_key(&self.m.get_sort(x)) {
@@ -22674,6 +22836,19 @@ impl Context {
                 return Ok(res);
             }
         }
+        // A datatype/record equality with an `ite` operand distributes:
+        // `t = ite(c,a,b)` ⟺ `ite(c, t=a, t=b)` (sound for any `t`). Without
+        // this an `update-field` result — an `ite` chain over the rebuilt
+        // constructor — compared to another constructor stays a free equality,
+        // an unsound spurious sat (fuzz-found: `mk 0 0 false = update-field a x 2`).
+        if head == "=" && args.len() == 2 {
+            let s = self.m.get_sort(args[0]);
+            if (self.datatypes.contains_key(&s) || self.records.contains_key(&s))
+                && (self.m.is_ite(args[0]) || self.m.is_ite(args[1]))
+            {
+                return Ok(self.eq_distrib_ite(args[0], args[1]));
+            }
+        }
         let m = &mut self.m;
         // Bit-vector binary ops and comparisons require equal operand widths;
         // reject a mismatch (as z3 does) instead of building a garbage term.
@@ -22892,6 +23067,9 @@ impl Context {
                     m.as_numeral(args[1]).and_then(|v| v.to_integer()),
                 ) && let Some(e) = exp.to_i64()
                     && (0..=1024).contains(&e)
+                    // `0^0` is unspecified in z3 (`(distinct (^ 0 0) 1)` is sat),
+                    // so it must stay opaque rather than fold to 1.
+                    && !(e == 0 && base.is_zero())
                 {
                     let is_int = m.is_int_sort(m.get_sort(args[0]));
                     let mut acc = Rational::from_integer(puremp::Int::from(1));
@@ -23098,6 +23276,16 @@ impl Context {
             }
             name => {
                 if let Some(d) = self.funcs.get(name).copied() {
+                    // A datatype/record selector applied to an `ite` distributes:
+                    // `sel(ite(c,a,b)) = ite(c, sel(a), sel(b))`. This lets a
+                    // selector/tester over an `update-field` result (itself an
+                    // `ite` chain) fold against the rebuilt constructor.
+                    if args.len() == 1 && self.m.is_ite(args[0]) {
+                        let s = self.m.get_sort(args[0]);
+                        if self.datatypes.contains_key(&s) || self.records.contains_key(&s) {
+                            return Ok(self.apply_unary_over_ite(d, args[0]));
+                        }
+                    }
                     return Ok(self.m.mk_app(d, &args));
                 }
                 // z3's internal datatype tester spelling `(is-C x)` (equivalent to
@@ -23106,7 +23294,7 @@ impl Context {
                     && args.len() == 1
                 {
                     if let Some(&tdecl) = self.tester_of.get(cname) {
-                        return Ok(self.m.mk_app(tdecl, &args));
+                        return Ok(self.apply_unary_over_ite(tdecl, args[0]));
                     }
                     if self.records.contains_key(&self.m.get_sort(args[0])) {
                         return Ok(self.m.mk_true());
