@@ -171,23 +171,31 @@ impl Solver {
     /// assert!(model.iter().any(|(n, v)| n == "x" && v == "42"));
     /// ```
     pub fn get_model(&mut self) -> Result<Vec<(String, String)>, String> {
-        // `(get-model)` prints one `(define-fun name () Sort value)` per line.
+        // `(get-model)` prints each entry as
+        //   (define-fun name (params) Sort
+        //       value)
+        // with the body on its own indented line.
         let out = self.eval("(get-model)")?;
         let text = out.join("\n");
+        let lines: Vec<&str> = text.lines().collect();
         let mut pairs = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i].trim();
             let Some(rest) = line.strip_prefix("(define-fun ") else {
+                i += 1;
                 continue;
             };
-            let inner = rest.trim_end().trim_end_matches(')').trim();
-            // inner = "name () Sort... value"; name is the first token and the
-            // (scalar) value is the last.
-            let mut toks = inner.split_whitespace();
-            let Some(name) = toks.next() else { continue };
-            if let Some(value) = inner.split_whitespace().last() {
+            let Some(name) = rest.split_whitespace().next() else {
+                i += 1;
+                continue;
+            };
+            // The value is on the next line, e.g. "    42)".
+            if i + 1 < lines.len() {
+                let value = lines[i + 1].trim().trim_end_matches(')').trim();
                 pairs.push((name.to_string(), value.to_string()));
             }
+            i += 2;
         }
         Ok(pairs)
     }

@@ -11,6 +11,60 @@ use crate::ast::AstId;
 use crate::ast::manager::AstManager;
 use crate::ast::node::AstNode;
 use core::fmt::Write;
+use puremp::{Int, Rational};
+
+/// Render an arithmetic numeral the way z3's SMT pretty-printer does:
+/// non-negative integers verbatim, negatives as `(- n)`, and reals as `n.0`
+/// or `(/ p.0 q.0)`.
+fn pp_numeral(r: &Rational, is_int: bool, out: &mut String) {
+    if is_int {
+        if *r.numerator() < Int::from(0) {
+            let _ = write!(out, "(- {})", r.numerator().abs());
+        } else {
+            let _ = write!(out, "{}", r.numerator());
+        }
+        return;
+    }
+    let real = |n: &Int, out: &mut String| {
+        if *n < Int::from(0) {
+            let _ = write!(out, "(- {}.0)", n.abs());
+        } else {
+            let _ = write!(out, "{n}.0");
+        }
+    };
+    if r.is_integer() {
+        real(r.numerator(), out);
+    } else {
+        out.push_str("(/ ");
+        real(r.numerator(), out);
+        out.push(' ');
+        real(r.denominator(), out);
+        out.push(')');
+    }
+}
+
+/// Render a bit-vector numeral like z3: `#x…` when the width is a multiple of 4,
+/// otherwise `#b…`.
+fn pp_bv(v: &Int, width: u32, out: &mut String) {
+    let v = v.mod_2k(width);
+    if width > 0 && width.is_multiple_of(4) {
+        out.push_str("#x");
+        for nibble in (0..width / 4).rev() {
+            let mut d = 0u8;
+            for b in 0..4 {
+                if v.bit(nibble * 4 + b) {
+                    d |= 1 << b;
+                }
+            }
+            out.push(char::from_digit(d as u32, 16).unwrap());
+        }
+    } else {
+        out.push_str("#b");
+        for i in (0..width).rev() {
+            out.push(if v.bit(i) { '1' } else { '0' });
+        }
+    }
+}
 
 impl AstManager {
     /// Render `id` as an s-expression string.
@@ -39,11 +93,40 @@ impl AstManager {
                 out.push(')');
             }
             AstNode::App(a) => {
+                // Arithmetic numeral: render per z3 conventions (negative
+                // integers as `(- n)`, reals as `n.0` or `(/ p.0 q.0)`).
+                if let Some(r) = self.as_numeral(id) {
+                    let is_int = self.is_int_sort(self.get_sort(id));
+                    pp_numeral(&r, is_int, out);
+                    return;
+                }
+                // Bit-vector numeral: `#x…` (width multiple of 4) or `#b…`.
+                if let Some(v) = self.bv_numeral_value(id) {
+                    let width = self.bv_sort_width(self.get_sort(id)).unwrap_or(0);
+                    pp_bv(&v, width, out);
+                    return;
+                }
+                // Unary minus prints as `(* (- 1) x)`, matching z3's arith pp.
+                if self.arith_op(id) == Some(crate::ast::arith::ArithOp::Uminus)
+                    && a.args.len() == 1
+                {
+                    out.push_str("(* (- 1) ");
+                    self.pp_into(a.args[0], out);
+                    out.push(')');
+                    return;
+                }
                 let name = self.func_decl(a.decl).expect("app decl").name;
+                // The `if` builtin prints as SMT-LIB `ite`.
+                let is_ite = self.is_ite(id);
                 if a.args.is_empty() {
                     let _ = write!(out, "{name}");
                 } else {
-                    let _ = write!(out, "({name}");
+                    out.push('(');
+                    if is_ite {
+                        out.push_str("ite");
+                    } else {
+                        let _ = write!(out, "{name}");
+                    }
                     for &arg in &a.args {
                         out.push(' ');
                         self.pp_into(arg, out);

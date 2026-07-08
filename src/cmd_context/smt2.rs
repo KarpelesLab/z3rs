@@ -1273,6 +1273,10 @@ struct Context {
     /// The pre-axiom goal for the string/seq witness (set around `decide`), so the
     /// witness substitutes into a clean formula rather than the axiom-laden one.
     witness_base: Option<AstId>,
+    /// Assumption literals of the most recent `(check-sat a …)` /
+    /// `(check-sat-assuming (a …))`, as `(printed-text, term)` — the candidates
+    /// an assumption-based `(get-unsat-core)` reports.
+    last_assumptions: Vec<(String, AstId)>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -2124,6 +2128,7 @@ impl Context {
             str_at_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
+            last_assumptions: Vec::new(),
         }
     }
 
@@ -2300,6 +2305,8 @@ impl Context {
                 Ok(Some(alloc::format!("({body})")))
             }
             "exit" => {
+                // z3 terminates the script at `(exit)`; the driver loop stops
+                // feeding commands once this flag is set.
                 self.exited = true;
                 Ok(None)
             }
@@ -2740,10 +2747,13 @@ impl Context {
                 // the same verdict. Route assumptions through `check_with` so the
                 // full decision pipeline (and model recording) applies.
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
+                self.last_assumptions.clear();
                 let (res, model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
                     for a in &list[1..] {
-                        assumptions.push(self.term(a)?);
+                        let id = self.term(a)?;
+                        self.last_assumptions.push((render_sexpr(a), id));
+                        assumptions.push(id);
                     }
                     self.check_with(&assumptions)
                 } else if self.objectives.is_empty() && self.soft.is_empty() {
@@ -2763,8 +2773,11 @@ impl Context {
                     _ => return Err("check-sat-assuming: expected a literal list".to_string()),
                 };
                 let mut terms = Vec::with_capacity(assumptions.len());
+                self.last_assumptions.clear();
                 for a in &assumptions {
-                    terms.push(self.term(a)?);
+                    let id = self.term(a)?;
+                    self.last_assumptions.push((render_sexpr(a), id));
+                    terms.push(id);
                 }
                 let (res, model) = self.check_with(&terms);
                 self.last_model = model;
@@ -19952,6 +19965,35 @@ impl Context {
         if self.last_verdict != Some(SmtResult::Unsat) {
             return Err("get-unsat-core requires a preceding unsatisfiable check-sat".to_string());
         }
+        // With assumption literals (`(check-sat a …)`), z3's core is the subset
+        // of assumptions needed for unsatisfiability. Minimize by dropping each
+        // assumption whose removal keeps the check unsatisfiable; keep an
+        // assumption when a definite model appears without it.
+        if !self.last_assumptions.is_empty() {
+            let assumps = self.last_assumptions.clone();
+            let mut keep = alloc::vec![true; assumps.len()];
+            for i in 0..assumps.len() {
+                keep[i] = false;
+                let extra: Vec<AstId> = assumps
+                    .iter()
+                    .zip(&keep)
+                    .filter(|(_, k)| **k)
+                    .map(|((_, id), _)| *id)
+                    .collect();
+                // Only drop when the remainder is provably satisfiable; a
+                // non-Sat result (unsat or unknown) conservatively keeps it.
+                if self.check_with(&extra).0 != SmtResult::Sat {
+                    keep[i] = true;
+                }
+            }
+            let names: Vec<String> = assumps
+                .iter()
+                .zip(&keep)
+                .filter(|(_, k)| **k)
+                .map(|((t, _), _)| t.clone())
+                .collect();
+            return Ok(alloc::format!("({})", names.join(" ")));
+        }
         let n = self.assertions.len();
         let mut keep = alloc::vec![true; n];
         for i in 0..n {
@@ -20050,7 +20092,7 @@ impl Context {
         for (name, c, sort_name) in &consts {
             let v = model.value_string(&self.m, *c);
             out.push_str(&alloc::format!(
-                "\n  (define-fun {name} () {sort_name} {v})"
+                "\n  (define-fun {name} () {sort_name}\n    {v})"
             ));
         }
         out.push_str("\n)");
@@ -21438,9 +21480,13 @@ mod tests {
         ";
         let out = run(script).unwrap();
         assert_eq!(out[0], "sat");
-        assert!(out[1].contains("(define-fun x () Int 3)"), "{}", out[1]);
         assert!(
-            out[1].contains("(define-fun b () Bool false)"),
+            out[1].contains("(define-fun x () Int\n    3)"),
+            "{}",
+            out[1]
+        );
+        assert!(
+            out[1].contains("(define-fun b () Bool\n    false)"),
             "{}",
             out[1]
         );
