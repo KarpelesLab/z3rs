@@ -532,15 +532,97 @@ fn verdict_word(res: SmtResult) -> &'static str {
     }
 }
 
-/// The content of an SMT-LIB string literal token (`"…"`), with the surrounding
-/// quotes removed and doubled `""` collapsed to a single quote. Non-string tokens
-/// are returned unchanged.
-fn unquote_string(tok: &str) -> String {
-    if tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"') {
-        tok[1..tok.len() - 1].replace("\"\"", "\"")
-    } else {
-        tok.to_string()
+/// z3's maximum Unicode code point for the string theory. A `\u{…}` escape whose
+/// value exceeds this is *not* recognised as an escape (the backslash is literal),
+/// matching z3.
+const SMT_MAX_CODE_POINT: u32 = 0x2FFFF;
+
+/// Decode an SMT-LIB Unicode escape starting at `s[0] == '\\'`: either `\uXXXX`
+/// (exactly four hex digits) or `\u{X…}` (one or more hex digits, value ≤
+/// [`SMT_MAX_CODE_POINT`]). Returns the decoded scalar and the number of `char`s
+/// consumed, or `None` if `s` is not a valid escape (the caller then treats the
+/// backslash literally). Surrogate code points, which cannot be held in a Rust
+/// `char`, are treated as non-escapes.
+fn decode_unicode_escape(s: &[char]) -> Option<(char, usize)> {
+    if s.first() != Some(&'\\') || s.get(1) != Some(&'u') {
+        return None;
     }
+    if s.get(2) == Some(&'{') {
+        let mut j = 3;
+        let mut val: u32 = 0;
+        let mut n = 0;
+        while j < s.len() && s[j] != '}' {
+            let d = s[j].to_digit(16)?;
+            val = val.checked_mul(16)?.checked_add(d)?;
+            if val > SMT_MAX_CODE_POINT {
+                return None;
+            }
+            n += 1;
+            j += 1;
+        }
+        if n == 0 || j >= s.len() || s[j] != '}' {
+            return None;
+        }
+        Some((char::from_u32(val)?, j + 1))
+    } else {
+        if s.len() < 6 {
+            return None;
+        }
+        let mut val: u32 = 0;
+        for &c in &s[2..6] {
+            val = val * 16 + c.to_digit(16)?;
+        }
+        Some((char::from_u32(val)?, 6))
+    }
+}
+
+/// The content of an SMT-LIB string literal token (`"…"`): surrounding quotes
+/// removed, doubled `""` collapsed to a single quote, and `\uXXXX` / `\u{X…}`
+/// Unicode escapes decoded. Non-string tokens are returned unchanged.
+fn unquote_string(tok: &str) -> String {
+    if !(tok.len() >= 2 && tok.starts_with('"') && tok.ends_with('"')) {
+        return tok.to_string();
+    }
+    let inner: Vec<char> = tok[1..tok.len() - 1].chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < inner.len() {
+        let c = inner[i];
+        if c == '"' && inner.get(i + 1) == Some(&'"') {
+            out.push('"');
+            i += 2;
+            continue;
+        }
+        if c == '\\'
+            && let Some((ch, adv)) = decode_unicode_escape(&inner[i..])
+        {
+            out.push(ch);
+            i += adv;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Render code points as an SMT-LIB string literal (with surrounding quotes),
+/// escaping exactly as z3 does: a `"` becomes `""`; a printable ASCII character
+/// is emitted verbatim (a backslash only escaped to `\u{5c}` when the next
+/// character is `u`, to avoid forging an escape on re-read); anything else
+/// becomes `\u{hex}`. The result round-trips through [`unquote_string`].
+fn smt_string_literal(cps: &[u32]) -> String {
+    let mut out = String::from("\"");
+    for (i, &c) in cps.iter().enumerate() {
+        match c {
+            0x22 => out.push_str("\"\""),
+            0x5c if cps.get(i + 1) == Some(&0x75) => out.push_str("\\u{5c}"),
+            0x20..=0x7e => out.push(char::from_u32(c).unwrap()),
+            _ => out.push_str(&alloc::format!("\\u{{{c:x}}}")),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The `:named` label of an assertion written `(! term :named name …)`, if any.
@@ -1146,7 +1228,7 @@ struct Context {
 
 /// A constant regular expression (the decidable, fully-literal fragment). Used
 /// to fold `(str.in_re "literal" r)` by matching.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Regex {
     /// Matches exactly this code-point sequence (`str.to_re` of a literal).
     Lit(Vec<u32>),
@@ -1369,7 +1451,268 @@ impl Regex {
                 return true;
             }
         }
-        matches!(self, Regex::None)
+        if matches!(self, Regex::None) {
+            return true;
+        }
+        // General decision: explore the Brzozowski-derivative automaton. This is
+        // exact for the full algebra (including `Comp`/`Inter`), so a definite
+        // `Some(true)` is a sound emptiness proof; `None` (state budget exceeded)
+        // falls back to "not proven empty".
+        self.language_is_empty() == Some(true)
+    }
+
+    /// Collect the interval cut points induced by the literals and ranges in this
+    /// regex, so a representative code point per behaviour class can be chosen for
+    /// the derivative automaton.
+    fn collect_cuts(&self, cuts: &mut BTreeSet<u32>) {
+        match self {
+            Regex::Lit(l) => {
+                for &x in l {
+                    cuts.insert(x);
+                    if x < SMT_MAX_CODE_POINT {
+                        cuts.insert(x + 1);
+                    }
+                }
+            }
+            Regex::Range(lo, hi) => {
+                cuts.insert(*lo);
+                if *hi < SMT_MAX_CODE_POINT {
+                    cuts.insert(hi + 1);
+                }
+            }
+            Regex::AllChar | Regex::All | Regex::None => {}
+            Regex::Concat(a, b) | Regex::Union(a, b) | Regex::Inter(a, b) => {
+                a.collect_cuts(cuts);
+                b.collect_cuts(cuts);
+            }
+            Regex::Comp(a) | Regex::Star(a) => a.collect_cuts(cuts),
+        }
+    }
+
+    /// The Brzozowski derivative of the language with respect to code point `c`:
+    /// the set of words `w` such that `c·w` is in `L(self)`.
+    fn derivative(&self, c: u32) -> Regex {
+        match self {
+            Regex::Lit(l) => match l.split_first() {
+                Some((&x, rest)) if x == c => Regex::Lit(rest.to_vec()),
+                _ => Regex::None,
+            },
+            Regex::Range(lo, hi) => {
+                if (*lo..=*hi).contains(&c) {
+                    Regex::Lit(Vec::new())
+                } else {
+                    Regex::None
+                }
+            }
+            Regex::AllChar => Regex::Lit(Vec::new()),
+            Regex::All => Regex::All,
+            Regex::None => Regex::None,
+            Regex::Concat(a, b) => {
+                let da = Regex::Concat(Box::new(a.derivative(c)), b.clone());
+                if a.nullable() {
+                    Regex::Union(Box::new(da), Box::new(b.derivative(c)))
+                } else {
+                    da
+                }
+            }
+            Regex::Union(a, b) => {
+                Regex::Union(Box::new(a.derivative(c)), Box::new(b.derivative(c)))
+            }
+            Regex::Inter(a, b) => {
+                Regex::Inter(Box::new(a.derivative(c)), Box::new(b.derivative(c)))
+            }
+            Regex::Comp(a) => Regex::Comp(Box::new(a.derivative(c))),
+            Regex::Star(a) => {
+                Regex::Concat(Box::new(a.derivative(c)), Box::new(Regex::Star(a.clone())))
+            }
+        }
+    }
+
+    /// A canonical form (union/intersection treated as ACI sets, epsilon/`None`
+    /// units folded, double complement/star collapsed). Keeps the derivative
+    /// state set finite so the automaton exploration terminates.
+    fn normalize(&self) -> Regex {
+        match self {
+            Regex::Lit(_) | Regex::Range(..) | Regex::AllChar | Regex::All | Regex::None => {
+                self.clone()
+            }
+            Regex::Concat(a, b) => {
+                // Flatten and drop epsilon; any `None` factor annihilates.
+                let mut factors: Vec<Regex> = Vec::new();
+                for part in [a.normalize(), b.normalize()] {
+                    let mut stack = alloc::vec![part];
+                    while let Some(p) = stack.pop() {
+                        match p {
+                            Regex::Concat(x, y) => {
+                                // preserve order: push y then x so x is processed first
+                                stack.push(*y);
+                                stack.push(*x);
+                            }
+                            other => factors.push(other),
+                        }
+                    }
+                }
+                if factors.iter().any(|f| matches!(f, Regex::None)) {
+                    return Regex::None;
+                }
+                // Merge adjacent literals and drop epsilons.
+                let mut merged: Vec<Regex> = Vec::new();
+                for f in factors {
+                    if let Regex::Lit(l) = &f {
+                        if l.is_empty() {
+                            continue;
+                        }
+                        if let Some(Regex::Lit(prev)) = merged.last_mut() {
+                            prev.extend_from_slice(l);
+                            continue;
+                        }
+                    }
+                    merged.push(f);
+                }
+                match merged.len() {
+                    0 => Regex::Lit(Vec::new()),
+                    1 => merged.pop().unwrap(),
+                    _ => {
+                        let mut it = merged.into_iter().rev();
+                        let mut acc = it.next().unwrap();
+                        for f in it {
+                            acc = Regex::Concat(Box::new(f), Box::new(acc));
+                        }
+                        acc
+                    }
+                }
+            }
+            Regex::Union(a, b) => {
+                // Flatten structurally first (never re-normalise a `Union` node,
+                // which would recurse into this same arm), then normalise leaves.
+                let mut set: BTreeSet<Regex> = BTreeSet::new();
+                let mut stack = alloc::vec![a.as_ref().clone(), b.as_ref().clone()];
+                while let Some(p) = stack.pop() {
+                    match p {
+                        Regex::Union(x, y) => {
+                            stack.push(*x);
+                            stack.push(*y);
+                        }
+                        other => match other.normalize() {
+                            Regex::Union(x, y) => {
+                                stack.push(*x);
+                                stack.push(*y);
+                            }
+                            Regex::None => {}
+                            Regex::All => return Regex::All,
+                            n => {
+                                set.insert(n);
+                            }
+                        },
+                    }
+                }
+                if set.is_empty() {
+                    return Regex::None;
+                }
+                let mut it = set.into_iter();
+                let mut acc = it.next().unwrap();
+                for r in it {
+                    acc = Regex::Union(Box::new(acc), Box::new(r));
+                }
+                acc
+            }
+            Regex::Inter(a, b) => {
+                let mut set: BTreeSet<Regex> = BTreeSet::new();
+                let mut stack = alloc::vec![a.as_ref().clone(), b.as_ref().clone()];
+                while let Some(p) = stack.pop() {
+                    match p {
+                        Regex::Inter(x, y) => {
+                            stack.push(*x);
+                            stack.push(*y);
+                        }
+                        other => match other.normalize() {
+                            Regex::Inter(x, y) => {
+                                stack.push(*x);
+                                stack.push(*y);
+                            }
+                            Regex::All => {}
+                            Regex::None => return Regex::None,
+                            n => {
+                                set.insert(n);
+                            }
+                        },
+                    }
+                }
+                match set.len() {
+                    0 => Regex::All,
+                    _ => {
+                        let mut it = set.into_iter();
+                        let mut acc = it.next().unwrap();
+                        for r in it {
+                            acc = Regex::Inter(Box::new(acc), Box::new(r));
+                        }
+                        acc
+                    }
+                }
+            }
+            Regex::Comp(a) => match a.normalize() {
+                Regex::Comp(inner) => *inner,
+                Regex::None => Regex::All,
+                Regex::All => Regex::None,
+                other => Regex::Comp(Box::new(other)),
+            },
+            Regex::Star(a) => match a.normalize() {
+                Regex::Star(inner) => Regex::Star(inner),
+                Regex::None => Regex::Lit(Vec::new()),
+                Regex::Lit(l) if l.is_empty() => Regex::Lit(Vec::new()),
+                Regex::All => Regex::All,
+                other => Regex::Star(Box::new(other)),
+            },
+        }
+    }
+
+    /// Decide whether the language is empty by exploring the derivative
+    /// automaton. `Some(true)`/`Some(false)` are exact; `None` means the state
+    /// budget was exceeded (caller must not conclude anything).
+    fn language_is_empty(&self) -> Option<bool> {
+        const STATE_BUDGET: usize = 4000;
+        let mut cuts: BTreeSet<u32> = BTreeSet::new();
+        cuts.insert(0);
+        self.collect_cuts(&mut cuts);
+        let reps: Vec<u32> = cuts.into_iter().collect();
+        let start = self.normalize();
+        if start.nullable() {
+            return Some(false);
+        }
+        let mut visited: BTreeSet<Regex> = BTreeSet::new();
+        visited.insert(start.clone());
+        let mut frontier = alloc::vec![start];
+        while let Some(r) = frontier.pop() {
+            for &c in &reps {
+                let d = r.derivative(c).normalize();
+                if d.nullable() {
+                    return Some(false);
+                }
+                if visited.insert(d.clone()) {
+                    if visited.len() > STATE_BUDGET {
+                        return None;
+                    }
+                    frontier.push(d);
+                }
+            }
+        }
+        Some(true)
+    }
+
+    /// Decide language equivalence with `other` via emptiness of the symmetric
+    /// difference. `None` when undecided (state budget exceeded).
+    fn equivalent(&self, other: &Regex) -> Option<bool> {
+        let symdiff = Regex::Union(
+            Box::new(Regex::Inter(
+                Box::new(self.clone()),
+                Box::new(Regex::Comp(Box::new(other.clone()))),
+            )),
+            Box::new(Regex::Inter(
+                Box::new(Regex::Comp(Box::new(self.clone()))),
+                Box::new(other.clone()),
+            )),
+        );
+        symdiff.language_is_empty()
     }
 
     /// Whether the language contains no *non-empty* word (it may contain `""`).
@@ -2771,7 +3114,8 @@ impl Context {
         }
         for (text, &c) in &self.str_lits {
             if c == id || model.terms_equal(&self.m, id, c) {
-                return Some(alloc::format!("\"{text}\""));
+                let cps: Vec<u32> = text.chars().map(|ch| ch as u32).collect();
+                return Some(smt_string_literal(&cps));
             }
         }
         None
@@ -10726,9 +11070,9 @@ impl Context {
             .find(|&p| sval[p..p + tval.len()] == tval[..])
         else {
             // `T` absent: `str.replace` returns `S` unchanged.
-            return SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(&sval)));
+            return SExpr::Atom(smt_string_literal(&sval));
         };
-        let lit = |cs: &[u32]| SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(cs)));
+        let lit = |cs: &[u32]| SExpr::Atom(smt_string_literal(cs));
         SExpr::List(alloc::vec![
             SExpr::Atom("str.++".to_string()),
             lit(&sval[..p]),
@@ -10854,7 +11198,7 @@ impl Context {
             }
             if lo > 0 || hi < parts.len() {
                 let residual: Vec<SExpr> = parts[lo..hi].to_vec();
-                let l_lit = SExpr::Atom(alloc::format!("\"{}\"", code_points_to_string(&l)));
+                let l_lit = SExpr::Atom(smt_string_literal(&l));
                 return self.concat_residual_eq(&residual, &[l_lit]);
             }
         }
@@ -13560,6 +13904,54 @@ impl Context {
             self.regex_of.insert(term, r);
         }
         Ok(term)
+    }
+
+    /// A fresh Boolean atom recorded as symbolic so the goal is answered
+    /// `unknown` — used when a regex relation can't be decided exactly.
+    fn regex_unknown_bool(&mut self) -> AstId {
+        let bool_sort = self.m.mk_bool_sort();
+        let name = alloc::format!("!re-rel!{}", self.fresh_counter);
+        self.fresh_counter += 1;
+        let d = self.m.mk_func_decl(Symbol::new(&name), &[], bool_sort);
+        let app = self.m.mk_const(d);
+        self.str_symbolic.insert(app);
+        app
+    }
+
+    /// Fold a `RegLan` `=`/`distinct` by deciding language equivalence of every
+    /// operand pair with the derivative automaton. Returns `Some(true/false)`
+    /// term when fully decided, or an `unknown`-forcing marker when some pair is
+    /// undecidable (a missing structure or the state budget being exceeded).
+    /// Never returns `None`, so the caller always handles the relation itself and
+    /// the (unsound) EUF fallback is bypassed.
+    fn regex_rel_fold(&mut self, head: &str, args: &[AstId]) -> Option<AstId> {
+        let regs: Vec<Option<Regex>> = args.iter().map(|a| self.regex_of.get(a).cloned()).collect();
+        let mut undecided = false;
+        for i in 0..args.len() {
+            for j in (i + 1)..args.len() {
+                // Syntactically identical operands are the same language; a
+                // symbolic operand without a tracked structure is undecidable.
+                let eq = if args[i] == args[j] {
+                    Some(true)
+                } else if let (Some(a), Some(b)) = (&regs[i], &regs[j]) {
+                    a.equivalent(b)
+                } else {
+                    None
+                };
+                match eq {
+                    Some(true) if head == "distinct" => return Some(self.m.mk_false()),
+                    Some(false) if head == "=" => return Some(self.m.mk_false()),
+                    None => undecided = true,
+                    _ => {}
+                }
+            }
+        }
+        if undecided {
+            return Some(self.regex_unknown_bool());
+        }
+        // All pairs decided: `=` holds (all equivalent), `distinct` holds (all
+        // pairwise inequivalent).
+        Some(self.m.mk_true())
     }
 
     /// A fresh uninterpreted term standing for a symbolic string operation,
@@ -18973,7 +19365,7 @@ impl Context {
             }
             let v = self
                 .str_value(*id)
-                .map(|cps| alloc::format!("\"{}\"", code_points_to_string(&cps)))
+                .map(|cps| smt_string_literal(&cps))
                 .or_else(|| self.str_model_value(&mut model, *id))
                 .or_else(|| self.enum_value_name(&mut model, *id))
                 .unwrap_or_else(|| model.value_string(&self.m, *id));
@@ -19215,16 +19607,21 @@ impl Context {
                         };
                         let rt = self.term(&l[1])?;
                         if let Some(r) = self.regex_of.get(&rt).cloned() {
-                            let mut alts: Vec<Regex> = Vec::new();
-                            for k in lo..=hi.max(lo) {
-                                let mut acc = Regex::Lit(Vec::new());
-                                for _ in 0..k {
-                                    acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                            // SMT-LIB: `(_ re.loop n1 n2)` with n1 > n2 denotes the
+                            // empty language (no repetition count is valid).
+                            let looped = if lo > hi {
+                                Regex::None
+                            } else {
+                                let mut alts: Vec<Regex> = Vec::new();
+                                for k in lo..=hi {
+                                    let mut acc = Regex::Lit(Vec::new());
+                                    for _ in 0..k {
+                                        acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                                    }
+                                    alts.push(acc);
                                 }
-                                alts.push(acc);
-                            }
-                            let looped =
-                                fold_regex(alts, |a, b| Regex::Union(Box::new(a), Box::new(b)));
+                                fold_regex(alts, |a, b| Regex::Union(Box::new(a), Box::new(b)))
+                            };
                             let sort = self.reglan_sort();
                             let t = self.fresh_const(sort);
                             self.regex_of.insert(t, looped);
@@ -19730,6 +20127,19 @@ impl Context {
                 } else {
                     self.m.mk_false()
                 });
+            }
+        }
+        // Regex (`RegLan`) `=`/`distinct` compares *languages*, not the syntactic
+        // term — two differently-written regexes may denote the same language.
+        // Decide each pair exactly with the derivative automaton; fall back to an
+        // `unknown`-forcing marker when a pair can't be decided (never let the EUF
+        // layer treat two regex constants as freely distinct — that is unsound).
+        if (head == "distinct" || head == "=") && args.len() >= 2 {
+            let rsort = self.reglan_sort();
+            if args.iter().all(|&a| self.m.get_sort(a) == rsort)
+                && let Some(res) = self.regex_rel_fold(head, &args)
+            {
+                return Ok(res);
             }
         }
         let m = &mut self.m;
