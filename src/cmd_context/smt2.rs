@@ -397,6 +397,13 @@ fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
     }
     let (int_part, frac_part) = s.split_once('.')?;
     let ip = if int_part.is_empty() { "0" } else { int_part };
+    // z3 leniently accepts a trailing-dot decimal such as `0.` (= `0.0`); the
+    // fractional part may be empty as long as the integer part is present.
+    let frac_part = if frac_part.is_empty() && !int_part.is_empty() {
+        "0"
+    } else {
+        frac_part
+    };
     if !is_digits(ip) || !is_digits(frac_part) {
         return None;
     }
@@ -15495,6 +15502,7 @@ impl Context {
         // (same divisor) ⇒ equal div/mod. Refutes `x = y ∧ mod x 5 = 2 ∧
         // mod y 5 ≠ 2`.
         let mut cong = self.divmod_congruence_axioms(combined);
+        cong.extend(self.realdiv_congruence_axioms(combined));
         cong.extend(self.mod_multiple_axioms(combined));
         if !cong.is_empty() {
             cong.push(combined);
@@ -18565,6 +18573,42 @@ impl Context {
                     let deq = self.m.mk_eq(a1, a2);
                     let req = self.m.mk_eq(t1, t2);
                     ax.push(self.m.mk_implies(deq, req));
+                }
+            }
+        }
+        ax
+    }
+
+    /// EUF congruence for real division `/`, generated on the PRE-lift goal
+    /// (lifting later replaces `(/ a b)` by a fresh quotient, losing it): for any
+    /// two `/` terms, `dividend1 = dividend2 ∧ divisor1 = divisor2 ⇒ term1 =
+    /// term2`. Unlike `div`/`mod` congruence, the divisor may *differ*
+    /// syntactically — needed so `(/ a b)` and `(/ a 0)` unify when `b = 0`
+    /// (division by zero is unspecified but *functional*). Refutes
+    /// `b = 0 ∧ (/ a b) ≠ (/ a 0)`. Sound: `/` is a total function.
+    fn realdiv_congruence_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let mut terms: Vec<(AstId, AstId, AstId)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.arith_op(t) == Some(ArithOp::Div) {
+                let a = self.m.app_args(t);
+                terms.push((t, a[0], a[1]));
+            }
+        }
+        let mut ax = Vec::new();
+        if terms.len() <= 16 {
+            for i in 0..terms.len() {
+                for j in i + 1..terms.len() {
+                    let (t1, a1, b1) = terms[i];
+                    let (t2, a2, b2) = terms[j];
+                    if t1 == t2 || (a1 == a2 && b1 == b2) {
+                        continue;
+                    }
+                    let aeq = self.m.mk_eq(a1, a2);
+                    let beq = self.m.mk_eq(b1, b2);
+                    let pre = self.m.mk_and(&[aeq, beq]);
+                    let req = self.m.mk_eq(t1, t2);
+                    ax.push(self.m.mk_implies(pre, req));
                 }
             }
         }
