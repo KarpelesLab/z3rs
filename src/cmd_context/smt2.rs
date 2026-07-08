@@ -1330,6 +1330,10 @@ struct Context {
     /// applications share one free bit-vector (z3 congruence: the result is an
     /// uninterpreted value distinguished by the full application).
     fp_to_bv_unspec: BTreeMap<(bool, u32, AstId, AstId), AstId>,
+    /// Gated `fp.to_ubv`/`fp.to_sbv` markers over a *symbolic* FP `x` (constant
+    /// rounding mode): marker BV → `(signed, m, rm_code, rm, x)`. Re-folded once
+    /// `x` is pinned to a concrete FP constant by a top-level equality.
+    fp_to_bv_markers: BTreeMap<AstId, (bool, u32, u32, AstId, AstId)>,
     /// `((_ to_fp eb sb) x)` reinterpreting a symbolic width-(eb+sb) bit-vector `x`
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
@@ -2238,6 +2242,7 @@ impl Context {
             fp_conv: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
             fp_to_bv_unspec: BTreeMap::new(),
+            fp_to_bv_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
@@ -3786,6 +3791,99 @@ impl Context {
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
         let g = self.blast_fp_equalities(g, &mut memo);
+        Some(crate::rewriter::simplify(&mut self.m, g))
+    }
+
+    /// Re-fold `fp.to_ubv`/`fp.to_sbv` markers once their FP argument is pinned to
+    /// a concrete constant by a top-level `v = literal` equality: an in-range
+    /// rounded value replaces the marker by that numeral; an out-of-range/NaN/∞
+    /// value is UNSPECIFIED, so the (previously gated) marker is replaced by a
+    /// congruent free bit-vector (see the parse-time constant case). Returns the
+    /// rewritten goal, or `None` if nothing folded.
+    fn fold_fp_to_bv(&mut self, goal: AstId) -> Option<AstId> {
+        if self.fp_to_bv_markers.is_empty() {
+            return None;
+        }
+        // Collect FP-constant pins from top-level equalities (bit-vector level, as
+        // `fold_fp_rem` does): a pinned bit-vector term → its numeral bits.
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut bvpin: BTreeMap<AstId, u64> = BTreeMap::new();
+        for &c in &conj {
+            if !self.m.is_eq(c) {
+                continue;
+            }
+            let a = self.m.app_args(c).to_vec();
+            if a.len() != 2 {
+                continue;
+            }
+            for (t, k) in [(a[0], a[1]), (a[1], a[0])] {
+                if let Some(kb) = self.bv_eval(k) {
+                    bvpin.insert(t, kb);
+                }
+            }
+        }
+        let operand_bits = |s: &Self, x: AstId, eb: u32, sb: u32| -> Option<u64> {
+            if let Some(&(b, e, sbn)) = s.fp_of.get(&x) {
+                return (e == eb && sbn == sb).then_some(b);
+            }
+            let bv = s.fp_bv.get(&x)?;
+            s.bv_eval(*bv).or_else(|| bvpin.get(bv).copied())
+        };
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let markers: Vec<(AstId, bool, u32, u32, AstId, AstId)> = self
+            .fp_to_bv_markers
+            .iter()
+            .filter(|(t, _)| present.contains(t))
+            .map(|(&t, &(signed, m, rmc, rm, x))| (t, signed, m, rmc, rm, x))
+            .collect();
+        let mut fold_subst: Vec<(AstId, AstId)> = Vec::new();
+        for (t, signed, m, rmc, rm, x) in &markers {
+            let Some((eb, sb)) = self.fp_format_of(self.m.get_sort(*x)) else {
+                continue;
+            };
+            let Some(bits) = operand_bits(self, *x, eb, sb) else {
+                continue;
+            };
+            let folded = Self::fp_real_value(bits, eb, sb)
+                .and_then(|r| Self::round_rational_to_int(&r, *rmc))
+                .filter(|&v| {
+                    if *signed {
+                        let hi = 1i64 << (*m - 1);
+                        v >= -hi && v < hi
+                    } else {
+                        v >= 0 && (*m == 64 || v < (1i64 << *m))
+                    }
+                });
+            let repl = if let Some(v) = folded {
+                self.m.mk_bv_numeral(Int::from(v), *m)
+            } else {
+                // Unspecified: a congruent free bit-vector by `(signed, m, rm, x)`.
+                let key = (*signed, *m, *rm, *x);
+                if let Some(&u) = self.fp_to_bv_unspec.get(&key) {
+                    u
+                } else {
+                    let s = self.m.mk_bv_sort(*m);
+                    let u = self.fresh_const(s);
+                    self.fp_to_bv_unspec.insert(key, u);
+                    u
+                }
+            };
+            fold_subst.push((*t, repl));
+        }
+        if fold_subst.is_empty() {
+            return None;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &fold_subst);
         Some(crate::rewriter::simplify(&mut self.m, g))
     }
 
@@ -19220,6 +19318,16 @@ impl Context {
                 return (r2, m2);
             }
         }
+        // Fallback: re-fold `fp.to_ubv`/`fp.to_sbv` once the FP argument is pinned
+        // to a concrete constant by a top-level equality.
+        if res == SmtResult::Unknown
+            && let Some(g) = self.fold_fp_to_bv(goal)
+        {
+            let (r2, m2) = self.decide_inner(g);
+            if r2 != SmtResult::Unknown {
+                return (r2, m2);
+            }
+        }
         // Fallback: a distinct-integers-with-bounds witness (min distinct assignment).
         if res == SmtResult::Unknown
             && let Some(m) = self.try_distinct_witness(goal)
@@ -21785,6 +21893,15 @@ impl Context {
                         let s = self.m.mk_bv_sort(m);
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
+                        // If only the FP input is symbolic (width in range, constant
+                        // rounding mode), record a marker so the conversion can be
+                        // re-folded once `x` is pinned to a concrete FP by a top-level
+                        // equality (mirrors `fold_fp_rem`).
+                        if (1..=63).contains(&m)
+                            && let Some(rmc) = self.rm_code(rm)
+                        {
+                            self.fp_to_bv_markers.insert(t, (signed, m, rmc, rm, x));
+                        }
                         return Ok(t);
                     }
                     return Err("unsupported qualified application".to_string());
