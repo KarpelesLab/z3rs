@@ -143,6 +143,14 @@ impl Solver {
         if !self.ok {
             return;
         }
+        // Clauses are added at decision level 0. After a prior `solve()` the trail
+        // still holds that call's (possibly non-level-0) assignment; a unit clause
+        // enqueued against it could conflict with a *decision* — not a real
+        // level-0 fact — and wrongly set `ok = false`, permanently killing the
+        // solver (a spurious `unsat` on the next `solve()`). Backtracking to level
+        // 0 first ensures a unit enqueues against the persistent level-0
+        // assignment, and non-unit clauses are re-propagated cleanly on `solve()`.
+        self.cancel_until(0);
         for &l in lits {
             self.ensure_var(l.var());
         }
@@ -608,6 +616,24 @@ mod tests {
         s.add_clause(&lits(&[-1]));
         assert_eq!(s.solve(), SatResult::Sat);
         assert!(s.model_holds(Lit::pos(1)));
+    }
+
+    #[test]
+    fn unit_clause_added_after_solve_backtracks_to_level_zero() {
+        // Regression: a unit clause added *after* a SAT solve must not conflict
+        // with that call's stale (non-level-0) trail and wrongly kill the solver.
+        // `(x1 ∨ x2)` is SAT; the first solve may decide x1=true. Adding the unit
+        // `¬x1` (a theory blocking clause) must still leave `(x1 ∨ x2)` SAT via
+        // x2, not report a spurious UNSAT — exactly the DPLL(T) blocking pattern.
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1, 2]));
+        assert_eq!(s.solve(), SatResult::Sat);
+        s.add_clause(&lits(&[-1])); // unit, forces x1 = false
+        assert_eq!(s.solve(), SatResult::Sat);
+        assert!(s.model_holds(Lit::pos(1))); // literal 2 (var 1) must hold
+        // And once genuinely over-constrained at level 0 it is UNSAT.
+        s.add_clause(&lits(&[-2]));
+        assert_eq!(s.solve(), SatResult::Unsat);
     }
 
     #[test]
