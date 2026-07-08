@@ -3192,6 +3192,39 @@ impl Context {
         Some(q)
     }
 
+    /// Apply the unary declaration `decl` to `arg`, distributing over any `ite`
+    /// in the argument: `f(ite(c,a,b)) = ite(c, f(a), f(b))` (sound for every
+    /// `f`). Used for datatype selectors/testers so they fold against the
+    /// constructor rebuilt inside an `update-field` `ite` chain.
+    fn apply_unary_over_ite(&mut self, decl: AstId, arg: AstId) -> AstId {
+        if self.m.is_ite(arg) {
+            let a = self.m.app_args(arg);
+            let (c, t, e) = (a[0], a[1], a[2]);
+            let ft = self.apply_unary_over_ite(decl, t);
+            let fe = self.apply_unary_over_ite(decl, e);
+            return self.m.mk_ite(c, ft, fe);
+        }
+        self.m.mk_app(decl, &[arg])
+    }
+
+    /// Distribute an equality over an `ite` operand:
+    /// `t = ite(c,a,b)` ⟺ `ite(c, t=a, t=b)` (sound for any `t`), recursively
+    /// so nested `ite`s (and both operands being `ite`) are handled. Leaf
+    /// equalities are built with `mk_eq` and fold via the datatype axioms.
+    fn eq_distrib_ite(&mut self, a: AstId, b: AstId) -> AstId {
+        if self.m.is_ite(b) {
+            let ar = self.m.app_args(b);
+            let (c, t, e) = (ar[0], ar[1], ar[2]);
+            let et = self.eq_distrib_ite(a, t);
+            let ee = self.eq_distrib_ite(a, e);
+            return self.m.mk_ite(c, et, ee);
+        }
+        if self.m.is_ite(a) {
+            return self.eq_distrib_ite(b, a);
+        }
+        self.m.mk_eq(a, b)
+    }
+
     /// If `t` is `(to_int a)`, return a fresh integer `k` with `k ≤ a < k + 1`
     /// (i.e. `k = ⌊a⌋`), memoized per argument. Constant arguments are folded
     /// earlier, so this handles the symbolic case.
@@ -21682,7 +21715,7 @@ impl Context {
                         let x = self.term(&l[1])?;
                         // General multi-constructor datatype: apply the predicate.
                         if let Some(&tdecl) = self.tester_of.get(&cname) {
-                            return Ok(self.m.mk_app(tdecl, &[x]));
+                            return Ok(self.apply_unary_over_ite(tdecl, x));
                         }
                         // A record has a single constructor, so its tester is true.
                         if self.records.contains_key(&self.m.get_sort(x)) {
@@ -22599,6 +22632,19 @@ impl Context {
                 return Ok(res);
             }
         }
+        // A datatype/record equality with an `ite` operand distributes:
+        // `t = ite(c,a,b)` ⟺ `ite(c, t=a, t=b)` (sound for any `t`). Without
+        // this an `update-field` result — an `ite` chain over the rebuilt
+        // constructor — compared to another constructor stays a free equality,
+        // an unsound spurious sat (fuzz-found: `mk 0 0 false = update-field a x 2`).
+        if head == "=" && args.len() == 2 {
+            let s = self.m.get_sort(args[0]);
+            if (self.datatypes.contains_key(&s) || self.records.contains_key(&s))
+                && (self.m.is_ite(args[0]) || self.m.is_ite(args[1]))
+            {
+                return Ok(self.eq_distrib_ite(args[0], args[1]));
+            }
+        }
         let m = &mut self.m;
         // Bit-vector binary ops and comparisons require equal operand widths;
         // reject a mismatch (as z3 does) instead of building a garbage term.
@@ -23026,6 +23072,16 @@ impl Context {
             }
             name => {
                 if let Some(d) = self.funcs.get(name).copied() {
+                    // A datatype/record selector applied to an `ite` distributes:
+                    // `sel(ite(c,a,b)) = ite(c, sel(a), sel(b))`. This lets a
+                    // selector/tester over an `update-field` result (itself an
+                    // `ite` chain) fold against the rebuilt constructor.
+                    if args.len() == 1 && self.m.is_ite(args[0]) {
+                        let s = self.m.get_sort(args[0]);
+                        if self.datatypes.contains_key(&s) || self.records.contains_key(&s) {
+                            return Ok(self.apply_unary_over_ite(d, args[0]));
+                        }
+                    }
                     return Ok(self.m.mk_app(d, &args));
                 }
                 // z3's internal datatype tester spelling `(is-C x)` (equivalent to
@@ -23034,7 +23090,7 @@ impl Context {
                     && args.len() == 1
                 {
                     if let Some(&tdecl) = self.tester_of.get(cname) {
-                        return Ok(self.m.mk_app(tdecl, &args));
+                        return Ok(self.apply_unary_over_ite(tdecl, args[0]));
                     }
                     if self.records.contains_key(&self.m.get_sort(args[0])) {
                         return Ok(self.m.mk_true());
