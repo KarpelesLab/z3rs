@@ -13938,6 +13938,19 @@ impl Context {
             } else if self.predicate_of(cons).is_some() {
                 Some(cons)
             } else {
+                // Arithmetic *property* head: fold `¬prop` into the guard and
+                // treat as a query. This is only sound when the consequent is
+                // predicate-free — otherwise negating it would embed the head
+                // predicate into a "guard" (a free relation to the model
+                // checker), yielding an unsound verdict. Decline in that case.
+                if self
+                    .m
+                    .postorder(cons)
+                    .iter()
+                    .any(|&t| self.predicate_of(t).is_some())
+                {
+                    return None;
+                }
                 let neg = self.m.mk_not(cons);
                 guards.push(neg);
                 None
@@ -14020,7 +14033,7 @@ impl Context {
                     // guard ⇒ false: satisfiable iff guard is unsat. If guard is
                     // satisfiable, the system is unsat (a ground contradiction).
                     let guard = build(self, &guards, &[], &[]);
-                    let (r, _) = check_model(&self.m, guard);
+                    let r = self.chc_check(guard);
                     match r {
                         SmtResult::Sat => return Some(SmtResult::Unsat),
                         SmtResult::Unsat => {}
@@ -14247,7 +14260,7 @@ impl Context {
                 continue;
             }
             let q = self.chc_rule_image(bs, *body_app, guards, None, &reach, &state)?;
-            match check_model(&self.m, q).0 {
+            match self.chc_check(q) {
                 SmtResult::Sat => return Some(SmtResult::Unsat),
                 SmtResult::Unknown => return None,
                 SmtResult::Unsat => {}
@@ -14288,7 +14301,7 @@ impl Context {
                     continue;
                 }
                 let q = self.chc_rule_image(bs, *body_app, guards, None, &reach, &state)?;
-                match check_model(&self.m, q).0 {
+                match self.chc_check(q) {
                     SmtResult::Sat => return Some(SmtResult::Unsat), // counterexample
                     // If the query can't be decided (the accumulating reach formula
                     // outgrew the budget), deeper rounds are only larger — bail.
@@ -14502,7 +14515,7 @@ impl Context {
             let hp = self.predicate_of(happ)?;
             let img = self.chc_rule_image(bs, None, guards, Some(happ), &empty, &state)?;
             let img = crate::rewriter::simplify(&mut self.m, img);
-            if matches!(check_model(&self.m, img).0, SmtResult::Sat) {
+            if matches!(self.chc_check(img), SmtResult::Sat) {
                 frontier.entry(hp).or_default().push(img);
             }
         }
@@ -14532,7 +14545,7 @@ impl Context {
                 };
                 for (rm, bsl) in paths {
                     let q = self.chc_rule_image(bsl, *body_app, guards, None, &rm, &state)?;
-                    if matches!(check_model(&self.m, q).0, SmtResult::Sat) {
+                    if matches!(self.chc_check(q), SmtResult::Sat) {
                         return Some(SmtResult::Unsat);
                     }
                 }
@@ -14552,9 +14565,7 @@ impl Context {
                         self.chc_rule_image(bs, Some(bapp), guards, Some(happ), &rm, &state)?;
                     let img = crate::rewriter::simplify(&mut self.m, img);
                     let bucket = next.entry(hp).or_default();
-                    if !bucket.contains(&img)
-                        && matches!(check_model(&self.m, img).0, SmtResult::Sat)
-                    {
+                    if !bucket.contains(&img) && matches!(self.chc_check(img), SmtResult::Sat) {
                         bucket.push(img);
                     }
                     if bucket.len() > MAX_PATHS {
@@ -14615,7 +14626,7 @@ impl Context {
             }
             conj.push(self.chc_inst(bad, state, &steps[k], next, &[], locals));
             let formula = self.m.mk_and(&conj);
-            match check_model(&self.m, formula).0 {
+            match self.chc_check(formula) {
                 SmtResult::Sat => return Some(SmtResult::Unsat), // counterexample ⇒ CHC unsat
                 SmtResult::Unknown => return None,
                 SmtResult::Unsat => {}
@@ -14636,12 +14647,27 @@ impl Context {
                 let sformula = self.m.mk_and(&sconj);
                 // `unsat` ⇒ ¬Bad is k-inductive ⇒ safe. A `sat`/`unknown` step is
                 // inconclusive; keep unrolling (BMC may find a counterexample).
-                if check_model(&self.m, sformula).0 == SmtResult::Unsat {
+                if self.chc_check(sformula) == SmtResult::Unsat {
                     return Some(SmtResult::Sat);
                 }
             }
         }
         None // bound reached: sound `unknown`
+    }
+
+    /// Ground satisfiability check for a CHC sub-goal. The CHC formulas are built
+    /// by direct `substitute` into rule bodies, so they may still contain
+    /// arithmetic-sorted `ite` / `div` / `mod` terms that `check_model` treats as
+    /// *opaque* (only Boolean `ite` is Tseitin-encoded; an arithmetic `ite` is an
+    /// unconstrained term). Feeding such a formula to `check_model` directly is
+    /// unsound — a guard like `1 = (ite (= x y) a x)` looks satisfiable even when
+    /// its branch definition refutes it, producing a spurious counterexample (and
+    /// thus a wrong `unsat`). Lift first (introducing the ite/div/mod definitions)
+    /// so the theory reasons about them. `lift` is equisatisfiable, so the verdict
+    /// is preserved.
+    fn chc_check(&mut self, formula: AstId) -> SmtResult {
+        let lifted = self.lift(formula);
+        check_model(&self.m, lifted).0
     }
 
     /// Instantiate a transition-system formula for one unrolling step: substitute
@@ -14680,7 +14706,21 @@ impl Context {
         if self.m.is_implies(body) {
             let args = self.m.app_args(body).to_vec();
             if args.len() == 2 {
-                return Some((args[0], args[1]));
+                let (ant, cons) = (args[0], args[1]);
+                // A multi-arg `(=> A B … H)` is stored right-associated as
+                // `(=> A (=> B … H))`. Logically `A ⇒ (B ⇒ H) ≡ (A ∧ B) ⇒ H`,
+                // so flatten the nested implication into a single antecedent
+                // conjunction. Without this the inner `(=> B H)` — which still
+                // contains the head predicate — is misread as an arithmetic
+                // "property head", negated into a guard, and the clause is
+                // wrongly treated as a query (unsound `unsat`).
+                if self.m.is_implies(cons)
+                    && let Some((ant2, cons2)) = self.chc_split_rule(cons)
+                {
+                    let conj = self.m.mk_and(&[ant, ant2]);
+                    return Some((conj, cons2));
+                }
+                return Some((ant, cons));
             }
         }
         // A bare head predicate `P(..)` is a fact with a `true` antecedent.
