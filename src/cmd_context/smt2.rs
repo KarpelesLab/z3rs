@@ -11215,7 +11215,7 @@ impl Context {
         None
     }
 
-    fn try_string_witness(&mut self, goal: AstId) -> Option<Model> {
+    fn try_string_witness(&mut self, goal: AstId, hint: Option<&mut Model>) -> Option<Model> {
         let string_sort = self.string_sort?;
         let lit_consts: BTreeSet<AstId> = self.str_lits.values().copied().collect();
         let mut vars: Vec<AstId> = Vec::new();
@@ -11292,6 +11292,49 @@ impl Context {
         if vars.len() > 3 {
             return None;
         }
+        // Model-guided filler words: when the abstract (length-only) model pins each
+        // string variable's length, a word of exactly that length is a candidate —
+        // one distinct character per model congruence class, so variables the model
+        // makes equal/distinct stay equal/distinct. Every candidate is verified
+        // below (substitute → refold → re-check with the string axioms), so this is
+        // always sound; it just lets a pure-length goal (`len(x·y) ≥ 13`) be
+        // witnessed past the short enumeration cap.
+        let model_fill: Vec<Option<Vec<u32>>> = if let Some(model) = hint {
+            let lenf = self.str_len_fn();
+            let fill_chars = [b'a', b'b', b'c', b'd', b'e', b'f'];
+            let mut class_char: Vec<(usize, u32)> = Vec::new();
+            let mut out: Vec<Option<Vec<u32>>> = Vec::with_capacity(vars.len());
+            for &v in &vars {
+                let lent = self.m.mk_app(lenf, &[v]);
+                let len = match model.eval(&self.m, lent) {
+                    Value::Num(r, _) => r.to_integer().and_then(|i| i.to_i64()),
+                    _ => None,
+                };
+                let class = match model.eval(&self.m, v) {
+                    Value::Uninterp(_, c) => c,
+                    _ => usize::MAX,
+                };
+                match len {
+                    // Cap the length so a pathological model can't build a huge word.
+                    Some(k) if (0..=2048).contains(&k) => {
+                        let ch = match class_char.iter().find(|(cl, _)| *cl == class) {
+                            Some(&(_, c)) => c,
+                            None => {
+                                let c =
+                                    fill_chars[class_char.len().min(fill_chars.len() - 1)] as u32;
+                                class_char.push((class, c));
+                                c
+                            }
+                        };
+                        out.push(Some(alloc::vec![ch; k as usize]));
+                    }
+                    _ => out.push(None),
+                }
+            }
+            out
+        } else {
+            alloc::vec![None; vars.len()]
+        };
         // Alphabet: characters occurring in string literals, plus two fresh ones.
         let mut alpha: Vec<u32> = Vec::new();
         for text in self.str_lits.keys() {
@@ -11484,7 +11527,7 @@ impl Context {
             }
         }
         let mut per_var: Vec<Vec<Vec<u32>>> = Vec::new();
-        for &v in &vars {
+        for (vi, &v) in vars.iter().enumerate() {
             if let Some(lv) = pinned.get(&v) {
                 per_var.push(alloc::vec![lv.clone()]);
                 continue;
@@ -11492,6 +11535,11 @@ impl Context {
             let exact = self.str_exact_len(goal, v);
             // Try literal substrings first (a concat piece is usually one of them).
             let mut cands: Vec<Vec<u32>> = Vec::new();
+            // The model-guided filler goes first so the all-filler assignment is the
+            // very first combination tried (immediate for pure-length goals).
+            if let Some(fill) = &model_fill[vi] {
+                cands.push(fill.clone());
+            }
             for sub in &lit_subs {
                 let ok = match exact {
                     Some(k) => sub.len() == k,
@@ -19528,14 +19576,18 @@ impl Context {
             // literal (e.g. a concat-vs-literal split forces `x="ab", y="cd"`);
             // verify that concrete assignment directly — it confirms `sat` without
             // an exponential candidate search.
-            if let Some(mut model) = model0
-                && let Some(m) = self.verify_string_model(wg, &mut model)
+            let mut model0 = model0;
+            if let Some(model) = model0.as_mut()
+                && let Some(m) = self.verify_string_model(wg, model)
             {
                 return (SmtResult::Sat, Some(m));
             }
             // Otherwise search for a concrete satisfying string/seq model, from the
-            // pre-axiom formula (its axioms fold cleanly under substitution).
-            if let Some(m) = self.try_string_witness(wg) {
+            // pre-axiom formula (its axioms fold cleanly under substitution). The
+            // abstract model's length assignment seeds a filler-word candidate so a
+            // pure-length goal (`len(x·y) ≥ 13`) is witnessed past the small
+            // enumeration cap.
+            if let Some(m) = self.try_string_witness(wg, model0.as_mut()) {
                 return (SmtResult::Sat, Some(m));
             }
             if let Some(m) = self.try_seq_witness(wg) {
