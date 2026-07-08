@@ -18656,6 +18656,48 @@ impl Context {
         (Rational::from_integer(Int::from(1)), alloc::vec![t])
     }
 
+    /// Exponentiation with a zero exponent over a *symbolic* base: `(^ b 0) = 1`
+    /// whenever `b ≠ 0` (verified against z3 for both Int and Real). z3 leaves
+    /// `0^0` unspecified, so we emit only the sound disjunction
+    /// `b = 0 ∨ (^ b 0) = 1`. Combined with the rest of the goal this lets the
+    /// engine finish, e.g. `x > 0 ∧ y = x^0 ∧ y ≠ 1 → unsat`. The concrete
+    /// literal `(^ 0 0)` is left fully unconstrained (z3 itself is inconsistent
+    /// on it), so we skip numeral bases here.
+    fn power_zero_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let mut axioms = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_app(t) {
+                continue;
+            }
+            if self.decl_name(self.m.app_decl(t)).as_deref() != Some("^") {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            if args.len() != 2 {
+                continue;
+            }
+            let (base, exp) = (args[0], args[1]);
+            // Exponent must be the integer 0, base must be symbolic (a numeral
+            // base is either already folded — nonzero — or the pathological
+            // literal `0^0` that z3 leaves unconstrained).
+            let exp_is_zero = self
+                .m
+                .as_numeral(exp)
+                .is_some_and(|e| e.is_integer() && e.is_zero());
+            if !exp_is_zero || self.m.as_numeral(base).is_some() || !seen.insert(t) {
+                continue;
+            }
+            let is_int = self.m.is_int_sort(self.m.get_sort(t));
+            let zero = self.m.mk_numeral(rat(0), is_int);
+            let one = self.m.mk_numeral(rat(1), is_int);
+            let base_zero = self.m.mk_eq(base, zero);
+            let pow_one = self.m.mk_eq(t, one);
+            axioms.push(self.m.mk_or(&[base_zero, pow_one]));
+        }
+        axioms
+    }
+
     /// Product-cancellation: `x·y = k·x` (a shared variable factor) implies
     /// `x = 0 ∨ y = k` — a sound consequence that lets the linear engine finish
     /// (`x·y = 2·x ∧ x > 0 ∧ y ≠ 2` → unsat). Emitted per equality with a common
@@ -19197,6 +19239,7 @@ impl Context {
         axioms.extend(self.string_axioms(lifted));
         axioms.extend(self.square_axioms(lifted));
         axioms.extend(self.product_cancel_axioms(lifted));
+        axioms.extend(self.power_zero_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.fp_from_bv_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
@@ -21011,7 +21054,18 @@ impl Context {
                         && let Some(ei) = e.to_i64()
                         && ei <= 8
                     {
-                        return self.icp_to_poly(args[0], var_map).pow(ei as u32);
+                        // `x^0 = 1` is only valid for a base known to be nonzero:
+                        // z3 leaves `0^0` unspecified (`(distinct (^ 0 0) 1)` is
+                        // sat), so folding `x^0 → 1` unconditionally is unsound.
+                        // Fold only when the base is a nonzero numeral; otherwise
+                        // fall through to a fresh opaque variable.
+                        if ei == 0 {
+                            if self.m.as_numeral(args[0]).is_some_and(|b| !b.is_zero()) {
+                                return Polynomial::constant(Rational::from_integer(1.into()));
+                            }
+                        } else {
+                            return self.icp_to_poly(args[0], var_map).pow(ei as u32);
+                        }
                     }
                     // Non-constant / large exponent: fall through to a fresh var.
                 }
@@ -22763,6 +22817,9 @@ impl Context {
                     m.as_numeral(args[1]).and_then(|v| v.to_integer()),
                 ) && let Some(e) = exp.to_i64()
                     && (0..=1024).contains(&e)
+                    // `0^0` is unspecified in z3 (`(distinct (^ 0 0) 1)` is sat),
+                    // so it must stay opaque rather than fold to 1.
+                    && !(e == 0 && base.is_zero())
                 {
                     let is_int = m.is_int_sort(m.get_sort(args[0]));
                     let mut acc = Rational::from_integer(puremp::Int::from(1));
