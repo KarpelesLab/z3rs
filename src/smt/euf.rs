@@ -54,18 +54,22 @@ impl Egraph {
         if let Some(&id) = self.ids.get(&t) {
             return id;
         }
-        let id = self.terms.len();
-        self.ids.insert(t, id);
-        self.terms.push(t);
-        self.parent.push(id);
-        // Record the application signature (children already interned: postorder).
+        // Record the application signature, interning any child not already seen
+        // first so its id exists before this node's (the AST is a DAG, so this
+        // terminates). Doing this before assigning `id` keeps every parallel
+        // vector index-aligned regardless of the caller's traversal order.
         let sig = match m.node(t) {
             AstNode::App(a) if !a.args.is_empty() => {
-                let arg_ids = a.args.iter().map(|&c| self.ids[&c]).collect();
+                let args = a.args.clone();
+                let arg_ids = args.iter().map(|&c| self.intern(m, c)).collect();
                 Some((a.decl, arg_ids))
             }
             _ => None,
         };
+        let id = self.terms.len();
+        self.ids.insert(t, id);
+        self.terms.push(t);
+        self.parent.push(id);
         self.app.push(sig);
         id
     }

@@ -2197,6 +2197,17 @@ impl Context {
                         let e = self.resolve_sort(&l[1])?;
                         Ok(self.seq_sort(e))
                     }
+                    // The built-in polymorphic `List` datatype (nil / insert with
+                    // head, tail), unless the user has shadowed the name. Registered
+                    // lazily as an ordinary parametric datatype on first use.
+                    "List"
+                        if l.len() == 2
+                            && !self.param_datatypes.contains_key("List")
+                            && !self.sort_ctors.contains_key("List") =>
+                    {
+                        self.ensure_builtin_list();
+                        self.monomorphize_datatype("List", &l[1..])
+                    }
                     // A set is its characteristic function: (Set T) = (Array T Bool).
                     "Set" if l.len() == 2 => {
                         let e = self.resolve_sort(&l[1])?;
@@ -2580,6 +2591,9 @@ impl Context {
             }
             "define-const" => {
                 // (define-const name S body) ≡ (define-fun name () S body).
+                if list.len() != 4 {
+                    return Err("define-const: expected (define-const name S body)".to_string());
+                }
                 let name = Self::sym(&list[1])?.to_string();
                 self.macros.insert(name, (Vec::new(), list[3].clone()));
                 Ok(None)
@@ -3075,6 +3089,55 @@ impl Context {
     /// `(Pair Int Bool)`. Creates (once) a concrete sort named `Name!arg1!arg2…`
     /// with its type parameters substituted by the argument sort expressions,
     /// then builds its constructors. Returns the concrete sort.
+    /// Register z3's built-in polymorphic `List` datatype the first time it is
+    /// used, as if the user had written
+    /// `(declare-datatypes ((List 1)) ((par (T) ((nil) (insert (head T) (tail (List T)))))))`.
+    fn ensure_builtin_list(&mut self) {
+        if self.param_datatypes.contains_key("List") {
+            return;
+        }
+        // Parse the constructor list once; this cannot fail for the literal above.
+        if let Ok(forms) = parse("((nil) (insert (head T) (tail (List T))))")
+            && let Some(SExpr::List(ctors)) = forms.into_iter().next()
+        {
+            self.param_datatypes
+                .insert("List".to_string(), (alloc::vec!["T".to_string()], ctors));
+        }
+    }
+
+    /// The declaration of a constructor named `name` whose result sort is `sort`,
+    /// if any. Used to disambiguate a polymorphic nullary constructor under an
+    /// `(as C S)` annotation when several monomorphic instances share the name.
+    fn ctor_of_sort(&self, sort: AstId, name: &str) -> Option<AstId> {
+        let matches = |&decl: &AstId| {
+            self.m
+                .func_decl(decl)
+                .and_then(|f| f.name.as_str())
+                .map(|n| n == name)
+                .unwrap_or(false)
+        };
+        if let Some(ctors) = self.datatypes.get(&sort)
+            && let Some((d, _, _)) = ctors.iter().find(|(d, _, _)| matches(d))
+        {
+            return Some(*d);
+        }
+        if let Some(ids) = self.enums.get(&sort) {
+            for &cid in ids {
+                if let Some(app) = self.m.app(cid)
+                    && matches(&app.decl)
+                {
+                    return Some(app.decl);
+                }
+            }
+        }
+        if let Some((cdecl, _)) = self.records.get(&sort)
+            && matches(cdecl)
+        {
+            return Some(*cdecl);
+        }
+        None
+    }
+
     fn monomorphize_datatype(&mut self, name: &str, args: &[SExpr]) -> Result<AstId, String> {
         let (params, ctors) = self.param_datatypes[name].clone();
         if params.len() != args.len() {
@@ -20184,6 +20247,19 @@ impl Context {
             SExpr::List(l) if !l.is_empty() => {
                 // Qualified-identifier head, e.g. ((as const (Array I E)) v).
                 if let SExpr::List(qid) = &l[0] {
+                    // ((as f Sort) args…): a return-sort-annotated application, e.g.
+                    // an overloaded datatype accessor `((as DDy Int) dd)`. The sort
+                    // annotation only disambiguates overloads we resolve by name, so
+                    // apply `f` to the arguments directly.
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "as")
+                        && matches!(&qid[1], SExpr::Atom(a) if a != "const")
+                    {
+                        let mut app = Vec::with_capacity(l.len());
+                        app.push(qid[1].clone());
+                        app.extend_from_slice(&l[1..]);
+                        return self.term(&SExpr::List(app));
+                    }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "is")
@@ -20201,6 +20277,63 @@ impl Context {
                         }
                         let c = self.term(&SExpr::Atom(cname))?;
                         return Ok(self.m.mk_eq(x, c));
+                    }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "update-field")
+                    {
+                        // ((_ update-field sel) x v): the datatype value equal to x
+                        // but with field `sel` set to v. For each constructor that
+                        // owns `sel`, rebuild it applying the remaining selectors to
+                        // x and substituting v at `sel`'s slot, guarded by that
+                        // constructor's tester; a value of any other constructor is
+                        // returned unchanged.
+                        let sel = Self::sym(&qid[2])?.to_string();
+                        let x = self.term(&l[1])?;
+                        let v = self.term(&l[2])?;
+                        let sort = self.m.get_sort(x);
+                        let sel_name =
+                            |s: &Self, d: AstId| s.m.func_decl(d).and_then(|f| f.name.as_str());
+                        // Record (single constructor): rebuild directly.
+                        if let Some((cdecl, sels)) = self.records.get(&sort).cloned() {
+                            if let Some(i) = sels
+                                .iter()
+                                .position(|&s| sel_name(self, s) == Some(sel.as_str()))
+                            {
+                                let args: Vec<AstId> = sels
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(j, &s)| if j == i { v } else { self.m.mk_app(s, &[x]) })
+                                    .collect();
+                                return Ok(self.m.mk_app(cdecl, &args));
+                            }
+                            return Ok(x);
+                        }
+                        // General datatype: an ite chain over the owning constructors.
+                        if let Some(ctors) = self.datatypes.get(&sort).cloned() {
+                            let mut result = x;
+                            for (cdecl, sels, tester) in ctors.iter().rev() {
+                                if let Some(i) = sels
+                                    .iter()
+                                    .position(|&s| sel_name(self, s) == Some(sel.as_str()))
+                                {
+                                    let args: Vec<AstId> = sels
+                                        .iter()
+                                        .enumerate()
+                                        .map(
+                                            |(j, &s)| {
+                                                if j == i { v } else { self.m.mk_app(s, &[x]) }
+                                            },
+                                        )
+                                        .collect();
+                                    let rebuilt = self.m.mk_app(*cdecl, &args);
+                                    let is_c = self.m.mk_app(*tester, &[x]);
+                                    result = self.m.mk_ite(is_c, rebuilt, result);
+                                }
+                            }
+                            return Ok(result);
+                        }
+                        return Err("update-field: not a datatype".to_string());
                     }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
@@ -20455,6 +20588,44 @@ impl Context {
                             self.m.mk_le(sum, kk)
                         });
                     }
+                    // Weighted pseudo-boolean constraints:
+                    //   ((_ pbge k w1…wn) x1…xn) ≡ Σ wi·[xi] ≥ k   (pble: ≤, pbeq: =)
+                    // Encoded as an exact integer sum of weighted 0/1 ites.
+                    if qid.len() >= 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a)
+                            if a == "pbeq" || a == "pbge" || a == "pble")
+                    {
+                        let op = Self::sym(&qid[1])?.to_string();
+                        let k: i64 = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "pb: bad threshold".to_string())?;
+                        let weights = &qid[3..];
+                        if weights.len() != l.len() - 1 {
+                            return Err("pb: weight/argument count mismatch".to_string());
+                        }
+                        let mut terms = Vec::new();
+                        for (arg, w) in l[1..].iter().zip(weights) {
+                            let wv: i64 = Self::sym(w)?
+                                .parse()
+                                .map_err(|_| "pb: bad weight".to_string())?;
+                            let b = self.term(arg)?;
+                            let one = self.m.mk_int(wv);
+                            let zero = self.m.mk_int(0);
+                            terms.push(self.m.mk_ite(b, one, zero));
+                        }
+                        let sum = match terms.len() {
+                            0 => self.m.mk_int(0),
+                            1 => terms[0],
+                            _ => self.m.mk_add(&terms),
+                        };
+                        let kk = self.m.mk_int(k);
+                        return Ok(match op.as_str() {
+                            "pbge" => self.m.mk_ge(sum, kk),
+                            "pble" => self.m.mk_le(sum, kk),
+                            _ => self.m.mk_eq(sum, kk),
+                        });
+                    }
                     // ((_ fp.to_ubv m) RM x) / ((_ fp.to_sbv m) RM x): convert an
                     // FP to an m-bit (un)signed bit-vector. Constant-fold when x is
                     // a finite FP constant, RM is a constant rounding mode, and the
@@ -20506,9 +20677,15 @@ impl Context {
                     _ => head,
                 };
                 if head == "let" {
+                    if l.len() != 3 {
+                        return Err("let: expected (let (bindings) body)".to_string());
+                    }
                     return self.term_let(&l[1], &l[2]);
                 }
                 if head == "match" {
+                    if l.len() != 3 {
+                        return Err("match: expected (match t (cases))".to_string());
+                    }
                     return self.term_match(&l[1], &l[2]);
                 }
                 if head == "as" && l.len() == 3 {
@@ -20517,6 +20694,16 @@ impl Context {
                     if matches!(&l[1], SExpr::Atom(a) if a == "seq.empty") {
                         let s = self.resolve_sort(&l[2])?;
                         return Ok(self.seq_empty_of(s));
+                    }
+                    // Resolving the annotated sort also registers a parametric
+                    // datatype instance (e.g. `(as nil (List Int))`). For a nullary
+                    // constructor this both triggers registration and disambiguates
+                    // which monomorphic instance's constructor is meant.
+                    if let Ok(s) = self.resolve_sort(&l[2])
+                        && let SExpr::Atom(cname) = &l[1]
+                        && let Some(d) = self.ctor_of_sort(s, cname)
+                    {
+                        return Ok(self.m.mk_const(d));
                     }
                     return self.term(&l[1]);
                 }
