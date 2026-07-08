@@ -20385,9 +20385,11 @@ impl Context {
                     .filter(|(_, k)| **k)
                     .map(|((_, id), _)| *id)
                     .collect();
-                // Only drop when the remainder is provably satisfiable; a
-                // non-Sat result (unsat or unknown) conservatively keeps it.
-                if self.check_with(&extra).0 != SmtResult::Sat {
+                // Assumption `i` is necessary iff dropping it makes the remainder
+                // satisfiable; keep it then. If the remainder is still unsat,
+                // `i` was redundant and stays dropped. (An `unknown` result is
+                // conservative: keep the assumption rather than drop it wrongly.)
+                if self.check_with(&extra).0 != SmtResult::Unsat {
                     keep[i] = true;
                 }
             }
@@ -20548,7 +20550,13 @@ impl Context {
                     continue; // array interpretations not yet emitted (invalid)
                 }
                 let c = self.m.mk_const(decl.d);
-                let v = model.value_string(&self.m, c);
+                let v = self
+                    .str_value(c)
+                    .map(|cps| smt_string_literal(&cps))
+                    .or_else(|| self.str_model_value(&mut model, c))
+                    .or_else(|| self.enum_value_name(&mut model, c))
+                    .or_else(|| self.fp_model_value(&mut model, c))
+                    .unwrap_or_else(|| model.value_string(&self.m, c));
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} () {sort_name}\n    {v})",
@@ -20579,6 +20587,12 @@ impl Context {
     fn sort_display(&self, sort: AstId) -> String {
         if let Some((i, e)) = self.m.array_sort_params(sort) {
             return alloc::format!("(Array {} {})", self.sort_display(i), self.sort_display(e));
+        }
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return alloc::format!("(_ BitVec {w})");
+        }
+        if let Some(&(eb, sb)) = self.fp_sorts.iter().find(|&(_, &s)| s == sort).map(|(k, _)| k) {
+            return alloc::format!("(_ FloatingPoint {eb} {sb})");
         }
         self.m
             .sort(sort)
