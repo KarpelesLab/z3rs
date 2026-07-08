@@ -1376,6 +1376,11 @@ struct Context {
     /// Symbolic `str.at x i` markers, cached by `(x, i)` so repeated reads at the
     /// same position are congruent — `str.at x i = "a" ∧ str.at x i = "b"` refutes.
     str_at_sym: BTreeMap<(AstId, AstId), AstId>,
+    /// Symbolic `fp.roundToIntegral rm x` markers, cached by `(rm, x)` so two
+    /// identical rounds are the same term (congruent). Needed for the idempotence
+    /// refutation `roundToIntegral(rm, roundToIntegral(rm, x)) = roundToIntegral(rm, x)`
+    /// when `rm` is symbolic (each `symbolic_fp` call is otherwise a fresh decl).
+    fp_r2i_sym: BTreeMap<(AstId, AstId), AstId>,
     /// The operation name behind each symbolic sequence marker declaration, so a
     /// marker can be re-folded once its arguments become concrete (witness search).
     seqop_ops: BTreeMap<AstId, String>,
@@ -2238,6 +2243,7 @@ impl Context {
             seq_at_sym: BTreeMap::new(),
             seq_unit_cache: BTreeMap::new(),
             str_at_sym: BTreeMap::new(),
+            fp_r2i_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
             witness_base: None,
             last_assumptions: Vec::new(),
@@ -14691,10 +14697,39 @@ impl Context {
                 self.symbolic_fp(op, args)
             }
             "fp.roundToIntegral" if args.len() == 2 => {
+                // Idempotence: `roundToIntegral(rm, roundToIntegral(rm, x))` =
+                // `roundToIntegral(rm, x)`. A roundToIntegral result is already an
+                // integer-valued float (NaN/±inf/±0 preserved), so a second round
+                // under the *same* rounding mode is the identity. Holds even when
+                // `rm` is symbolic, as long as it is the identical term. Refutes
+                // `roundToIntegral(rm, roundToIntegral(rm, x)) ≠ roundToIntegral(rm, x)`.
+                if self.m.is_app(args[1])
+                    && self.m.app_args(args[1]).len() == 2
+                    && self.m.app_args(args[1])[0] == args[0]
+                    && self
+                        .decl_name(self.m.app_decl(args[1]))
+                        .as_deref()
+                        .is_some_and(|n| n.starts_with("!fpr2i!"))
+                {
+                    return Ok(args[1]);
+                }
                 if let Some(t) = self.fp_r2i_bv(args[0], args[1]) {
                     return Ok(t);
                 }
-                self.symbolic_fp(op, args)
+                // Symbolic rounding mode: opaque, but cache by `(rm, x)` so two
+                // identical rounds are the same term (idempotence above needs it).
+                if let Some(&c) = self.fp_r2i_sym.get(&(args[0], args[1])) {
+                    return Ok(c);
+                }
+                let sort = self.m.get_sort(args[1]);
+                let domain = [self.m.get_sort(args[0]), sort];
+                let name = alloc::format!("!fpr2i!{}", self.fresh_counter);
+                self.fresh_counter += 1;
+                let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
+                let app = self.m.mk_app(d, args);
+                self.str_symbolic.insert(app);
+                self.fp_r2i_sym.insert((args[0], args[1]), app);
+                Ok(app)
             }
             "fp.fma" if args.len() == 4 => {
                 if let Some(t) = self.fp_fma_bv(args[0], args[1], args[2], args[3]) {
