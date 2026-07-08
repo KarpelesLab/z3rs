@@ -1330,6 +1330,12 @@ struct Context {
     /// applications share one free bit-vector (z3 congruence: the result is an
     /// uninterpreted value distinguished by the full application).
     fp_to_bv_unspec: BTreeMap<(bool, u32, AstId, AstId), AstId>,
+    /// Unspecified sign of an `fp.min`/`fp.max` ±0 clash, cached by
+    /// `(is_min, a, b)` so identical applications share one free 1-bit sign
+    /// (SMT-LIB leaves the result sign of `min(+0,-0)`/`max(+0,-0)` unspecified,
+    /// but it is a function: same operands ⇒ same zero). A free 1-bit value is
+    /// already exactly `{+0, -0}`, so no extra constraint is needed.
+    fp_minmax_zero_sign: BTreeMap<(bool, AstId, AstId), AstId>,
     /// Gated `fp.to_ubv`/`fp.to_sbv` markers over a *symbolic* FP `x` (constant
     /// rounding mode): marker BV → `(signed, m, rm_code, rm, x)`. Re-folded once
     /// `x` is pinned to a concrete FP constant by a top-level equality.
@@ -2249,6 +2255,7 @@ impl Context {
             fp_class_markers: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
             fp_to_bv_unspec: BTreeMap::new(),
+            fp_minmax_zero_sign: BTreeMap::new(),
             fp_to_bv_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
@@ -13129,22 +13136,12 @@ impl Context {
         let sa1 = self.m.mk_eq(sa, one1);
         let sb1 = self.m.mk_eq(sbb, one1);
         let zeros = self.m.mk_bv(0, w - 1);
-        let neg_zero = self.m.mk_bv_concat(one1, zeros);
-        let pos_zero = self.m.mk_bv(0, w);
         let lt_ab = self.fp_real_lt(bva, bvb, w);
         let lt_ba = self.fp_real_lt(bvb, bva, w);
         let is_min = op == "fp.min";
-        // ±0 clash → the signed zero z3 prefers.
-        let zero_res = if is_min {
-            let either_neg = self.m.mk_or(&[sa1, sb1]);
-            self.m.mk_ite(either_neg, neg_zero, pos_zero)
-        } else {
-            let nsa1 = self.m.mk_not(sa1);
-            let nsb1 = self.m.mk_not(sb1);
-            let either_pos = self.m.mk_or(&[nsa1, nsb1]);
-            self.m.mk_ite(either_pos, pos_zero, neg_zero)
-        };
-        let eq_case = self.m.mk_ite(both_zero, zero_res, bva);
+        // Both operands are zero of the *same* sign ⇒ that signed zero (`bva`
+        // and `bvb` are then bit-identical).
+        let eq_case = bva;
         // min: a<b→a, b<a→b; max: a>b→a, b>a→b.
         let (first, second) = if is_min {
             (lt_ab, lt_ba)
@@ -13155,7 +13152,30 @@ impl Context {
         let core = self.m.mk_ite(first, bva, inner);
         // NaN operand ⇒ the other operand.
         let r1 = self.m.mk_ite(nan_b, bva, core);
-        let result_bv = self.m.mk_ite(nan_a, bvb, r1);
+        let core_bv = self.m.mk_ite(nan_a, bvb, r1);
+        // ±0 clash. When the two operands are +0 and −0, SMT-LIB leaves the
+        // result sign unspecified (either +0 or −0). Model it as an unspecified
+        // free 1-bit sign, cached per application so identical `fp.min`/`fp.max`
+        // terms stay congruent. A 1-bit value is exactly `{+0, −0}`, so no extra
+        // constraint is required. This must override `core_bv`, because the
+        // ordering circuit (`fp_real_lt`) treats −0 < +0 and would otherwise
+        // commit to a definite sign. The clash is `both_zero && sa1 != sb1`.
+        let same_sign = self.m.mk_eq(sa1, sb1);
+        let diff_sign = self.m.mk_not(same_sign);
+        let clash = self.m.mk_and(&[both_zero, diff_sign]);
+        let unspec_sign = {
+            let key = (is_min, a, b);
+            if let Some(&s) = self.fp_minmax_zero_sign.get(&key) {
+                s
+            } else {
+                let s1 = self.m.mk_bv_sort(1);
+                let s = self.fresh_const(s1);
+                self.fp_minmax_zero_sign.insert(key, s);
+                s
+            }
+        };
+        let unspec_zero = self.m.mk_bv_concat(unspec_sign, zeros);
+        let result_bv = self.m.mk_ite(clash, unspec_zero, core_bv);
         let fps = self.fp_sort(eb, sb);
         let result = self.fresh_const(fps);
         self.fp_bv.insert(result, result_bv);
@@ -15044,8 +15064,16 @@ impl Context {
             }
             "fp.min" | "fp.max" if args.len() == 2 => {
                 if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
-                    let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
-                    return Ok(self.mk_fp(f64_bits(r), 11, 53));
+                    // A concrete ±0 clash has an SMT-LIB-unspecified result sign;
+                    // fall through to the symbolic circuit (which models the sign
+                    // as an unspecified free bit) instead of committing to Rust's
+                    // deterministic `f64::min`/`max` choice.
+                    let clash =
+                        a == 0.0 && b == 0.0 && a.is_sign_negative() != b.is_sign_negative();
+                    if !clash {
+                        let r = if op == "fp.min" { a.min(b) } else { a.max(b) };
+                        return Ok(self.mk_fp(f64_bits(r), 11, 53));
+                    }
                 }
                 if let Some(t) = self.fp_min_max_bv(op, args[0], args[1]) {
                     return Ok(t);
@@ -24142,6 +24170,42 @@ mod tests {
                  (assert (fp.lt (fp.min x y) (fp.max x y)))(check-sat)")
             .unwrap(),
             alloc::vec!["sat"]
+        );
+    }
+
+    #[test]
+    fn fp_min_max_zero_clash_unspecified() {
+        // SMT-LIB leaves the *sign* of fp.min(+0,−0) / fp.max(+0,−0) unspecified:
+        // the result may be +0 or −0. Both sign choices must be satisfiable
+        // (z3 agrees), rather than z3rs committing to one and wrongly refuting
+        // the other.
+        let clash = "(declare-const x Float32)(declare-const y Float32)\
+                     (assert (= x (_ +zero 8 24)))(assert (= y (_ -zero 8 24)))";
+        for (op, want) in [
+            ("fp.min", "_ +zero 8 24"),
+            ("fp.min", "_ -zero 8 24"),
+            ("fp.max", "_ +zero 8 24"),
+            ("fp.max", "_ -zero 8 24"),
+        ] {
+            let s = alloc::format!("{clash}(assert (= ({op} x y) ({want})))(check-sat)");
+            assert_eq!(run(&s).unwrap(), alloc::vec!["sat"], "{op} = ({want})");
+        }
+        // The unspecified result is still a *function*: two syntactically-equal
+        // applications are congruent, so they can never be `distinct`.
+        assert_eq!(
+            run(&alloc::format!(
+                "{clash}(assert (distinct (fp.min x y) (fp.min x y)))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // ...and it is definitely a zero (never a nonzero value).
+        assert_eq!(
+            run(&alloc::format!(
+                "{clash}(assert (not (fp.isZero (fp.max x y))))(check-sat)"
+            ))
+            .unwrap(),
+            alloc::vec!["unsat"]
         );
     }
 
