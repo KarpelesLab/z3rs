@@ -31,6 +31,7 @@ use alloc::vec::Vec;
 
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
+use crate::ast::bv::BvOp;
 use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
@@ -249,8 +250,375 @@ impl Model {
     }
 
     /// Render `t`'s value as an SMT-LIB2 term (`true`, `5`, `(/ 1.0 2.0)`, …).
+    ///
+    /// Unlike [`Model::eval`] (used by the solver for model checking), this drives
+    /// a *fully folding* evaluator: ground bit-vector / arithmetic / Boolean
+    /// operators over model values are constant-folded, so `(get-value)` / `(eval)`
+    /// return a concrete literal rather than a placeholder or a stray `0`.
     pub fn value_string(&mut self, m: &AstManager, t: AstId) -> alloc::string::String {
-        self.eval(m, t).render(m)
+        self.eval_full(m, t).render(m)
+    }
+
+    /// A fully-folding variant of [`Model::eval`] used only for value rendering.
+    fn eval_full(&mut self, m: &AstManager, t: AstId) -> Value {
+        let s = m.get_sort(t);
+        if let Some(width) = m.bv_sort_width(s) {
+            Value::Bv(self.eval_bv_full(m, t, width), width)
+        } else if m.is_bool_sort(s) {
+            Value::Bool(self.eval_bool_full(m, t))
+        } else if m.is_arith_sort(s) {
+            let is_int = m.is_int_sort(s);
+            match self.eval_num_full(m, t) {
+                Some(r) => Value::Num(r, is_int),
+                None => Value::Num(ast_to_lin(m, t).eval(&self.arith), is_int),
+            }
+        } else {
+            Value::Uninterp(s, self.euf.class_of(m, t))
+        }
+    }
+
+    /// Fold a bit-vector term to its concrete value (reduced mod `2^width`).
+    fn eval_bv_full(&mut self, m: &AstManager, t: AstId, width: u32) -> Int {
+        if let Some((v, _)) = self.bv.get(&t) {
+            return v.mod_2k(width);
+        }
+        if let Some(v) = m.bv_numeral_value(t) {
+            return v.mod_2k(width);
+        }
+        if m.is_ite(t) {
+            let a = m.app_args(t).to_vec();
+            return if self.eval_bool_full(m, a[0]) {
+                self.eval_bv_full(m, a[1], width)
+            } else {
+                self.eval_bv_full(m, a[2], width)
+            };
+        }
+        if let Some(op) = m.bv_op(t) {
+            let args = m.app_args(t).to_vec();
+            let argw = |m: &AstManager, x: AstId| m.bv_sort_width(m.get_sort(x)).unwrap_or(width);
+            let ev = |s: &mut Self, m: &AstManager, x: AstId| {
+                let w = argw(m, x);
+                s.eval_bv_full(m, x, w)
+            };
+            match op {
+                BvOp::Neg => {
+                    let a = ev(self, m, args[0]);
+                    return Int::from(0).sub(&a).mod_2k(width);
+                }
+                BvOp::Add => {
+                    let mut acc = Int::from(0);
+                    for &x in &args {
+                        acc = acc.add(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::Sub => {
+                    let mut acc = ev(self, m, args[0]);
+                    for &x in &args[1..] {
+                        acc = acc.sub(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::Mul => {
+                    let mut acc = Int::from(1);
+                    for &x in &args {
+                        acc = acc.mul(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::Udiv => {
+                    let a = ev(self, m, args[0]);
+                    let b = ev(self, m, args[1]);
+                    return if b.is_zero() {
+                        Int::from(1).mul_2k(width).sub(&Int::from(1)) // all ones
+                    } else {
+                        a.div_trunc(&b).mod_2k(width)
+                    };
+                }
+                BvOp::Urem => {
+                    let a = ev(self, m, args[0]);
+                    let b = ev(self, m, args[1]);
+                    return if b.is_zero() {
+                        a
+                    } else {
+                        a.rem_trunc(&b).mod_2k(width)
+                    };
+                }
+                BvOp::BAnd => {
+                    let mut acc = Int::from(1).mul_2k(width).sub(&Int::from(1));
+                    for &x in &args {
+                        acc = acc.bitand(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::BOr => {
+                    let mut acc = Int::from(0);
+                    for &x in &args {
+                        acc = acc.bitor(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::BXor => {
+                    let mut acc = Int::from(0);
+                    for &x in &args {
+                        acc = acc.bitxor(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::BNot => {
+                    let a = ev(self, m, args[0]);
+                    return a.bitnot(width).mod_2k(width);
+                }
+                BvOp::Concat => {
+                    let mut acc = Int::from(0);
+                    for &x in &args {
+                        let w = argw(m, x);
+                        acc = acc.mul_2k(w).bitor(&ev(self, m, x));
+                    }
+                    return acc.mod_2k(width);
+                }
+                BvOp::ZeroExt => {
+                    return ev(self, m, args[0]).mod_2k(width);
+                }
+                BvOp::SignExt => {
+                    let w0 = argw(m, args[0]);
+                    let a = ev(self, m, args[0]);
+                    let signed = to_signed_int(&a, w0);
+                    return signed.mod_2k(width);
+                }
+                BvOp::Extract => {
+                    if let Some((high, low)) = m.bv_extract_params(t) {
+                        let a = ev(self, m, args[0]);
+                        return a.div_2k_trunc(low).mod_2k(high - low + 1);
+                    }
+                }
+                BvOp::Shl => {
+                    let a = ev(self, m, args[0]);
+                    let sh = ev(self, m, args[1]);
+                    return match sh.to_i64() {
+                        Some(k) if (k as u32) < width => a.mul_2k(k as u32).mod_2k(width),
+                        _ => Int::from(0),
+                    };
+                }
+                BvOp::Lshr => {
+                    let a = ev(self, m, args[0]);
+                    let sh = ev(self, m, args[1]);
+                    return match sh.to_i64() {
+                        Some(k) if (k as u32) < width => a.div_2k_trunc(k as u32),
+                        _ => Int::from(0),
+                    };
+                }
+                BvOp::Ashr => {
+                    let a = ev(self, m, args[0]);
+                    let signed = to_signed_int(&a, width);
+                    let sh = ev(self, m, args[1]);
+                    return match sh.to_i64() {
+                        Some(k) if (k as u32) < width => signed
+                            .div_floor(&Int::from(1).mul_2k(k as u32))
+                            .mod_2k(width),
+                        _ => {
+                            // shift ≥ width: fill with the sign bit.
+                            if a.bit(width - 1) {
+                                Int::from(1).mul_2k(width).sub(&Int::from(1))
+                            } else {
+                                Int::from(0)
+                            }
+                        }
+                    };
+                }
+                // Boolean-sorted bit-vector predicates never reach here.
+                BvOp::Num | BvOp::Uleq | BvOp::Ult | BvOp::Sleq | BvOp::Slt => {}
+            }
+        }
+        Int::from(0)
+    }
+
+    /// Fold an arithmetic term to a concrete rational, or `None` if some leaf is
+    /// not resolvable by pure folding (the caller then falls back to the linear
+    /// evaluator over the model assignment).
+    fn eval_num_full(&mut self, m: &AstManager, t: AstId) -> Option<Rational> {
+        if let Some(r) = m.as_numeral(t) {
+            return Some(r);
+        }
+        if m.is_ite(t) {
+            let a = m.app_args(t).to_vec();
+            return if self.eval_bool_full(m, a[0]) {
+                self.eval_num_full(m, a[1])
+            } else {
+                self.eval_num_full(m, a[2])
+            };
+        }
+        // bv2int / bv2nat / (u/s)bv_to_int bridge from a folded bit-vector.
+        if let Some(app) = m.app(t).filter(|a| a.args.len() == 1) {
+            let nm = m.func_decl(app.decl).and_then(|d| d.name.as_str());
+            if let Some(nm) =
+                nm.filter(|n| matches!(*n, "bv2int" | "bv2nat" | "ubv_to_int" | "sbv_to_int"))
+            {
+                let arg = app.args[0];
+                let w = m.bv_sort_width(m.get_sort(arg))?;
+                let v = self.eval_bv_full(m, arg, w);
+                let v = if nm == "sbv_to_int" {
+                    to_signed_int(&v, w)
+                } else {
+                    v
+                };
+                return Some(Rational::from_integer(v));
+            }
+        }
+        let op = m.arith_op(t)?;
+        let args = m.app_args(t).to_vec();
+        let ev = |s: &mut Self, x: AstId| s.eval_num_full(m, x);
+        match op {
+            ArithOp::Add => {
+                let mut acc = Rational::from_integer(Int::from(0));
+                for &x in &args {
+                    acc += ev(self, x)?;
+                }
+                Some(acc)
+            }
+            ArithOp::Sub => {
+                let mut acc = ev(self, args[0])?;
+                for &x in &args[1..] {
+                    acc -= ev(self, x)?;
+                }
+                Some(acc)
+            }
+            ArithOp::Uminus => Some(-ev(self, args[0])?),
+            ArithOp::Mul => {
+                let mut acc = Rational::from_integer(Int::from(1));
+                for &x in &args {
+                    acc *= ev(self, x)?;
+                }
+                Some(acc)
+            }
+            ArithOp::Div => {
+                let a = ev(self, args[0])?;
+                let b = ev(self, args[1])?;
+                if b.is_zero() { None } else { Some(a / b) }
+            }
+            ArithOp::Idiv => {
+                let a = ev(self, args[0])?.to_integer()?;
+                let b = ev(self, args[1])?.to_integer()?;
+                if b.is_zero() {
+                    None
+                } else {
+                    Some(Rational::from_integer(a.div_euclid(&b)))
+                }
+            }
+            ArithOp::Mod => {
+                let a = ev(self, args[0])?.to_integer()?;
+                let b = ev(self, args[1])?.to_integer()?;
+                if b.is_zero() {
+                    None
+                } else {
+                    Some(Rational::from_integer(a.rem_euclid(&b)))
+                }
+            }
+            ArithOp::Abs => Some(ev(self, args[0])?.abs()),
+            ArithOp::ToReal => ev(self, args[0]),
+            ArithOp::ToInt => {
+                let a = ev(self, args[0])?;
+                Some(Rational::from_integer(a.floor()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Fold a Boolean term to a concrete truth value.
+    fn eval_bool_full(&mut self, m: &AstManager, t: AstId) -> bool {
+        if let Some(&b) = self.bools.get(&t) {
+            return b;
+        }
+        if m.is_true(t) {
+            return true;
+        }
+        if m.is_false(t) {
+            return false;
+        }
+        if m.is_not(t) {
+            return !self.eval_bool_full(m, m.app_args(t)[0]);
+        }
+        if m.is_and(t) {
+            return m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .all(|&a| self.eval_bool_full(m, a));
+        }
+        if m.is_or(t) {
+            return m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .any(|&a| self.eval_bool_full(m, a));
+        }
+        if m.is_xor(t) {
+            return m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .fold(false, |acc, &a| acc ^ self.eval_bool_full(m, a));
+        }
+        if m.is_implies(t) {
+            let a = m.app_args(t).to_vec();
+            return !self.eval_bool_full(m, a[0]) || self.eval_bool_full(m, a[1]);
+        }
+        if m.is_ite(t) {
+            let a = m.app_args(t).to_vec();
+            return if self.eval_bool_full(m, a[0]) {
+                self.eval_bool_full(m, a[1])
+            } else {
+                self.eval_bool_full(m, a[2])
+            };
+        }
+        if m.is_eq(t) {
+            let a = m.app_args(t).to_vec();
+            return self.values_eq_full(m, a[0], a[1]);
+        }
+        // Bit-vector comparisons.
+        if let Some(op) = m.bv_op(t) {
+            let args = m.app_args(t).to_vec();
+            if matches!(op, BvOp::Uleq | BvOp::Ult | BvOp::Sleq | BvOp::Slt) {
+                let w = m.bv_sort_width(m.get_sort(args[0])).unwrap_or(0);
+                let a = self.eval_bv_full(m, args[0], w);
+                let b = self.eval_bv_full(m, args[1], w);
+                return match op {
+                    BvOp::Uleq => a <= b,
+                    BvOp::Ult => a < b,
+                    BvOp::Sleq => to_signed_int(&a, w) <= to_signed_int(&b, w),
+                    BvOp::Slt => to_signed_int(&a, w) < to_signed_int(&b, w),
+                    _ => unreachable!(),
+                };
+            }
+        }
+        // Arithmetic comparisons.
+        if let Some(op @ (ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt)) = m.arith_op(t)
+            && let (Some(a), Some(b)) = (
+                self.eval_num_full(m, m.app_args(t)[0]),
+                self.eval_num_full(m, m.app_args(t)[1]),
+            )
+        {
+            return match op {
+                ArithOp::Le => a <= b,
+                ArithOp::Ge => a >= b,
+                ArithOp::Lt => a < b,
+                ArithOp::Gt => a > b,
+                _ => unreachable!(),
+            };
+        }
+        // Fall back to the model's atom table / EUF-based comparison.
+        self.eval_bool(m, t)
+    }
+
+    /// Equality under the folding evaluator.
+    fn values_eq_full(&mut self, m: &AstManager, a: AstId, b: AstId) -> bool {
+        match (self.eval_full(m, a), self.eval_full(m, b)) {
+            (Value::Bool(x), Value::Bool(y)) => x == y,
+            (Value::Num(x, _), Value::Num(y, _)) => x == y,
+            (Value::Uninterp(_, x), Value::Uninterp(_, y)) => x == y,
+            (Value::Bv(x, _), Value::Bv(y, _)) => x == y,
+            _ => false,
+        }
     }
 
     fn eval_bool(&mut self, m: &AstManager, t: AstId) -> bool {
@@ -317,6 +685,16 @@ impl Value {
             }
             Value::Bv(v, width) => render_bv(v, *width),
         }
+    }
+}
+
+/// The signed (two's-complement) integer value of an unsigned `width`-bit value.
+fn to_signed_int(v: &Int, width: u32) -> Int {
+    let v = v.mod_2k(width);
+    if width > 0 && v.bit(width - 1) {
+        v.sub(&Int::from(1).mul_2k(width))
+    } else {
+        v
     }
 }
 

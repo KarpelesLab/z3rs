@@ -271,6 +271,54 @@ fn to_signed(v: &Int, w: u32) -> Int {
     }
 }
 
+/// Render a `w`-bit field as z3's model printer does: `#x…` when the width is a
+/// multiple of four, else `#b…`.
+fn render_bv_field(v: u64, w: u32) -> String {
+    if w > 0 && w.is_multiple_of(4) {
+        let mut s = String::from("#x");
+        for nib in (0..w / 4).rev() {
+            let d = (v >> (nib * 4)) & 0xf;
+            s.push(char::from_digit(d as u32, 16).unwrap());
+        }
+        s
+    } else {
+        let mut s = String::from("#b");
+        for i in (0..w).rev() {
+            s.push(if (v >> i) & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    }
+}
+
+/// Render a floating-point bit pattern of format `(eb, sb)` the way z3's model
+/// printer does: the special values as `(_ NaN eb sb)` / `(_ ±oo eb sb)` /
+/// `(_ ±zero eb sb)`, and any finite value as `(fp #b<sign> <exp> <sig>)`.
+fn render_fp(bits: u64, eb: u32, sb: u32) -> String {
+    let mant = sb - 1;
+    let sign = (bits >> (eb + mant)) & 1;
+    let exp = (bits >> mant) & ((1u64 << eb) - 1);
+    let sig = bits & ((1u64 << mant) - 1);
+    let exp_ones = (1u64 << eb) - 1;
+    if exp == exp_ones {
+        return if sig == 0 {
+            alloc::format!("(_ {} {eb} {sb})", if sign == 1 { "-oo" } else { "+oo" })
+        } else {
+            alloc::format!("(_ NaN {eb} {sb})")
+        };
+    }
+    if exp == 0 && sig == 0 {
+        return alloc::format!(
+            "(_ {} {eb} {sb})",
+            if sign == 1 { "-zero" } else { "+zero" }
+        );
+    }
+    alloc::format!(
+        "(fp #b{sign} {} {})",
+        render_bv_field(exp, eb),
+        render_bv_field(sig, mant)
+    )
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -2471,6 +2519,17 @@ impl Context {
                 let t = self.term(&list[1])?;
                 let folded = self.dt_fold(t);
                 let s = crate::rewriter::simplify(&mut self.m, folded);
+                // A ground bit-vector term folds to a concrete numeral (the
+                // th_rewriter itself does not constant-fold bit-vector ops).
+                if self.m.bv_sort_width(self.m.get_sort(s)).is_some() && self.is_fully_concrete(s) {
+                    let mut model = Model::from_bv(BTreeMap::new());
+                    return Ok(Some(model.value_string(&self.m, s)));
+                }
+                // A string-literal result renders as its quoted text, not the
+                // internal `!str!N` constant name.
+                if let Some(cps) = self.str_value(s) {
+                    return Ok(Some(smt_string_literal(&cps)));
+                }
                 Ok(Some(self.m.pp(s)))
             }
             "apply" => {
@@ -2540,6 +2599,7 @@ impl Context {
                 let mut model = self.last_model.take().unwrap();
                 let v = self
                     .enum_value_name(&mut model, id)
+                    .or_else(|| self.fp_model_value(&mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
                 Ok(Some(v))
@@ -3282,7 +3342,46 @@ impl Context {
                 return Some(smt_string_literal(&cps));
             }
         }
+        // A string not pinned to any literal and absent from every assertion is
+        // unconstrained; z3's model gives it the empty string.
+        if !self.occurs_in_assertions(id) {
+            return Some(smt_string_literal(&[]));
+        }
         None
+    }
+
+    /// Does `id` occur as a subterm of any asserted formula?
+    fn occurs_in_assertions(&self, id: AstId) -> bool {
+        self.assertions
+            .iter()
+            .any(|&a| self.m.postorder(a).contains(&id))
+    }
+
+    /// If `id` is a floating-point term, render its concrete value under `model`
+    /// as z3 does: `(fp #b0 #x.. #b..)` for finite values, or the indexed forms
+    /// `(_ NaN eb sb)` / `(_ +oo eb sb)` / `(_ +zero eb sb)` for the specials.
+    /// A concrete FP literal reads its bits directly; a symbolic FP term reads
+    /// them from its bit-blasted representation's value in the model.
+    fn fp_model_value(&self, model: &mut Model, id: AstId) -> Option<String> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(id))?;
+        let bits: u64 = if let Some(&(b, _, _)) = self.fp_of.get(&id) {
+            b
+        } else {
+            let bv = self.fp_bv.get(&id).copied()?;
+            let v = match model.eval(&self.m, bv) {
+                Value::Bv(v, _) => v,
+                _ => return None,
+            };
+            let width = eb + sb;
+            let mut bits = 0u64;
+            for i in 0..width {
+                if v.bit(i) {
+                    bits |= 1u64 << i;
+                }
+            }
+            bits
+        };
+        Some(render_fp(bits, eb, sb))
     }
 
     /// If `id` has an enum sort, the name of the constructor it equals under
@@ -20080,6 +20179,27 @@ impl Context {
 
     /// `(get-value (t1 t2 …))` — evaluate each term under the current model and
     /// return `((t1 v1) (t2 v2) …)`.
+    /// True if every leaf reachable from `id` is a concrete value (a numeral or
+    /// `true`/`false`) — i.e. the term is ground and can be constant-folded.
+    fn is_fully_concrete(&self, id: AstId) -> bool {
+        for &n in &self.m.postorder(id) {
+            match self.m.app(n) {
+                Some(app) if app.args.is_empty() => {
+                    let leaf_ok = self.m.bv_numeral_value(n).is_some()
+                        || self.m.as_numeral(n).is_some()
+                        || self.m.is_true(n)
+                        || self.m.is_false(n);
+                    if !leaf_ok {
+                        return false;
+                    }
+                }
+                Some(_) => {}
+                None => return false, // a bound variable
+            }
+        }
+        true
+    }
+
     fn get_value(&mut self, list: &[SExpr]) -> Result<String, String> {
         let queries = match list.get(1) {
             Some(SExpr::List(q)) => q,
@@ -20088,9 +20208,22 @@ impl Context {
         if self.last_model.is_none() {
             return Err("get-value requires a preceding satisfiable check-sat".to_string());
         }
-        // Build every queried term first (this borrows `self.m` mutably).
-        let mut terms: Vec<(String, AstId)> = Vec::new();
+        // Build every queried term first (this borrows `self.m` mutably). A bare
+        // reference to an n-ary function symbol (`Err(decl)`) is rendered as its
+        // constant-array interpretation, matching z3.
+        // Ok = an ordinary term; Err = a bare function symbol `(decl, dom, range)`.
+        type QueryTarget = Result<AstId, (AstId, AstId, AstId)>;
+        let mut terms: Vec<(String, QueryTarget)> = Vec::new();
         for q in queries {
+            if let SExpr::Atom(name) = q
+                && let Some(&d) = self.funcs.get(name)
+                && let Some(fd) = self.m.func_decl(d)
+                && fd.domain.len() == 1
+            {
+                let (dom, ran) = (fd.domain[0], fd.range);
+                terms.push((render_sexpr(q), Err((d, dom, ran))));
+                continue;
+            }
             let mut id = self.term(q)?;
             // Substitute the string-witness assignment and re-fold, so a string
             // term evaluates to its concrete literal instead of a placeholder.
@@ -20101,7 +20234,7 @@ impl Context {
                 id = self.refold_str_markers(id, &mut memo);
                 id = crate::rewriter::simplify(&mut self.m, id);
             }
-            terms.push((render_sexpr(q), id));
+            terms.push((render_sexpr(q), Ok(id)));
         }
         // Then evaluate against the model (disjoint immutable borrow of `m`).
         let mut model = self.last_model.take().unwrap();
@@ -20110,12 +20243,25 @@ impl Context {
             if i > 0 {
                 out.push(' ');
             }
-            let v = self
-                .str_value(*id)
-                .map(|cps| smt_string_literal(&cps))
-                .or_else(|| self.str_model_value(&mut model, *id))
-                .or_else(|| self.enum_value_name(&mut model, *id))
-                .unwrap_or_else(|| model.value_string(&self.m, *id));
+            let v = match *id {
+                Ok(id) => self
+                    .str_value(id)
+                    .map(|cps| smt_string_literal(&cps))
+                    .or_else(|| self.str_model_value(&mut model, id))
+                    .or_else(|| self.enum_value_name(&mut model, id))
+                    .or_else(|| self.fp_model_value(&mut model, id))
+                    .unwrap_or_else(|| model.value_string(&self.m, id)),
+                Err((d, dom, ran)) => {
+                    let body = self
+                        .const_fn_interp(d, &mut model)
+                        .unwrap_or_else(|| "0".to_string());
+                    alloc::format!(
+                        "((as const (Array {} {})) {body})",
+                        self.sort_display(dom),
+                        self.sort_display(ran)
+                    )
+                }
+            };
             out.push_str(&alloc::format!("({text} {v})"));
         }
         out.push(')');
@@ -20129,38 +20275,106 @@ impl Context {
         if self.last_model.is_none() {
             return Err("get-model requires a preceding satisfiable check-sat".to_string());
         }
-        // Collect the 0-ary constants and their range-sort names.
-        let mut consts: Vec<(String, AstId, String)> = Vec::new();
-        for name in &self.decl_order {
-            let d = self.funcs[name];
-            let fd = self.m.func_decl(d).unwrap();
-            if !fd.domain.is_empty() {
-                continue; // n-ary function interpretations not yet emitted
-            }
-            let range = fd.range;
-            if self.m.is_array_sort(range) {
-                continue; // array interpretations not yet emitted (would be invalid)
-            }
-            let sort_name = self
-                .m
-                .sort(range)
-                .and_then(|s| s.name.as_str())
-                .unwrap_or("?")
-                .to_string();
-            let c = self.m.mk_const(d);
-            consts.push((name.clone(), c, sort_name));
+        // Snapshot each declaration's shape (order preserved), avoiding a borrow
+        // of `self.decl_order` across the mutable model evaluation below.
+        struct Decl {
+            name: String,
+            d: AstId,
+            domain: Vec<AstId>,
+            range: AstId,
         }
+        let decls: Vec<Decl> = self
+            .decl_order
+            .iter()
+            .map(|name| {
+                let d = self.funcs[name];
+                let fd = self.m.func_decl(d).unwrap();
+                Decl {
+                    name: name.clone(),
+                    d,
+                    domain: fd.domain.clone(),
+                    range: fd.range,
+                }
+            })
+            .collect();
         let mut model = self.last_model.take().unwrap();
         let mut out = String::from("(");
-        for (name, c, sort_name) in &consts {
-            let v = model.value_string(&self.m, *c);
-            out.push_str(&alloc::format!(
-                "\n  (define-fun {name} () {sort_name}\n    {v})"
-            ));
+        for decl in &decls {
+            if decl.domain.is_empty() {
+                if self.m.is_array_sort(decl.range) {
+                    continue; // array interpretations not yet emitted (invalid)
+                }
+                let c = self.m.mk_const(decl.d);
+                let v = model.value_string(&self.m, c);
+                let sort_name = self.sort_display(decl.range);
+                out.push_str(&alloc::format!(
+                    "\n  (define-fun {} () {sort_name}\n    {v})",
+                    decl.name
+                ));
+            } else if let Some(body) = self.const_fn_interp(decl.d, &mut model) {
+                // An n-ary function with a constant interpretation.
+                let params = decl
+                    .domain
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &s)| alloc::format!("(x!{i} {})", self.sort_display(s)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ret = self.sort_display(decl.range);
+                out.push_str(&alloc::format!(
+                    "\n  (define-fun {} ({params}) {ret}\n    {body})",
+                    decl.name
+                ));
+            }
         }
         out.push_str("\n)");
         self.last_model = Some(model);
         Ok(out)
+    }
+
+    /// Render a sort as SMT-LIB2 text (a named sort by its name, arrays nested).
+    fn sort_display(&self, sort: AstId) -> String {
+        if let Some((i, e)) = self.m.array_sort_params(sort) {
+            return alloc::format!("(Array {} {})", self.sort_display(i), self.sort_display(e));
+        }
+        self.m
+            .sort(sort)
+            .and_then(|s| s.name.as_str())
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    /// The default model value z3 gives an otherwise-unconstrained range sort.
+    fn default_value(&self, range: AstId) -> Option<String> {
+        if self.m.is_bool_sort(range) {
+            Some("false".to_string())
+        } else if self.m.is_int_sort(range) {
+            Some("0".to_string())
+        } else {
+            self.m.bv_sort_width(range).map(|w| render_bv_field(0, w))
+        }
+    }
+
+    /// If every application of function `d` in the assertions evaluates to one
+    /// and the same value under `model` (or there are none), return that value's
+    /// rendering — the constant interpretation z3 emits for such a function.
+    /// `None` if the applications disagree (a non-constant graph we don't emit).
+    fn const_fn_interp(&self, d: AstId, model: &mut Model) -> Option<String> {
+        let range = self.m.func_decl(d)?.range;
+        let mut value: Option<String> = None;
+        for &a in &self.assertions {
+            for t in self.m.postorder(a) {
+                if self.m.is_app(t) && !self.m.app_args(t).is_empty() && self.m.app_decl(t) == d {
+                    let v = model.value_string(&self.m, t);
+                    match &value {
+                        None => value = Some(v),
+                        Some(prev) if *prev != v => return None,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        value.or_else(|| self.default_value(range))
     }
 
     /// `((_ repeat k) x)` — concatenate `x` with itself `k` times.
