@@ -271,6 +271,54 @@ fn to_signed(v: &Int, w: u32) -> Int {
     }
 }
 
+/// Render a `w`-bit field as z3's model printer does: `#x…` when the width is a
+/// multiple of four, else `#b…`.
+fn render_bv_field(v: u64, w: u32) -> String {
+    if w > 0 && w.is_multiple_of(4) {
+        let mut s = String::from("#x");
+        for nib in (0..w / 4).rev() {
+            let d = (v >> (nib * 4)) & 0xf;
+            s.push(char::from_digit(d as u32, 16).unwrap());
+        }
+        s
+    } else {
+        let mut s = String::from("#b");
+        for i in (0..w).rev() {
+            s.push(if (v >> i) & 1 == 1 { '1' } else { '0' });
+        }
+        s
+    }
+}
+
+/// Render a floating-point bit pattern of format `(eb, sb)` the way z3's model
+/// printer does: the special values as `(_ NaN eb sb)` / `(_ ±oo eb sb)` /
+/// `(_ ±zero eb sb)`, and any finite value as `(fp #b<sign> <exp> <sig>)`.
+fn render_fp(bits: u64, eb: u32, sb: u32) -> String {
+    let mant = sb - 1;
+    let sign = (bits >> (eb + mant)) & 1;
+    let exp = (bits >> mant) & ((1u64 << eb) - 1);
+    let sig = bits & ((1u64 << mant) - 1);
+    let exp_ones = (1u64 << eb) - 1;
+    if exp == exp_ones {
+        return if sig == 0 {
+            alloc::format!("(_ {} {eb} {sb})", if sign == 1 { "-oo" } else { "+oo" })
+        } else {
+            alloc::format!("(_ NaN {eb} {sb})")
+        };
+    }
+    if exp == 0 && sig == 0 {
+        return alloc::format!(
+            "(_ {} {eb} {sb})",
+            if sign == 1 { "-zero" } else { "+zero" }
+        );
+    }
+    alloc::format!(
+        "(fp #b{sign} {} {})",
+        render_bv_field(exp, eb),
+        render_bv_field(sig, mant)
+    )
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -2535,6 +2583,7 @@ impl Context {
                 let mut model = self.last_model.take().unwrap();
                 let v = self
                     .enum_value_name(&mut model, id)
+                    .or_else(|| self.fp_model_value(&mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
                 Ok(Some(v))
@@ -3226,6 +3275,33 @@ impl Context {
             }
         }
         None
+    }
+
+    /// If `id` is a floating-point term, render its concrete value under `model`
+    /// as z3 does: `(fp #b0 #x.. #b..)` for finite values, or the indexed forms
+    /// `(_ NaN eb sb)` / `(_ +oo eb sb)` / `(_ +zero eb sb)` for the specials.
+    /// A concrete FP literal reads its bits directly; a symbolic FP term reads
+    /// them from its bit-blasted representation's value in the model.
+    fn fp_model_value(&self, model: &mut Model, id: AstId) -> Option<String> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(id))?;
+        let bits: u64 = if let Some(&(b, _, _)) = self.fp_of.get(&id) {
+            b
+        } else {
+            let bv = self.fp_bv.get(&id).copied()?;
+            let v = match model.eval(&self.m, bv) {
+                Value::Bv(v, _) => v,
+                _ => return None,
+            };
+            let width = eb + sb;
+            let mut bits = 0u64;
+            for i in 0..width {
+                if v.bit(i) {
+                    bits |= 1u64 << i;
+                }
+            }
+            bits
+        };
+        Some(render_fp(bits, eb, sb))
     }
 
     /// If `id` has an enum sort, the name of the constructor it equals under
@@ -20079,6 +20155,7 @@ impl Context {
                 .map(|cps| smt_string_literal(&cps))
                 .or_else(|| self.str_model_value(&mut model, *id))
                 .or_else(|| self.enum_value_name(&mut model, *id))
+                .or_else(|| self.fp_model_value(&mut model, *id))
                 .unwrap_or_else(|| model.value_string(&self.m, *id));
             out.push_str(&alloc::format!("({text} {v})"));
         }
