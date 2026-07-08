@@ -1092,6 +1092,10 @@ struct Context {
     /// `(eb, sb) = (11, 53)` constants are folded (via `f64`); other formats and
     /// symbolic values are gated to a sound `unknown`.
     fp_of: BTreeMap<AstId, (u64, u32, u32)>,
+    /// Interning of FP constants by their (canonical) value `(bits, eb, sb)` →
+    /// term, so two equal-valued literals share one AstId. This keeps EUF
+    /// congruence honest: `f(+oo)` parsed twice must be the same application.
+    fp_const_cache: BTreeMap<(u64, u32, u32), AstId>,
     /// Bit-vector representation of a symbolic FP term (`fp_to_bv`), so equality
     /// and the classification predicates bit-blast through the QF_BV engine.
     fp_bv: BTreeMap<AstId, AstId>,
@@ -1709,6 +1713,7 @@ impl Context {
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             fp_of: BTreeMap::new(),
+            fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
@@ -11337,10 +11342,31 @@ impl Context {
 
     /// A floating-point constant of the given bits/format, recorded in `fp_of`.
     fn mk_fp(&mut self, bits: u64, eb: u32, sb: u32) -> AstId {
+        let bits = Self::canonicalize_fp_bits(bits, eb, sb);
+        if let Some(&t) = self.fp_const_cache.get(&(bits, eb, sb)) {
+            return t;
+        }
         let sort = self.fp_sort(eb, sb);
         let t = self.fresh_const(sort);
         self.fp_of.insert(t, (bits, eb, sb));
+        self.fp_const_cache.insert((bits, eb, sb), t);
         t
+    }
+
+    /// SMT-LIB FP has a single NaN value: every NaN bit pattern denotes the same
+    /// value (payload/sign are not observable). Collapse any NaN of format
+    /// `(eb, sb)` to the canonical qNaN bits so that two NaN literals compare
+    /// `=` (and never `distinct`).
+    fn canonicalize_fp_bits(bits: u64, eb: u32, sb: u32) -> u64 {
+        let mant_bits = sb - 1;
+        let exp_mask = (1u64 << eb) - 1;
+        let exp = (bits >> mant_bits) & exp_mask;
+        let mant = bits & ((1u64 << mant_bits) - 1);
+        if exp == exp_mask && mant != 0 {
+            (exp_mask << mant_bits) | (1u64 << (mant_bits - 1)) // canonical qNaN, sign 0
+        } else {
+            bits
+        }
     }
 
     /// The `f64` value of `t` if it is a `Float64` constant.
@@ -19288,10 +19314,32 @@ impl Context {
                             let rm = self.term(&l[1])?;
                             // Round a constant real/int to the target format under a
                             // constant rounding mode — bit-exact for any (eb,sb).
-                            if let (Some(rmc), Some(r)) = (self.rm_code(rm), self.m.as_numeral(x))
-                                && let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc)
-                            {
-                                return Ok(self.mk_fp(bits, eb, sb));
+                            // Ternary form `((_ to_fp eb sb) RM sig exp)` denotes the
+                            // real `sig * 2^exp` (z3 extension); fold that value too.
+                            if let Some(rmc) = self.rm_code(rm) {
+                                let base = self.m.as_numeral(x);
+                                let r_opt: Option<Rational> = if l.len() == 4 {
+                                    let e = self.term(&l[3])?;
+                                    match (
+                                        base,
+                                        self.m
+                                            .as_numeral(e)
+                                            .and_then(|r| r.to_integer())
+                                            .and_then(|i| i.to_i64()),
+                                    ) {
+                                        (Some(b), Some(ei)) if ei.unsigned_abs() <= 100_000 => {
+                                            Some(b.mul(&Rational::power_of_two(ei as i32)))
+                                        }
+                                        _ => None,
+                                    }
+                                } else {
+                                    base
+                                };
+                                if let Some(r) = r_opt
+                                    && let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc)
+                                {
+                                    return Ok(self.mk_fp(bits, eb, sb));
+                                }
                             }
                             // Float → float format conversion.
                             if self.fp_format_of(self.m.get_sort(x)).is_some()
