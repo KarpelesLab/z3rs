@@ -1706,6 +1706,22 @@ fn theory_check(
         if matches!(arith, Feas::Unsat) {
             return TheoryOutcome::Unsat;
         }
+        // The arithmetic model is a witness of non-entailment: any two interface
+        // terms it gives *different* values cannot be arith-entailed equal, so the
+        // O(n²) entailment loop below can skip the (two-solve) query for them and
+        // only pay for pairs the model makes equal. This prunes almost every pair —
+        // decisive when there are many interface terms (Nelson–Oppen was redoing
+        // ~n²/2 feasibility solves every round). Sound: a separating model proves
+        // non-entailment exactly; equal-in-model pairs still get the full check.
+        let iface_vals: Option<Vec<Rational>> = match &arith {
+            Feas::Sat(a) => Some(
+                interface
+                    .iter()
+                    .map(|&t| ast_to_lin(m, t).eval(a))
+                    .collect(),
+            ),
+            _ => None,
+        };
         // Congruence closure augmented with the arithmetic-implied equalities.
         let mut all_eqs = eqs.clone();
         all_eqs.extend(euf_extra.iter().cloned());
@@ -1732,9 +1748,15 @@ fn theory_check(
             for j in (i + 1)..interface.len() {
                 let (u, v) = (interface[i], interface[j]);
                 let same_class = g.class_of(m, u) == g.class_of(m, v);
-                let entailed = match arith_entails_eq(m, &sys, u, v, &mut *budget) {
-                    Some(e) => e,
-                    None => return TheoryOutcome::Unknown, // work budget exhausted
+                // Skip the entailment solve when the arith model already separates
+                // u and v (a proof they are not entailed equal).
+                let entailed = if iface_vals.as_ref().is_some_and(|vs| vs[i] != vs[j]) {
+                    false
+                } else {
+                    match arith_entails_eq(m, &sys, u, v, &mut *budget) {
+                        Some(e) => e,
+                        None => return TheoryOutcome::Unknown, // work budget exhausted
+                    }
                 };
                 if entailed && !same_class {
                     euf_extra.push((u, v)); // arith → EUF

@@ -251,27 +251,40 @@ pub fn model_with_diseqs_budgeted(
     diseqs: &[LinExpr],
     budget: &mut u64,
 ) -> SolveOutcome {
-    match diseqs.split_first() {
-        None => {
-            if *budget == 0 {
-                return SolveOutcome::Exhausted;
-            }
-            *budget -= 1;
-            // FM elimination shares the same budget so a single blow-up can't hang.
-            model_budgeted(constraints, budget)
+    // Model-guided disequality splitting. Instead of eagerly case-splitting every
+    // disequality (`< 0` vs `> 0`, 2^n leaves), first solve the constraints
+    // *ignoring* the disequalities, then case-split only on a disequality the
+    // resulting model actually violates (its expression is pinned to exactly 0).
+    // A generic LRA vertex satisfies almost every disequality, so in practice this
+    // does a handful of solves rather than an exponential number — while remaining
+    // exact: constraints ∧ (d ≠ 0) is feasible iff (constraints ∧ d < 0) or
+    // (constraints ∧ d > 0) is, and every unviolated disequality already holds at
+    // the model. The shared `budget` (decremented per FM resolvent and once per
+    // split node) keeps the whole search terminating with a sound `Exhausted`.
+    if *budget == 0 {
+        return SolveOutcome::Exhausted;
+    }
+    *budget -= 1;
+    // FM elimination shares the same budget so a single blow-up can't hang.
+    let model = match model_budgeted(constraints, budget) {
+        SolveOutcome::Sat(m) => m,
+        other => return other, // Unsat or Exhausted
+    };
+    // A disequality violated by this model is pinned to 0; split on it. Unviolated
+    // disequalities are satisfied at `model`, so if none is violated the model is a
+    // witness for the full system.
+    let Some(d) = diseqs.iter().find(|d| d.eval(&model).is_zero()) else {
+        return SolveOutcome::Sat(model);
+    };
+    let mut lt = constraints.to_vec();
+    lt.push(Constraint::lt(d.clone()));
+    match model_with_diseqs_budgeted(&lt, diseqs, budget) {
+        SolveOutcome::Unsat => {
+            let mut gt = constraints.to_vec();
+            gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
+            model_with_diseqs_budgeted(&gt, diseqs, budget)
         }
-        Some((d, rest)) => {
-            let mut lt = constraints.to_vec();
-            lt.push(Constraint::lt(d.clone()));
-            match model_with_diseqs_budgeted(&lt, rest, budget) {
-                SolveOutcome::Unsat => {
-                    let mut gt = constraints.to_vec();
-                    gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
-                    model_with_diseqs_budgeted(&gt, rest, budget)
-                }
-                other => other, // Sat or Exhausted short-circuits
-            }
-        }
+        other => other, // Sat or Exhausted short-circuits
     }
 }
 
