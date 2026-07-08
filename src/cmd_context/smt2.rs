@@ -20825,6 +20825,17 @@ impl Context {
             if lin != goal && !self.arith_nonlinear(lin) {
                 return check_model(&self.m, lin);
             }
+            // An opaque exponentiation `(^ b e)` (symbolic exponent, or a constant
+            // exponent too large to expand into a product) is a fresh, wholly
+            // unconstrained UF term: the polynomial machinery below sees it as a
+            // free variable, so any `sat` it derives is untrustworthy (a spurious
+            // model that never actually verifies `b^e`). Only a *refutation* — which
+            // holds even when the free term ranges over everything — is sound; a
+            // constant-exponent power `(^ y k)` with no solution (`y^65 = 2`) is thus
+            // reported as a sound `unknown` rather than a wrong `sat`.
+            let has_opaque_pow = self.m.postorder(lin).iter().any(|&t| {
+                self.m.is_app(t) && self.decl_name(self.m.app_decl(t)).as_deref() == Some("^")
+            });
             // A genuinely nonlinear residual in a *single* variable is decided
             // exactly by the univariate procedure (real-root isolation over the
             // reals; integer-root enumeration over the integers) — this is a
@@ -20832,7 +20843,11 @@ impl Context {
             // Polynomial-level decision: eliminate linearly-determined variables,
             // then decide the residual exactly (univariate CAD, or exhaustive
             // search over a bounded integer box). Complete for those fragments.
-            if let Some(r) = self.decide_nonlinear_definite(lin) {
+            // With an opaque power present only a returned `unsat` is trusted (a
+            // free term can only make the system more satisfiable, never less).
+            if let Some(r) = self.decide_nonlinear_definite(lin)
+                && (!has_opaque_pow || r == SmtResult::Unsat)
+            {
                 return (r, None);
             }
             // Otherwise, interval constraint propagation over the *actual*
@@ -20840,7 +20855,9 @@ impl Context {
             // unsatisfiable; that refutation is sound.
             if self.nonlinear_icp_refutes(lin) {
                 (SmtResult::Unsat, None)
-            } else if let Some(m) = self.try_int_box_witness(lin) {
+            } else if let Some(m) = self.try_int_box_witness(lin)
+                && !has_opaque_pow
+            {
                 (SmtResult::Sat, Some(m))
             } else {
                 (SmtResult::Unknown, None)
@@ -23078,6 +23095,25 @@ impl Context {
                     }
                     return Ok(m.mk_numeral(acc, is_int));
                 }
+                // Symbolic base with a *constant* non-negative integer exponent
+                // `k` is exactly the nonlinear product `b·b·…·b` (k factors). Expand
+                // it so it flows through the sound nonlinear machinery (which decides
+                // e.g. `(= (* y y) 2)` UNSAT) instead of becoming an opaque UF whose
+                // free value yields a spurious `sat`. `k = 1 → b`. `k = 0` is left
+                // opaque so `power_zero_axioms` supplies the sound `b = 0 ∨ b^0 = 1`
+                // disjunction (z3 leaves `0^0` unspecified). A large `k` also stays
+                // opaque to avoid a pathological high-degree blow-up.
+                if let Some(exp) = m.as_numeral(args[1]).and_then(|v| v.to_integer())
+                    && let Some(e) = exp.to_i64()
+                    && (1..=64).contains(&e)
+                    && m.as_numeral(args[0]).is_none()
+                {
+                    if e == 1 {
+                        return Ok(args[0]);
+                    }
+                    let factors = alloc::vec![args[0]; e as usize];
+                    return Ok(m.mk_mul(&factors));
+                }
                 let d = m.mk_func_decl(
                     Symbol::new("^"),
                     &[m.get_sort(args[0]); 2],
@@ -24941,6 +24977,43 @@ mod tests {
         assert_eq!(
             run("(assert (= (^ 2 3) 9))(check-sat)").unwrap(),
             alloc::vec!["unsat"]
+        );
+        // A constant non-negative integer exponent over a *symbolic* base expands
+        // to the product `y·y·…·y`, so it flows through the sound nonlinear engine
+        // instead of an opaque UF: `y² = 2` and `y³ = 7` have no integer root.
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (^ y 2) 2))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (^ y 3) 7))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // Real roots exist and are found (matches z3): `y² = 9`, `y³ = 8`.
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (^ y 2) 9))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (^ y 3) 8))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // `(^ y 1) = y` — exponent one is the base itself.
+        assert_eq!(
+            run("(declare-const y Int)(assert (= (^ y 1) 3))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
+        );
+        // A guarded zero exponent stays sound via `power_zero_axioms`:
+        // `y > 0 ⇒ y⁰ = 1 ≠ 5`.
+        assert_eq!(
+            run("(declare-const y Int)(assert (and (> y 0)(= (^ y 0) 5)))(check-sat)").unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A large constant exponent left opaque must never yield a wrong `sat`
+        // (`y⁶⁵ = 2` is unsat over the integers): a sound `unknown` is required.
+        assert_ne!(
+            run("(declare-const y Int)(assert (= (^ y 65) 2))(check-sat)").unwrap(),
+            alloc::vec!["sat"]
         );
     }
 
