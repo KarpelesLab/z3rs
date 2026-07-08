@@ -20758,6 +20758,32 @@ impl Context {
                                 {
                                     return Ok(self.mk_fp(bits, eb, sb));
                                 }
+                                // `((_ to_fp eb sb) RM bv)` converts a *signed*
+                                // machine integer to FP; `to_fp_unsigned` an
+                                // unsigned one. Fold a constant bit-vector.
+                                if l.len() == 3
+                                    && let Some(m_w) = self.m.bv_sort_width(self.m.get_sort(x))
+                                    && let Some(val) = self.m.bv_numeral_value(x)
+                                {
+                                    let two = Int::from(2);
+                                    let mut uval = Int::from(0);
+                                    for i in 0..m_w {
+                                        if val.bit(i) {
+                                            uval = uval.add(&two.pow(i));
+                                        }
+                                    }
+                                    let is_unsigned =
+                                        matches!(&qid[1], SExpr::Atom(a) if a == "to_fp_unsigned");
+                                    let ival = if !is_unsigned && m_w > 0 && val.bit(m_w - 1) {
+                                        uval.sub(&two.pow(m_w))
+                                    } else {
+                                        uval
+                                    };
+                                    let r = Rational::from_integer(ival);
+                                    if let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc) {
+                                        return Ok(self.mk_fp(bits, eb, sb));
+                                    }
+                                }
                             }
                             // Float → float format conversion.
                             if self.fp_format_of(self.m.get_sort(x)).is_some()
