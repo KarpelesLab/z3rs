@@ -501,6 +501,30 @@ fn all_int(m: &AstManager, args: &[AstId]) -> bool {
     args.iter().all(|&a| m.is_int_sort(m.get_sort(a)))
 }
 
+/// Coerce a mixed Int/Real operand list of a numeric operator to all-Real, as
+/// z3 does (an integer numeral or term in a real context is promoted). Without
+/// this an n-ary product/sum inherits the sort of its *first* operand, so
+/// `(* 17 3.5 r)` (integer literal first) would be built `Int`-sorted and fed to
+/// integer reasoning — a fuzz/regression unsoundness (issue 3154). No-op unless
+/// the list genuinely mixes an `Int`-sorted and a `Real`-sorted operand.
+fn coerce_mixed_reals(m: &mut AstManager, args: &mut [AstId]) {
+    let has_real = args
+        .iter()
+        .any(|&a| m.is_arith_sort(m.get_sort(a)) && !m.is_int_sort(m.get_sort(a)));
+    let has_int = args.iter().any(|&a| m.is_int_sort(m.get_sort(a)));
+    if !(has_real && has_int) {
+        return;
+    }
+    for a in args.iter_mut() {
+        if m.is_int_sort(m.get_sort(*a)) {
+            *a = match m.as_numeral(*a) {
+                Some(v) => m.mk_numeral(v, false),
+                None => m.mk_to_real(*a),
+            };
+        }
+    }
+}
+
 /// If both terms are integer numerals, return them as [`Int`]s.
 fn int_pair(m: &AstManager, a: AstId, b: AstId) -> Option<(Int, Int)> {
     let ai = m.as_numeral(a)?.to_integer()?;
@@ -1112,6 +1136,11 @@ struct Context {
     /// check reason about the constant-dividend class after lifting has replaced
     /// the div/mod terms with `q`/`r`.
     symbolic_divmod: Vec<(AstId, AstId, AstId, AstId)>,
+    /// Per symbolic-divisor real `/` abstraction: `(dividend, divisor, q)` where
+    /// `q` is the fresh real quotient. Lets a post-lift pass emit the exact-quotient
+    /// identity `q = k` when the dividend is a product `d·k` and `d` is provably
+    /// nonzero (`(/ (x·y) y) = x`).
+    symbolic_realdiv: Vec<(AstId, AstId, AstId)>,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -1715,6 +1744,7 @@ impl Context {
             seq_empty: BTreeMap::new(),
             symbolic_divisors: BTreeSet::new(),
             symbolic_divmod: Vec::new(),
+            symbolic_realdiv: Vec::new(),
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
@@ -2555,6 +2585,10 @@ impl Context {
             let q1 = self.m.mk_eq(q, one);
             ctx.defs.push(self.m.mk_implies(bne0, q1));
         }
+        // Record for the post-lift exact-quotient identity (product dividend over a
+        // provably-nonzero divisor). Only a symbolic (non-numeral) divisor reaches
+        // here, so `b` is the divisor to test for nonzero-ness.
+        self.symbolic_realdiv.push((a, b, q));
         ctx.rdiv.insert(t, q);
         Some(q)
     }
@@ -9628,6 +9662,7 @@ impl Context {
     /// the guard `d ≠ 0` provably holds; needed because the guarded implication's
     /// nonlinear `d·q` is opaque and isn't discharged by the linear engine.
     fn divmod_nonzero_identity(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
         if self.symbolic_divmod.is_empty() {
             return Vec::new();
         }
@@ -9658,9 +9693,95 @@ impl Context {
             {
                 continue;
             }
-            let dq = self.m.mk_mul(&[d, q]);
-            let sum = self.m.mk_add(&[dq, r]);
-            axioms.push(self.m.mk_eq(a, sum));
+            // When the dividend is a product that has the (nonzero) divisor `d` as
+            // one of its factors — `a = d·k` exactly — the Euclidean quotient and
+            // remainder are pinned: `div(a,d) = k` and `mod(a,d) = 0` (the unique
+            // solution of `a = d·q + r ∧ 0 ≤ r < |d|` is `q = k, r = 0`). The
+            // nonlinear identity `a = d·q + r` alone leaves both `d·q` and the
+            // product `a` opaque, so the linear engine can't cancel `d`; emit the
+            // pinned values directly. Decides `div(x·y, y) = x` / `mod(x·y, y) = 0`
+            // (issue 1683).
+            if self.m.arith_op(a) == Some(ArithOp::Mul)
+                && let Some(pos) = self.m.app_args(a).iter().position(|&f| f == d)
+            {
+                let mut rest: Vec<AstId> = self.m.app_args(a).to_vec();
+                rest.remove(pos);
+                let k = match rest.len() {
+                    0 => self.m.mk_int(1),
+                    1 => rest[0],
+                    _ => self.m.mk_mul(&rest),
+                };
+                axioms.push(self.m.mk_eq(q, k));
+                let zero = self.m.mk_int(0);
+                axioms.push(self.m.mk_eq(r, zero));
+            } else {
+                let dq = self.m.mk_mul(&[d, q]);
+                let sum = self.m.mk_add(&[dq, r]);
+                axioms.push(self.m.mk_eq(a, sum));
+            }
+        }
+        axioms
+    }
+
+    /// Exact-quotient identity for real `/`: when the dividend is a product
+    /// `d·k` and the divisor `d` is provably nonzero, `(/ (d·k) d) = k` (real
+    /// division is exact). The nonlinear `q·d = d·k` identity leaves both products
+    /// opaque, so emit the cancelled `q = k` directly. Decides `(/ (x·y) y) = x`
+    /// (issue 1683, `smt.arith.solver 2/6`).
+    fn realdiv_nonzero_identity(&mut self, goal: AstId) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        if self.symbolic_realdiv.is_empty() {
+            return Vec::new();
+        }
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let srd = self.symbolic_realdiv.clone();
+        let mut axioms = Vec::new();
+        let mut nonzero: BTreeMap<AstId, bool> = BTreeMap::new();
+        for (a, d, q) in srd {
+            if !present.contains(&q) {
+                continue;
+            }
+            if self.m.arith_op(a) != Some(ArithOp::Mul) {
+                continue;
+            }
+            let Some(pos) = self.m.app_args(a).iter().position(|&f| f == d) else {
+                continue;
+            };
+            if !*nonzero
+                .entry(d)
+                .or_insert_with(|| self.divisor_nonzero(d, &top))
+            {
+                continue;
+            }
+            let mut rest: Vec<AstId> = self.m.app_args(a).to_vec();
+            rest.remove(pos);
+            let k = match rest.len() {
+                0 => self.m.mk_int(1),
+                1 => rest[0],
+                _ => self.m.mk_mul(&rest),
+            };
+            // `q` is Real; coerce an integer `k` to Real so the equality is well
+            // sorted (and matches the coerced `to_real(k)` the goal already carries).
+            let k = if self.m.is_int_sort(self.m.get_sort(k)) {
+                match self.m.as_numeral(k) {
+                    Some(v) => self.m.mk_numeral(v, false),
+                    None => self.m.mk_to_real(k),
+                }
+            } else {
+                k
+            };
+            axioms.push(self.m.mk_eq(q, k));
         }
         axioms
     }
@@ -13823,7 +13944,8 @@ impl Context {
         // discharged through the opaque nonlinear product `d·q`. Refutes
         // `y ≠ 0 ∧ mod x y ≠ x − (div x y)·y`.
         let lifted = {
-            let id = self.divmod_nonzero_identity(lifted);
+            let mut id = self.divmod_nonzero_identity(lifted);
+            id.extend(self.realdiv_nonzero_identity(lifted));
             if id.is_empty() {
                 lifted
             } else {
@@ -19707,7 +19829,17 @@ impl Context {
         result
     }
 
-    fn apply(&mut self, head: &str, args: Vec<AstId>) -> Result<AstId, String> {
+    fn apply(&mut self, head: &str, mut args: Vec<AstId>) -> Result<AstId, String> {
+        // A numeric operator with a mix of `Int`- and `Real`-sorted operands is
+        // promoted to all-`Real` (z3's coercion). Must run before the operators
+        // are built: an n-ary `*`/`+` takes its result sort from its first
+        // operand, so `(* 17 3.5 r)` would otherwise be `Int`-sorted (issue 3154).
+        if matches!(
+            head,
+            "+" | "-" | "*" | "/" | "<=" | "<" | ">=" | ">" | "=" | "distinct"
+        ) {
+            coerce_mixed_reals(&mut self.m, &mut args);
+        }
         // `distinct` of more terms than a finite sort has inhabitants is
         // unsatisfiable — fold to `false` before the equality expansion (which
         // would field-expand record equalities and hide the pigeonhole). Covers
