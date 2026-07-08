@@ -14681,6 +14681,23 @@ impl Context {
                     }
                     body_pred = Some(a);
                 } else {
+                    // A guard that is not itself a predicate application but still
+                    // *contains* one (e.g. the antecedent `(p a ⇒ ¬p b)`) is not a
+                    // pure arithmetic guard: the transition-system framing would
+                    // treat those predicate atoms as a free relation to the model
+                    // checker, so a satisfiable "guard" wrongly refutes the system
+                    // (`∀x. (p a ⇒ ¬p b) ⇒ x > c` is satisfiable — pick `p` so the
+                    // antecedent is false — yet the guard `(p a ⇒ ¬p b) ∧ x ≤ c`
+                    // is satisfiable, which the query branch reads as `unsat`).
+                    // Decline and let the general instantiation engine handle it.
+                    if self
+                        .m
+                        .postorder(a)
+                        .iter()
+                        .any(|&t| self.predicate_of(t).is_some())
+                    {
+                        return None;
+                    }
                     guards.push(a);
                 }
             }
@@ -16850,6 +16867,33 @@ impl Context {
         // User-function declarations (targets for E-matching triggers) and, per
         // universal, a trigger that covers all its binders (if one exists).
         let user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        // Set when a *non-definitional* universal constrains an infinite
+        // arithmetic (Int/Real) binder with an arithmetic atom — a comparison
+        // (`x < y`), an arithmetic equality (`x = y`, `x = f(y)`), or an
+        // arithmetic operator (`x + 1`). Neither enumerative (Phase 2) nor
+        // E-matching (Phase 1) instantiation can cover such a constraint over the
+        // infinite domain: E-matching only instantiates the binder at the
+        // finitely-many ground trigger arguments, so a body atom like `(< x y)`
+        // — true at the matched points yet false for some unmatched pair — is
+        // never refuted (`∀x y. x=y ∨ p(x)` with `¬p(2)`; or
+        // `∀x y. p(x) ∧ (< x y) ∧ …` whose arithmetic conjunct is unsatisfiable
+        // for some x,y regardless of `p`). A finite instantiation that happens to
+        // be satisfiable is therefore NOT a proof of satisfiability, so the run
+        // is not saturated and a `sat` stays a sound `unknown`. (UNSAT is
+        // unaffected — every instance is a consequence.) A **functional
+        // definition** `∀x. f(x) = rhs` is excluded: it fixes `f` pointwise and
+        // so always extends to a total model, making its E-matching saturation
+        // sound (a non-terminating one never reaches the fixpoint → `unknown`
+        // anyway).
+        let mut arith_constrained = false;
+        for (vars, body) in &universals {
+            if self.universal_arith_constrained(vars, *body)
+                && !self.universal_is_definition(vars, *body, &user_decls)
+            {
+                arith_constrained = true;
+                break;
+            }
+        }
         let trigs: Vec<Vec<Vec<AstId>>> = universals
             .iter()
             .map(|(vars, body)| {
@@ -17058,7 +17102,11 @@ impl Context {
                 // infinite-domain (datatype) binder to have been enumerated.
                 return (
                     instances,
-                    ematch_saturated && !dt_enumerated && !arith_enumerated && !seed_enumerated,
+                    ematch_saturated
+                        && !dt_enumerated
+                        && !arith_enumerated
+                        && !seed_enumerated
+                        && !arith_constrained,
                 );
             }
         }
@@ -17095,6 +17143,110 @@ impl Context {
             );
             if is_arith_op && self.m.postorder(t).iter().any(|s| binders.contains(s)) {
                 return true;
+            }
+        }
+        false
+    }
+
+    /// Is this universal a **functional definition** `∀x̄. f(x̄) = rhs`
+    /// (optionally under a guard `∀x̄. g ⇒ f(x̄) = rhs`), where `f` is a user
+    /// function whose arguments are exactly the (distinct) binders? Such an
+    /// axiom fixes `f` pointwise and always extends to a total model, so its
+    /// E-matching saturation is a sound basis for `sat` — it must not be gated as
+    /// an unsaturable arithmetic constraint (recursive `define-fun-rec`s land
+    /// here).
+    fn universal_is_definition(
+        &self,
+        vars: &[AstId],
+        body: AstId,
+        user_decls: &BTreeSet<AstId>,
+    ) -> bool {
+        // Peel a leading implication chain: the definition is the final
+        // consequent; the antecedents are guards.
+        let mut core = body;
+        while self.m.is_implies(core) {
+            let args = self.m.app_args(core);
+            if args.len() != 2 {
+                break;
+            }
+            core = args[1];
+        }
+        if !self.m.is_eq(core) {
+            return false;
+        }
+        let args = self.m.app_args(core).to_vec();
+        if args.len() != 2 {
+            return false;
+        }
+        let binders: BTreeSet<AstId> = vars.iter().copied().collect();
+        // Either side may be the defined application `f(x̄)`.
+        for &side in &args {
+            if let Some(app) = self.m.app(side)
+                && user_decls.contains(&app.decl)
+                && !app.args.is_empty()
+            {
+                let mut seen: BTreeSet<AstId> = BTreeSet::new();
+                let all_bare_binders = app.args.iter().all(|&a| {
+                    self.m.is_uninterp_const(a) && binders.contains(&a) && seen.insert(a)
+                });
+                // Every binder must be pinned by an argument (so `f`'s value is
+                // fixed pointwise over the whole tuple of binders).
+                if all_bare_binders && seen.len() == binders.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Does `body` constrain an infinite arithmetic (Int/Real) binder with an
+    /// arithmetic atom — a comparison (`<`, `<=`, `>`, `>=`), an arithmetic
+    /// operator (`+`, `-`, `*`, `div`, `mod`, `^`), or an equality between
+    /// arithmetic-sorted terms (`x = y`, `x = f(y)`)? Such a constraint ranges
+    /// over the whole infinite domain, so finite instantiation (enumerative or
+    /// E-matching, which only reaches the ground trigger arguments) cannot prove
+    /// the universal holds for every value. Broader than
+    /// `universal_arith_productive`, which only detects arithmetic *operators*.
+    fn universal_arith_constrained(&self, vars: &[AstId], body: AstId) -> bool {
+        let binders: BTreeSet<AstId> = vars
+            .iter()
+            .copied()
+            .filter(|&v| self.m.is_arith_sort(self.m.get_sort(v)))
+            .collect();
+        if binders.is_empty() {
+            return false;
+        }
+        for t in self.m.postorder(body) {
+            let mentions = || self.m.postorder(t).iter().any(|s| binders.contains(s));
+            // A comparison or arithmetic operator mentioning an arith binder.
+            if matches!(
+                self.m.arith_op(t),
+                Some(
+                    ArithOp::Le
+                        | ArithOp::Lt
+                        | ArithOp::Ge
+                        | ArithOp::Gt
+                        | ArithOp::Add
+                        | ArithOp::Sub
+                        | ArithOp::Mul
+                        | ArithOp::Uminus
+                        | ArithOp::Div
+                        | ArithOp::Idiv
+                        | ArithOp::Mod
+                        | ArithOp::Rem
+                        | ArithOp::Power
+                )
+            ) && mentions()
+            {
+                return true;
+            }
+            // An equality between arithmetic-sorted terms mentioning a binder.
+            if self.m.is_eq(t) {
+                let args = self.m.app_args(t);
+                if !args.is_empty() && self.m.is_arith_sort(self.m.get_sort(args[0])) && mentions()
+                {
+                    return true;
+                }
             }
         }
         false
