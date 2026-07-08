@@ -319,6 +319,57 @@ fn render_fp(bits: u64, eb: u32, sb: u32) -> String {
     )
 }
 
+/// Render a dyadic rational `num / 2^k` as an exact decimal string (`"1.0"`,
+/// `"1.5"`, …). Dyadic rationals terminate, so this is exact.
+fn dyadic_decimal(num: &Int, k: u32) -> String {
+    if k == 0 {
+        return alloc::format!("{num}.0");
+    }
+    // num / 2^k = (num · 5^k) / 10^k.
+    let mut five_k = Int::from(1);
+    let five = Int::from(5);
+    for _ in 0..k {
+        five_k = five_k.mul(&five);
+    }
+    let scaled = num.mul(&five_k);
+    let mut digits = alloc::format!("{scaled}");
+    let k = k as usize;
+    while digits.len() <= k {
+        digits.insert(0, '0');
+    }
+    let point = digits.len() - k;
+    let int_part = &digits[..point];
+    let frac = digits[point..].trim_end_matches('0');
+    let frac = if frac.is_empty() { "0" } else { frac };
+    alloc::format!("{int_part}.{frac}")
+}
+
+/// Render a finite floating-point value in z3's `pp.fp_real_literals` form:
+/// `((_ to_fp eb sb) RTZ <significand> <exponent>)`, value = significand·2^exp.
+/// `None` for special values (NaN/±oo/±zero) and subnormals, which keep the
+/// canonical form.
+fn render_fp_real(bits: u64, eb: u32, sb: u32) -> Option<String> {
+    let mant = sb - 1;
+    let sign = (bits >> (eb + mant)) & 1;
+    let exp = (bits >> mant) & ((1u64 << eb) - 1);
+    let sig = bits & ((1u64 << mant) - 1);
+    let exp_ones = (1u64 << eb) - 1;
+    if exp == exp_ones || exp == 0 {
+        return None; // special value or subnormal: leave to render_fp
+    }
+    let bias = (1i64 << (eb - 1)) - 1;
+    // Normalized significand in [1,2): 1 + sig/2^mant; exponent = exp − bias.
+    let num = Int::from((1u64 << mant) + sig);
+    let e = exp as i64 - bias;
+    let decimal = dyadic_decimal(&num, mant);
+    let signed = if sign == 1 {
+        alloc::format!("-{decimal}")
+    } else {
+        decimal
+    };
+    Some(alloc::format!("((_ to_fp {eb} {sb}) RTZ {signed} {e})"))
+}
+
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
@@ -1218,6 +1269,11 @@ struct Context {
     /// Soft constraints (`assert-soft`) as `(penalty indicator bool, weight)`;
     /// `check-sat` minimizes the total weight of the violated ones (MaxSAT).
     soft: Vec<(AstId, i64)>,
+    /// The `:id` group name shared by the `assert-soft` constraints (empty when
+    /// none is given), and the minimized total penalty after the last optimize —
+    /// reported by `get-objectives` as an anonymous MaxSAT objective.
+    soft_id: String,
+    penalty_value: Option<String>,
     /// The interned `String` sort, once used.
     string_sort: Option<AstId>,
     /// String literal text → its distinct constant of the `String` sort.
@@ -2145,6 +2201,8 @@ impl Context {
             objectives: Vec::new(),
             objective_values: Vec::new(),
             soft: Vec::new(),
+            soft_id: String::new(),
+            penalty_value: None,
             string_sort: None,
             str_lits: BTreeMap::new(),
             str_len_decl: None,
@@ -2610,9 +2668,17 @@ impl Context {
                     return Err("eval requires a preceding satisfiable check-sat".to_string());
                 }
                 let id = self.term(&list[1])?;
+                // An asserted formula (a top-level conjunct of the assertions)
+                // holds in every satisfying model, so its value is `true`
+                // regardless of the concrete model recorded — and `(not …)` of one
+                // is `false`. Genuine: the check-sat returned `sat`.
+                if let Some(b) = self.asserted_truth(id) {
+                    return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                }
                 let mut model = self.last_model.take().unwrap();
                 let v = self
-                    .enum_value_name(&mut model, id)
+                    .eval_array_value(id)
+                    .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
@@ -2811,6 +2877,13 @@ impl Context {
                 // total weight of the softs whose pᵢ is forced true.
                 let f = self.term(&list[1])?;
                 let weight = attr_int(list, ":weight").unwrap_or(1);
+                if let Some(pos) = list
+                    .iter()
+                    .position(|s| matches!(s, SExpr::Atom(a) if a == ":id"))
+                    && let Some(SExpr::Atom(id)) = list.get(pos + 1)
+                {
+                    self.soft_id = id.clone();
+                }
                 let name = alloc::format!("!soft!{}", self.fresh_counter);
                 self.fresh_counter += 1;
                 let b = self.m.mk_bool_sort();
@@ -3395,6 +3468,11 @@ impl Context {
             }
             bits
         };
+        if self.params.get_bool(":pp.fp_real_literals", false)
+            && let Some(r) = render_fp_real(bits, eb, sb)
+        {
+            return Some(r);
+        }
         Some(render_fp(bits, eb, sb))
     }
 
@@ -5507,6 +5585,206 @@ impl Context {
                 return None;
             }
         }
+    }
+
+    /// If `id` is a top-level conjunct of the assertions, it holds in every model
+    /// → `Some(true)`; if it is `(not c)` for such a conjunct `c`, `Some(false)`.
+    /// `None` otherwise. Sound only after a `sat` verdict.
+    fn asserted_truth(&self, id: AstId) -> Option<bool> {
+        let mut conjuncts: BTreeSet<AstId> = BTreeSet::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend_from_slice(self.m.app_args(t));
+            } else {
+                conjuncts.insert(t);
+            }
+        }
+        if conjuncts.contains(&id) {
+            return Some(true);
+        }
+        if self.m.is_not(id) {
+            let inner = self.m.app_args(id)[0];
+            if conjuncts.contains(&inner) {
+                return Some(false);
+            }
+        }
+        None
+    }
+
+    /// True if `x` is a user-declared 0-ary constant (not a value/builtin).
+    fn is_decl_const(&self, x: AstId) -> bool {
+        if !self.m.is_app(x) || !self.m.app_args(x).is_empty() {
+            return false;
+        }
+        let d = self.m.app_decl(x);
+        self.m.func_decl(d).is_some_and(|fd| fd.domain.is_empty())
+            && self.funcs.values().any(|&fd| fd == d)
+    }
+
+    /// Top-level `const = definition` equalities (over the assertion conjuncts),
+    /// with `const` a declared 0-ary constant not occurring in its own body —
+    /// used to inline constants when evaluating a term against the model.
+    fn inline_const_defs(&self) -> Vec<(AstId, AstId)> {
+        let mut defs: Vec<(AstId, AstId)> = Vec::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend_from_slice(self.m.app_args(t));
+                continue;
+            }
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            if args.len() != 2 {
+                continue;
+            }
+            let (l, r) = (args[0], args[1]);
+            for (x, d) in [(l, r), (r, l)] {
+                if self.is_decl_const(x)
+                    && x != d
+                    && !self.m.postorder(d).contains(&x)
+                    && !defs.iter().any(|(c, _)| *c == x)
+                {
+                    defs.push((x, d));
+                }
+            }
+        }
+        defs
+    }
+
+    /// Compare two terms as concrete values: `Some(true)`/`Some(false)` when both
+    /// fully fold to concrete values, `None` when either is still symbolic.
+    fn same_concrete(&mut self, a: AstId, b: AstId) -> Option<bool> {
+        let a = crate::rewriter::simplify(&mut self.m, a);
+        let b = crate::rewriter::simplify(&mut self.m, b);
+        if a == b {
+            return Some(true);
+        }
+        (self.is_fully_concrete(a) && self.is_fully_concrete(b)).then_some(false)
+    }
+
+    /// The value read from ground array term `arr` at concrete index `idx`,
+    /// folding `store`/`(as const)`/`(_ map f)`; `None` if it cannot be resolved.
+    fn arr_read(&mut self, arr: AstId, idx: AstId) -> Option<AstId> {
+        if self.m.is_const_array(arr) {
+            return Some(self.m.app_args(arr)[0]);
+        }
+        if self.m.is_store(arr) {
+            let a = self.m.app_args(arr).to_vec();
+            match self.same_concrete(idx, a[1])? {
+                true => return Some(a[2]),
+                false => return self.arr_read(a[0], idx),
+            }
+        }
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let mut vals = Vec::with_capacity(arrays.len());
+            for a in arrays {
+                vals.push(self.arr_read(a, idx)?);
+            }
+            let applied = self.apply(&fname, vals).ok()?;
+            return Some(crate::rewriter::simplify(&mut self.m, applied));
+        }
+        None
+    }
+
+    /// The default value of ground array term `arr` (its value at almost every
+    /// index): the const base, threaded through `store` and `(_ map f)`.
+    fn arr_default(&mut self, arr: AstId) -> Option<AstId> {
+        if self.m.is_const_array(arr) {
+            return Some(self.m.app_args(arr)[0]);
+        }
+        if self.m.is_store(arr) {
+            let base = self.m.app_args(arr)[0];
+            return self.arr_default(base);
+        }
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let mut vals = Vec::with_capacity(arrays.len());
+            for a in arrays {
+                vals.push(self.arr_default(a)?);
+            }
+            let applied = self.apply(&fname, vals).ok()?;
+            return Some(crate::rewriter::simplify(&mut self.m, applied));
+        }
+        None
+    }
+
+    /// Concrete `store` indices occurring in ground array term `arr` (and its
+    /// `(_ map f)` sources) — the finite support to compare for array equality.
+    fn arr_support(&self, arr: AstId, out: &mut Vec<AstId>) {
+        if self.m.is_store(arr) {
+            let a = self.m.app_args(arr);
+            let (base, idx) = (a[0], a[1]);
+            if !out.contains(&idx) {
+                out.push(idx);
+            }
+            self.arr_support(base, out);
+        } else if let Some((_, arrays)) = self.maps.get(&arr) {
+            for a in arrays.clone() {
+                self.arr_support(a, out);
+            }
+        }
+    }
+
+    /// Decide equality of two ground array terms by comparing their default and
+    /// every finite-support index; `None` if a read cannot be resolved.
+    fn arr_eq(&mut self, a: AstId, b: AstId) -> Option<bool> {
+        let da = self.arr_default(a)?;
+        let db = self.arr_default(b)?;
+        if !self.same_concrete(da, db)? {
+            return Some(false);
+        }
+        let mut indices = Vec::new();
+        self.arr_support(a, &mut indices);
+        self.arr_support(b, &mut indices);
+        for i in indices {
+            let va = self.arr_read(a, i)?;
+            let vb = self.arr_read(b, i)?;
+            if !self.same_concrete(va, vb)? {
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+
+    /// Evaluate `id` against the model by inlining top-level constant definitions
+    /// and folding ground `select`/array-equality; `None` if it doesn't reduce to
+    /// a concrete value. Genuine: the inlined equalities hold in every model.
+    fn eval_array_value(&mut self, id: AstId) -> Option<String> {
+        let defs = self.inline_const_defs();
+        if defs.is_empty() {
+            return None;
+        }
+        let mut t = id;
+        for _ in 0..4 {
+            let next = crate::rewriter::substitute(&mut self.m, t, &defs);
+            if next == t {
+                break;
+            }
+            t = next;
+        }
+        let folded = if self.m.is_select(t) {
+            let a = self.m.app_args(t).to_vec();
+            let idx = crate::rewriter::simplify(&mut self.m, a[1]);
+            self.arr_read(a[0], idx)?
+        } else if self.m.is_eq(t) {
+            let a = self.m.app_args(t).to_vec();
+            if a.len() == 2 && self.m.is_array_sort(self.m.get_sort(a[0])) {
+                let eq = self.arr_eq(a[0], a[1])?;
+                if eq {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                }
+            } else {
+                return None;
+            }
+        } else {
+            return None;
+        };
+        let folded = crate::rewriter::simplify(&mut self.m, folded);
+        self.is_fully_concrete(folded).then(|| self.m.pp(folded))
     }
 
     /// A top-level `A = B` between arrays whose const-array bases carry different
@@ -16178,6 +16456,18 @@ impl Context {
         for (i, (obj, maximize, _)) in objs.iter().enumerate() {
             let (obj, maximize) = (*obj, *maximize);
             let osort = self.m.get_sort(obj);
+            if let Some(w) = self.m.bv_sort_width(osort) {
+                // Bit-vector objective: optimize the unsigned value by bisection
+                // over the fixed range [0, 2^w − 1]. z3 renders it as a decimal.
+                if let Some(v) = self.opt_bv_search(obj, maximize, w, &fixed) {
+                    values[i] = render_int(&v);
+                    let bv = self.m.mk_bv_numeral(v, w);
+                    let eq = self.m.mk_eq(obj, bv);
+                    fixed.push(eq);
+                    model = self.check_with(&fixed).1;
+                }
+                continue;
+            }
             if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
                 // Real objective: Fourier–Motzkin optimum, then verify it.
                 match self.real_optimize(obj, maximize, &fixed) {
@@ -16232,8 +16522,10 @@ impl Context {
                 OptResult::Unknown => {}
             }
         }
-        // `get-objectives` reports only the user objectives, not the penalty.
+        // The MaxSAT penalty is reported as an anonymous objective, the user
+        // objectives after it.
         self.objective_values = values.split_off(user_start);
+        self.penalty_value = (user_start > 0).then(|| values[0].clone());
         (SmtResult::Sat, model)
     }
 
@@ -16393,9 +16685,74 @@ impl Context {
         OptResult::Optimum(lo)
     }
 
+    /// Optimize the **unsigned** value of a bit-vector objective by bisection
+    /// over the fixed range `[0, 2^w − 1]`. Returns the optimal value, or `None`
+    /// on budget exhaustion. `fixed` is asserted alongside the base assertions.
+    fn opt_bv_search(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        w: u32,
+        fixed: &[AstId],
+    ) -> Option<Int> {
+        let mut budget = 2 * w as i32 + 8;
+        // `obj ≥ k` (maximize) / `obj ≤ k` (minimize), both unsigned.
+        let sat_bound = |ctx: &mut Self, k: &Int, budget: &mut i32| -> Option<bool> {
+            if *budget <= 0 {
+                return None;
+            }
+            *budget -= 1;
+            let kv = ctx.m.mk_bv_numeral(k.clone(), w);
+            let c = if maximize {
+                ctx.m.mk_bvule(kv, obj)
+            } else {
+                ctx.m.mk_bvule(obj, kv)
+            };
+            let mut ex = fixed.to_vec();
+            ex.push(c);
+            Some(ctx.check_with(&ex).0 == SmtResult::Sat)
+        };
+        let two = Int::from(2);
+        let maxval = pow2(w).sub(&Int::from(1));
+        let (mut lo, mut hi) = (Int::from(0), maxval);
+        while lo < hi {
+            let sum = lo.add(&hi);
+            let mid = if maximize {
+                // ceil((lo+hi)/2) to make progress toward hi
+                sum.add(&Int::from(1))
+                    .div_rem(&two)
+                    .map(|(q, _)| q)
+                    .unwrap()
+            } else {
+                sum.div_rem(&two).map(|(q, _)| q).unwrap()
+            };
+            match sat_bound(self, &mid, &mut budget)? {
+                true => {
+                    if maximize {
+                        lo = mid;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                false => {
+                    if maximize {
+                        hi = mid.sub(&Int::from(1));
+                    } else {
+                        lo = mid.add(&Int::from(1));
+                    }
+                }
+            }
+        }
+        Some(lo)
+    }
+
     /// The `(objectives …)` response after an optimizing `check-sat`.
     fn get_objectives(&self) -> String {
         let mut out = String::from("(objectives");
+        if let Some(pen) = &self.penalty_value {
+            // The MaxSAT penalty is an anonymous objective (its `:id`, or empty).
+            out.push_str(&alloc::format!("\n ({} {pen})", self.soft_id));
+        }
         for ((_, _, text), val) in self.objectives.iter().zip(&self.objective_values) {
             out.push_str(&alloc::format!("\n ({text} {val})"));
         }
@@ -20477,9 +20834,11 @@ impl Context {
                     .filter(|(_, k)| **k)
                     .map(|((_, id), _)| *id)
                     .collect();
-                // Only drop when the remainder is provably satisfiable; a
-                // non-Sat result (unsat or unknown) conservatively keeps it.
-                if self.check_with(&extra).0 != SmtResult::Sat {
+                // Assumption `i` is necessary iff dropping it makes the remainder
+                // satisfiable; keep it then. If the remainder is still unsat,
+                // `i` was redundant and stays dropped. (An `unknown` result is
+                // conservative: keep the assumption rather than drop it wrongly.)
+                if self.check_with(&extra).0 != SmtResult::Unsat {
                     keep[i] = true;
                 }
             }
@@ -20640,7 +20999,13 @@ impl Context {
                     continue; // array interpretations not yet emitted (invalid)
                 }
                 let c = self.m.mk_const(decl.d);
-                let v = model.value_string(&self.m, c);
+                let v = self
+                    .str_value(c)
+                    .map(|cps| smt_string_literal(&cps))
+                    .or_else(|| self.str_model_value(&mut model, c))
+                    .or_else(|| self.enum_value_name(&mut model, c))
+                    .or_else(|| self.fp_model_value(&mut model, c))
+                    .unwrap_or_else(|| model.value_string(&self.m, c));
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} () {sort_name}\n    {v})",
@@ -20671,6 +21036,17 @@ impl Context {
     fn sort_display(&self, sort: AstId) -> String {
         if let Some((i, e)) = self.m.array_sort_params(sort) {
             return alloc::format!("(Array {} {})", self.sort_display(i), self.sort_display(e));
+        }
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return alloc::format!("(_ BitVec {w})");
+        }
+        if let Some(&(eb, sb)) = self
+            .fp_sorts
+            .iter()
+            .find(|&(_, &s)| s == sort)
+            .map(|(k, _)| k)
+        {
+            return alloc::format!("(_ FloatingPoint {eb} {sb})");
         }
         self.m
             .sort(sort)
