@@ -5949,6 +5949,37 @@ impl Context {
         None
     }
 
+    /// Rewrite every `select(map, i)` in `t` by pushing through the `(_ map f)`
+    /// layers recursively, so a NESTED map read like `select((_ map and) s1
+    /// ((_ map not) s2), x)` fully expands to `and(s1[x], not(s2[x]))`. Without
+    /// this, only the outermost map layer was resolved and the inner map read
+    /// stayed an opaque select (a sound `unknown`). Sound: the map defining
+    /// equation. Memoized over the goal DAG.
+    fn expand_map_selects(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let args: Vec<AstId> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .iter()
+                .map(|&a| self.expand_map_selects(a, memo))
+                .collect();
+            if self.m.is_select(t) && self.maps.contains_key(&args[0]) {
+                self.select_expand_map(args[0], args[1])
+            } else {
+                self.m.mk_app(decl, &args)
+            }
+        } else {
+            t
+        };
+        memo.insert(t, out);
+        out
+    }
+
     /// Rewrite `select(arr, idx)` pushing through `(_ map f)` layers:
     /// `select((_ map f) a…, i) → f(select(a, i)…)`, recursively, leaving a
     /// select over a non-map array (plain variable, store, const) symbolic. This
@@ -20524,6 +20555,10 @@ impl Context {
             goal
         } else {
             let g = self.inline_map_bindings(goal);
+            // Fully expand nested `select(map, i)` reads (recursively through map
+            // layers) so `select((_ map and) s1 ((_ map not) s2), x)` decides.
+            let mut memo = BTreeMap::new();
+            let g = self.expand_map_selects(g, &mut memo);
             // Decide any map-array *equality* pointwise (extensionality), so the
             // De Morgan / commutativity identities over `(_ map f)` don't hit the
             // conservative map-array `unknown` gate below.
