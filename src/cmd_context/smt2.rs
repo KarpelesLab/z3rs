@@ -103,6 +103,28 @@ fn subst_sort(body: &SExpr, subst: &[(String, SExpr)]) -> SExpr {
     }
 }
 
+/// Rewrite every bare reference to a sibling parametric datatype into its
+/// implicit self-parameter application, e.g. in the legacy form
+/// `(declare-datatypes (T) ((Tree … (children TreeList)) (TreeList …)))` the
+/// bare `TreeList` denotes `(TreeList T)`. Applied recursively over a
+/// constructor s-expression; leaves atoms that are not sibling names (type
+/// parameters, field/constructor names) untouched.
+fn apply_implicit_params(s: &SExpr, siblings: &[String], params: &[SExpr]) -> SExpr {
+    match s {
+        SExpr::Atom(a) if siblings.iter().any(|sib| sib == a) => {
+            let mut v = alloc::vec![SExpr::Atom(a.clone())];
+            v.extend(params.iter().cloned());
+            SExpr::List(v)
+        }
+        SExpr::List(l) => SExpr::List(
+            l.iter()
+                .map(|e| apply_implicit_params(e, siblings, params))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// The `(exponent bits, significand bits)` of a named floating-point format.
 fn fp_format(name: &str) -> Option<(u32, u32)> {
     match name {
@@ -3268,6 +3290,34 @@ impl Context {
     fn declare_datatypes(&mut self, sort_decls: &SExpr, bodies: &SExpr) -> Result<(), String> {
         let sort_decls = as_list(sort_decls)?;
         let bodies = as_list(bodies)?;
+        // Legacy *parametric* form: `(declare-datatypes (T U …) ((Name ctors…)…))`,
+        // where the first list holds shared type *parameters* (atoms), not sort
+        // declarations. Each body declares one (possibly mutually-recursive)
+        // parametric datatype over those parameters; store each as a template for
+        // monomorphization, rewriting bare sibling references to their implicit
+        // self-parameter application (`TreeList` → `(TreeList T)`).
+        if !sort_decls.is_empty() && sort_decls.iter().all(|s| matches!(s, SExpr::Atom(_))) {
+            let params: Vec<SExpr> = sort_decls.to_vec();
+            let param_names: Vec<String> = params
+                .iter()
+                .map(|p| Self::sym(p).map(str::to_string))
+                .collect::<Result<_, _>>()?;
+            let siblings: Vec<String> = bodies
+                .iter()
+                .map(|b| Ok::<_, String>(Self::sym(&as_list(b)?[0])?.to_string()))
+                .collect::<Result<_, _>>()?;
+            for body in bodies {
+                let bodyl = as_list(body)?;
+                let name = Self::sym(&bodyl[0])?.to_string();
+                let ctors: Vec<SExpr> = bodyl[1..]
+                    .iter()
+                    .map(|c| apply_implicit_params(c, &siblings, &params))
+                    .collect();
+                self.param_datatypes
+                    .insert(name, (param_names.clone(), ctors));
+            }
+            return Ok(());
+        }
         // Pass 1: register every datatype sort name up front, so a constructor
         // field may reference a mutually-recursive sibling (e.g. T referencing F
         // before F is fully declared).
