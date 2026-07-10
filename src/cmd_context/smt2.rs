@@ -20933,6 +20933,15 @@ impl Context {
             if let Some(r) = self.decide_nonlinear_definite(lin)
                 && (!has_opaque_pow || r == SmtResult::Unsat)
             {
+                // A proven-sat integer goal has no model attached yet; try to
+                // produce a concrete witness so `(eval)`/`(get-model)` work.
+                // Sound: the witness is verified, and the verdict is already
+                // proven independently. Falls back to a model-less `sat`.
+                if r == SmtResult::Sat
+                    && let Some(m) = self.try_int_box_witness(lin)
+                {
+                    return (SmtResult::Sat, Some(m));
+                }
                 return (r, None);
             }
             // Otherwise, interval constraint propagation over the *actual*
