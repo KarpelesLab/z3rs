@@ -4626,13 +4626,11 @@ impl Context {
         for &v in &nlvars {
             let (lo, hi) = match (lower.get(&v), upper.get(&v)) {
                 (Some(&lo), Some(&hi)) => (lo, hi),
-                _ => match self.modular_residue(goal, v) {
-                    Some(a) => {
-                        residue_only = true;
-                        (a, a)
-                    }
-                    None => return None,
-                },
+                _ => {
+                    let a = self.modular_residue(goal, v)?;
+                    residue_only = true;
+                    (a, a)
+                }
             };
             if hi < lo {
                 return if residue_only {
@@ -11905,7 +11903,7 @@ impl Context {
         // witnessed past the short enumeration cap.
         let model_fill: Vec<Option<Vec<u32>>> = if let Some(model) = hint {
             let lenf = self.str_len_fn();
-            let fill_chars = [b'a', b'b', b'c', b'd', b'e', b'f'];
+            let fill_chars = *b"abcdef";
             let mut class_char: Vec<(usize, u32)> = Vec::new();
             let mut out: Vec<Option<Vec<u32>>> = Vec::with_capacity(vars.len());
             for &v in &vars {
@@ -17916,7 +17914,8 @@ impl Context {
                 return None;
             }
             (args[0], args[1], "=")
-        } else if let Some(o) = m.arith_op(atom) {
+        } else {
+            let o = m.arith_op(atom)?;
             let args = m.app_args(atom);
             let s = match o {
                 ArithOp::Le => "<=",
@@ -17926,8 +17925,6 @@ impl Context {
                 _ => return None,
             };
             (args[0], args[1], s)
-        } else {
-            return None;
         };
         let diff = ast_to_lin(m, a).sub(&ast_to_lin(m, b)); // a - b
         // Build the constraint(s) for `op` (positive) or its negation.
@@ -23232,7 +23229,15 @@ impl Context {
             "bvsle" => Ok(m.mk_bvsle(args[0], args[1])),
             "bvsgt" => Ok(m.mk_bvslt(args[1], args[0])), // a >s b  ⟺  b <s a
             "bvsge" => Ok(m.mk_bvsle(args[1], args[0])), // a ≥s b  ⟺  b ≤s a
-            "concat" => Ok(m.mk_bv_concat(args[0], args[1])),
+            "concat" => {
+                // `concat` is binary in SMT-LIB but z3 accepts it n-ary and
+                // left-associative: concat(a,b,c,…) = concat(concat(a,b),c)….
+                let mut acc = args[0];
+                for &a in &args[1..] {
+                    acc = m.mk_bv_concat(acc, a);
+                }
+                Ok(acc)
+            }
             // Derived bitwise ops: nand/nor/xnor = not of and/or/xor.
             "bvnand" => {
                 let t = m.mk_bvand(args[0], args[1]);
