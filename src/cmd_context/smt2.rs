@@ -4396,6 +4396,41 @@ impl Context {
     /// to the bit-pattern equality `x = bits(c)` — the reinterpretation is a
     /// bijection on non-NaN values, so the biconditional is sound. NaN targets have
     /// many bit patterns and are skipped.
+    /// `fp.add`/`fp.mul` are commutative in their two operands for *every*
+    /// rounding mode — including NaN propagation and ±0 sign rules — so two
+    /// symbolic markers that differ only by swapping the operands denote the same
+    /// value. Emitting their equality lets a swapped-operand goal decide even
+    /// when the rounding mode is symbolic (the markers are otherwise distinct,
+    /// fresh-per-call terms). Refutes `fp.add(rm,x,NaN) ≠ fp.add(rm,NaN,x)`.
+    fn fp_commutativity_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let present = self.m.postorder(goal);
+        let mut groups: BTreeMap<(bool, AstId, AstId, AstId), Vec<AstId>> = BTreeMap::new();
+        for &t in &present {
+            if !self.m.is_app(t) || self.m.app_args(t).len() != 3 {
+                continue;
+            }
+            let Some(name) = self.decl_name(self.m.app_decl(t)) else {
+                continue;
+            };
+            let is_add = name.starts_with("!fpop!fp.add!");
+            let is_mul = name.starts_with("!fpop!fp.mul!");
+            if !is_add && !is_mul {
+                continue;
+            }
+            let a = self.m.app_args(t);
+            let (rm, x, y) = (a[0], a[1], a[2]);
+            let (lo, hi) = if x <= y { (x, y) } else { (y, x) };
+            groups.entry((is_add, rm, lo, hi)).or_default().push(t);
+        }
+        let mut ax = Vec::new();
+        for markers in groups.into_values() {
+            for w in markers.windows(2) {
+                ax.push(self.m.mk_eq(w[0], w[1]));
+            }
+        }
+        ax
+    }
+
     fn fp_from_bv_axioms(&mut self, goal: AstId) -> Vec<AstId> {
         if self.fp_from_bv.is_empty() {
             return Vec::new();
@@ -19697,6 +19732,7 @@ impl Context {
         axioms.extend(self.power_zero_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.fp_from_bv_axioms(lifted));
+        axioms.extend(self.fp_commutativity_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
