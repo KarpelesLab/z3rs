@@ -12097,6 +12097,32 @@ impl Context {
                 }
             }
         }
+        // Literal ± one character: a variable that must *contain* a literal but be
+        // *distinct* from it (`str.contains x "barbar" ∧ x ≠ "barbar"`) needs a
+        // witness one character longer than the literal — beyond the `default_len`
+        // cap that bounds the plain alphabet search. These extensions are added to
+        // every non-length-pinned variable's candidates below, unfiltered by
+        // `default_len` (still verified, so sound).
+        let mut lit_ext: Vec<Vec<u32>> = Vec::new();
+        if lit_cps.len() <= 8 {
+            for cps in &lit_cps {
+                if cps.is_empty() || cps.len() > 12 {
+                    continue;
+                }
+                for &c in alpha.iter().take(2) {
+                    let mut suff = cps.clone();
+                    suff.push(c);
+                    if !lit_ext.contains(&suff) {
+                        lit_ext.push(suff);
+                    }
+                    let mut pref = alloc::vec![c];
+                    pref.extend_from_slice(cps);
+                    if !lit_ext.contains(&pref) {
+                        lit_ext.push(pref);
+                    }
+                }
+            }
+        }
         // `str.to_int x = n` (n ≥ 0): x is the decimal string of n, possibly with
         // leading zeros — the digits are outside the literal alphabet, so add them
         // as explicit candidates.
@@ -12196,6 +12222,16 @@ impl Context {
             for c in rest {
                 if !cands.contains(&c) {
                     cands.push(c);
+                }
+            }
+            // Literal-plus-one-character extensions (`"barbar"` → `"barbara"`), so a
+            // `contains`-but-distinct variable is witnessed past the `default_len`
+            // cap. Only when the length isn't already pinned to an exact value.
+            if exact.is_none() {
+                for c in &lit_ext {
+                    if !cands.contains(c) {
+                        cands.push(c.clone());
+                    }
                 }
             }
             per_var.push(cands);
