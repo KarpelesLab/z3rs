@@ -6637,6 +6637,43 @@ impl Context {
                 }
             }
         }
+        // Prefix search always succeeds at 0: `str.indexof s (str.substr s 0 n) 0
+        // ≥ 0` — a prefix of `s` (empty when n ≤ 0) is found at position 0.
+        // Refutes `¬(str.indexof s (str.substr s 0 n) 0 ≥ 0)` (issue-963). Kept
+        // narrow (only the substr-prefix pattern) so an indexof-heavy goal is not
+        // bloated with unhelpful axioms.
+        {
+            let zero = self.m.mk_int(0);
+            let mut ges: Vec<AstId> = Vec::new();
+            for &t in &present {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.indexof")
+                    && self.m.app_args(t).len() == 3
+                    && self.int_arg(self.m.app_args(t)[2]) == Some(0)
+                {
+                    let a = self.m.app_args(t);
+                    // `sub` is `(str.substr s 0 _)` with the same source `s`.
+                    let sub = a[1];
+                    if self.m.is_app(sub)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(sub))
+                            .map(String::as_str)
+                            == Some("str.substr")
+                        && self.m.app_args(sub).len() == 3
+                        && self.m.app_args(sub)[0] == a[0]
+                        && self.int_arg(self.m.app_args(sub)[1]) == Some(0)
+                    {
+                        ges.push(self.m.mk_ge(t, zero));
+                    }
+                }
+            }
+            ax.extend(ges);
+        }
         // Concrete sequence lengths: `seq.len(u) = |elements|` for every
         // known-element sequence term `u` in the goal, so a variable bound to it
         // (`s = (seq.unit 1)`) inherits the length by congruence (else a
