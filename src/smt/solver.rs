@@ -212,6 +212,14 @@ impl Model {
         }
     }
 
+    /// Pin an arithmetic leaf variable to a concrete value. Used when a witness
+    /// search substitutes a variable out of the goal before checking (so the
+    /// resulting model no longer mentions it) and must re-attach the value it was
+    /// pinned to, or `(eval x)` would read a stray default.
+    pub fn set_arith(&mut self, var: AstId, val: Rational) {
+        self.arith.insert(var, val);
+    }
+
     /// Evaluate `t` under this model.
     pub fn eval(&mut self, m: &AstManager, t: AstId) -> Value {
         let s = m.get_sort(t);

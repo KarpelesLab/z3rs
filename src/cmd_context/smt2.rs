@@ -21112,7 +21112,17 @@ impl Context {
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let g = crate::rewriter::simplify(&mut self.m, g);
             if let (SmtResult::Sat, m) = check_model(&self.m, g) {
-                return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+                // The satisfying model of `g` no longer mentions the enumerated
+                // variables (they were substituted to constants), so re-attach
+                // their pinned values or `(eval x)`/`(get-model)` would read a
+                // stray default (e.g. reporting `x=0` for a witness `x=1`).
+                let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                for &(v, val) in &subst {
+                    if let Some(r) = self.m.as_numeral(val) {
+                        model.set_arith(v, r);
+                    }
+                }
+                return Some(model);
             }
         }
         None
