@@ -11982,13 +11982,8 @@ impl Context {
         // below drives those, and the concrete string ops then fold away.
         let has_index_var = self.m.postorder(goal).iter().any(|&t| {
             self.m.is_app(t)
-                && matches!(
-                    self.str_op_decls
-                        .get(&self.m.app_decl(t))
-                        .map(String::as_str),
-                    Some("str.at") | Some("str.substr") | Some("str.indexof")
-                )
-                && self.m.app_args(t)[1..].iter().any(|&ia| {
+                && self.str_op_decls.contains_key(&self.m.app_decl(t))
+                && self.m.app_args(t).iter().any(|&ia| {
                     self.m.is_uninterp_const(ia) && self.m.is_int_sort(self.m.get_sort(ia))
                 })
         });
@@ -12322,15 +12317,11 @@ impl Context {
         }
         let mut idx_vars: Vec<AstId> = Vec::new();
         for t in self.m.postorder(goal) {
-            if self.m.is_app(t)
-                && matches!(
-                    self.str_op_decls
-                        .get(&self.m.app_decl(t))
-                        .map(String::as_str),
-                    Some("str.at") | Some("str.substr") | Some("str.indexof")
-                )
-            {
-                for &ia in &self.m.app_args(t).to_vec()[1..] {
+            // Any integer argument of a string op is a small index / length /
+            // int-to-string conversion value worth enumerating (`str.substr s i
+            // n`, `int.to.str b`, …); the int-sort filter skips string args.
+            if self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t)) {
+                for &ia in &self.m.app_args(t).to_vec() {
                     if self.m.is_uninterp_const(ia)
                         && self.m.is_int_sort(self.m.get_sort(ia))
                         && !all_vars.contains(&ia)
