@@ -13031,6 +13031,21 @@ impl Context {
                         self.m.mk_true()
                     });
                 }
+                // `(str.contains s (str.substr s i n))` is always true: a substring
+                // of `s` is either empty (degenerate range) or a contiguous piece,
+                // both contained in `s`, whatever the (symbolic) offsets are.
+                if op == "str.contains"
+                    && raw.len() == 2
+                    && self.m.is_app(raw[1])
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(raw[1]))
+                        .map(String::as_str)
+                        == Some("str.substr")
+                    && self.m.app_args(raw[1])[0] == raw[0]
+                {
+                    return Ok(self.m.mk_true());
+                }
                 // A symbolic string predicate can also be unsound if its string
                 // argument is pinned to a literal, so gate via a symbolic marker.
                 let atom = self.symbolic_string(op, raw)?;
