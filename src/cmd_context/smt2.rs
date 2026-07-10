@@ -6595,6 +6595,48 @@ impl Context {
                 }
             }
         }
+        // indexof / contains link: `str.indexof s sub i ≥ 0` means `sub` occurs
+        // in `s` at some position ≥ i, so `str.contains s sub` holds. The axiom
+        // reuses the *existing* `contains` marker in the goal (so it is the same
+        // atom the negation refers to). Sound for any `i`: `i<0` makes indexof
+        // return −1, so the antecedent is false. Refutes `indexof(s,sub,i) ≥ 0 ∧
+        // ¬contains(s,sub)` (string13).
+        {
+            let mut contains_of: BTreeMap<(AstId, AstId), AstId> = BTreeMap::new();
+            for &t in &present {
+                if self.m.is_app(t)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        == Some("str.contains")
+                    && self.m.app_args(t).len() == 2
+                {
+                    let a = self.m.app_args(t);
+                    contains_of.insert((a[0], a[1]), t);
+                }
+            }
+            if !contains_of.is_empty() {
+                let zero = self.m.mk_int(0);
+                for &t in &present {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some("str.indexof")
+                        && self.m.app_args(t).len() == 3
+                    {
+                        let a = self.m.app_args(t);
+                        if let Some(&c) = contains_of.get(&(a[0], a[1])) {
+                            let ge = self.m.mk_ge(t, zero);
+                            let imp = self.m.mk_implies(ge, c);
+                            ax.push(imp);
+                        }
+                    }
+                }
+            }
+        }
         // Concrete sequence lengths: `seq.len(u) = |elements|` for every
         // known-element sequence term `u` in the goal, so a variable bound to it
         // (`s = (seq.unit 1)`) inherits the length by congruence (else a
