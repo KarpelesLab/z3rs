@@ -20937,10 +20937,13 @@ impl Context {
                 // produce a concrete witness so `(eval)`/`(get-model)` work.
                 // Sound: the witness is verified, and the verdict is already
                 // proven independently. Falls back to a model-less `sat`.
-                if r == SmtResult::Sat
-                    && let Some(m) = self.try_int_box_witness(lin)
-                {
-                    return (SmtResult::Sat, Some(m));
+                if r == SmtResult::Sat {
+                    if let Some(m) = self.try_int_box_witness(lin) {
+                        return (SmtResult::Sat, Some(m));
+                    }
+                    if let Some(m) = self.try_nonlinear_witness(lin) {
+                        return (SmtResult::Sat, Some(m));
+                    }
                 }
                 return (r, None);
             }
@@ -20950,6 +20953,10 @@ impl Context {
             if self.nonlinear_icp_refutes(lin) {
                 (SmtResult::Unsat, None)
             } else if let Some(m) = self.try_int_box_witness(lin)
+                && !has_opaque_pow
+            {
+                (SmtResult::Sat, Some(m))
+            } else if let Some(m) = self.try_nonlinear_witness(lin)
                 && !has_opaque_pow
             {
                 (SmtResult::Sat, Some(m))
@@ -21161,6 +21168,91 @@ impl Context {
                 // variables (they were substituted to constants), so re-attach
                 // their pinned values or `(eval x)`/`(get-model)` would read a
                 // stray default (e.g. reporting `x=0` for a witness `x=1`).
+                let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                for &(v, val) in &subst {
+                    if let Some(r) = self.m.as_numeral(val) {
+                        model.set_arith(v, r);
+                    }
+                }
+                return Some(model);
+            }
+        }
+        None
+    }
+
+    /// Witness a nonlinear goal by enumerating only its *nonlinear-critical*
+    /// variables — those occurring inside a product of ≥2 non-constants, or a
+    /// power — over a small integer grid, letting the linear model check solve
+    /// (and model) the residual. Unlike [`Self::try_int_box_witness`] this copes
+    /// with many *extra* linearly-constrained variables (`x1² + x2 = 0 ∧ x2 =
+    /// x3+1 ∧ …`, where only `x1` is nonlinear): enumerating `x1` linearises the
+    /// rest, which `check_model` both decides and assigns. The enumerated values
+    /// are pinned into the returned model.
+    ///
+    /// Sound: a candidate is accepted only once substitution has made the goal
+    /// fully linear (so `check_model`'s `sat` is trustworthy — it never treats a
+    /// leftover product as an opaque free term) and that ground/linear instance
+    /// verifies.
+    fn try_nonlinear_witness(&mut self, goal: AstId) -> Option<Model> {
+        let mut nl_vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            let Some(op) = self.m.arith_op(t) else {
+                continue;
+            };
+            let is_nl = match op {
+                ArithOp::Mul => {
+                    self.m
+                        .app_args(t)
+                        .iter()
+                        .filter(|a| self.m.as_numeral(**a).is_none())
+                        .count()
+                        >= 2
+                }
+                ArithOp::Power => true,
+                _ => false,
+            };
+            if !is_nl {
+                continue;
+            }
+            for a in self.m.app_args(t).to_vec() {
+                for s in self.m.postorder(a) {
+                    if self.m.is_uninterp_const(s)
+                        && self.m.is_arith_sort(self.m.get_sort(s))
+                        && !nl_vars.contains(&s)
+                    {
+                        nl_vars.push(s);
+                    }
+                }
+            }
+        }
+        if nl_vars.is_empty() || nl_vars.len() > 2 {
+            return None;
+        }
+        const B: i64 = 8;
+        let side = (2 * B + 1) as usize;
+        let total = side.pow(nl_vars.len() as u32);
+        for idx in 0..total {
+            let mut rem = idx;
+            let subst: Vec<(AstId, AstId)> = nl_vars
+                .iter()
+                .map(|&v| {
+                    let d = (rem % side) as i64 - B;
+                    rem /= side;
+                    let lit = if self.m.is_int_sort(self.m.get_sort(v)) {
+                        self.m.mk_int(d)
+                    } else {
+                        self.m.mk_real(d)
+                    };
+                    (v, lit)
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            // Only trust a residual the substitution has fully linearised.
+            if self.arith_nonlinear(g) {
+                continue;
+            }
+            if let (SmtResult::Sat, m) = check_model(&self.m, g) {
                 let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
                 for &(v, val) in &subst {
                     if let Some(r) = self.m.as_numeral(val) {
