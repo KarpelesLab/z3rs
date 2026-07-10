@@ -11976,7 +11976,23 @@ impl Context {
             }
         }
         vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
-        if vars.is_empty() && derived.is_empty() {
+        // A goal with no string *variable* is still witnessable when its only
+        // unknowns are integer *indices* of `str.at`/`str.substr`/`str.indexof`
+        // over string literals (`str.indexof "" "" a ≠ 0`): the index enumeration
+        // below drives those, and the concrete string ops then fold away.
+        let has_index_var = self.m.postorder(goal).iter().any(|&t| {
+            self.m.is_app(t)
+                && matches!(
+                    self.str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str),
+                    Some("str.at") | Some("str.substr") | Some("str.indexof")
+                )
+                && self.m.app_args(t)[1..].iter().any(|&ia| {
+                    self.m.is_uninterp_const(ia) && self.m.is_int_sort(self.m.get_sort(ia))
+                })
+        });
+        if vars.is_empty() && derived.is_empty() && !has_index_var {
             return None;
         }
         if vars.len() > 3 {
