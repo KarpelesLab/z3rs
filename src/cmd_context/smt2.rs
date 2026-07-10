@@ -2358,6 +2358,9 @@ impl Context {
                         }
                         Ok(acc)
                     }
+                    // z3 legacy spelling: `(RegEx String)` is the regular-language
+                    // sort `RegLan`.
+                    "RegEx" => Ok(self.reglan_sort()),
                     "_" if l.len() == 3 && Self::sym(&l[1])? == "BitVec" => {
                         let w: u32 = Self::sym(&l[2])?
                             .parse()
@@ -12998,14 +13001,24 @@ impl Context {
                 self.symbolic_string(op, raw)
             }
             "str.in_re" | "str.in.re" => {
-                // (str.in_re s r): if s is a literal and r a constant regex, match.
-                if let (Some(s), Some(r)) = (self.str_value(raw[0]), self.regex_of.get(&raw[1])) {
-                    let hit = r.matches(&s);
-                    return Ok(if hit {
-                        self.m.mk_true()
-                    } else {
-                        self.m.mk_false()
-                    });
+                // (str.in_re s r): folds independent of `s` when the language is
+                // universal (`re.all`, matches every string) or empty (`re.none`).
+                if let Some(r) = self.regex_of.get(&raw[1]) {
+                    if matches!(r, Regex::All) {
+                        return Ok(self.m.mk_true());
+                    }
+                    if r.is_empty_lang() {
+                        return Ok(self.m.mk_false());
+                    }
+                    // If s is a literal and r a constant regex, match directly.
+                    if let Some(s) = self.str_value(raw[0]) {
+                        let hit = r.matches(&s);
+                        return Ok(if hit {
+                            self.m.mk_true()
+                        } else {
+                            self.m.mk_false()
+                        });
+                    }
                 }
                 self.symbolic_string(op, raw)
             }
@@ -15689,7 +15702,7 @@ impl Context {
                 }
                 _ => None,
             },
-            "re.none" | "re.empty" => Some(Regex::None),
+            "re.none" | "re.empty" | "re.nostr" => Some(Regex::None),
             "re.all" => Some(Regex::All),
             "re.allchar" => Some(Regex::AllChar),
             "re.++" => subs.map(|s| fold_regex(s, |a, b| Regex::Concat(Box::new(a), Box::new(b)))),
