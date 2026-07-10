@@ -1346,6 +1346,9 @@ struct Context {
     /// pinned to a concrete FP constant (via `fold_fp_conversions`), so the
     /// predicate does not stay a free Boolean (a fuzz-found spurious `sat`).
     fp_class_markers: BTreeMap<AstId, (alloc::string::String, AstId)>,
+    /// Uninterpreted `(default arr)` function decls, one per array sort, so a
+    /// symbolic array's default value is congruent (`a = b ⇒ default a = default b`).
+    array_default_decls: BTreeMap<AstId, AstId>,
     /// Opaque FP comparison-predicate markers (`fp.eq`/`fp.lt`/`fp.leq`/`fp.gt`/
     /// `fp.geq` whose operands could not be bit-blasted, e.g. `to_fp` conversions
     /// of symbolic reals/ints) -> (op name, lhs, rhs). Resolved once both operands
@@ -2259,6 +2262,7 @@ impl Context {
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
             fp_class_markers: BTreeMap::new(),
+            array_default_decls: BTreeMap::new(),
             fp_cmp_markers: BTreeMap::new(),
             fp_rem_markers: BTreeMap::new(),
             fp_to_bv_unspec: BTreeMap::new(),
@@ -22764,6 +22768,42 @@ impl Context {
         result
     }
 
+    /// `(default arr)` — the array's default value (z3 extension). Folds
+    /// `(as const v) → v`, `store(a,i,v) → default(a)`, `(_ map f) a… →
+    /// f(default(a)…)`; a symbolic array becomes an uninterpreted `default`
+    /// application, congruent per array so `a = b ⇒ default(a) = default(b)`.
+    fn array_default(&mut self, arr: AstId) -> Result<AstId, String> {
+        if self.m.is_const_array(arr) {
+            return Ok(self.m.app_args(arr)[0]);
+        }
+        if self.m.is_store(arr) {
+            let base = self.m.app_args(arr)[0];
+            return self.array_default(base);
+        }
+        if let Some((fname, arrays)) = self.maps.get(&arr).cloned() {
+            let mut vals = Vec::with_capacity(arrays.len());
+            for a in arrays {
+                vals.push(self.array_default(a)?);
+            }
+            let applied = self.apply(&fname, vals)?;
+            return Ok(crate::rewriter::simplify(&mut self.m, applied));
+        }
+        let sort = self.m.get_sort(arr);
+        let (_, elem) = self
+            .m
+            .array_sort_params(sort)
+            .ok_or_else(|| "default: argument is not an array".to_string())?;
+        let decl = if let Some(&d) = self.array_default_decls.get(&sort) {
+            d
+        } else {
+            let name = alloc::format!("!default!{}", self.array_default_decls.len());
+            let d = self.m.mk_func_decl(Symbol::new(&name), &[sort], elem);
+            self.array_default_decls.insert(sort, d);
+            d
+        };
+        Ok(self.m.mk_app(decl, &[arr]))
+    }
+
     fn apply(&mut self, head: &str, mut args: Vec<AstId>) -> Result<AstId, String> {
         // Legacy/alternate operator spellings z3's parser accepts as builtins
         // (arith_decl_plugin / ast.cpp op_names). Normalize to the canonical
@@ -22862,6 +22902,9 @@ impl Context {
             {
                 return Ok(self.eq_distrib_ite(args[0], args[1]));
             }
+        }
+        if head == "default" && args.len() == 1 {
+            return self.array_default(args[0]);
         }
         let m = &mut self.m;
         // Bit-vector binary ops and comparisons require equal operand widths;
