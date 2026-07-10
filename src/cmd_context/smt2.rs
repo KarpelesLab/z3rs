@@ -13079,6 +13079,24 @@ impl Context {
                     // `t` does not occur: `str.replace` returns `s` unchanged.
                     return Ok(self.mk_str_lit(&code_points_to_string(&s)));
                 }
+                // `str.replace s "" r` = `r ++ s`: the empty pattern matches at
+                // position 0, so `r` is inserted at the front (any symbolic s, r).
+                if op == "str.replace"
+                    && raw.len() == 3
+                    && self.str_value(raw[1]).is_some_and(|t| t.is_empty())
+                {
+                    let parts = alloc::vec![raw[2], raw[0]];
+                    return self.string_op("str.++", &parts);
+                }
+                // `str.replace "" pat ""` = "": the empty source yields "" whether
+                // `pat` is empty (replaced by "") or non-empty (left unmatched).
+                if op == "str.replace"
+                    && raw.len() == 3
+                    && self.str_value(raw[0]).is_some_and(|s| s.is_empty())
+                    && self.str_value(raw[2]).is_some_and(|r| r.is_empty())
+                {
+                    return Ok(self.mk_str_lit(""));
+                }
                 // `str.at x i`: reuse one congruent marker per `(x, i)` so repeated
                 // reads at the same position are the same term.
                 if op == "str.at" && raw.len() == 2 {
