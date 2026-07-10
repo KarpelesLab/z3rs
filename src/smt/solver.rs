@@ -448,6 +448,13 @@ impl Model {
         if let Some(r) = m.as_numeral(t) {
             return Some(r);
         }
+        // An arithmetic leaf pinned in the assignment: read it directly so that
+        // *nonlinear* terms over it (e.g. `(* x x)`) fold to the true value
+        // rather than the linear fallback's stray `0`. The assignment only ever
+        // holds leaf variables, so no arity guard is needed.
+        if let Some(r) = self.arith.get(&t) {
+            return Some(r.clone());
+        }
         if m.is_ite(t) {
             let a = m.app_args(t).to_vec();
             return if self.eval_bool_full(m, a[0]) {
