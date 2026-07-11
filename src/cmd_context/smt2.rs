@@ -13068,6 +13068,113 @@ impl Context {
         })
     }
 
+    /// Build a `str.++` of `parts` (`""` when empty, the part itself when single).
+    fn mk_concat(&mut self, parts: &[AstId]) -> AstId {
+        match parts.len() {
+            0 => self.mk_str_lit(""),
+            1 => parts[0],
+            _ => self.string_op("str.++", parts).unwrap_or(parts[0]),
+        }
+    }
+
+    /// If `length` is `(str.len base)` or `(+ (str.len base) c)` (either operand
+    /// order), return `c` (0 for the bare length); else `None`.
+    fn match_len_of_plus_const(&self, length: AstId, base: AstId) -> Option<i64> {
+        let is_len_of = |t: AstId| {
+            self.m.is_app(t)
+                && self.str_len_decl == Some(self.m.app_decl(t))
+                && self.m.app_args(t).len() == 1
+                && self.m.app_args(t)[0] == base
+        };
+        if is_len_of(length) {
+            return Some(0);
+        }
+        if self.m.arith_op(length) == Some(ArithOp::Add) {
+            let args = self.m.app_args(length);
+            if args.len() == 2 {
+                for (l, r) in [(args[0], args[1]), (args[1], args[0])] {
+                    if is_len_of(l)
+                        && let Some(c) = self
+                            .m
+                            .as_numeral(r)
+                            .and_then(|q| q.to_integer())
+                            .and_then(|i| i.to_i64())
+                    {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Peel leading operands of `(str.substr (str.++ p₀ p₁ …) 0 n)` that the
+    /// length fully covers. `n` may be a constant, or `(+ (str.len p₀) k)` (take
+    /// `p₀` whole, recurse on the rest with length `k`). Sound: each peeled prefix
+    /// is exactly the leading `n` characters. `None` when no progress is possible.
+    fn substr_concat_peel(&mut self, source: AstId, length: AstId) -> Option<AstId> {
+        if !(self.m.is_app(source)
+            && self
+                .str_op_decls
+                .get(&self.m.app_decl(source))
+                .map(String::as_str)
+                == Some("str.++"))
+        {
+            return None;
+        }
+        let parts: Vec<AstId> = self.m.app_args(source).to_vec();
+        if parts.is_empty() {
+            return None;
+        }
+        let zero = self.m.mk_int(0);
+        // Length `(+ (str.len p₀) k)` with `k ≥ 0`: `p₀` is taken whole.
+        if let Some(k) = self.match_len_of_plus_const(length, parts[0])
+            && k >= 0
+        {
+            let rest = self.mk_concat(&parts[1..]);
+            let kk = self.m.mk_int(k);
+            let inner = self.string_op("str.substr", &[rest, zero, kk]).ok()?;
+            return self.string_op("str.++", &[parts[0], inner]).ok();
+        }
+        // Constant length: peel whole literal operands greedily.
+        if let Some(m0) = self.int_arg(length).filter(|&m| m >= 0) {
+            let mut taken: Vec<AstId> = Vec::new();
+            let mut rem = m0;
+            let mut idx = 0;
+            while idx < parts.len() && rem > 0 {
+                match self.str_value(parts[idx]) {
+                    Some(lit) => {
+                        let l = lit.len() as i64;
+                        if rem >= l {
+                            taken.push(parts[idx]);
+                            rem -= l;
+                            idx += 1;
+                        } else {
+                            let piece = code_points_to_string(&lit[..rem as usize]);
+                            taken.push(self.mk_str_lit(&piece));
+                            rem = 0;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            // Fully determined, or the length ran past the whole concatenation.
+            if rem == 0 || idx >= parts.len() {
+                return Some(self.mk_concat(&taken));
+            }
+            // Stopped at a non-literal operand with length remaining; keep it as a
+            // (shorter) residual substr so at least the literal prefix is exposed.
+            if !taken.is_empty() {
+                let rest = self.mk_concat(&parts[idx..]);
+                let rr = self.m.mk_int(rem);
+                let inner = self.string_op("str.substr", &[rest, zero, rr]).ok()?;
+                taken.push(inner);
+                return Some(self.mk_concat(&taken));
+            }
+        }
+        None
+    }
+
     /// Build a string-theory application `(op args…)`, folding when every string
     /// argument is a literal and otherwise producing an uninterpreted term
     /// (marked symbolic so a goal mentioning it is answered `unknown`).
@@ -13131,6 +13238,15 @@ impl Context {
                     && self.str_value(raw[2]).is_some_and(|r| r.is_empty())
                 {
                     return Ok(self.mk_str_lit(""));
+                }
+                // `str.substr (str.++ p …) 0 n`: peel whole leading operands the
+                // length covers (`substr(a·"ab"·b, 0, len(a)+1) = a·"a"`).
+                if op == "str.substr"
+                    && raw.len() == 3
+                    && self.int_arg(raw[1]) == Some(0)
+                    && let Some(peeled) = self.substr_concat_peel(raw[0], raw[2])
+                {
+                    return Ok(peeled);
                 }
                 // `str.at x i`: reuse one congruent marker per `(x, i)` so repeated
                 // reads at the same position are the same term.
