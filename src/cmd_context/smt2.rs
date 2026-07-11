@@ -16183,6 +16183,173 @@ impl Context {
         self.m.mk_const(d)
     }
 
+    /// A concrete default value of `sort` (`0` / `false` / `#b0…` / `+zero` / `""`
+    /// / a record of defaults), used to fill an unconstrained record field so the
+    /// witness stays fully concrete. A fresh constant for an uninterpreted sort
+    /// (EUF handles it opaquely). `None` if no default can be built.
+    fn default_value_of_sort(&mut self, sort: AstId, depth: u32) -> Option<AstId> {
+        if depth > 4 {
+            return None;
+        }
+        if self.m.is_bool_sort(sort) {
+            return Some(self.m.mk_false());
+        }
+        if self.m.is_int_sort(sort) {
+            return Some(self.m.mk_int(0));
+        }
+        if self.m.is_arith_sort(sort) && !self.m.is_int_sort(sort) {
+            return Some(self.m.mk_real(0));
+        }
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return Some(self.m.mk_bv(0, w));
+        }
+        if let Some((eb, sb)) = self.fp_format_of(sort) {
+            return Some(self.fp_special("+zero", eb, sb));
+        }
+        if self.string_sort == Some(sort) {
+            return Some(self.mk_str_lit(""));
+        }
+        if let Some((cdecl, selectors)) = self.records.get(&sort).cloned() {
+            let mut args = Vec::with_capacity(selectors.len());
+            for &sd in &selectors {
+                let fsort = self.m.func_decl(sd)?.range;
+                args.push(self.default_value_of_sort(fsort, depth + 1)?);
+            }
+            return Some(self.m.mk_app(cdecl, &args));
+        }
+        // Any other sort (uninterpreted, array, non-record datatype): a fresh
+        // opaque element. Sound — an unconstrained value that check_model verifies
+        // — and, not being bit-vector/float-sorted, it does not re-trigger the
+        // bit-blast gate this witness exists to avoid.
+        Some(self.fresh_const(sort))
+    }
+
+    /// Is `v` the surjectivity (eta) form `C(sel₁(s),…,selₙ(s))` of the record
+    /// variable `s` — i.e. the axiom that merely restates `s`, not a value binding?
+    fn is_record_eta(&self, s: AstId, v: AstId) -> bool {
+        let Some((cdecl, selectors)) = self.records.get(&self.m.get_sort(s)) else {
+            return false;
+        };
+        if !self.m.is_app(v) || self.m.app_decl(v) != *cdecl {
+            return false;
+        }
+        let args = self.m.app_args(v).to_vec();
+        if args.len() != selectors.len() {
+            return false;
+        }
+        selectors.iter().zip(&args).all(|(&sd, &a)| {
+            self.m.is_app(a)
+                && self.m.app_decl(a) == sd
+                && self.m.app_args(a).len() == 1
+                && self.m.app_args(a)[0] == s
+        })
+    }
+
+    /// Witness a goal with a record variable whose fields are (partly) pinned by
+    /// top-level `selᵢ(x) = vᵢ` equalities: build `x = C(v₁,…,vₙ)` using each
+    /// pin, or a concrete default for an unconstrained field, substitute, and
+    /// verify. Sidesteps the bit-blast / theory-combination gate on a record that
+    /// carries a bit-vector or float field (whose value is otherwise opaque and
+    /// forces a spurious `unknown`).
+    fn try_record_witness(&mut self, goal: AstId) -> Option<Model> {
+        if self.records.is_empty() {
+            return None;
+        }
+        // Top-level conjuncts: collect selector pins `selᵢ(x) = v`.
+        let mut top: Vec<AstId> = Vec::new();
+        let mut st = alloc::vec![goal];
+        while let Some(t) = st.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    st.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let mut pin: BTreeMap<AstId, AstId> = BTreeMap::new();
+        // Record variables that are *directly* bound by a top-level equality
+        // (`p = mk-pair(…)`, `p = q`) are already determined — the normal datatype
+        // path decides them, and filling their fields with defaults would fabricate
+        // a conflicting value. Only witness records constrained via `selᵢ(p) = v`.
+        let mut directly_bound: BTreeSet<AstId> = BTreeSet::new();
+        for &c in &top {
+            if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
+                let a = self.m.app_args(c);
+                for (s, v) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(s)
+                        && self.records.contains_key(&self.m.get_sort(s))
+                        && !self.is_record_eta(s, v)
+                    {
+                        // A genuine binding `s = value` — not the surjectivity axiom
+                        // `s = C(sel₁(s),…)`, which merely restates s and is harmless.
+                        directly_bound.insert(s);
+                    }
+                    if self.m.is_app(s) && self.m.app_args(s).len() == 1 {
+                        pin.entry(s).or_insert(v);
+                    }
+                }
+            }
+        }
+        // Record-sorted variables to eliminate by constructor substitution.
+        let mut cand_subst: Vec<(AstId, AstId)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_uninterp_const(t) || directly_bound.contains(&t) {
+                continue;
+            }
+            let sort = self.m.get_sort(t);
+            let Some((cdecl, selectors)) = self.records.get(&sort).cloned() else {
+                continue;
+            };
+            let mut args = Vec::with_capacity(selectors.len());
+            let mut ok = true;
+            for &sd in &selectors {
+                let sel_app = self.m.mk_app(sd, &[t]);
+                if let Some(&v) = pin.get(&sel_app) {
+                    args.push(v);
+                } else if let Some(range) = self.m.func_decl(sd).map(|f| f.range)
+                    && let Some(d) = self.default_value_of_sort(range, 0)
+                {
+                    args.push(d);
+                } else {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                let cand = self.m.mk_app(cdecl, &args);
+                cand_subst.push((t, cand));
+            }
+        }
+        if cand_subst.is_empty() {
+            return None;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &cand_subst);
+        // Fold `selᵢ(C(a₁,…,aₙ)) → aᵢ` so each field's concrete value replaces the
+        // selector application (the rewriter alone does not know record selectors).
+        let g = self.dt_fold(g);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        // A residual record variable could hide an unmet constraint — and would
+        // re-enter this witness — so require every record variable eliminated.
+        if self
+            .m
+            .postorder(g)
+            .iter()
+            .any(|&t| self.m.is_uninterp_const(t) && self.records.contains_key(&self.m.get_sort(t)))
+        {
+            return None;
+        }
+        // Decide the record-free residual with the full (bit-blasting) path, so a
+        // concrete bit-vector / float field is checked soundly — `check_model`
+        // alone would treat two distinct bit-vector literals as EUF-mergeable and
+        // report a spurious `sat`. A returned `sat` is a genuine witness; the
+        // recursion terminates because `g` has no record variable left.
+        match self.decide(g) {
+            (SmtResult::Sat, m) => Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()))),
+            _ => None,
+        }
+    }
+
     /// Lift term-level `ite`s and constant-divisor `div`/`mod` out of `base`,
     /// conjoining their defining constraints, so the theory solvers can reason
     /// about them.
@@ -20780,6 +20947,16 @@ impl Context {
 
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // A record variable with (partly) pinned fields — including a bit-vector or
+        // float field, which otherwise forces the bit-blast gate to `unknown` — is
+        // witnessed by constructing `x = C(pinned/default fields)` and verifying.
+        // Runs before FP equalities are lowered to bit-vectors so the `selᵢ(x)=v`
+        // pins are still visible.
+        if !self.records.is_empty()
+            && let Some(m) = self.try_record_witness(goal)
+        {
+            return (SmtResult::Sat, Some(m));
+        }
         // Fold `to_fp` conversions of arithmetic-pinned reals/ints (and the
         // `fp.is*` classification markers over them) EAGERLY — check_model would
         // otherwise treat the conversion / classification as a free term and
