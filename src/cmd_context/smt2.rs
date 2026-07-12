@@ -6709,6 +6709,46 @@ impl Context {
             }
             ax.extend(ges);
         }
+        // Suffix identity: `str.suffixof s0 s1 ⇒ s0 = str.substr s1 (len s1 − len
+        // s0) (len s0)` — a suffix equals the tail substring. Emitted only when
+        // that exact tail-substr term is present in the goal, so it refutes
+        // `suffixof(s0,s1) ∧ s0 ≠ substr(s1, len s1 − len s0, len s0)` (2415).
+        {
+            let suffixes: Vec<(AstId, AstId, AstId)> = present
+                .iter()
+                .filter_map(|&t| {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some("str.suffixof")
+                        && self.m.app_args(t).len() == 2
+                    {
+                        let a = self.m.app_args(t);
+                        Some((t, a[0], a[1]))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !suffixes.is_empty() {
+                let lenf = self.str_len_fn();
+                for (marker, s0, s1) in suffixes {
+                    let len_s1 = self.m.mk_app(lenf, &[s1]);
+                    let len_s0 = self.m.mk_app(lenf, &[s0]);
+                    let idx = self.m.mk_sub(&[len_s1, len_s0]);
+                    let Ok(tail) = self.string_op("str.substr", &[s1, idx, len_s0]) else {
+                        continue;
+                    };
+                    if present_set.contains(&tail) {
+                        let eq = self.m.mk_eq(s0, tail);
+                        let imp = self.m.mk_implies(marker, eq);
+                        ax.push(imp);
+                    }
+                }
+            }
+        }
         // Concrete sequence lengths: `seq.len(u) = |elements|` for every
         // known-element sequence term `u` in the goal, so a variable bound to it
         // (`s = (seq.unit 1)`) inherits the length by congruence (else a
