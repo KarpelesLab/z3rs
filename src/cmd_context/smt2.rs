@@ -2921,7 +2921,12 @@ impl Context {
                         .collect::<Result<_, _>>()?;
                     let inner = self.skolemize_body(&inner, &univ, true)?;
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
-                    if let Some(qf) = self.qe_forall(&vars, body) {
+                    if let Some(expanded) = self.expand_finite_forall(&vars, body) {
+                        // Every bound sort is finite → the ground conjunction over
+                        // the domain is exact (no instantiation heuristics needed).
+                        self.assertions.push(expanded);
+                        self.assert_names.push(None);
+                    } else if let Some(qf) = self.qe_forall(&vars, body) {
                         self.assertions.push(qf);
                         self.assert_names.push(None);
                     } else {
@@ -18009,6 +18014,65 @@ impl Context {
 
     /// Quantifier elimination for a top-level `∀ vars. body` over **real**
     /// linear arithmetic: `∀x.φ ≡ ¬∃x.¬φ`; the DNF of `¬φ` is projected
+    /// The finite domain of `sort` — Boolean (`true`/`false`) or an enumeration
+    /// datatype (its constructor constants). `None` if the sort is infinite (or
+    /// not a recognised finite one), so the caller keeps the quantifier.
+    fn finite_domain_values(&mut self, sort: AstId) -> Option<Vec<AstId>> {
+        if self.m.is_bool_sort(sort) {
+            return Some(alloc::vec![self.m.mk_true(), self.m.mk_false()]);
+        }
+        self.enums.get(&sort).cloned()
+    }
+
+    /// Expand `∀x₁:S₁ … xₙ:Sₙ. φ` to the ground conjunction over the domains when
+    /// every `Sᵢ` is finite — exact and quantifier-free. `None` if any sort is
+    /// infinite or the product exceeds a small cap.
+    fn expand_finite_forall(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
+        if vars.is_empty() {
+            return None;
+        }
+        let mut domains: Vec<Vec<AstId>> = Vec::new();
+        let mut total = 1usize;
+        for &v in vars {
+            let dom = self.finite_domain_values(self.m.get_sort(v))?;
+            if dom.is_empty() {
+                return None;
+            }
+            total = total.checked_mul(dom.len())?;
+            if total > 256 {
+                return None;
+            }
+            domains.push(dom);
+        }
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut idx = alloc::vec![0usize; vars.len()];
+        loop {
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| (v, domains[k][idx[k]]))
+                .collect();
+            let inst = crate::rewriter::substitute(&mut self.m, body, &subst);
+            conj.push(crate::rewriter::simplify(&mut self.m, inst));
+            let mut k = 0;
+            loop {
+                if k == vars.len() {
+                    return Some(if conj.len() == 1 {
+                        conj[0]
+                    } else {
+                        self.m.mk_and(&conj)
+                    });
+                }
+                idx[k] += 1;
+                if idx[k] < domains[k].len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
     /// variable-by-variable (Fourier–Motzkin, exact for the reals), and the
     /// result is rebuilt as a quantifier-free formula. `None` if the body is not
     /// purely linear or a projection exceeds budget (→ fall back to instantiation).
