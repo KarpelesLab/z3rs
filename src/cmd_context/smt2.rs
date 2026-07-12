@@ -23302,6 +23302,22 @@ impl Context {
                     .iter()
                     .map(|a| self.term(a))
                     .collect::<Result<_, _>>()?;
+                // Fold equality / disequality of two string literals (z3 does this
+                // in simplify): distinct literals are unequal. Prevents a downstream
+                // rewrite from equating two distinct literals, which the EUF — which
+                // has no literal-distinctness — would otherwise merge.
+                if (head == "=" || head == "distinct")
+                    && args.len() == 2
+                    && let (Some(a), Some(b)) = (self.str_value(args[0]), self.str_value(args[1]))
+                {
+                    let equal = a == b;
+                    let yes = if head == "=" { equal } else { !equal };
+                    return Ok(if yes {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    });
+                }
                 // (select (lambda ((x S)…) body) i…) beta-reduces to body[x:=i…].
                 if head == "select"
                     && let Some((params, body)) = self.lambdas.get(&args[0]).cloned()
