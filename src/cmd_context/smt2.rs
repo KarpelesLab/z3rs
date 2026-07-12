@@ -21555,7 +21555,7 @@ impl Context {
                 return (SmtResult::Unsat, None);
             }
         }
-        if res == SmtResult::Sat && self.arith_nonlinear(goal) {
+        if res != SmtResult::Unsat && self.arith_nonlinear(goal) {
             // First, try to *linearize*: a variable pinned by an equality
             // `x = c` (constant) can be substituted throughout, which often
             // turns a nonlinear product like `x*y` into the linear `c*y`. If the
@@ -21864,6 +21864,11 @@ impl Context {
                         >= 2
                 }
                 ArithOp::Power => true,
+                // A non-constant divisor is nonlinear too; enumerating its (and
+                // the dividend's) variables makes the quotient concrete.
+                ArithOp::Div | ArithOp::Idiv | ArithOp::Mod | ArithOp::Rem => {
+                    self.m.as_numeral(self.m.app_args(t)[1]).is_none()
+                }
                 _ => false,
             };
             if !is_nl {
