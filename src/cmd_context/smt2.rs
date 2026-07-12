@@ -18021,6 +18021,10 @@ impl Context {
         if self.m.is_bool_sort(sort) {
             return Some(alloc::vec![self.m.mk_true(), self.m.mk_false()]);
         }
+        // A narrow bit-vector has 2ʷ concrete values.
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return (w <= 8).then(|| (0..(1i64 << w)).map(|i| self.m.mk_bv(i, w)).collect());
+        }
         self.enums.get(&sort).cloned()
     }
 
