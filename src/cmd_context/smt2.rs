@@ -20843,6 +20843,30 @@ impl Context {
             if !ok {
                 continue;
             }
+            // A known-element (concrete) part must equal its forced slice, else the
+            // pinned-length split is infeasible and the whole conjunction is unsat;
+            // a part that is neither a variable nor a concrete sequence cannot be
+            // pinned soundly. (Mirrors the fix in `inline_str_concat_split`.)
+            let mut infeasible = false;
+            let mut unsplittable = false;
+            for (i, &p) in parts.iter().enumerate() {
+                let (lo, hi) = ranges[i];
+                if let Some(pv) = self.seq_of.get(&p) {
+                    if pv[..] != cv[lo..hi] {
+                        infeasible = true;
+                        break;
+                    }
+                } else if !self.m.is_uninterp_const(p) {
+                    unsplittable = true;
+                    break;
+                }
+            }
+            if infeasible {
+                return self.m.mk_false();
+            }
+            if unsplittable {
+                continue;
+            }
             for (i, &p) in parts.iter().enumerate() {
                 if self.m.is_uninterp_const(p) && !bound.contains(&p) {
                     let (lo, hi) = ranges[i];
