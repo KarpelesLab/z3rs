@@ -16705,11 +16705,108 @@ impl Context {
         // A `sat` result is complete only if instantiation reached a fixpoint
         // (every ground instance is present — e.g. a finite Datalog domain);
         // otherwise the un-instantiated cases keep it a sound `unknown`.
-        if res == SmtResult::Sat && !self.universals.is_empty() && !saturated {
+        if res == SmtResult::Sat
+            && !self.universals.is_empty()
+            && !saturated
+            && !self.all_universals_free_macros()
+        {
             (SmtResult::Unknown, None)
         } else {
             (res, model)
         }
+    }
+
+    /// The defining head function of a *free macro* universal `∀x̄. body`:
+    /// `body = (= (f …) t)` (either order) or the predicate `(f …)`, where `f` is
+    /// an uninterpreted function of arity ≥ 1, every bound variable occurs as a
+    /// direct argument of `f` (so distinct assignments give distinct arg-tuples —
+    /// no functional conflict), and `f` does not occur in the definition `t`.
+    /// `None` if `body` is not such a head.
+    fn macro_head(&self, vars: &[AstId], body: AstId) -> Option<AstId> {
+        let uf = |ctx: &Self, t: AstId| -> Option<AstId> {
+            let app = ctx.m.app(t)?;
+            if app.args.is_empty() {
+                return None;
+            }
+            let fd = ctx.m.func_decl(app.decl)?;
+            (fd.info.family_id == crate::ast::NULL_FAMILY_ID).then_some(app.decl)
+        };
+        let (head, rhs) = if self.m.is_eq(body) && self.m.app_args(body).len() == 2 {
+            let a = self.m.app_args(body);
+            if uf(self, a[0]).is_some() {
+                (a[0], Some(a[1]))
+            } else if uf(self, a[1]).is_some() {
+                (a[1], Some(a[0]))
+            } else {
+                return None;
+            }
+        } else if self.m.is_bool_sort(self.m.get_sort(body)) && uf(self, body).is_some() {
+            (body, None)
+        } else {
+            return None;
+        };
+        let f = self.m.app_decl(head);
+        let args = self.m.app_args(head).to_vec();
+        // Every bound variable must be a direct argument of the head.
+        if !vars.iter().all(|v| args.contains(v)) {
+            return None;
+        }
+        // `f` must not occur in the definition body.
+        if let Some(t) = rhs
+            && self
+                .m
+                .postorder(t)
+                .iter()
+                .any(|&s| self.m.app(s).is_some_and(|a| a.decl == f))
+        {
+            return None;
+        }
+        Some(f)
+    }
+
+    /// Every recorded universal is a *free macro* defining an uninterpreted
+    /// function that is used nowhere else (no ground assertion, no other
+    /// universal). Such a set is always satisfiable — define each function by its
+    /// macro — so a `sat` need not be gated on saturating the instantiation.
+    fn all_universals_free_macros(&self) -> bool {
+        if self.universals.is_empty() {
+            return false;
+        }
+        let mut heads: Vec<AstId> = Vec::new();
+        for (vars, body) in &self.universals {
+            match self.macro_head(vars, *body) {
+                Some(f) => heads.push(f),
+                None => return false,
+            }
+        }
+        // Function symbols used in the ground assertions.
+        let mut ground: BTreeSet<AstId> = BTreeSet::new();
+        for &a in &self.assertions {
+            for t in self.m.postorder(a) {
+                if let Some(app) = self.m.app(t)
+                    && !app.args.is_empty()
+                {
+                    ground.insert(app.decl);
+                }
+            }
+        }
+        for (i, &f) in heads.iter().enumerate() {
+            if ground.contains(&f) {
+                return false;
+            }
+            for (j, (_, body)) in self.universals.iter().enumerate() {
+                if i != j
+                    && self
+                        .m
+                        .postorder(*body)
+                        .iter()
+                        .any(|&t| self.m.app(t).is_some_and(|a| a.decl == f))
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// If `t` is an application of an uninterpreted, `Bool`-ranged function of
