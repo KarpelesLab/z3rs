@@ -13191,15 +13191,63 @@ impl Context {
                 Ok(self.m.mk_app(d, &[raw[0]]))
             }
             "str.++" => {
-                if let Some(parts) = strs {
-                    let joined: Vec<u32> = parts.into_iter().flatten().collect();
-                    return Ok(self.mk_str_lit(&code_points_to_string(&joined)));
+                // Normal form (z3 seq_rewriter::mk_seq_concat): flatten nested
+                // concats, merge adjacent string literals, drop empty operands.
+                let mut flat: Vec<AstId> = Vec::new();
+                let mut stack: Vec<AstId> = raw.iter().rev().copied().collect();
+                while let Some(t) = stack.pop() {
+                    if self.m.is_app(t)
+                        && self
+                            .str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str)
+                            == Some("str.++")
+                    {
+                        for &a in self.m.app_args(t).to_vec().iter().rev() {
+                            stack.push(a);
+                        }
+                    } else {
+                        flat.push(t);
+                    }
                 }
-                self.symbolic_string(op, raw)
+                let mut norm: Vec<AstId> = Vec::new();
+                let mut pending: Vec<u32> = Vec::new();
+                for t in flat {
+                    if let Some(v) = self.str_value(t) {
+                        pending.extend(v);
+                    } else {
+                        if !pending.is_empty() {
+                            let lit = self.mk_str_lit(&code_points_to_string(&pending));
+                            norm.push(lit);
+                            pending.clear();
+                        }
+                        norm.push(t);
+                    }
+                }
+                if !pending.is_empty() {
+                    let lit = self.mk_str_lit(&code_points_to_string(&pending));
+                    norm.push(lit);
+                }
+                match norm.len() {
+                    0 => Ok(self.mk_str_lit("")),
+                    1 => Ok(norm[0]),
+                    _ => self.symbolic_string(op, &norm),
+                }
             }
             "str.at" | "str.substr" | "str.replace" | "str.from_int" | "str.from-int" => {
                 if let Some(v) = self.fold_string_producer(op, raw) {
                     return Ok(self.mk_str_lit(&v));
+                }
+                // z3 seq_rewriter `mk_seq_replace`: `replace a b c` with `b == c`
+                // is `a` (replacing a substring with itself); with `a == b` is `c`
+                // (the whole string is the pattern). Hold for any (symbolic) terms.
+                if op == "str.replace" && raw.len() == 3 {
+                    if raw[1] == raw[2] {
+                        return Ok(raw[0]);
+                    }
+                    if raw[0] == raw[1] {
+                        return Ok(raw[2]);
+                    }
                 }
                 // `str.replace s t r` with concrete `s`, `t` and symbolic `r`
                 // rewrites to `before ++ r ++ after` (first occurrence of `t`), so
@@ -13229,6 +13277,25 @@ impl Context {
                 {
                     let parts = alloc::vec![raw[2], raw[0]];
                     return self.string_op("str.++", &parts);
+                }
+                // z3 seq_rewriter: `replace (p₀ ++ rest) b c` with `p₀ == b` is
+                // `c ++ rest` — the pattern is exactly the first operand, matched
+                // at position 0 (sound even if `p₀` is empty: `c ++ rest`).
+                if op == "str.replace"
+                    && raw.len() == 3
+                    && self.m.is_app(raw[0])
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(raw[0]))
+                        .map(String::as_str)
+                        == Some("str.++")
+                {
+                    let parts: Vec<AstId> = self.m.app_args(raw[0]).to_vec();
+                    if parts.first() == Some(&raw[1]) {
+                        let mut new_parts = alloc::vec![raw[2]];
+                        new_parts.extend_from_slice(&parts[1..]);
+                        return self.string_op("str.++", &new_parts);
+                    }
                 }
                 // `str.replace "" pat ""` = "": the empty source yields "" whether
                 // `pat` is empty (replaced by "") or non-empty (left unmatched).
