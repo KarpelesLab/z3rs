@@ -24194,6 +24194,22 @@ impl Context {
                     };
                     return Ok(m.mk_numeral(Rational::from_integer(val), true));
                 }
+                // Unsigned bridge inverse: `bv2nat((_ int2bv n) t) = t mod 2ⁿ`
+                // (`int2bv` truncates to n bits, `bv2nat` reads it back unsigned).
+                if head != "sbv_to_int" {
+                    let inner = m
+                        .app(args[0])
+                        .filter(|a| !a.args.is_empty())
+                        .map(|a| (a.decl, a.args[0]));
+                    if let Some((decl, t)) = inner
+                        && m.func_decl(decl).and_then(|d| d.name.as_str()) == Some("int2bv")
+                        && let Some(n) = m.bv_sort_width(m.get_sort(args[0]))
+                        && n < 63
+                    {
+                        let modulus = m.mk_int(1i64 << n);
+                        return Ok(m.mk_mod(t, modulus));
+                    }
+                }
                 let int = m.mk_int_sort();
                 let bvs = m.get_sort(args[0]);
                 let d = m.mk_func_decl(Symbol::new(head), &[bvs], int);
