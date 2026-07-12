@@ -21880,18 +21880,20 @@ impl Context {
                 }
             }
         }
-        if nl_vars.is_empty() || nl_vars.len() > 2 {
+        if nl_vars.is_empty() || nl_vars.len() > 3 {
             return None;
         }
-        const B: i64 = 8;
-        let side = (2 * B + 1) as usize;
+        // Grid half-width shrinks with the variable count so the product of
+        // enumerations stays bounded (17 / 17² / 11³ candidates).
+        let b: i64 = if nl_vars.len() >= 3 { 5 } else { 8 };
+        let side = (2 * b + 1) as usize;
         let total = side.pow(nl_vars.len() as u32);
         for idx in 0..total {
             let mut rem = idx;
             let subst: Vec<(AstId, AstId)> = nl_vars
                 .iter()
                 .map(|&v| {
-                    let d = (rem % side) as i64 - B;
+                    let d = (rem % side) as i64 - b;
                     rem /= side;
                     let lit = if self.m.is_int_sort(self.m.get_sort(v)) {
                         self.m.mk_int(d)
