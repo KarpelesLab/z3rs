@@ -20953,6 +20953,32 @@ impl Context {
             if !ok {
                 continue;
             }
+            // Every part's slice is now forced by the pinned lengths. A concrete
+            // literal part that does not equal its slice makes the split (and the
+            // whole conjunction) unsatisfiable — this is the check that stops
+            // `x·"ab"·y = "abab" ∧ len x = 1` from a spurious `sat` via
+            // `"aabb" = "abab"` (which the EUF would merge). A part that is neither
+            // a variable nor a literal cannot be pinned soundly, so skip the split.
+            let mut infeasible = false;
+            let mut unsplittable = false;
+            for (i, &p) in parts.iter().enumerate() {
+                let (lo, hi) = ranges[i];
+                if let Some(pv) = self.str_value(p) {
+                    if pv[..] != cv[lo..hi] {
+                        infeasible = true;
+                        break;
+                    }
+                } else if !self.m.is_uninterp_const(p) {
+                    unsplittable = true;
+                    break;
+                }
+            }
+            if infeasible {
+                return self.m.mk_false();
+            }
+            if unsplittable {
+                continue;
+            }
             for (i, &p) in parts.iter().enumerate() {
                 if self.m.is_uninterp_const(p) && !bound.contains(&p) {
                     let (lo, hi) = ranges[i];
