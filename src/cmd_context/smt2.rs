@@ -24022,6 +24022,28 @@ impl Context {
                     let factors = alloc::vec![args[0]; e as usize];
                     return Ok(m.mk_mul(&factors));
                 }
+                // Negative constant exponent on a real base: `x^(-k) = ite(x=0, 0,
+                // 1/x^k)`. Matches z3, whose `(^ x -1.0)` simplifies to
+                // `(ite (= x 0.0) 0.0 (/ 1.0 x))` — *not* plain `1/x`, since
+                // division-by-zero is a distinct unspecified value from `x^(-1)|₀=0`.
+                if let Some(exp) = m.as_numeral(args[1]).and_then(|v| v.to_integer())
+                    && let Some(e) = exp.to_i64()
+                    && (-64..=-1).contains(&e)
+                    && !m.is_int_sort(m.get_sort(args[0]))
+                {
+                    let k = (-e) as usize;
+                    let base = args[0];
+                    let powk = if k == 1 {
+                        base
+                    } else {
+                        m.mk_mul(&alloc::vec![base; k])
+                    };
+                    let one = m.mk_real(1);
+                    let recip = m.mk_div(one, powk);
+                    let zero = m.mk_real(0);
+                    let is_zero = m.mk_eq(base, zero);
+                    return Ok(m.mk_ite(is_zero, zero, recip));
+                }
                 let d = m.mk_func_decl(
                     Symbol::new("^"),
                     &[m.get_sort(args[0]); 2],
