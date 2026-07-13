@@ -6273,6 +6273,65 @@ impl Context {
         false
     }
 
+    /// Evaluate a fully *ground* array — a `const` base overlaid with `store`s at
+    /// concrete integer indices and concrete (numeral) values — to its
+    /// `(index → value overrides, default)`. `None` if any part is symbolic.
+    fn eval_ground_array(&self, arr: AstId) -> Option<(BTreeMap<i64, AstId>, AstId)> {
+        if self.m.is_const_array(arr) {
+            let d = self.m.app_args(arr)[0];
+            self.m.as_numeral(d)?;
+            return Some((BTreeMap::new(), d));
+        }
+        if self.m.is_store(arr) {
+            let a = self.m.app_args(arr);
+            let idx = self.m.as_numeral(a[1])?.to_integer()?.to_i64()?;
+            let val = a[2];
+            self.m.as_numeral(val)?;
+            let (mut map, def) = self.eval_ground_array(a[0])?;
+            map.insert(idx, val);
+            return Some((map, def));
+        }
+        None
+    }
+
+    /// A top-level `(= a b)` where `a` and `b` are ground arrays that evaluate to
+    /// different point functions is UNSAT — decides ground `store`-chain equality
+    /// at any depth (the extensionality/read-over-write axioms miss deep chains).
+    fn ground_array_eq_conflict(&self, goal: AstId) -> bool {
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        for c in top {
+            if self.m.is_eq(c)
+                && self.m.app_args(c).len() == 2
+                && let Some((ma, da)) = self.eval_ground_array(self.m.app_args(c)[0])
+                && let Some((mb, db)) = self.eval_ground_array(self.m.app_args(c)[1])
+            {
+                if da != db {
+                    return true;
+                }
+                let mut idxs: BTreeSet<i64> = ma.keys().copied().collect();
+                idxs.extend(mb.keys().copied());
+                for i in idxs {
+                    let va = ma.get(&i).copied().unwrap_or(da);
+                    let vb = mb.get(&i).copied().unwrap_or(db);
+                    if va != vb {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     fn extensionality_unsat(&self, goal: AstId) -> bool {
         // Array pairs forced equal by a `∀i. a[i] = b[i]` assertion.
         let mut pairs: Vec<(AstId, AstId)> = Vec::new();
@@ -21468,6 +21527,10 @@ impl Context {
         // Two arrays with different const-array defaults over an infinite index are
         // unequal — `store(const 0,2,3) = store(const 1,2,3)` is UNSAT.
         if self.const_array_default_conflict(goal) {
+            return (SmtResult::Unsat, None);
+        }
+        // Ground `store`-chain equality decided pointwise (any depth).
+        if self.ground_array_eq_conflict(goal) {
             return (SmtResult::Unsat, None);
         }
         // Array extensionality: `a ≠ b ∧ ∀i. a[i] = b[i]` is UNSAT.
