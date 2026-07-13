@@ -20385,6 +20385,34 @@ impl Context {
         axioms
     }
 
+    /// `-1 ≤ f(x) ≤ 1` for every `sin`/`cos`/`tanh` application (the abstracted
+    /// transcendental markers) — a sound bound that refutes e.g. `sin θ > 1`.
+    fn transcendental_bound_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let present = self.m.postorder(goal);
+        let mut bounded: Vec<AstId> = Vec::new();
+        for &t in &present {
+            if self.m.is_app(t)
+                && self.m.app_args(t).len() == 1
+                && let Some(nm) = self.decl_name(self.m.app_decl(t))
+                && matches!(nm.as_str(), "sin" | "cos" | "tanh")
+                && !self.funcs.contains_key(&nm)
+            {
+                bounded.push(t);
+            }
+        }
+        if bounded.is_empty() {
+            return Vec::new();
+        }
+        let neg1 = self.m.mk_real(-1);
+        let pos1 = self.m.mk_real(1);
+        let mut ax = Vec::new();
+        for t in bounded {
+            ax.push(self.m.mk_ge(t, neg1));
+            ax.push(self.m.mk_le(t, pos1));
+        }
+        ax
+    }
+
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
@@ -20397,6 +20425,7 @@ impl Context {
         axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.fp_from_bv_axioms(lifted));
         axioms.extend(self.fp_commutativity_axioms(lifted));
+        axioms.extend(self.transcendental_bound_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
             lifted
