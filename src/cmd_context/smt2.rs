@@ -103,6 +103,56 @@ fn subst_sort(body: &SExpr, subst: &[(String, SExpr)]) -> SExpr {
     }
 }
 
+/// `to_int(arg)` with integer-numeral summands pulled out of the floor:
+/// `to_int(x + n) = n + to_int(x)` for integer `n` (matches z3's `mk_to_int_core`).
+fn to_int_normal(m: &mut AstManager, arg: AstId) -> AstId {
+    if let Some(v) = m.as_numeral(arg) {
+        return m.mk_numeral(Rational::from_integer(v.floor()), true);
+    }
+    if m.arith_op(arg) == Some(ArithOp::Add) {
+        let src = m.app_args(arg).to_vec();
+        let mut int_sum = Rational::from_integer(puremp::Int::from(0));
+        let mut rest: Vec<AstId> = Vec::new();
+        for p in src {
+            match m.as_numeral(p) {
+                Some(v) if v.is_integer() => int_sum = &int_sum + &v,
+                _ => rest.push(p),
+            }
+        }
+        if !rest.is_empty() && !int_sum.is_zero() {
+            let rest_t = if rest.len() == 1 {
+                rest[0]
+            } else {
+                m.mk_add(&rest)
+            };
+            let ti = m.mk_to_int(rest_t);
+            let n = m.mk_numeral(int_sum, true);
+            return m.mk_add(&[n, ti]);
+        }
+    }
+    m.mk_to_int(arg)
+}
+
+/// `to_real(arg)` distributed over `+` (`to_real` is a ring homomorphism), so
+/// integer offsets align with a `to_int` pulled out of a sum.
+fn to_real_normal(m: &mut AstManager, arg: AstId) -> AstId {
+    if let Some(v) = m.as_numeral(arg) {
+        return m.mk_numeral(v, false);
+    }
+    if m.arith_op(arg) == Some(ArithOp::Add) {
+        let src = m.app_args(arg).to_vec();
+        let mut parts = Vec::with_capacity(src.len());
+        for p in src {
+            match m.as_numeral(p) {
+                Some(v) => parts.push(m.mk_numeral(v, false)),
+                None => parts.push(m.mk_to_real(p)),
+            }
+        }
+        return m.mk_add(&parts);
+    }
+    m.mk_to_real(arg)
+}
+
 /// Rewrite every bare reference to a sibling parametric datatype into its
 /// implicit self-parameter application, e.g. in the legacy form
 /// `(declare-datatypes (T) ((Tree … (children TreeList)) (TreeList …)))` the
@@ -24295,14 +24345,8 @@ impl Context {
                     Ok(m.mk_ite(ge, args[0], neg))
                 }
             },
-            "to_real" => match m.as_numeral(args[0]) {
-                Some(v) => Ok(m.mk_numeral(v, false)),
-                None => Ok(m.mk_to_real(args[0])),
-            },
-            "to_int" => match m.as_numeral(args[0]) {
-                Some(v) => Ok(m.mk_numeral(Rational::from_integer(v.floor()), true)),
-                None => Ok(m.mk_to_int(args[0])),
-            },
+            "to_real" => Ok(to_real_normal(m, args[0])),
+            "to_int" => Ok(to_int_normal(m, args[0])),
             "is_int" => match m.as_numeral(args[0]) {
                 // (is_int r): true iff r is integral.
                 Some(v) => Ok(if v.is_integer() {
@@ -24311,9 +24355,11 @@ impl Context {
                     m.mk_false()
                 }),
                 // Symbolic: is_int(x) ⟺ to_real(to_int(x)) = x (i.e. ⌊x⌋ = x).
+                // Build the `to_int`/`to_real` through the normalising helpers so an
+                // integer offset (`is_int(x+1)`) aligns with `is_int(x)`.
                 None => {
-                    let ti = m.mk_to_int(args[0]);
-                    let tr = m.mk_to_real(ti);
+                    let ti = to_int_normal(m, args[0]);
+                    let tr = to_real_normal(m, ti);
                     Ok(m.mk_eq(tr, args[0]))
                 }
             },
