@@ -12,6 +12,7 @@
 pub mod cad;
 pub mod elim;
 pub mod icp;
+pub mod nla;
 pub mod realclosure;
 pub mod univariate;
 

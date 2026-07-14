@@ -22349,7 +22349,7 @@ impl Context {
             // Otherwise, interval constraint propagation over the *actual*
             // polynomials may still prove the (multivariate) system
             // unsatisfiable; that refutation is sound.
-            if self.nonlinear_icp_refutes(lin) {
+            if self.nonlinear_icp_refutes(lin) || self.nla_saturate_refutes(lin) {
                 (SmtResult::Unsat, None)
             } else if let Some(m) = self.try_int_box_witness(lin)
                 && !has_opaque_pow
@@ -22762,6 +22762,121 @@ impl Context {
             return Some(SmtResult::Sat);
         }
         None
+    }
+
+    /// Refute a nonlinear goal by **polynomial saturation + monomial abstraction**
+    /// (`nlsat::nla`): derive valid nonlinear lemmas (sign products, equality ×
+    /// variable, squares are nonnegative), then replace every degree-≥2 monomial
+    /// by a fresh unconstrained variable and let the *linear* engine look for the
+    /// contradiction. This decides the unbounded **integer** systems that CAD
+    /// (reals only) and bounded interval propagation both decline.
+    ///
+    /// Sound in one direction only: abstraction weakens the system, so an `unsat`
+    /// of the abstraction refutes the original, while a `sat` means nothing. We
+    /// therefore report only `true` (= proven unsat).
+    fn nla_saturate_refutes(&mut self, goal: AstId) -> bool {
+        use crate::nlsat::Rel as NRel;
+        let mut conjuncts = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut cons: Vec<crate::nlsat::Constraint> = Vec::new();
+        for atom in conjuncts {
+            let (negated, a) = if self.m.is_not(atom) {
+                (true, self.m.app_args(atom)[0])
+            } else {
+                (false, atom)
+            };
+            if let Some(c) = self.icp_atom(a, negated, &mut var_map) {
+                cons.push(c);
+            }
+        }
+        if cons.len() < 2 || var_map.is_empty() {
+            return false;
+        }
+        // Every polynomial variable must be a free constant — then treating it as
+        // an unconstrained variable of the abstraction is sound. Keep the system
+        // uniformly Int or uniformly Real so the built terms are well-sorted.
+        let mut all_int = true;
+        let mut all_real = true;
+        for &ast in var_map.keys() {
+            if !self.m.is_uninterp_const(ast) {
+                return false;
+            }
+            if self.m.is_int_sort(self.m.get_sort(ast)) {
+                all_real = false;
+            } else {
+                all_int = false;
+            }
+        }
+        if !all_int && !all_real {
+            return false;
+        }
+        let inv: BTreeMap<u32, AstId> = var_map.iter().map(|(&a, &v)| (v, a)).collect();
+        let saturated = crate::nlsat::nla::saturate(&cons, var_map.len() as u32);
+
+        // Abstract: degree-1 monomials stay as their variable, degree-≥2 monomials
+        // become a fresh constant (the same one for equal monomials).
+        let sort = if all_int {
+            self.m.mk_int_sort()
+        } else {
+            self.m.mk_real_sort()
+        };
+        let mut mono_var: Vec<(crate::math::polynomial::Monomial, AstId)> = Vec::new();
+        let mut atoms: Vec<AstId> = Vec::new();
+        for c in &saturated {
+            let mut summands: Vec<AstId> = Vec::new();
+            for (coeff, mono) in c.poly.terms() {
+                // An Int system must keep integer coefficients, or `mk_numeral`
+                // would fabricate a non-integral Int literal.
+                if all_int && !coeff.is_integer() {
+                    return false;
+                }
+                let k = self.m.mk_numeral(coeff.clone(), all_int);
+                let term = if mono.total_degree() == 0 {
+                    k
+                } else {
+                    let base = if mono.total_degree() == 1 {
+                        let v = mono.vars().next().expect("degree-1 monomial has a var");
+                        inv[&v]
+                    } else if let Some(id) = mono_var
+                        .iter()
+                        .find(|(mm, _)| mm == mono)
+                        .map(|(_, id)| *id)
+                    {
+                        id
+                    } else {
+                        let id = self.fresh_const(sort);
+                        mono_var.push((mono.clone(), id));
+                        id
+                    };
+                    self.m.mk_mul(&[k, base])
+                };
+                summands.push(term);
+            }
+            let lhs = match summands.len() {
+                0 => self.m.mk_numeral(rat(0), all_int),
+                1 => summands[0],
+                _ => self.m.mk_add(&summands),
+            };
+            let zero = self.m.mk_numeral(rat(0), all_int);
+            let a = match c.rel {
+                NRel::Lt => self.m.mk_lt(lhs, zero),
+                NRel::Le => self.m.mk_le(lhs, zero),
+                NRel::Eq => self.m.mk_eq(lhs, zero),
+                NRel::Ne => {
+                    let e = self.m.mk_eq(lhs, zero);
+                    self.m.mk_not(e)
+                }
+                NRel::Ge => self.m.mk_ge(lhs, zero),
+                NRel::Gt => self.m.mk_gt(lhs, zero),
+            };
+            atoms.push(a);
+        }
+        if atoms.len() < 2 {
+            return false;
+        }
+        let g = self.m.mk_and(&atoms);
+        check_model(&self.m, g).0 == SmtResult::Unsat
     }
 
     /// Try to refute a (nonlinear) goal by interval constraint propagation over
