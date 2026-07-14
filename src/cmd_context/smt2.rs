@@ -554,10 +554,7 @@ fn is_closed_over(
     }
     let (fam, nargs) = {
         let a = m.app(body).expect("is_app");
-        (
-            m.func_decl(a.decl).map(|d| d.info.family_id),
-            a.args.len(),
-        )
+        (m.func_decl(a.decl).map(|d| d.info.family_id), a.args.len())
     };
     if fam == Some(crate::ast::NULL_FAMILY_ID) {
         // an uninterpreted symbol: a bound-var const is fine, anything else free
