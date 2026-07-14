@@ -1222,6 +1222,45 @@ fn flatten_foralls(body: &SExpr) -> (Vec<SExpr>, SExpr) {
     (extra, cur)
 }
 
+/// Push a leading `not` through a top-level quantifier so negated quantifiers
+/// get sound handling instead of falling back to `unknown`:
+/// `¬∃x.φ ⇒ ∀x.¬φ`, `¬∀x.φ ⇒ ∃x.¬φ`, and `¬¬φ ⇒ φ`. Applied repeatedly.
+fn push_not_quantifier(s: &SExpr) -> SExpr {
+    if let SExpr::List(l) = s
+        && l.len() == 2
+        && matches!(&l[0], SExpr::Atom(a) if a == "not")
+    {
+        if let SExpr::List(inner) = &l[1]
+            && inner.len() == 3
+            && let SExpr::Atom(h) = &inner[0]
+            && let Some(q) = match h.as_str() {
+                "forall" => Some("exists"),
+                "exists" => Some("forall"),
+                _ => None,
+            }
+        {
+            let negbody = SExpr::List(alloc::vec![
+                SExpr::Atom("not".to_string()),
+                inner[2].clone()
+            ]);
+            let rewritten = SExpr::List(alloc::vec![
+                SExpr::Atom(q.to_string()),
+                inner[1].clone(),
+                negbody
+            ]);
+            return push_not_quantifier(&rewritten);
+        }
+        // `¬¬φ ⇒ φ`, so a doubly-negated quantifier is still reached.
+        if let SExpr::List(inner) = &l[1]
+            && inner.len() == 2
+            && matches!(&inner[0], SExpr::Atom(a) if a == "not")
+        {
+            return push_not_quantifier(&inner[1]);
+        }
+    }
+    s.clone()
+}
+
 fn top_level_quantifier(s: &SExpr) -> Option<&'static str> {
     if let SExpr::List(l) = s
         && l.len() == 3
@@ -3147,8 +3186,11 @@ impl Context {
                 // skolemized (its body asserted with fresh constants), `forall` is
                 // recorded for ground instantiation at check-sat. Quantifiers
                 // nested inside a formula fall back to the `unknown` sentinel.
-                if let Some(kind) = top_level_quantifier(&list[1]) {
-                    let ql = as_list(&list[1])?;
+                // Normalize a negated top-level quantifier (`¬∃`/`¬∀`) into the dual
+                // so it gets sound handling rather than becoming an opaque `unknown`.
+                let asserted = push_not_quantifier(&list[1]);
+                if let Some(kind) = top_level_quantifier(&asserted) {
+                    let ql = as_list(&asserted)?;
                     // Flatten `∀x.∀y.φ` into a single `∀x,y.φ` so E-matching /
                     // instantiation handle it instead of gating the inner
                     // quantifier to `unknown`.
@@ -3234,7 +3276,7 @@ impl Context {
                     self.last_verdict = None;
                     return Ok(None);
                 }
-                let t = self.term(&list[1])?;
+                let t = self.term(&asserted)?;
                 let name = named_label(&list[1]);
                 self.assertions.push(t);
                 self.assert_names.push(name);
