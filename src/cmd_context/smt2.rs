@@ -914,7 +914,19 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
             continue;
         }
         let cmd_start = p;
-        let form = parse_one(&toks, &mut p)?;
+        let form = match parse_one(&toks, &positions, &mut p) {
+            Ok(f) => f,
+            // A recoverable syntax error (e.g. a malformed quantifier): z3 prints
+            // the `(error …)` and resyncs to the next command-opening `(`.
+            Err(e) if e.recover => {
+                out.push(e.msg);
+                while p < toks.len() && toks[p] != "(" {
+                    p += 1;
+                }
+                continue;
+            }
+            Err(e) => return Err(e.msg),
+        };
         // Unknown `(set-logic X)`: z3 prints `unsupported` and an ignoring-comment
         // (with the command's position) and proceeds as if no logic were set.
         if let SExpr::List(l) = &form
@@ -1356,13 +1368,20 @@ fn tokenize(input: &str) -> (Vec<String>, Vec<(u32, u32)>) {
 }
 
 fn parse(input: &str) -> Result<Vec<SExpr>, String> {
-    let (toks, _positions) = tokenize(input);
+    let (toks, positions) = tokenize(input);
     let mut pos = 0;
     let mut forms = Vec::new();
     while pos < toks.len() {
-        forms.push(parse_one(&toks, &mut pos)?);
+        forms.push(parse_one(&toks, &positions, &mut pos).map_err(|e| e.msg)?);
     }
     Ok(forms)
+}
+
+/// A parse failure. `recover` distinguishes errors z3 reports and then resyncs
+/// past (`(error …)` already formatted in `msg`) from ones that abort the run.
+struct ParseErr {
+    msg: String,
+    recover: bool,
 }
 
 /// Render an s-expression back to its textual form (used to echo `get-value`
@@ -1377,7 +1396,11 @@ fn render_sexpr(s: &SExpr) -> String {
     }
 }
 
-fn parse_one(toks: &[String], pos: &mut usize) -> Result<SExpr, String> {
+fn parse_one(
+    toks: &[String],
+    positions: &[(u32, u32)],
+    pos: &mut usize,
+) -> Result<SExpr, ParseErr> {
     let tok = &toks[*pos];
     *pos += 1;
     match tok.as_str() {
@@ -1385,17 +1408,38 @@ fn parse_one(toks: &[String], pos: &mut usize) -> Result<SExpr, String> {
             let mut list = Vec::new();
             loop {
                 if *pos >= toks.len() {
-                    return Err("unexpected end of input (missing `)`)".to_string());
+                    return Err(ParseErr {
+                        msg: "unexpected end of input (missing `)`)".to_string(),
+                        recover: false,
+                    });
                 }
                 if toks[*pos] == ")" {
                     *pos += 1;
                     break;
                 }
-                list.push(parse_one(toks, pos)?);
+                list.push(parse_one(toks, positions, pos)?);
+            }
+            // A quantifier binds `((<symbol> <sort>)*) <expr>` — exactly one body.
+            // z3 reports a wrong body count at the closing paren and resyncs.
+            if let Some(SExpr::Atom(h)) = list.first()
+                && (h == "forall" || h == "exists" || h == "lambda")
+                && list.len() != 3
+            {
+                let (l, c) = positions.get(*pos - 1).copied().unwrap_or((0, 0));
+                return Err(ParseErr {
+                    msg: alloc::format!(
+                        "(error \"line {l} column {c}: invalid quantified expression, syntax error: \
+                         (forall|exists ((<symbol> <sort>)*) <expr>) expected\")"
+                    ),
+                    recover: true,
+                });
             }
             Ok(SExpr::List(list))
         }
-        ")" => Err("unexpected `)`".to_string()),
+        ")" => Err(ParseErr {
+            msg: "unexpected `)`".to_string(),
+            recover: false,
+        }),
         atom => Ok(SExpr::Atom(atom.to_string())),
     }
 }
