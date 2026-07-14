@@ -501,6 +501,22 @@ fn bv_sign(m: &mut AstManager, x: AstId) -> AstId {
     m.mk_eq(msb, one)
 }
 
+/// Whether `needle` occurs anywhere in the AST rooted at `hay` (memoised over
+/// the hash-consed DAG so shared subterms are visited once).
+fn ast_occurs(m: &AstManager, needle: AstId, hay: AstId, seen: &mut BTreeSet<AstId>) -> bool {
+    if hay == needle {
+        return true;
+    }
+    if !seen.insert(hay) {
+        return false;
+    }
+    if m.is_app(hay) {
+        let args: Vec<AstId> = m.app_args(hay).to_vec();
+        return args.iter().any(|&c| ast_occurs(m, needle, c, seen));
+    }
+    false
+}
+
 /// Whether `id` is syntactically non-negative because it is the canonical
 /// integer/real `abs` expansion `(ite (>= t 0) t (- t))`. Used to fold
 /// `abs(abs t) = abs t` so idempotent absolute values are recognised equal.
@@ -18524,6 +18540,71 @@ impl Context {
         self.enums.get(&sort).cloned()
     }
 
+    /// Try to reduce a nested `(forall|exists xs. φ)` to a ground term without the
+    /// opaque `unknown` sentinel: drop bound vars absent from `φ` (sorts are
+    /// non-empty, so `Qx:S. φ ≡ φ` when `x ∉ φ`), and if the survivors range over
+    /// finite sorts, expand exactly (∧ for ∀, ∨ for ∃). `None` → fall back.
+    fn try_ground_quantifier(
+        &mut self,
+        is_forall: bool,
+        binders: &SExpr,
+        body: &SExpr,
+    ) -> Option<AstId> {
+        let (vars, bodyt) = self.parse_quantifier(binders, body).ok()?;
+        let used: Vec<AstId> = vars
+            .into_iter()
+            .filter(|&v| {
+                let mut seen = BTreeSet::new();
+                ast_occurs(&self.m, v, bodyt, &mut seen)
+            })
+            .collect();
+        if used.is_empty() {
+            return Some(bodyt);
+        }
+        let mut domains: Vec<Vec<AstId>> = Vec::new();
+        let mut total = 1usize;
+        for &v in &used {
+            let dom = self.finite_domain_values(self.m.get_sort(v))?;
+            if dom.is_empty() {
+                return None;
+            }
+            total = total.checked_mul(dom.len())?;
+            if total > 256 {
+                return None;
+            }
+            domains.push(dom);
+        }
+        let mut terms: Vec<AstId> = Vec::new();
+        let mut idx = alloc::vec![0usize; used.len()];
+        loop {
+            let subst: Vec<(AstId, AstId)> = used
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| (v, domains[k][idx[k]]))
+                .collect();
+            let inst = crate::rewriter::substitute(&mut self.m, bodyt, &subst);
+            terms.push(crate::rewriter::simplify(&mut self.m, inst));
+            let mut k = 0;
+            loop {
+                if k == used.len() {
+                    return Some(if terms.len() == 1 {
+                        terms[0]
+                    } else if is_forall {
+                        self.m.mk_and(&terms)
+                    } else {
+                        self.m.mk_or(&terms)
+                    });
+                }
+                idx[k] += 1;
+                if idx[k] < domains[k].len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
     /// Expand `∀x₁:S₁ … xₙ:Sₙ. φ` to the ground conjunction over the domains when
     /// every `Sᵢ` is finite — exact and quantifier-free. `None` if any sort is
     /// infinite or the product exceeds a small cap.
@@ -23842,6 +23923,14 @@ impl Context {
                     return self.term(&l[1]);
                 }
                 if head == "forall" || head == "exists" {
+                    // First try to reduce it exactly (drop unused binders, expand
+                    // finite domains) so nested trivial/finite quantifiers don't
+                    // force `unknown`.
+                    if l.len() == 3
+                        && let Some(t) = self.try_ground_quantifier(head == "forall", &l[1], &l[2])
+                    {
+                        return Ok(t);
+                    }
                     // Quantifiers are not decided yet. Sound over-approximation:
                     // replace the quantified formula by a fresh, unconstrained
                     // Boolean sentinel; any goal that mentions one forces a sound
