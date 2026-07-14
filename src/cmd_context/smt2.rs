@@ -1020,6 +1020,19 @@ fn z3_command_error(msg: &str, toks: &[String], positions: &[(u32, u32)]) -> Opt
             "(error \"line {l} column {c}: unknown constant {name}\")"
         ));
     }
+    // `unknown sort 'X'` → same message, positioned at X's first occurrence.
+    if let Some(rest) = msg.strip_prefix("unknown sort '")
+        && let Some(name) = rest.strip_suffix('\'')
+    {
+        let (l, c) = toks
+            .iter()
+            .position(|t| t == name)
+            .map(|i| positions[i])
+            .unwrap_or((0, 0));
+        return Some(alloc::format!(
+            "(error \"line {l} column {c}: unknown sort '{name}'\")"
+        ));
+    }
     None
 }
 
@@ -1472,6 +1485,10 @@ struct Context {
     /// `:print-success` (also enabled by `:smtlib2-compliant`): when true, every
     /// state-changing command that succeeds prints `success`.
     print_success: bool,
+    /// The logic set by `(set-logic …)`, if any. When set, sorts/operators
+    /// outside the logic's theories are rejected as z3 does (e.g. `Array` under
+    /// `BV`). `None` means no restriction (the permissive `ALL` default).
+    logic: Option<String>,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -2475,6 +2492,7 @@ impl Context {
             last_verdict: None,
             exited: false,
             print_success: false,
+            logic: None,
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -2573,6 +2591,15 @@ impl Context {
         }
     }
 
+    /// Whether the active logic admits the array theory. z3's `logic_has_array`
+    /// (substring-based); with no logic set, everything is permitted.
+    fn logic_has_array(&self) -> bool {
+        match &self.logic {
+            None => true,
+            Some(s) => s.starts_with("QF_A") || s.starts_with('A') || s == "SMTFD" || s == "HORN",
+        }
+    }
+
     fn resolve_sort(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
             SExpr::Atom(name) if name == "String" => Ok(self.string_sort()),
@@ -2596,6 +2623,7 @@ impl Context {
             SExpr::List(l) if !l.is_empty() => {
                 // Parametric sort application, e.g. (Array I E) or (_ BitVec n).
                 match Self::sym(&l[0])? {
+                    "Array" if !self.logic_has_array() => Err("unknown sort 'Array'".to_string()),
                     "Array" if l.len() >= 3 => {
                         // Multi-dimensional arrays curry right-associatively:
                         // `(Array A B C)` ≡ `(Array A (Array B C))` (z3). The last
@@ -2756,7 +2784,13 @@ impl Context {
                 self.exited = true;
                 Ok(None)
             }
-            "set-logic" | "set-info" => Ok(None),
+            "set-logic" => {
+                if let Some(SExpr::Atom(name)) = list.get(1) {
+                    self.logic = Some(name.clone());
+                }
+                Ok(None)
+            }
+            "set-info" => Ok(None),
             "echo" => Ok(Some(match list.get(1) {
                 Some(SExpr::Atom(a)) => unquote_string(a),
                 _ => String::new(),
