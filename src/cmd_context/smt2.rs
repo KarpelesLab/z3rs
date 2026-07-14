@@ -913,10 +913,7 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
             }
             continue;
         }
-        let form = match parse_one(&toks, &mut p) {
-            Ok(f) => f,
-            Err(msg) => return Err(msg),
-        };
+        let form = parse_one(&toks, &mut p)?;
         if let Some(resp) = ctx.command(&form)? {
             out.push(resp);
         }
