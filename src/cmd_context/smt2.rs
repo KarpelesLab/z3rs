@@ -887,16 +887,36 @@ enum SExpr {
 /// (`"sat"`, `"unsat"`, or `"unknown"`). Accepts both SMT-LIB 2 command scripts
 /// and the older SMT-LIB 1.2 `(benchmark …)` format.
 pub fn run(script: &str) -> Result<Vec<String>, String> {
-    let forms = parse(script)?;
+    let (toks, positions) = tokenize(script);
     // SMT-LIB 1.2: a single top-level (benchmark …) form.
-    if let [SExpr::List(l)] = forms.as_slice()
-        && matches!(l.first(), Some(SExpr::Atom(a)) if a == "benchmark")
+    if toks.first().map(String::as_str) == Some("(")
+        && toks.get(1).map(String::as_str) == Some("benchmark")
     {
-        return run_v1(l);
+        let forms = parse(script)?;
+        if let [SExpr::List(l)] = forms.as_slice() {
+            return run_v1(l);
+        }
     }
     let mut ctx = Context::new();
     let mut out = Vec::new();
-    for form in forms {
+    let mut p = 0usize;
+    while p < toks.len() {
+        // Every top-level command starts with `(`; anything else is a syntax
+        // error, reported at its position, after which z3 resyncs to the next `(`.
+        if toks[p] != "(" {
+            let (l, c) = positions[p];
+            out.push(alloc::format!(
+                "(error \"line {l} column {c}: invalid command, '(' expected\")"
+            ));
+            while p < toks.len() && toks[p] != "(" {
+                p += 1;
+            }
+            continue;
+        }
+        let form = match parse_one(&toks, &mut p) {
+            Ok(f) => f,
+            Err(msg) => return Err(msg),
+        };
         if let Some(resp) = ctx.command(&form)? {
             out.push(resp);
         }
@@ -1132,33 +1152,54 @@ fn v1_to_v2(s: &SExpr) -> SExpr {
 
 // --- tokenizer + parser ---------------------------------------------------
 
-fn tokenize(input: &str) -> Vec<String> {
-    let mut toks = Vec::new();
-    let mut chars = input.chars().peekable();
-    while let Some(&c) = chars.peek() {
+/// Tokenize, recording each token's source position as `(line, column)` with
+/// 1-based line and 0-based column (matching z3's diagnostics).
+fn tokenize(input: &str) -> (Vec<String>, Vec<(u32, u32)>) {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0usize;
+    let mut line: u32 = 1;
+    let mut col: u32 = 0;
+    let mut toks: Vec<String> = Vec::new();
+    let mut positions: Vec<(u32, u32)> = Vec::new();
+    // Consume `chars[i]`, advancing the line/column counters.
+    macro_rules! adv {
+        () => {{
+            if chars[i] == '\n' {
+                line += 1;
+                col = 0;
+            } else {
+                col += 1;
+            }
+            i += 1;
+        }};
+    }
+    while i < chars.len() {
+        let c = chars[i];
+        let start = (line, col);
         match c {
             ';' => {
                 // comment to end of line
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
+                while i < chars.len() && chars[i] != '\n' {
+                    adv!();
                 }
             }
             c if c.is_whitespace() => {
-                chars.next();
+                adv!();
             }
             '(' | ')' => {
                 toks.push(c.to_string());
-                chars.next();
+                positions.push(start);
+                adv!();
             }
             '{' => {
                 // SMT-LIB v1 annotation block `{ … }` (e.g. :source); depth-matched
                 // and kept as one opaque token.
-                chars.next();
+                adv!();
                 let mut s = String::from("{");
                 let mut depth = 1;
-                for c in chars.by_ref() {
+                while i < chars.len() {
+                    let c = chars[i];
+                    adv!();
                     if c == '{' {
                         depth += 1;
                     } else if c == '}' {
@@ -1171,20 +1212,22 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
                 s.push('}');
                 toks.push(s);
+                positions.push(start);
             }
             '"' => {
                 // String literal "…"; a doubled "" is an embedded quote. Kept
                 // with its surrounding quotes so it stays a single, recognizable
                 // token.
-                chars.next(); // opening quote
+                adv!(); // opening quote
                 let mut s = String::from("\"");
-                while let Some(&c) = chars.peek() {
-                    chars.next();
+                while i < chars.len() {
+                    let c = chars[i];
+                    adv!();
                     if c == '"' {
-                        if chars.peek() == Some(&'"') {
+                        if i < chars.len() && chars[i] == '"' {
                             s.push('"');
                             s.push('"');
-                            chars.next();
+                            adv!();
                             continue;
                         }
                         break;
@@ -1193,37 +1236,43 @@ fn tokenize(input: &str) -> Vec<String> {
                 }
                 s.push('"'); // closing quote
                 toks.push(s);
+                positions.push(start);
             }
             '|' => {
                 // quoted symbol |...|
-                chars.next();
+                adv!();
                 let mut s = String::new();
-                for c in chars.by_ref() {
+                while i < chars.len() {
+                    let c = chars[i];
+                    adv!();
                     if c == '|' {
                         break;
                     }
                     s.push(c);
                 }
                 toks.push(s);
+                positions.push(start);
             }
             _ => {
                 let mut s = String::new();
-                while let Some(&c) = chars.peek() {
+                while i < chars.len() {
+                    let c = chars[i];
                     if c.is_whitespace() || c == '(' || c == ')' || c == ';' {
                         break;
                     }
                     s.push(c);
-                    chars.next();
+                    adv!();
                 }
                 toks.push(s);
+                positions.push(start);
             }
         }
     }
-    toks
+    (toks, positions)
 }
 
 fn parse(input: &str) -> Result<Vec<SExpr>, String> {
-    let toks = tokenize(input);
+    let (toks, _positions) = tokenize(input);
     let mut pos = 0;
     let mut forms = Vec::new();
     while pos < toks.len() {
