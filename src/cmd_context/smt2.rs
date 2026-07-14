@@ -517,6 +517,62 @@ fn ast_occurs(m: &AstManager, needle: AstId, hay: AstId, seen: &mut BTreeSet<Ast
     false
 }
 
+/// Whether `body` contains a partial arithmetic operator (`div`/`mod`/`rem`/`/`).
+/// These are unspecified on a zero divisor — effectively uninterpreted there —
+/// so a closed universal over them can't be soundly decided by pinning a value.
+fn contains_partial_arith(m: &AstManager, body: AstId, seen: &mut BTreeSet<AstId>) -> bool {
+    if !seen.insert(body) {
+        return false;
+    }
+    if matches!(
+        m.arith_op(body),
+        Some(ArithOp::Div | ArithOp::Idiv | ArithOp::Mod | ArithOp::Rem)
+    ) {
+        return true;
+    }
+    if !m.is_app(body) {
+        return false;
+    }
+    let args = m.app_args(body).to_vec();
+    args.iter().any(|&c| contains_partial_arith(m, c, seen))
+}
+
+/// Whether every uninterpreted leaf of `body` is one of `vars` — i.e. `body`
+/// has no free symbol other than the given (bound-variable) constants. A free
+/// uninterpreted *function* application (arity ≥ 1) always disqualifies it.
+fn is_closed_over(
+    m: &AstManager,
+    body: AstId,
+    vars: &BTreeSet<AstId>,
+    seen: &mut BTreeSet<AstId>,
+) -> bool {
+    if !seen.insert(body) {
+        return true;
+    }
+    if !m.is_app(body) {
+        return true;
+    }
+    let (fam, nargs) = {
+        let a = m.app(body).expect("is_app");
+        (
+            m.func_decl(a.decl).map(|d| d.info.family_id),
+            a.args.len(),
+        )
+    };
+    if fam == Some(crate::ast::NULL_FAMILY_ID) {
+        // an uninterpreted symbol: a bound-var const is fine, anything else free
+        if nargs == 0 {
+            if !vars.contains(&body) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    let args = m.app_args(body).to_vec();
+    args.iter().all(|&c| is_closed_over(m, c, vars, seen))
+}
+
 /// Whether `id` is syntactically non-negative because it is the canonical
 /// integer/real `abs` expansion `(ite (>= t 0) t (- t))`. Used to fold
 /// `abs(abs t) = abs t` so idempotent absolute values are recognised equal.
@@ -3282,6 +3338,14 @@ impl Context {
                         // the domain is exact (no instantiation heuristics needed).
                         self.assertions.push(expanded);
                         self.assert_names.push(None);
+                    } else if let Some(valid) = self.decide_closed_universal(&vars, body) {
+                        // Closed universal decided by refuting ¬φ: valid → drop it;
+                        // refuted → the assertion is `false`, so the run is unsat.
+                        if !valid {
+                            let f = self.m.mk_false();
+                            self.assertions.push(f);
+                            self.assert_names.push(None);
+                        }
                     } else if let Some(qf) = self.qe_forall(&vars, body) {
                         self.assertions.push(qf);
                         self.assert_names.push(None);
@@ -18602,6 +18666,31 @@ impl Context {
                 idx[k] = 0;
                 k += 1;
             }
+        }
+    }
+
+    /// Decide a *closed* universal `∀xs. φ` (φ mentions only the bound vars) by
+    /// asking the ground solver whether `¬φ` is satisfiable over fresh constants.
+    /// `Some(true)` → φ is valid (the assertion is trivially true, drop it);
+    /// `Some(false)` → φ is refuted (the assertion is `false`, the run is unsat);
+    /// `None` → not closed or the sub-solve was inconclusive (fall back).
+    fn decide_closed_universal(&mut self, vars: &[AstId], body: AstId) -> Option<bool> {
+        let vset: BTreeSet<AstId> = vars.iter().copied().collect();
+        let mut seen = BTreeSet::new();
+        if !is_closed_over(&self.m, body, &vset, &mut seen) {
+            return None;
+        }
+        // A partial op (div/mod/…) is unspecified on a zero divisor, so pinning a
+        // value to refute or validate the universal would be unsound.
+        let mut seen2 = BTreeSet::new();
+        if contains_partial_arith(&self.m, body, &mut seen2) {
+            return None;
+        }
+        let neg = self.m.mk_not(body);
+        match check_model(&self.m, neg).0 {
+            SmtResult::Sat => Some(false),
+            SmtResult::Unsat => Some(true),
+            SmtResult::Unknown => None,
         }
     }
 
