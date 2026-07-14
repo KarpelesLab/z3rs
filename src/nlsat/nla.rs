@@ -44,6 +44,77 @@ fn one() -> Rational {
     Rational::from_integer(1.into())
 }
 
+/// The exact square root of a nonnegative rational, if it is a perfect square.
+fn rational_sqrt(c: &Rational) -> Option<Rational> {
+    if c.is_negative() {
+        return None;
+    }
+    let n = c.numerator().sqrt_exact()?;
+    let d = c.denominator().sqrt_exact()?;
+    Some(Rational::new(n, d))
+}
+
+/// Halve every exponent of `m`; `None` unless all of them are even.
+fn half_monomial(m: &Monomial) -> Option<Monomial> {
+    let vs: Vec<_> = m.vars().collect();
+    let mut pairs = Vec::with_capacity(vs.len());
+    for v in vs {
+        let e = m.degree_of(v);
+        if !e.is_multiple_of(2) {
+            return None;
+        }
+        pairs.push((v, e / 2));
+    }
+    Some(Monomial::from_powers(&pairs))
+}
+
+/// The exact square root of `p` as a polynomial, if `p` is a perfect square.
+///
+/// Builds `q` term-by-term from the leading term downwards (`q₀ = √lead(p)`, then
+/// each next term is `lead(p − q²) / (2·lead(q))`, the classic long-division
+/// square root) and then **verifies** `q² = p`. The verification is what makes
+/// the answer trustworthy — the construction is only a search.
+///
+/// This is what recognises `x₁²x₃⁴ − 2x₁x₂x₃²x₄ + x₂²x₄² = (x₁x₃² − x₂x₄)²`, hence
+/// nonnegative, refuting `that < x₅ < 0`.
+pub fn poly_sqrt(p: &Polynomial) -> Option<Polynomial> {
+    if p.is_zero() {
+        return Some(Polynomial::zero());
+    }
+    let (c0, m0) = p.terms().first()?.clone();
+    let r0 = rational_sqrt(&c0)?;
+    let h0 = half_monomial(&m0)?;
+    let mut q = Polynomial::from_terms(alloc::vec![(r0, h0)]);
+    let two = Rational::from_integer(2.into());
+    for _ in 0..64 {
+        let rem = p.sub(&q.mul(&q));
+        if rem.is_zero() {
+            break;
+        }
+        let (rc, rm) = rem.terms().first()?.clone();
+        let (qc, qm) = q.terms().first()?.clone();
+        let tc = rc.div(&qc.mul(&two));
+        let tm = rm.checked_div(&qm)?;
+        let t = Polynomial::from_terms(alloc::vec![(tc, tm)]);
+        if t.is_zero() {
+            return None;
+        }
+        q = q.add(&t);
+    }
+    (q.mul(&q) == *p).then_some(q)
+}
+
+/// The degree-≥2 part of `p` (its nonlinear terms).
+fn nonlinear_part(p: &Polynomial) -> Polynomial {
+    Polynomial::from_terms(
+        p.terms()
+            .iter()
+            .filter(|(_, m)| m.total_degree() >= 2)
+            .cloned()
+            .collect(),
+    )
+}
+
 /// The input constraints plus derived consequences (see the module docs).
 /// `nvars` is the number of polynomial variables (indices `0..nvars`).
 pub fn saturate(cons: &[Constraint], nvars: u32) -> Vec<Constraint> {
@@ -129,6 +200,27 @@ pub fn saturate(cons: &[Constraint], nvars: u32) -> Vec<Constraint> {
         }
     }
     for p in squares {
+        nonneg.push((p.clone(), false));
+        out.push(Constraint::new(p, Rel::Ge));
+    }
+
+    // (2b) A *perfect-square polynomial* is nonnegative. The interesting case is a
+    // constraint whose nonlinear part is a square while its linear part is not,
+    // e.g. `(x₁x₃² − x₂x₄)² < x₅ ∧ x₅ < 0`: recognising `SOS ≥ 0` makes the
+    // abstracted system linearly contradictory. Monomial-wise squares (2) cannot
+    // see this — the cross term `−2x₁x₂x₃²x₄` is unbounded on its own.
+    let mut sos: Vec<Polynomial> = Vec::new();
+    for c in cons {
+        for cand in [c.poly.clone(), nonlinear_part(&c.poly)] {
+            if cand.total_degree() >= 2
+                && poly_sqrt(&cand).is_some()
+                && !sos.iter().any(|s| s.sub(&cand).is_zero())
+            {
+                sos.push(cand);
+            }
+        }
+    }
+    for p in sos {
         nonneg.push((p.clone(), false));
         out.push(Constraint::new(p, Rel::Ge));
     }
@@ -223,6 +315,35 @@ mod tests {
         assert!(
             sat.iter()
                 .any(|c| c.rel == Rel::Eq && c.poly.sub(&want).is_zero())
+        );
+    }
+
+    /// `(x₁x₃² − x₂x₄)²` is recognised as a perfect square, and a non-square is not.
+    #[test]
+    fn perfect_square_is_detected() {
+        // q = x0*x2^2 - x1*x3
+        let q = v(0).mul(&v(2)).mul(&v(2)).sub(&v(1).mul(&v(3)));
+        let p = q.mul(&q);
+        let root = poly_sqrt(&p).expect("should be a perfect square");
+        assert!(root.mul(&root).sub(&p).is_zero());
+        // not a square: q^2 + 1
+        assert!(poly_sqrt(&p.add(&c(1))).is_none());
+        // not a square: an odd-degree leading term
+        assert!(poly_sqrt(&v(0).mul(&v(0)).mul(&v(1))).is_none());
+    }
+
+    /// The nonlinear part of `SOS − x₅` is a square, so `SOS ≥ 0` is derived.
+    #[test]
+    fn derives_sum_of_squares_nonneg() {
+        let q = v(0).mul(&v(2)).mul(&v(2)).sub(&v(1).mul(&v(3)));
+        let sos = q.mul(&q);
+        // SOS - x4 < 0
+        let cons = [Constraint::new(sos.sub(&v(4)), Rel::Lt)];
+        let sat = saturate(&cons, 5);
+        assert!(
+            sat.iter()
+                .any(|c| c.rel == Rel::Ge && c.poly.sub(&sos).is_zero()),
+            "expected SOS >= 0"
         );
     }
 
