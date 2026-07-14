@@ -1627,6 +1627,13 @@ struct Context {
     /// `bvurem x 0 = x`). When false, division by zero is an *uninterpreted*
     /// function of the dividend, which is strictly more permissive.
     hi_div0: bool,
+    /// Sorts introduced by a nullary `(declare-sort S)`. These are the only sorts
+    /// with *no* intended semantics, so only these may be given an arbitrary
+    /// finite domain by finite model finding. (A null AST family is **not** a
+    /// usable test: `fp_sort`, `string_sort`, … are all built on
+    /// `mk_uninterpreted_sort` too, and giving `Float64` a 4-element domain would
+    /// happily "prove" `∀a. fp.isNaN a`.)
+    declared_sorts: BTreeSet<AstId>,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -2632,6 +2639,7 @@ impl Context {
             print_success: false,
             logic: None,
             hi_div0: true,
+            declared_sorts: BTreeSet::new(),
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -3039,6 +3047,7 @@ impl Context {
                     let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
                     self.sorts.insert(name.clone(), s);
                     self.sort_order.push(name);
+                    self.declared_sorts.insert(s);
                 } else {
                     self.sort_ctors.insert(name, arity);
                 }
@@ -17201,11 +17210,21 @@ impl Context {
         // A `sat` result is complete only if instantiation reached a fixpoint
         // (every ground instance is present — e.g. a finite Datalog domain);
         // otherwise the un-instantiated cases keep it a sound `unknown`.
-        if res == SmtResult::Sat
+        let gated_sat = res == SmtResult::Sat
             && !self.universals.is_empty()
             && !saturated
-            && !self.all_universals_free_macros()
+            && !self.all_universals_free_macros();
+        // The instantiation engine cannot confirm a `sat` over un-saturated
+        // universals, and may not decide the goal at all. Finite model finding can
+        // still *exhibit* a model when every bound variable ranges over an
+        // uninterpreted sort — and exhibiting one settles `sat` outright.
+        if (gated_sat || res == SmtResult::Unknown)
+            && !self.universals.is_empty()
+            && let Some(m) = self.try_finite_model_find()
         {
+            return (SmtResult::Sat, Some(m));
+        }
+        if gated_sat {
             (SmtResult::Unknown, None)
         } else {
             (res, model)
@@ -17654,6 +17673,21 @@ impl Context {
             self.icp_flatten_and(ant, &mut conj);
             let mut body_app = None;
             let mut guards = Vec::new();
+            // A guard must be a *predicate-free* constraint. One that merely
+            // **contains** a predicate application — e.g. the antecedent
+            // `(p y ⇒ r b)`, which `icp_flatten_and` cannot break up because it is
+            // an implication, not a conjunction — is not Horn at all: the
+            // transition-system framing hands those buried predicate atoms to the
+            // model checker as a free relation, so a satisfiable "guard" wrongly
+            // refutes the system. `∀y. (p y ⇒ r b) ⇒ a = b` is plainly satisfiable
+            // (take `a = b`), yet was reported `unsat`. `solve_chc` already declines
+            // these; the multi-predicate parser must too.
+            let predicate_free = |ctx: &Self, t: AstId| {
+                !ctx.m
+                    .postorder(t)
+                    .iter()
+                    .any(|&u| ctx.predicate_of(u).is_some())
+            };
             for a in conj {
                 if self.predicate_of(a).is_some() {
                     if body_app.is_some() {
@@ -17661,6 +17695,9 @@ impl Context {
                     }
                     body_app = Some(a);
                 } else {
+                    if !predicate_free(self, a) {
+                        return None;
+                    }
                     guards.push(a);
                 }
             }
@@ -17669,6 +17706,10 @@ impl Context {
             } else if self.predicate_of(cons).is_some() {
                 Some(cons)
             } else {
+                // Same rule for a non-predicate head: it becomes the guard `¬cons`.
+                if !predicate_free(self, cons) {
+                    return None;
+                }
                 let neg = self.m.mk_not(cons);
                 guards.push(neg);
                 None
@@ -20985,6 +21026,125 @@ impl Context {
                 let a = self.assertions.clone();
                 self.m.mk_and(&a)
             }
+        }
+    }
+
+    /// Is `s` a plain user `(declare-sort S)` — an uninterpreted sort carrying no
+    /// intended semantics, so it may be given any finite domain?
+    ///
+    /// Tested *positively* against the set recorded at `declare-sort`. Do not be
+    /// tempted to test for a null AST family instead: `fp_sort`, `string_sort` and
+    /// friends are all built on `mk_uninterpreted_sort`, so that test would accept
+    /// `Float64` and let finite model finding "prove" `∀a. fp.isNaN a` (3919).
+    fn is_plain_uninterp_sort(&self, s: AstId) -> bool {
+        self.declared_sorts.contains(&s)
+            && !self.enums.contains_key(&s)
+            && !self.records.contains_key(&s)
+            && !self.datatypes.contains_key(&s)
+    }
+
+    /// **Finite model finding** (MACE-style). When every universally quantified
+    /// variable ranges over a plain uninterpreted sort, look for a model in which
+    /// each such sort has a small finite domain: fix `k` domain constants, expand
+    /// every universal over them, and *close* each term of that sort to the domain.
+    ///
+    /// Sound: a model of that system **is** a model of the original formula — the
+    /// closure makes the sort's universe exactly the `k` domain elements, and the
+    /// universal was checked at every one of them — so `sat` here exhibits a real
+    /// model. Failing to find one for any `k ≤ 4` just declines to `unknown`.
+    fn try_finite_model_find(&mut self) -> Option<Model> {
+        let mut usorts: Vec<AstId> = Vec::new();
+        for (vars, _) in &self.universals {
+            for &v in vars {
+                let s = self.m.get_sort(v);
+                if !self.is_plain_uninterp_sort(s) {
+                    return None;
+                }
+                if !usorts.contains(&s) {
+                    usorts.push(s);
+                }
+            }
+        }
+        if usorts.is_empty() {
+            return None;
+        }
+        (1..=4usize).find_map(|k| self.fmf_with_size(k, &usorts))
+    }
+
+    /// One finite-model-finding round: give each sort in `usorts` a `k`-element
+    /// domain and decide the resulting ground system.
+    fn fmf_with_size(&mut self, k: usize, usorts: &[AstId]) -> Option<Model> {
+        let mut domain: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for &s in usorts {
+            let elems: Vec<AstId> = (0..k).map(|_| self.fresh_const(s)).collect();
+            domain.insert(s, elems);
+        }
+        // Ground assertions, plus each universal expanded over the domain.
+        let mut parts = alloc::vec![self.conjunction()];
+        for (vars, body) in self.universals.clone() {
+            if vars.is_empty() {
+                continue;
+            }
+            let mut idx = alloc::vec![0usize; vars.len()];
+            loop {
+                let subst: Vec<(AstId, AstId)> = vars
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (v, domain[&self.m.get_sort(v)][idx[i]]))
+                    .collect();
+                let inst = crate::rewriter::substitute(&mut self.m, body, &subst);
+                parts.push(inst);
+                let mut i = 0;
+                while i < vars.len() {
+                    idx[i] += 1;
+                    if idx[i] < k {
+                        break;
+                    }
+                    idx[i] = 0;
+                    i += 1;
+                }
+                if i == vars.len() {
+                    break;
+                }
+            }
+        }
+        let combined = if parts.len() == 1 {
+            parts[0]
+        } else {
+            self.m.mk_and(&parts)
+        };
+        // Build the full goal *first* — `with_axioms` can introduce further terms
+        // of an uninterpreted sort, and every one of them must be closed too, or
+        // the model could hold an element the universal was never checked at.
+        let lifted = self.lift(combined);
+        let goal = self.with_axioms(lifted);
+        // Domain closure: each term of an uninterpreted sort equals one of its
+        // domain elements. This is what makes the universal's expansion faithful.
+        let mut closure: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal).to_vec() {
+            let s = self.m.get_sort(t);
+            let Some(elems) = domain.get(&s).cloned() else {
+                continue;
+            };
+            if elems.contains(&t) {
+                continue;
+            }
+            let eqs: Vec<AstId> = elems.iter().map(|&e| self.m.mk_eq(t, e)).collect();
+            closure.push(if eqs.len() == 1 {
+                eqs[0]
+            } else {
+                self.m.mk_or(&eqs)
+            });
+        }
+        let final_goal = if closure.is_empty() {
+            goal
+        } else {
+            closure.push(goal);
+            self.m.mk_and(&closure)
+        };
+        match check_model(&self.m, final_goal) {
+            (SmtResult::Sat, m) => Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()))),
+            _ => None,
         }
     }
 
