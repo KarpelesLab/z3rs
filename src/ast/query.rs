@@ -122,6 +122,10 @@ impl AstManager {
     pub fn is_eq(&self, id: AstId) -> bool {
         self.is_basic(id, BasicOp::Eq)
     }
+    /// Is `id` a `distinct` application?
+    pub fn is_distinct(&self, id: AstId) -> bool {
+        self.is_basic(id, BasicOp::Distinct)
+    }
     /// Is `id` an `ite` application?
     pub fn is_ite(&self, id: AstId) -> bool {
         self.is_basic(id, BasicOp::Ite)

@@ -5724,13 +5724,13 @@ impl Context {
         Some(total)
     }
 
-    /// Enum pigeonhole: a clique of pairwise-distinct terms of a sort with `k`
-    /// inhabitants larger than `k` cannot be satisfied (`distinct v0…v4` over a
-    /// 4-value enum, or over `mk(Bool, Bool)` which also has 4 inhabitants).
+    /// Finite-sort pigeonhole: a clique of pairwise-distinct terms of a sort with
+    /// `k` inhabitants larger than `k` cannot be satisfied — `distinct v0…v4` over
+    /// a 4-value enum, over `mk(Bool, Bool)`, or over `(Set (_ BitVec 1))`, i.e.
+    /// `(Array (_ BitVec 1) Bool)`, which likewise has `2² = 4` inhabitants.
+    /// `datatype_cardinality` counts every finite sort (Bool, bit-vectors, arrays
+    /// over finite index/element sorts, enums, records), not just datatypes.
     fn enum_pigeonhole_unsat(&self, goal: AstId) -> bool {
-        if self.enums.is_empty() && self.datatypes.is_empty() {
-            return false;
-        }
         let mut conj: Vec<AstId> = Vec::new();
         let mut stack = alloc::vec![goal];
         while let Some(t) = stack.pop() {
@@ -5746,19 +5746,25 @@ impl Context {
         let mut by_sort: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
         let mut card: BTreeMap<AstId, Option<u64>> = BTreeMap::new();
         for &c in &conj {
-            if !self.m.is_not(c) {
+            // The disequal terms this conjunct asserts: `(not (= a b))` gives the
+            // one pair, an n-ary `(distinct t…)` gives every pair.
+            let terms: Vec<AstId> = if self.m.is_not(c) {
+                let inner = self.m.app_args(c)[0];
+                if !self.m.is_eq(inner) {
+                    continue;
+                }
+                let a = self.m.app_args(inner);
+                if a.len() != 2 {
+                    continue;
+                }
+                a.to_vec()
+            } else if self.m.is_distinct(c) {
+                self.m.app_args(c).to_vec()
+            } else {
                 continue;
-            }
-            let inner = self.m.app_args(c)[0];
-            if !self.m.is_eq(inner) {
-                continue;
-            }
-            let a = self.m.app_args(inner);
-            if a.len() != 2 {
-                continue;
-            }
-            let s = self.m.get_sort(a[0]);
-            if self.m.get_sort(a[1]) != s {
+            };
+            let s = self.m.get_sort(terms[0]);
+            if terms.iter().any(|&t| self.m.get_sort(t) != s) {
                 continue;
             }
             // Only sorts with a finite inhabitant count can pigeonhole.
@@ -5768,9 +5774,14 @@ impl Context {
             if fin.is_none() {
                 continue;
             }
-            diseq.insert((a[0].min(a[1]), a[0].max(a[1])));
+            for i in 0..terms.len() {
+                for j in (i + 1)..terms.len() {
+                    let (a, b) = (terms[i], terms[j]);
+                    diseq.insert((a.min(b), a.max(b)));
+                }
+            }
             let v = by_sort.entry(s).or_default();
-            for &e in &[a[0], a[1]] {
+            for &e in &terms {
                 if !v.contains(&e) {
                     v.push(e);
                 }
