@@ -913,15 +913,43 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
             }
             continue;
         }
+        let cmd_start = p;
         let form = parse_one(&toks, &mut p)?;
-        if let Some(resp) = ctx.command(&form)? {
-            out.push(resp);
+        match ctx.command(&form) {
+            Ok(Some(resp)) => out.push(resp),
+            Ok(None) => {}
+            Err(msg) => match z3_command_error(&msg, &toks[cmd_start..p], &positions[cmd_start..p])
+            {
+                // A recoverable error z3 reports as `(error …)` and continues past.
+                Some(err) => out.push(err),
+                None => return Err(msg),
+            },
         }
         if ctx.exited {
             break;
         }
     }
     Ok(out)
+}
+
+/// Translate a recoverable command error into z3's `(error "line L column C: …")`
+/// form, locating the offending symbol among the command's tokens. `None` for an
+/// error z3rs does not (yet) render z3-compatibly — the caller then aborts.
+fn z3_command_error(msg: &str, toks: &[String], positions: &[(u32, u32)]) -> Option<String> {
+    // `unknown symbol "X"` → `unknown constant X` at X's first occurrence.
+    if let Some(rest) = msg.strip_prefix("unknown symbol \"")
+        && let Some(name) = rest.strip_suffix('"')
+    {
+        let (l, c) = toks
+            .iter()
+            .position(|t| t == name)
+            .map(|i| positions[i])
+            .unwrap_or((0, 0));
+        return Some(alloc::format!(
+            "(error \"line {l} column {c}: unknown constant {name}\")"
+        ));
+    }
+    None
 }
 
 /// A persistent SMT-LIB2 session. Unlike [`run`], declarations, assertions, the
@@ -24978,7 +25006,8 @@ mod tests {
     #[test]
     fn pop_undeclares_scoped_constants() {
         // x is declared inside a push; after pop it is out of scope, so the
-        // reference errors (matching SMT-LIB declaration scoping).
+        // reference is reported as `(error …)` — z3 continues past it (it does not
+        // abort the script), then the check-sat still runs.
         let script = "
             (push 1)
               (declare-const x Int)
@@ -24987,7 +25016,9 @@ mod tests {
             (assert (> x 0))
             (check-sat)
         ";
-        assert!(run(script).is_err());
+        let out = run(script).unwrap();
+        assert!(out.iter().any(|l| l.contains("unknown constant x")));
+        assert_eq!(out.last().map(String::as_str), Some("sat"));
     }
 
     #[test]

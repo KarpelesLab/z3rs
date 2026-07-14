@@ -57,8 +57,11 @@ fn dimacs_sat_and_unsat() {
 
 #[test]
 fn smt2_reports_errors() {
-    assert!(run_smt2("(assert (= a b))").is_err()); // undeclared symbols
-    assert!(run_smt2("(check-sat").is_err()); // unbalanced parens
+    // Undeclared symbols are reported as `(error …)` and the script continues
+    // (z3's behaviour), rather than aborting the whole run.
+    let out = run_smt2("(assert (= a b))").unwrap();
+    assert!(out.iter().any(|l| l.contains("unknown constant a")));
+    assert!(run_smt2("(check-sat").is_err()); // unbalanced parens still abort
 }
 
 #[test]
