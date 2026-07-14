@@ -501,6 +501,31 @@ fn bv_sign(m: &mut AstManager, x: AstId) -> AstId {
     m.mk_eq(msb, one)
 }
 
+/// Whether `id` is syntactically non-negative because it is the canonical
+/// integer/real `abs` expansion `(ite (>= t 0) t (- t))`. Used to fold
+/// `abs(abs t) = abs t` so idempotent absolute values are recognised equal.
+fn is_abs_nonneg(m: &AstManager, id: AstId) -> bool {
+    if !m.is_ite(id) {
+        return false;
+    }
+    let a = m.app_args(id);
+    if a.len() != 3 {
+        return false;
+    }
+    let (then, els) = (a[1], a[2]);
+    // condition is `(>= then 0)`
+    if m.arith_op(a[0]) != Some(ArithOp::Ge) {
+        return false;
+    }
+    let c = m.app_args(a[0]);
+    if c.len() != 2 || c[0] != then || m.as_numeral(c[1]).map(|r| r.is_zero()) != Some(true) {
+        return false;
+    }
+    // else branch is `(- then)`
+    let e = m.app_args(els);
+    m.arith_op(els) == Some(ArithOp::Uminus) && e.len() == 1 && e[0] == then
+}
+
 /// `|x|` as a bit-vector: `ite(sign, -x, x)`.
 fn bv_abs(m: &mut AstManager, x: AstId) -> AstId {
     let s = bv_sign(m, x);
@@ -24384,15 +24409,27 @@ impl Context {
                         return Err(alloc::format!("=: bit-vector width mismatch ({x} vs {y})"));
                     }
                 }
-                // chainable: (= a b c) => (and (= a b) (= b c))
+                // chainable: (= a b c) => (and (= a b) (= b c)). Syntactically
+                // identical operands are equal (`a = a` is `true` — SMT `=` is
+                // Leibniz identity), so drop those pairs / fold to true.
                 if args.len() == 2 {
-                    Ok(m.mk_eq(args[0], args[1]))
+                    if args[0] == args[1] {
+                        Ok(m.mk_true())
+                    } else {
+                        Ok(m.mk_eq(args[0], args[1]))
+                    }
                 } else {
                     let mut eqs = Vec::new();
                     for w in args.windows(2) {
-                        eqs.push(m.mk_eq(w[0], w[1]));
+                        if w[0] != w[1] {
+                            eqs.push(m.mk_eq(w[0], w[1]));
+                        }
                     }
-                    Ok(m.mk_and(&eqs))
+                    match eqs.len() {
+                        0 => Ok(m.mk_true()),
+                        1 => Ok(eqs[0]),
+                        _ => Ok(m.mk_and(&eqs)),
+                    }
                 }
             }
             // --- linear arithmetic (with constant folding, so downstream `mod`,
@@ -24560,6 +24597,12 @@ impl Context {
             "abs" => match m.as_numeral(args[0]).and_then(|v| v.to_integer()) {
                 Some(a) => Ok(m.mk_numeral(Rational::from_integer(a.abs()), true)),
                 None => {
+                    // abs is idempotent: if `a` is already a canonical abs (hence
+                    // ≥ 0), `abs a = a`. Folds `abs(abs t)` and lets EUF see the
+                    // two occurrences as equal.
+                    if is_abs_nonneg(m, args[0]) {
+                        return Ok(args[0]);
+                    }
                     // (abs a) = (ite (>= a 0) a (- a)); opaque to the linear core
                     // for non-constant a, but structurally faithful.
                     let zero = m.mk_int(0);
