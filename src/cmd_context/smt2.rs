@@ -915,6 +915,21 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
         }
         let cmd_start = p;
         let form = parse_one(&toks, &mut p)?;
+        // Unknown `(set-logic X)`: z3 prints `unsupported` and an ignoring-comment
+        // (with the command's position) and proceeds as if no logic were set.
+        if let SExpr::List(l) = &form
+            && l.len() == 2
+            && matches!(&l[0], SExpr::Atom(a) if a == "set-logic")
+            && let SExpr::Atom(name) = &l[1]
+            && !supported_logic(name)
+        {
+            let (line, col) = positions[cmd_start];
+            out.push("unsupported".to_string());
+            out.push(alloc::format!(
+                "; ignoring unsupported logic {name} line: {line} position: {col}"
+            ));
+            continue;
+        }
         match ctx.command(&form) {
             Ok(Some(resp)) => out.push(resp),
             Ok(None) => {}
@@ -930,6 +945,44 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
         }
     }
     Ok(out)
+}
+
+/// Whether `s` is a logic z3 recognises (port of `smt_logics::supported_logic`,
+/// substring-based). An unrecognised logic is reported as `unsupported`.
+fn supported_logic(s: &str) -> bool {
+    let is_all = s == "ALL" || s == "HO_ALL";
+    let has_horn = s == "HORN";
+    let has_str = s == "QF_S" || s == "QF_SLIA" || s == "QF_SNIA" || is_all;
+    let has_arith = ["LRA", "LIRA", "LIA", "NRA", "NIRA", "NIA", "IDL", "RDL"]
+        .iter()
+        .any(|p| s.contains(p))
+        || s == "QF_BVRE"
+        || s.contains("FP")
+        || s == "QF_S"
+        || is_all
+        || s == "QF_FD"
+        || s == "HORN";
+    let has_bv =
+        s.contains("BV") || s == "FP" || is_all || s == "QF_FD" || s == "SMTFD" || s == "HORN";
+    let has_uf = s.contains("UF") || s == "SMTFD";
+    let has_array = s.starts_with("QF_A") || s.starts_with('A') || s == "SMTFD" || s == "HORN";
+    let has_seq = s == "QF_BVRE" || has_str;
+    let has_fpa = s.contains("FP") || is_all;
+    let has_datatype = s.contains("DT") || s == "QF_FD" || is_all || has_horn;
+    let has_finite_sets = s.contains("FS") || is_all;
+    let has_fd = s == "QF_FD";
+    has_uf
+        || is_all
+        || has_fd
+        || has_arith
+        || has_bv
+        || has_array
+        || has_seq
+        || has_str
+        || has_horn
+        || has_fpa
+        || has_datatype
+        || has_finite_sets
 }
 
 /// Translate a recoverable command error into z3's `(error "line L column C: …")`
