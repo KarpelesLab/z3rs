@@ -1622,6 +1622,11 @@ struct Context {
     /// outside the logic's theories are rejected as z3 does (e.g. `Array` under
     /// `BV`). `None` means no restriction (the permissive `ALL` default).
     logic: Option<String>,
+    /// `:rewriter.hi-div0` (z3's default: true) — use the "hardware
+    /// interpretation" of bit-vector division by zero (`bvudiv x 0 = 0b1…1`,
+    /// `bvurem x 0 = x`). When false, division by zero is an *uninterpreted*
+    /// function of the dividend, which is strictly more permissive.
+    hi_div0: bool,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -2626,6 +2631,7 @@ impl Context {
             exited: false,
             print_success: false,
             logic: None,
+            hi_div0: true,
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -2880,10 +2886,13 @@ impl Context {
                         // `:print-success` (and `:smtlib2-compliant`, which implies
                         // it) toggle whether successful commands print `success`.
                         let key = name.trim_start_matches(':');
-                        if let ParamValue::Bool(b) = &pv
-                            && (key == "print-success" || key == "smtlib2-compliant")
-                        {
-                            self.print_success = *b;
+                        if let ParamValue::Bool(b) = &pv {
+                            if key == "print-success" || key == "smtlib2-compliant" {
+                                self.print_success = *b;
+                            }
+                            if key == "rewriter.hi-div0" || key == "rewriter.hi_div0" {
+                                self.hi_div0 = *b;
+                            }
                         }
                         self.params.set(&name, pv);
                     }
@@ -22496,9 +22505,14 @@ impl Context {
     fn free_uf_bv_groups(&self, goal: AstId) -> Vec<Vec<AstId>> {
         let mut groups: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
         for t in self.m.postorder(goal) {
+            let s = self.m.get_sort(t);
+            // A bit-vector- or Boolean-sorted uninterpreted application: both can be
+            // Ackermannized into a fresh blastable constant (a fresh bit-vector or a
+            // fresh propositional variable) with argument-congruence axioms, so an
+            // uninterpreted predicate `p(bv…)` no longer blocks the pure-BV path.
             if let Some(app) = self.m.app(t)
                 && !app.args.is_empty()
-                && self.m.bv_sort_width(self.m.get_sort(t)).is_some()
+                && (self.m.bv_sort_width(s).is_some() || self.m.is_bool_sort(s))
                 && !self.m.is_select(t)
                 && !self.m.is_store(t)
                 && self
@@ -24388,6 +24402,41 @@ impl Context {
     /// `(as const v) → v`, `store(a,i,v) → default(a)`, `(_ map f) a… →
     /// f(default(a)…)`; a symbolic array becomes an uninterpreted `default`
     /// application, congruent per array so `a = b ⇒ default(a) = default(b)`.
+    /// Build a bit-vector division/remainder under `:rewriter.hi-div0 false`,
+    /// where division by zero is *unspecified*: z3 rewrites `(op x y)` to
+    /// `(ite (= y 0) (op0 x) (op x y))` with `op0` an uninterpreted unary
+    /// function of the dividend (`bv_rewriter::mk_bv_udiv_core` &c.). Modelling
+    /// it as an uninterpreted function — rather than pinning the hardware value —
+    /// is what makes `hi-div0 false` strictly more permissive.
+    fn bv_div_underspecified(&mut self, head: &str, x: AstId, y: AstId) -> Result<AstId, String> {
+        let w = self
+            .m
+            .bv_sort_width(self.m.get_sort(x))
+            .ok_or_else(|| alloc::format!("{head}: not a bit-vector"))?;
+        // One uninterpreted decl per (op, width); `mk_func_decl` is hash-consed, so
+        // equal dividends yield the same term and congruence holds automatically.
+        let s = self.m.mk_bv_sort(w);
+        let d = self
+            .m
+            .mk_func_decl(Symbol::new(&alloc::format!("{head}0!{w}")), &[s], s);
+        let zero_case = self.m.mk_app(d, &[x]);
+        // A literally-zero divisor is exactly the uninterpreted value.
+        if self.m.bv_numeral_value(y).is_some_and(|v| v.is_zero()) {
+            return Ok(zero_case);
+        }
+        let m = &mut self.m;
+        let normal = match head {
+            "bvudiv" => m.mk_bvudiv(x, y),
+            "bvurem" => m.mk_bvurem(x, y),
+            "bvsdiv" => bv_sdiv(m, x, y),
+            "bvsrem" => bv_srem(m, x, y),
+            _ => bv_smod(m, x, y),
+        };
+        let zero = m.mk_bv(0, w);
+        let is_zero = m.mk_eq(y, zero);
+        Ok(m.mk_ite(is_zero, zero_case, normal))
+    }
+
     fn array_default(&mut self, arr: AstId) -> Result<AstId, String> {
         if self.m.is_const_array(arr) {
             return Ok(self.m.app_args(arr)[0]);
@@ -24521,6 +24570,14 @@ impl Context {
         }
         if head == "default" && args.len() == 1 {
             return self.array_default(args[0]);
+        }
+        // Under `:rewriter.hi-div0 false`, bit-vector division by zero is an
+        // uninterpreted function of the dividend rather than the hardware value.
+        if !self.hi_div0
+            && args.len() == 2
+            && matches!(head, "bvudiv" | "bvurem" | "bvsdiv" | "bvsrem" | "bvsmod")
+        {
+            return self.bv_div_underspecified(head, args[0], args[1]);
         }
         let m = &mut self.m;
         // Bit-vector binary ops and comparisons require equal operand widths;
