@@ -17131,7 +17131,18 @@ impl Context {
         // counterexample trace) and k-induction (for `sat`, an inductive
         // invariant). Both are sound; on the resource bound it declines (`None`)
         // and falls through to the general instantiation engine.
-        if !self.universals.is_empty()
+        // The CHC engines decide the universal *rules in isolation*: apart from
+        // checking that no ground assertion mentions a predicate, they never look at
+        // the ground side at all. Any ground constraint is therefore silently
+        // dropped — `∀x. q(f x)` together with the ground `¬(a = a)` was answered
+        // `sat`, and a query's counterexample trace can likewise be infeasible once
+        // the ground assertions are taken into account (wrong `unsat`). A genuine
+        // CHC benchmark states its facts *about the predicate*, which the check
+        // below already declines, so the fast path only ever legitimately applies
+        // when the ground side is empty. Require exactly that.
+        let ground_trivial = self.assertions.iter().all(|&a| self.m.is_true(a));
+        if ground_trivial
+            && !self.universals.is_empty()
             && let Some(r) = self
                 .solve_chc()
                 .or_else(|| self.solve_chc_acyclic())
