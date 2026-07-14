@@ -932,7 +932,13 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
         }
         match ctx.command(&form) {
             Ok(Some(resp)) => out.push(resp),
-            Ok(None) => {}
+            // A state-changing command that produced no output prints `success`
+            // when `:print-success` is on (SMT-LIB compliance mode).
+            Ok(None) => {
+                if ctx.print_success {
+                    out.push("success".to_string());
+                }
+            }
             Err(msg) => match z3_command_error(&msg, &toks[cmd_start..p], &positions[cmd_start..p])
             {
                 // A recoverable error z3 reports as `(error …)` and continues past.
@@ -1419,6 +1425,9 @@ struct Context {
     last_verdict: Option<SmtResult>,
     /// Set by `(exit)`: subsequent commands in the script are ignored.
     exited: bool,
+    /// `:print-success` (also enabled by `:smtlib2-compliant`): when true, every
+    /// state-changing command that succeeds prints `success`.
+    print_success: bool,
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
@@ -2421,6 +2430,7 @@ impl Context {
             assert_names: Vec::new(),
             last_verdict: None,
             exited: false,
+            print_success: false,
             scope_stack: Vec::new(),
             scopes: Vec::new(),
             macros: BTreeMap::new(),
@@ -2662,6 +2672,14 @@ impl Context {
                                 }
                             }
                         };
+                        // `:print-success` (and `:smtlib2-compliant`, which implies
+                        // it) toggle whether successful commands print `success`.
+                        let key = name.trim_start_matches(':');
+                        if let ParamValue::Bool(b) = &pv
+                            && (key == "print-success" || key == "smtlib2-compliant")
+                        {
+                            self.print_success = *b;
+                        }
                         self.params.set(&name, pv);
                     }
                 }
