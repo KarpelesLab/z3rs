@@ -12687,6 +12687,107 @@ impl Context {
             }
         }
         vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
+        // A string var bound by `x = int.to.str(t)` (`str.from_int`, a producer
+        // whose value is determined once its integer argument is fixed by the index
+        // enumeration below) is COMPUTED by folding the producer — the search can't
+        // guess an arbitrary decimal-digit string otherwise (issue-1846 #2).
+        let mut derived_prod: Vec<(AstId, AstId)> = Vec::new();
+        {
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(t) = st.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        st.push(a);
+                    }
+                } else {
+                    top.push(t);
+                }
+            }
+            for t in top {
+                if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                    let a = self.m.app_args(t);
+                    for (v, p) in [(a[0], a[1]), (a[1], a[0])] {
+                        if vars.contains(&v)
+                            && !derived_prod.iter().any(|(d, _)| *d == v)
+                            && self.m.is_app(p)
+                            && matches!(
+                                self.str_op_decls
+                                    .get(&self.m.app_decl(p))
+                                    .map(String::as_str),
+                                Some("str.from_int") | Some("str.from-int")
+                            )
+                        {
+                            derived_prod.push((v, p));
+                        }
+                    }
+                }
+            }
+        }
+        vars.retain(|v| !derived_prod.iter().any(|(d, _)| d == v));
+        // Integer index/length/conversion arguments of string ops (`str.substr s i
+        // n`, `int.to.str t`, …) — enumerated (with the abstract model's value
+        // seeded) as the fast-advancing dimensions of the product below, so that a
+        // goal like `substr(x,i,j) = lit` reaches the right (i,j) without first
+        // exhausting the string candidate list.
+        let mut idx_vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t)) {
+                for &ia in &self.m.app_args(t).to_vec() {
+                    if self.m.is_uninterp_const(ia)
+                        && self.m.is_int_sort(self.m.get_sort(ia))
+                        && !vars.contains(&ia)
+                        && !idx_vars.contains(&ia)
+                    {
+                        idx_vars.push(ia);
+                    }
+                }
+            }
+        }
+        // Literals paired with a `str.substr`/`str.at` over a string variable in a
+        // top-level equality (`"bef" = (str.substr a f d)`): the variable must
+        // CONTAIN that literal, so a padded candidate placing the literal at
+        // offset 0 (extended to the model's hinted length) is seeded below — the
+        // plain alphabet/length search never builds a long word around a literal.
+        let mut substr_lits: BTreeMap<AstId, Vec<Vec<u32>>> = BTreeMap::new();
+        {
+            let mut top: Vec<AstId> = Vec::new();
+            let mut st = alloc::vec![goal];
+            while let Some(t) = st.pop() {
+                if self.m.is_and(t) {
+                    for &a in self.m.app_args(t) {
+                        st.push(a);
+                    }
+                } else {
+                    top.push(t);
+                }
+            }
+            for t in top {
+                if !self.m.is_eq(t) || self.m.app_args(t).len() != 2 {
+                    continue;
+                }
+                let a = self.m.app_args(t);
+                for (s, l) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_app(s)
+                        && matches!(
+                            self.str_op_decls
+                                .get(&self.m.app_decl(s))
+                                .map(String::as_str),
+                            Some("str.substr") | Some("str.at")
+                        )
+                        && !self.m.app_args(s).is_empty()
+                    {
+                        let x = self.m.app_args(s)[0];
+                        if vars.contains(&x)
+                            && let Some(lv) = self.str_value(l)
+                            && !lv.is_empty()
+                        {
+                            substr_lits.entry(x).or_default().push(lv);
+                        }
+                    }
+                }
+            }
+        }
         // A goal with no string *variable* is still witnessable when its only
         // unknowns are integer *indices* of `str.at`/`str.substr`/`str.indexof`
         // over string literals (`str.indexof "" "" a ≠ 0`): the index enumeration
@@ -12698,7 +12799,7 @@ impl Context {
                     self.m.is_uninterp_const(ia) && self.m.is_int_sort(self.m.get_sort(ia))
                 })
         });
-        if vars.is_empty() && derived.is_empty() && !has_index_var {
+        if vars.is_empty() && derived.is_empty() && derived_prod.is_empty() && !has_index_var {
             return None;
         }
         if vars.len() > 3 {
@@ -12711,11 +12812,23 @@ impl Context {
         // below (substitute → refold → re-check with the string axioms), so this is
         // always sound; it just lets a pure-length goal (`len(x·y) ≥ 13`) be
         // witnessed past the short enumeration cap.
+        let mut idx_model: BTreeMap<AstId, i64> = BTreeMap::new();
+        let mut var_len: BTreeMap<AstId, i64> = BTreeMap::new();
         let model_fill: Vec<Option<Vec<u32>>> = if let Some(model) = hint {
             let lenf = self.str_len_fn();
             let fill_chars = *b"abcdef";
             let mut class_char: Vec<(usize, u32)> = Vec::new();
             let mut out: Vec<Option<Vec<u32>>> = Vec::with_capacity(vars.len());
+            // The abstract model's concrete value for each integer index/conversion
+            // variable — seeds `int.to.str t` with a `t ≥ 53` witness (issue-1846),
+            // where `-1..=8` never reaches the needed value.
+            for &iv in &idx_vars {
+                if let Value::Num(r, _) = model.eval(&self.m, iv)
+                    && let Some(i) = r.to_integer().and_then(|i| i.to_i64())
+                {
+                    idx_model.insert(iv, i);
+                }
+            }
             for &v in &vars {
                 let lent = self.m.mk_app(lenf, &[v]);
                 let len = match model.eval(&self.m, lent) {
@@ -12726,6 +12839,9 @@ impl Context {
                     Value::Uninterp(_, c) => c,
                     _ => usize::MAX,
                 };
+                if let Some(k) = len {
+                    var_len.insert(v, k);
+                }
                 match len {
                     // Cap the length so a pathological model can't build a huge word.
                     Some(k) if (0..=2048).contains(&k) => {
@@ -12973,9 +13089,43 @@ impl Context {
             let exact = self.str_exact_len(goal, v);
             // Try literal substrings first (a concat piece is usually one of them).
             let mut cands: Vec<Vec<u32>> = Vec::new();
-            // The model-guided filler goes first so the all-filler assignment is the
-            // very first combination tried (immediate for pure-length goals).
-            if let Some(fill) = &model_fill[vi] {
+            // Substr-equality padded candidates go FIRST so the constructed word is
+            // the variable's index-0 candidate — with the index vars advancing
+            // fastest, the correct (offset,len) is then reached inside the try cap
+            // while this word stays fixed (3889: `a = "bef"·filler`, len(a)>10).
+            if let Some(lits) = substr_lits.get(&v) {
+                let target = match (exact, var_len.get(&v)) {
+                    (Some(k), _) => Some(k),
+                    (None, Some(&k)) if (0..=2048).contains(&k) => Some(k as usize),
+                    _ => None,
+                };
+                for lit in lits {
+                    // Length to pad to: the model's hint if it isn't shorter than the
+                    // literal, else the literal plus a little slack (so any lower
+                    // length bound like `len > 10` is comfortably met).
+                    let k = match target {
+                        Some(k) if k >= lit.len() => k,
+                        _ => lit.len() + 8,
+                    };
+                    let pad = k - lit.len();
+                    // Literal at offset 0, then the mirror with it at the end.
+                    let mut pre = lit.clone();
+                    pre.extend(alloc::vec!['a' as u32; pad]);
+                    if !cands.contains(&pre) {
+                        cands.push(pre);
+                    }
+                    let mut suf = alloc::vec!['a' as u32; pad];
+                    suf.extend_from_slice(lit);
+                    if !cands.contains(&suf) {
+                        cands.push(suf);
+                    }
+                }
+            }
+            // The model-guided filler goes next so the all-filler assignment is an
+            // early combination tried (immediate for pure-length goals).
+            if let Some(fill) = &model_fill[vi]
+                && !cands.contains(fill)
+            {
                 cands.push(fill.clone());
             }
             for sub in &lit_subs {
@@ -13011,45 +13161,37 @@ impl Context {
         if per_var.iter().any(|c| c.is_empty()) {
             return None;
         }
-        // Precompute candidate *terms* for each string variable, then append any
-        // integer index variables (arguments of `str.at`/`str.substr`/
-        // `str.indexof`) with small concrete values — so `str.at x i = "a" ∧
-        // len x = 3` decides by also trying i ∈ {−1,0,1,…}.
-        let mut all_vars: Vec<AstId> = vars.clone();
+        // Build the search dimensions with the integer index variables FIRST (they
+        // advance fastest in the mixed-radix counter below), then the string
+        // variables. Enumerating indices innermost lets `substr(x,i,j) = lit` reach
+        // the right (i,j) with the string word held at its (constructed) index-0
+        // value, instead of exhausting the string list before an index advances.
+        let mut all_vars: Vec<AstId> = Vec::new();
         let mut per_term: Vec<Vec<AstId>> = Vec::new();
-        for cs in &per_var {
-            let mut terms: Vec<AstId> = Vec::with_capacity(cs.len());
-            for cp in cs {
-                let s = code_points_to_string(cp);
-                let lit = self.mk_str_lit(&s);
-                terms.push(lit);
-            }
-            per_term.push(terms);
-        }
-        let mut idx_vars: Vec<AstId> = Vec::new();
-        for t in self.m.postorder(goal) {
-            // Any integer argument of a string op is a small index / length /
-            // int-to-string conversion value worth enumerating (`str.substr s i
-            // n`, `int.to.str b`, …); the int-sort filter skips string args.
-            if self.m.is_app(t) && self.str_op_decls.contains_key(&self.m.app_decl(t)) {
-                for &ia in &self.m.app_args(t).to_vec() {
-                    if self.m.is_uninterp_const(ia)
-                        && self.m.is_int_sort(self.m.get_sort(ia))
-                        && !all_vars.contains(&ia)
-                        && !idx_vars.contains(&ia)
-                    {
-                        idx_vars.push(ia);
-                    }
-                }
-            }
-        }
-        // Keep the combined search space bounded.
-        if all_vars.len() + idx_vars.len() <= 3 {
+        // Keep the combined search space bounded: with up to 6 dimensions the
+        // MAX_TRIES cap still holds the total work in check.
+        if vars.len() + idx_vars.len() <= 6 {
             for &iv in &idx_vars {
                 all_vars.push(iv);
-                let terms: Vec<AstId> = (-1..=8i64).map(|n| self.m.mk_int(n)).collect();
-                per_term.push(terms);
+                let mut ns: Vec<i64> = (-1..=8i64).collect();
+                if let Some(&mv) = idx_model.get(&iv)
+                    && !ns.contains(&mv)
+                {
+                    ns.push(mv);
+                }
+                per_term.push(ns.iter().map(|&n| self.m.mk_int(n)).collect());
             }
+        }
+        for (vi, &v) in vars.iter().enumerate() {
+            all_vars.push(v);
+            let terms: Vec<AstId> = per_var[vi]
+                .iter()
+                .map(|cp| {
+                    let s = code_points_to_string(cp);
+                    self.mk_str_lit(&s)
+                })
+                .collect();
+            per_term.push(terms);
         }
         // Cartesian product of candidates over the variables, capped.
         const MAX_TRIES: usize = 3000;
@@ -13084,6 +13226,18 @@ impl Context {
                     }
                 }
                 if ok {
+                    let lit = self.mk_str_lit(&code_points_to_string(&val));
+                    subst.push((*dv, lit));
+                }
+            }
+            // Compute each producer-determined variable (`s = int.to.str(t)`) by
+            // substituting the now-concrete integer args into the producer term and
+            // folding it to a literal; skip this combination if it doesn't fold.
+            for (dv, prod) in &derived_prod {
+                let p1 = crate::rewriter::substitute(&mut self.m, *prod, &subst);
+                let mut pmemo = BTreeMap::new();
+                let p2 = self.refold_str_markers(p1, &mut pmemo);
+                if let Some(val) = self.str_value(p2) {
                     let lit = self.mk_str_lit(&code_points_to_string(&val));
                     subst.push((*dv, lit));
                 }
