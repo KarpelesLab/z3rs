@@ -8582,7 +8582,7 @@ impl Context {
                 flat
             })
         };
-        let affix_markers: Vec<(bool, AstId, AstId)> = present
+        let affix_markers: Vec<(bool, AstId, AstId, AstId)> = present
             .iter()
             .filter_map(|&t| {
                 if !self.m.is_app(t) || self.m.app_args(t).len() != 2 {
@@ -8594,16 +8594,16 @@ impl Context {
                     .map(String::as_str)
                 {
                     Some("str.prefixof") => {
-                        Some((true, self.m.app_args(t)[0], self.m.app_args(t)[1]))
+                        Some((true, self.m.app_args(t)[0], self.m.app_args(t)[1], t))
                     }
                     Some("str.suffixof") => {
-                        Some((false, self.m.app_args(t)[0], self.m.app_args(t)[1]))
+                        Some((false, self.m.app_args(t)[0], self.m.app_args(t)[1], t))
                     }
                     _ => None,
                 }
             })
             .collect();
-        for (is_pre, pat, x) in affix_markers {
+        for (is_pre, pat, x, marker) in affix_markers {
             let Some(parts) = str_concat_parts(self, pat) else {
                 continue;
             };
@@ -8619,7 +8619,13 @@ impl Context {
                     let iv = self.m.mk_int(i as i64);
                     let cl = self.mk_str_lit(&code_points_to_string(&[ch]));
                     if let Ok(at) = self.string_op("str.at", &[x, iv]) {
-                        ax.push(self.m.mk_eq(at, cl));
+                        // Guard by the predicate: only when `pat` IS a prefix of `x`
+                        // must `x[i]` equal `pat`'s i-th (concrete) char. Asserting
+                        // it unconditionally is unsound — e.g. `prefixof("efg"·e, "")`
+                        // would force `str.at("",0)="e"`, i.e. `""="e"`, refuting the
+                        // formula in both polarities of the predicate.
+                        let eq = self.m.mk_eq(at, cl);
+                        ax.push(self.m.mk_implies(marker, eq));
                     }
                 }
             } else {
@@ -8646,7 +8652,11 @@ impl Context {
                     let iv = self.m.mk_int(pos);
                     let cl = self.mk_str_lit(&code_points_to_string(&[ch]));
                     if let Ok(at) = self.string_op("str.at", &[x, iv]) {
-                        ax.push(self.m.mk_eq(at, cl));
+                        // Guard by the predicate (see the prefix branch): the
+                        // trailing chars of `x` match `pat` only when `suffixof`
+                        // actually holds.
+                        let eq = self.m.mk_eq(at, cl);
+                        ax.push(self.m.mk_implies(marker, eq));
                     }
                 }
             }
