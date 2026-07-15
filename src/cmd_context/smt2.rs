@@ -12812,7 +12812,12 @@ impl Context {
         if vars.is_empty() && derived.is_empty() && derived_prod.is_empty() && !has_index_var {
             return None;
         }
-        if vars.len() > 3 {
+        // Up to four free string variables. The Cartesian enumeration is bounded
+        // by `MAX_TRIES` regardless of the variable count, so a fourth variable
+        // does not blow up the work — it just widens the (still-capped) search,
+        // which lets a disjunctive goal over four strings (`a ≠ b·c ∨ …`, 3500)
+        // find a satisfying branch.
+        if vars.len() > 4 {
             return None;
         }
         // Model-guided filler words: when the abstract (length-only) model pins each
