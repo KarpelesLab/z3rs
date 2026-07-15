@@ -1,0 +1,1 @@
+(declare-fun s () String)(declare-fun i Int)(assert (not (str.prefixof (str.substr s 1 i) s)))(check-sat)

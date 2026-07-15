@@ -13705,6 +13705,62 @@ impl Context {
         None
     }
 
+    /// True when `t` is *provably* a front-prefix of `s`, i.e. `str.prefixof t s`
+    /// holds for every model. Recursive, conservative (returns false when unsure):
+    /// - `t == s` (same AstId): `s` is a prefix of itself.
+    /// - `t` is the empty literal `""`: "" is a prefix of every string.
+    /// - `t` is `(str.substr s 0 _)`: the substring starting at offset 0 is the
+    ///   clamped leading run of `s` — "" for offset≤0, the first k chars for
+    ///   0<k<len(s), or all of `s` for k≥len(s) — a prefix for every length.
+    ///   The base string must be the same AstId as `s` and the offset the literal
+    ///   0 (a `str.substr s i _` with `i != 0` is *not* a front-prefix).
+    /// - `t` is `(ite c A B)` with both `A` and `B` provable front-prefixes of `s`.
+    ///
+    /// `depth` caps recursion to guard against pathological/cyclic terms.
+    fn substr_is_front_prefix_depth(&self, t: AstId, s: AstId, depth: u32) -> bool {
+        if depth == 0 {
+            return false;
+        }
+        // `s` is a prefix of itself.
+        if t == s {
+            return true;
+        }
+        // The empty string is a prefix of everything.
+        if self.str_value(t).is_some_and(|v| v.is_empty()) {
+            return true;
+        }
+        if self.m.is_app(t) {
+            // `(str.substr s 0 _)`: offset-0 substring of exactly `s`.
+            if self
+                .str_op_decls
+                .get(&self.m.app_decl(t))
+                .map(String::as_str)
+                == Some("str.substr")
+            {
+                let args = self.m.app_args(t);
+                if args.len() == 3 && args[0] == s && self.int_arg(args[1]) == Some(0) {
+                    return true;
+                }
+            }
+        }
+        // `(ite c A B)`: a prefix of `s` when both branches are.
+        if self.m.is_ite(t) {
+            let args = self.m.app_args(t);
+            if args.len() == 3
+                && self.substr_is_front_prefix_depth(args[1], s, depth - 1)
+                && self.substr_is_front_prefix_depth(args[2], s, depth - 1)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `substr_is_front_prefix_depth` with the default recursion cap.
+    fn substr_is_front_prefix(&self, t: AstId, s: AstId) -> bool {
+        self.substr_is_front_prefix_depth(t, s, 64)
+    }
+
     /// Peel leading operands of `(str.substr (str.++ p₀ p₁ …) 0 n)` that the
     /// length fully covers. `n` may be a constant, or `(+ (str.len p₀) k)` (take
     /// `p₀` whole, recurse on the rest with length `k`). Sound: each peeled prefix
@@ -13967,6 +14023,17 @@ impl Context {
                         .map(String::as_str)
                         == Some("str.substr")
                     && self.m.app_args(raw[1])[0] == raw[0]
+                {
+                    return Ok(self.m.mk_true());
+                }
+                // `(str.prefixof T s)` is always true when `T` is provably a
+                // front-prefix of `s`: `(str.substr s 0 _)` (clamped to "", a
+                // prefix, or all of s for every offset), "", s itself, or an ite
+                // of two such front-prefixes. Argument order: raw[0] is the
+                // candidate prefix, raw[1] the whole string.
+                if op == "str.prefixof"
+                    && raw.len() == 2
+                    && self.substr_is_front_prefix(raw[0], raw[1])
                 {
                     return Ok(self.m.mk_true());
                 }
