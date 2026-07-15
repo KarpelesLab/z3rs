@@ -13903,6 +13903,29 @@ impl Context {
                 if let Some(v) = self.fold_string_producer(op, raw) {
                     return Ok(self.mk_str_lit(&v));
                 }
+                // Fold A — `str.substr s pos len` → "" for symbolic `s` when the
+                // extract is empty for every value of `s` (z3 zstring::extract):
+                //   * `pos` is the term `(str.len s)` for the *same* base `s`:
+                //     `pos == len(s) ≥ len(s)`, so the offset is out of range.
+                //   * `pos` is a strictly-negative integer literal (pos < 0 ⇒ "").
+                //   * `len` is an integer literal ≤ 0 (len ≤ 0 ⇒ "").
+                // The `str.len` base must be the *exact* same AstId as the substr
+                // base; `str.substr s (str.len t) k` with `t ≠ s` must not fold.
+                if op == "str.substr" && raw.len() == 3 {
+                    let neg_pos = self.int_arg(raw[1]).is_some_and(|p| p < 0);
+                    let nonpos_len = self.int_arg(raw[2]).is_some_and(|n| n <= 0);
+                    let pos_is_len_of_base = self.m.is_app(raw[1])
+                        && self.str_len_decl == Some(self.m.app_decl(raw[1]))
+                        && *self.m.app_args(raw[1]) == [raw[0]][..];
+                    if neg_pos || nonpos_len || pos_is_len_of_base {
+                        return Ok(self.mk_str_lit(""));
+                    }
+                }
+                // Fold B — `str.at s i` → "" for any `s` when `i` is a strictly
+                // negative integer literal (z3 mk_seq_at/at_axiom: i < 0 ⇒ "").
+                if op == "str.at" && raw.len() == 2 && self.int_arg(raw[1]).is_some_and(|i| i < 0) {
+                    return Ok(self.mk_str_lit(""));
+                }
                 // z3 seq_rewriter `mk_seq_replace`: `replace a b c` with `b == c`
                 // is `a` (replacing a substring with itself); with `a == b` is `c`
                 // (the whole string is the pattern). Hold for any (symbolic) terms.
