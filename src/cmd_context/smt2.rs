@@ -21881,10 +21881,23 @@ impl Context {
                 continue;
             }
             for (v, l) in [(a[0], a[1]), (a[1], a[0])] {
+                // RHS may be a string literal, or a `str.++` term not mentioning
+                // `v` (acyclic). Inlining `v = (p₀ ++ …)` lets folds like
+                // `substr_concat_peel` fire on `str.substr v 0 …` after `v` is
+                // replaced by its concat definition. Sound: `v = l` is an asserted
+                // conjunct, so replacing `v` by the equal term `l` preserves
+                // satisfiability.
+                let rhs_is_concat = self.m.is_app(l)
+                    && self
+                        .str_op_decls
+                        .get(&self.m.app_decl(l))
+                        .map(String::as_str)
+                        == Some("str.++")
+                    && !self.m.postorder(l).contains(&v);
                 if self.m.is_uninterp_const(v)
                     && self.m.get_sort(v) == ss
                     && !lit_consts.contains(&v)
-                    && lit_consts.contains(&l)
+                    && (lit_consts.contains(&l) || rhs_is_concat)
                     && !bound.contains(&v)
                 {
                     subst.push((v, l));
