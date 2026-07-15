@@ -1945,6 +1945,53 @@ impl Regex {
         self.ends(s, 0).contains(&s.len())
     }
 
+    /// Collect intervals of single code points (`[lo, hi]`, clamped to
+    /// `max_char`) that are *provably* accepted as length-1 words by `self`.
+    ///
+    /// This is deliberately a *lower bound* on the single-character language:
+    /// only nodes whose length-1 acceptance set is exactly known contribute
+    /// (`re.range`, `re.allchar`/`re.all`, a single-char literal, and unions of
+    /// those). Every other node — `Concat`, `Inter`, `Comp`, `Star`, `None`,
+    /// multi-char literals — contributes nothing, which can only *under*-report
+    /// coverage. Callers may therefore soundly conclude "accepts every single
+    /// character" from a positive coverage result, never the reverse.
+    fn collect_single_char_intervals(&self, max_char: u32, out: &mut Vec<(u32, u32)>) {
+        match self {
+            Regex::Range(lo, hi) => out.push((*lo, (*hi).min(max_char))),
+            Regex::AllChar | Regex::All => out.push((0, max_char)),
+            Regex::Lit(l) if l.len() == 1 => out.push((l[0], l[0])),
+            Regex::Union(a, b) => {
+                a.collect_single_char_intervals(max_char, out);
+                b.collect_single_char_intervals(max_char, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Does `self` provably accept *every* single code point in the alphabet
+    /// `[0, max_char]`? Sound (never a false positive) via
+    /// [`Regex::collect_single_char_intervals`]. When true and `self` is the
+    /// body of a `re.*`, that Kleene star matches Σ*: any string is a
+    /// concatenation of length-1 words, each of which `self` accepts.
+    fn accepts_all_single_chars(&self, max_char: u32) -> bool {
+        let mut ivs: Vec<(u32, u32)> = Vec::new();
+        self.collect_single_char_intervals(max_char, &mut ivs);
+        ivs.sort_unstable();
+        let mut next: u32 = 0;
+        for (lo, hi) in ivs {
+            if lo > next {
+                return false;
+            }
+            if hi >= next {
+                if hi >= max_char {
+                    return true;
+                }
+                next = hi + 1;
+            }
+        }
+        false
+    }
+
     /// A literal operand of a (possibly nested) `re.inter` — the language is then a
     /// subset of `{that literal}`, so membership pins the word.
     fn inter_literal(&self) -> Option<Vec<u32>> {
@@ -13728,6 +13775,18 @@ impl Context {
     /// Build a string-theory application `(op args…)`, folding when every string
     /// argument is a literal and otherwise producing an uninterpreted term
     /// (marked symbolic so a goal mentioning it is answered `unknown`).
+    /// The largest code point in the current string alphabet. z3's default
+    /// (and `:encoding unicode`) alphabet is `[0, 0x2FFFF]`; `:encoding ascii`
+    /// restricts it to the 8-bit range `[0, 0xFF]`. Used by the regex
+    /// universality fold so `(re.range \x00 \xFF)` is universal in ascii mode
+    /// and `(re.range \x00 \x2FFFF)` is universal in unicode mode, matching z3.
+    fn alphabet_max_char(&self) -> u32 {
+        match self.params.get("encoding") {
+            Some(crate::util::ParamValue::Str(s)) if s == "ascii" => 0xFF,
+            _ => SMT_MAX_CODE_POINT,
+        }
+    }
+
     fn string_op(&mut self, op: &str, raw: &[AstId]) -> Result<AstId, String> {
         // Concrete code points of each argument, if all are string literals.
         let strs: Option<Vec<Vec<u32>>> = raw.iter().map(|&a| self.str_value(a)).collect();
@@ -13978,6 +14037,15 @@ impl Context {
                 // universal (`re.all`, matches every string) or empty (`re.none`).
                 if let Some(r) = self.regex_of.get(&raw[1]) {
                     if matches!(r, Regex::All) {
+                        return Ok(self.m.mk_true());
+                    }
+                    // `(re.* inner)` matches Σ* when `inner` accepts every single
+                    // character of the alphabet: any string is then a
+                    // concatenation of length-1 `inner`-words, so membership holds
+                    // for every `s`, independent of it.
+                    if let Regex::Star(inner) = r
+                        && inner.accepts_all_single_chars(self.alphabet_max_char())
+                    {
                         return Ok(self.m.mk_true());
                     }
                     if r.is_empty_lang() {
