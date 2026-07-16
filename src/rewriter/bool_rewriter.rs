@@ -101,6 +101,12 @@ fn simplify_eq(m: &mut AstManager, args: &[AstId]) -> Option<AstId> {
     if let (Some(x), Some(y)) = (m.as_numeral(a), m.as_numeral(b)) {
         return Some(if x == y { m.mk_true() } else { m.mk_false() });
     }
+    // Bit-vector values: two numerals of the same sort are equal iff their values
+    // match (z3 `bv_rewriter::mk_eq_core`). Without this a `(= #x2 #x7)` stays a
+    // symbolic atom that the EUF core may satisfy either way.
+    if let (Some(x), Some(y)) = (m.bv_numeral_value(a), m.bv_numeral_value(b)) {
+        return Some(if x == y { m.mk_true() } else { m.mk_false() });
+    }
     if m.is_true(a) {
         return Some(b);
     }
