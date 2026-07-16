@@ -12327,16 +12327,30 @@ impl Context {
     fn try_seq_witness(&mut self, goal: AstId) -> Option<Model> {
         let int_sort = self.m.mk_int_sort();
         let mut vars: Vec<AstId> = Vec::new();
+        let mut elem_sort: Option<AstId> = None;
         for t in self.m.postorder(goal) {
             if self.m.is_app(t)
                 && self.m.app_args(t).is_empty()
                 && !self.seq_of.contains_key(&t)
-                && self.seq_elem_sort(self.m.get_sort(t)) == Some(int_sort)
+                && let Some(es) = self.seq_elem_sort(self.m.get_sort(t))
+                && (es == int_sort || self.m.bv_sort_width(es).is_some())
                 && !vars.contains(&t)
             {
+                // Enumerate seqs over `Int` or bit-vector elements; mixed element
+                // sorts bail (the builder needs a single sort).
+                match elem_sort {
+                    None => elem_sort = Some(es),
+                    Some(e) if e == es => {}
+                    Some(_) => return None,
+                }
                 vars.push(t);
             }
         }
+        let elem_sort = elem_sort.unwrap_or(int_sort);
+        let elem_bv_width = self.m.bv_sort_width(elem_sort);
+        // The seq sort, so an *empty* candidate keeps the right element sort:
+        // `mk_seq(vec![])` cannot infer it and would default to `Seq Int`.
+        let seq_sort_id = self.seq_sort(elem_sort);
         // A `s = seq.++(parts)` seq variable is computed from its parts, not enumerated.
         let mut derived: Vec<(AstId, Vec<AstId>)> = Vec::new();
         {
@@ -12387,6 +12401,13 @@ impl Context {
         }
         vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
         if (vars.is_empty() && derived.is_empty()) || vars.len() > 2 {
+            return None;
+        }
+        // Each enumerated candidate re-simplifies and model-checks the whole goal,
+        // so on a large formula the (bounded) search is still seconds of work for a
+        // result that is almost always `unknown`. Skip it past a size threshold —
+        // the witness is a heuristic for small satisfiable fragments.
+        if self.m.postorder(goal).len() > 600 {
             return None;
         }
         // Integer element candidates: 0,1,2 plus any small integer literal in the
@@ -12486,9 +12507,17 @@ impl Context {
                 .map(|(k, &v)| {
                     let es: Vec<AstId> = per_var[k][idx[k]]
                         .iter()
-                        .map(|&n| self.m.mk_int(n))
+                        .map(|&n| match elem_bv_width {
+                            Some(w) => self.m.mk_bv(n, w),
+                            None => self.m.mk_int(n),
+                        })
                         .collect();
-                    (v, self.mk_seq(es))
+                    let seq = if es.is_empty() {
+                        self.seq_empty_of(seq_sort_id)
+                    } else {
+                        self.mk_seq(es)
+                    };
+                    (v, seq)
                 })
                 .collect();
             // Compute each concat-determined seq variable from its substituted parts.
@@ -12510,7 +12539,11 @@ impl Context {
                     }
                 }
                 if ok {
-                    let sv = self.mk_seq(elems);
+                    let sv = if elems.is_empty() {
+                        self.seq_empty_of(seq_sort_id)
+                    } else {
+                        self.mk_seq(elems)
+                    };
                     subst.push((*dv, sv));
                 }
             }
@@ -12545,6 +12578,10 @@ impl Context {
                     conj.push(g2);
                     self.m.mk_and(&conj)
                 };
+                // Constant-fold before the model check so concrete bit-vector
+                // element equalities left by `refold` collapse (simplify_eq now
+                // handles bit-vector numerals) rather than leaking to the EUF core.
+                let g3 = crate::rewriter::simplify(&mut self.m, g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
                     // `check_model` may report `sat` without a model when the goal
