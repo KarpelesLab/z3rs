@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::ast::AstId;
 use crate::ast::manager::AstManager;
 use crate::ast::node::AstNode;
-use crate::rewriter::{arith_rewriter, bool_rewriter};
+use crate::rewriter::{arith_rewriter, bool_rewriter, bv_rewriter};
 
 /// Simplify `root`, rewriting bottom-up.
 pub fn simplify(m: &mut AstManager, root: AstId) -> AstId {
@@ -44,6 +44,9 @@ fn simplify_app(m: &mut AstManager, decl: AstId, args: &[AstId]) -> AstId {
         return r;
     }
     if let Some(r) = arith_rewriter::try_fold(m, decl, args) {
+        return r;
+    }
+    if let Some(r) = bv_rewriter::try_fold(m, decl, args) {
         return r;
     }
     // No theory rule fired: rebuild (hash-consing returns the original node if

@@ -21,6 +21,7 @@
 
 pub mod arith_rewriter;
 pub mod bool_rewriter;
+pub mod bv_rewriter;
 pub mod nnf;
 pub mod subst;
 pub mod th_rewriter;
