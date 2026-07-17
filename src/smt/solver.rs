@@ -267,6 +267,13 @@ impl Model {
         self.eval_full(m, t).render(m)
     }
 
+    /// The fully-folded value of `t` under this model (the same evaluator that
+    /// backs [`Model::value_string`], but returning the structured [`Value`]).
+    /// Used by model construction to reconstruct a concrete argument/result term.
+    pub fn eval_value(&mut self, m: &AstManager, t: AstId) -> Value {
+        self.eval_full(m, t)
+    }
+
     /// A fully-folding variant of [`Model::eval`] used only for value rendering.
     fn eval_full(&mut self, m: &AstManager, t: AstId) -> Value {
         let s = m.get_sort(t);

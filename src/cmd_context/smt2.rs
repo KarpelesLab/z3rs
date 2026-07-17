@@ -23983,6 +23983,33 @@ impl Context {
             })
             .collect();
         let mut model = self.last_model.take().unwrap();
+
+        // Build constant interpretations for every n-ary (non-array-range)
+        // function, then *jointly* validate: a single function may validate in
+        // isolation yet contradict the others once they are all fixed to their
+        // constants. Greedily drop offenders until the emitted set is sound
+        // (dropped functions stay free, so re-checking the model is still SAT).
+        let csub = self.model_const_subst(&mut model);
+        let mut chosen: Vec<(AstId, String, Option<AstId>)> = Vec::new();
+        for decl in &decls {
+            if !decl.domain.is_empty()
+                && !self.m.is_array_sort(decl.range)
+                && let Some((render, term)) = self.fn_const_interp(decl.d, &mut model, &csub)
+            {
+                chosen.push((decl.d, render, term));
+            }
+        }
+        while !chosen.is_empty() {
+            let pairs: Vec<(AstId, Option<AstId>)> =
+                chosen.iter().map(|(d, _, t)| (*d, *t)).collect();
+            if self.joint_model_valid(&pairs, &mut model, &csub) {
+                break;
+            }
+            chosen.pop();
+        }
+        let fn_bodies: BTreeMap<AstId, String> =
+            chosen.into_iter().map(|(d, r, _)| (d, r)).collect();
+
         let mut out = String::from("(");
         for decl in &decls {
             if decl.domain.is_empty() {
@@ -24002,8 +24029,8 @@ impl Context {
                     "\n  (define-fun {} () {sort_name}\n    {v})",
                     decl.name
                 ));
-            } else if let Some(body) = self.const_fn_interp(decl.d, &mut model) {
-                // An n-ary function with a constant interpretation.
+            } else if let Some(body) = fn_bodies.get(&decl.d) {
+                // An n-ary function with a (jointly validated) constant interpretation.
                 let params = decl
                     .domain
                     .iter()
@@ -24057,26 +24084,237 @@ impl Context {
         }
     }
 
-    /// If every application of function `d` in the assertions evaluates to one
-    /// and the same value under `model` (or there are none), return that value's
-    /// rendering — the constant interpretation z3 emits for such a function.
-    /// `None` if the applications disagree (a non-constant graph we don't emit).
-    fn const_fn_interp(&self, d: AstId, model: &mut Model) -> Option<String> {
+    /// Render a term's model value through the same value stack the constant and
+    /// `get-value` paths use (string / enum / floating-point / generic).
+    fn model_value_str(&self, model: &mut Model, id: AstId) -> String {
+        self.str_value(id)
+            .map(|cps| smt_string_literal(&cps))
+            .or_else(|| self.str_model_value(model, id))
+            .or_else(|| self.enum_value_name(model, id))
+            .or_else(|| self.fp_model_value(model, id))
+            .unwrap_or_else(|| model.value_string(&self.m, id))
+    }
+
+    /// Reconstruct a concrete *ground value term* for `t` under `model`
+    /// (`true`/`false`, a numeral, or a bit-vector literal). This folds nested
+    /// structure — including applications of the very function being modelled,
+    /// via the model's atom table — so that e.g. an argument `(ite (p 1) 10 20)`
+    /// collapses to the numeral `10`. Returns `None` for sorts we cannot render
+    /// as a self-contained term (uninterpreted, string, floating-point, …).
+    fn eval_value_term(&mut self, model: &mut Model, t: AstId) -> Option<AstId> {
+        let s = self.m.get_sort(t);
+        if self.m.is_bool_sort(s) {
+            let b = matches!(model.eval_value(&self.m, t), Value::Bool(true));
+            return Some(if b {
+                self.m.mk_true()
+            } else {
+                self.m.mk_false()
+            });
+        }
+        if self.m.is_arith_sort(s) {
+            if let Value::Num(r, is_int) = model.eval_value(&self.m, t) {
+                return Some(self.m.mk_numeral(r, is_int));
+            }
+            return None;
+        }
+        if let Some(w) = self.m.bv_sort_width(s)
+            && let Value::Bv(v, _) = model.eval_value(&self.m, t)
+        {
+            return Some(self.m.mk_bv_numeral(v, w));
+        }
+        None
+    }
+
+    /// Rewrite `root`, replacing 0-ary constants listed in `csub` by their model
+    /// value and every application of a function listed in `fsub` by that
+    /// function's constant value. Substituting the constants *first* canonicalises
+    /// distinct-but-equal argument terms (e.g. `(p a)` and `(p c)` with `a = c =
+    /// 0` both become `(p 0)`), so the model evaluator reads them consistently.
+    fn subst_all(
+        &mut self,
+        root: AstId,
+        csub: &BTreeMap<AstId, AstId>,
+        fsub: &BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for id in self.m.postorder(root) {
+            let new = if self.m.is_app(id) {
+                let args = self.m.app_args(id).to_vec();
+                let decl = self.m.app_decl(id);
+                if args.is_empty() {
+                    csub.get(&decl).copied().unwrap_or(id)
+                } else if let Some(&v) = fsub.get(&decl) {
+                    v
+                } else {
+                    let nargs: Vec<AstId> = args.iter().map(|c| memo[c]).collect();
+                    if nargs == args {
+                        id
+                    } else {
+                        self.m.mk_app(decl, &nargs)
+                    }
+                }
+            } else {
+                id
+            };
+            memo.insert(id, new);
+        }
+        memo[&root]
+    }
+
+    /// The substitution mapping each declared 0-ary constant to its model value
+    /// term (Boolean / integer / bit-vector only), used to canonicalise argument
+    /// terms before model-based validation.
+    fn model_const_subst(&mut self, model: &mut Model) -> BTreeMap<AstId, AstId> {
+        let mut csub = BTreeMap::new();
+        for name in self.decl_order.clone() {
+            let d = self.funcs[&name];
+            if let Some(fd) = self.m.func_decl(d)
+                && fd.domain.is_empty()
+            {
+                let c = self.m.mk_const(d);
+                if let Some(v) = self.eval_value_term(model, c) {
+                    csub.insert(d, v);
+                }
+            }
+        }
+        csub
+    }
+
+    /// Does the constant interpretation `d ≡ val` satisfy every assertion under
+    /// the model (with constants canonicalised via `csub`)?
+    fn validate_constant(
+        &mut self,
+        d: AstId,
+        val: AstId,
+        model: &mut Model,
+        csub: &BTreeMap<AstId, AstId>,
+    ) -> bool {
+        let mut fsub = BTreeMap::new();
+        fsub.insert(d, val);
+        let assertions = self.assertions.clone();
+        for a in assertions {
+            let sub = self.subst_all(a, csub, &fsub);
+            if self.model_value_str(model, sub) != "true" {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Confirm that substituting every chosen function by its constant
+    /// interpretation *simultaneously* leaves each assertion true under the
+    /// model — the joint soundness gate for the emitted model. Functions whose
+    /// value could not be reconstructed as a term (`None`) are left symbolic
+    /// (their agreed model value already backs the assertion).
+    fn joint_model_valid(
+        &mut self,
+        chosen: &[(AstId, Option<AstId>)],
+        model: &mut Model,
+        csub: &BTreeMap<AstId, AstId>,
+    ) -> bool {
+        let fsub: BTreeMap<AstId, AstId> = chosen
+            .iter()
+            .filter_map(|&(d, t)| t.map(|t| (d, t)))
+            .collect();
+        let assertions = self.assertions.clone();
+        for a in assertions {
+            let sub = self.subst_all(a, csub, &fsub);
+            if self.model_value_str(model, sub) != "true" {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The constant range values z3 considers as a function's default, in its
+    /// preference order (`false`/`true` for a predicate; `0` for numeric/bit-vector
+    /// ranges). Each is `(value-term, rendering)`. Empty for ranges we cannot
+    /// render as a ground constant (real, uninterpreted, …).
+    fn const_candidates(&mut self, range: AstId) -> Vec<(AstId, String)> {
+        if self.m.is_bool_sort(range) {
+            let f = self.m.mk_false();
+            let t = self.m.mk_true();
+            alloc::vec![(f, "false".to_string()), (t, "true".to_string())]
+        } else if self.m.is_int_sort(range) {
+            let z = self.m.mk_int(0);
+            alloc::vec![(z, "0".to_string())]
+        } else if let Some(w) = self.m.bv_sort_width(range) {
+            let z = self.m.mk_bv_numeral(Int::from(0), w);
+            alloc::vec![(z, render_bv_field(0, w))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Build the *constant* interpretation z3 emits for the n-ary uninterpreted
+    /// function/predicate `d`, as `(rendering, value-term)`.
+    ///
+    /// The model pins a function only at the *syntactic* application terms the
+    /// solver asserted. We therefore read the value at each such application and:
+    /// - with no applications, use the range default (`false` / `0`);
+    /// - when every application agrees on one value, use that value;
+    /// - on genuine disagreement (the model did not pin the points to a single
+    ///   value), fall back to the range default constant that *validates* against
+    ///   the assertions — z3's model completion, which for a predicate like
+    ///   `z3name_bug`'s `p` yields the constant `true`.
+    ///
+    /// The returned `value-term` is `Some` for Boolean / integer / bit-vector
+    /// ranges (used by the joint soundness check) and `None` otherwise.
+    fn fn_const_interp(
+        &mut self,
+        d: AstId,
+        model: &mut Model,
+        csub: &BTreeMap<AstId, AstId>,
+    ) -> Option<(String, Option<AstId>)> {
         let range = self.m.func_decl(d)?.range;
-        let mut value: Option<String> = None;
-        for &a in &self.assertions {
+        // Read one value per constrained argument tuple (first occurrence wins).
+        let mut entries: Vec<(Vec<String>, String, Option<AstId>)> = Vec::new();
+        let assertions = self.assertions.clone();
+        for a in assertions {
             for t in self.m.postorder(a) {
                 if self.m.is_app(t) && !self.m.app_args(t).is_empty() && self.m.app_decl(t) == d {
-                    let v = model.value_string(&self.m, t);
-                    match &value {
-                        None => value = Some(v),
-                        Some(prev) if *prev != v => return None,
-                        _ => {}
+                    let args = self.m.app_args(t).to_vec();
+                    let key: Option<Vec<String>> = args
+                        .iter()
+                        .map(|&x| {
+                            self.eval_value_term(model, x)
+                                .map(|vt| self.model_value_str(model, vt))
+                        })
+                        .collect();
+                    let Some(key) = key else { continue };
+                    if !entries.iter().any(|(k, _, _)| *k == key) {
+                        let result = self.model_value_str(model, t);
+                        let term = self.eval_value_term(model, t);
+                        entries.push((key, result, term));
                     }
                 }
             }
         }
-        value.or_else(|| self.default_value(range))
+        if entries.is_empty() {
+            // Unconstrained: the range default (Boolean / integer / bit-vector only).
+            let (term, render) = self.const_candidates(range).into_iter().next()?;
+            return Some((render, Some(term)));
+        }
+        let first = entries[0].1.clone();
+        if entries.iter().all(|(_, r, _)| *r == first) {
+            // Every application agrees: a constant interpretation.
+            return Some((first, entries[0].2));
+        }
+        // Disagreement: emit the first range-default constant that validates.
+        for (term, render) in self.const_candidates(range) {
+            if self.validate_constant(d, term, model, csub) {
+                return Some((render, Some(term)));
+            }
+        }
+        None
+    }
+
+    /// The constant interpretation rendering for `d` (the array `else`/`get-value`
+    /// path). See [`Self::fn_const_interp`].
+    fn const_fn_interp(&mut self, d: AstId, model: &mut Model) -> Option<String> {
+        let csub = self.model_const_subst(model);
+        self.fn_const_interp(d, model, &csub)
+            .map(|(render, _)| render)
     }
 
     /// `((_ repeat k) x)` — concatenate `x` with itself `k` times.
