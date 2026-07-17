@@ -11,7 +11,7 @@
 //! detecting unsatisfiability but not complete for `Int` (a real solution need
 //! not be integral).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use puremp::{Int, Rational};
@@ -377,6 +377,116 @@ pub fn feasible(constraints: &[Constraint]) -> bool {
     model(constraints).is_some()
 }
 
+/// Work budget for [`feasible_core`]'s Fourier–Motzkin elimination. On exhaustion
+/// the search returns `None` (no core), so the caller falls back to the always
+/// sound full-assignment block — a bounded blow-up can only weaken a lemma.
+const FEASIBLE_CORE_BUDGET: u64 = 200_000;
+
+/// Provenance-tracked Fourier–Motzkin: like [`feasible`] over the rationals, but
+/// when the system is infeasible via a **direct FM false derivation** it returns
+/// the set of original constraint indices whose Farkas combination produced the
+/// contradiction — the conflict core (Z3's `theory_arith` conflict = the
+/// constraints with a nonzero Farkas coefficient). `None` when no rational
+/// contradiction is derived.
+///
+/// **MVP scope:** only the pure `≤ / < / =` case over the RATIONALS (the direct FM
+/// false derivation). It does NOT core disequality splits or integer-only (Omega)
+/// infeasibility — for a system that is rational-feasible (so FM derives no
+/// contradiction) it returns `None` even if the integer test would refute it, and
+/// the caller then uses the full block. [`feasible`]/[`feasible_with_diseqs`] are
+/// left untouched and remain the sound/complete deciders.
+///
+/// Provenance: each original constraint `i`'s ineqs start tagged `{i}`; when a
+/// lower and an upper bound are combined during elimination the resolvent's tag is
+/// the UNION of the two operands' tags — exactly which original constraints the
+/// Farkas combination used. A derived constant ineq that is unsatisfiable (`c ≤ 0`
+/// with `c > 0`, or `c < 0` with `c ≥ 0`, over an empty variable set) is the
+/// contradiction; its tag is the returned core.
+pub fn feasible_core(constraints: &[Constraint]) -> Option<Vec<usize>> {
+    // A provenance-tagged inequality `expr ⋈ 0` plus the set of original
+    // constraint indices it descends from.
+    struct IneqP {
+        expr: LinExpr,
+        strict: bool,
+        origin: BTreeSet<usize>,
+    }
+    // A trivially-false constant ineq is a contradiction; report its origin set.
+    fn false_core(iq: &IneqP) -> Option<Vec<usize>> {
+        if iq.expr.is_constant() {
+            let k = iq.expr.const_term();
+            let violated = if iq.strict { *k >= zero() } else { *k > zero() };
+            if violated {
+                return Some(iq.origin.iter().copied().collect());
+            }
+        }
+        None
+    }
+
+    let mut ineqs: Vec<IneqP> = Vec::new();
+    for (i, c) in constraints.iter().enumerate() {
+        for iq in c.to_ineqs() {
+            let mut origin = BTreeSet::new();
+            origin.insert(i);
+            let tagged = IneqP {
+                expr: iq.expr,
+                strict: iq.strict,
+                origin,
+            };
+            if let Some(core) = false_core(&tagged) {
+                return Some(core);
+            }
+            ineqs.push(tagged);
+        }
+    }
+
+    let mut budget = FEASIBLE_CORE_BUDGET;
+    // Eliminate variables one at a time (Fourier–Motzkin), unioning provenance.
+    while let Some(v) = ineqs.iter().find_map(|i| i.expr.vars().next()) {
+        let mut upper = Vec::new(); // coeff(v) > 0
+        let mut lower = Vec::new(); // coeff(v) < 0
+        let mut next: Vec<IneqP> = Vec::new(); // coeff(v) == 0
+        for iq in ineqs {
+            let c = iq.expr.coeff(v);
+            if c.is_zero() {
+                next.push(iq);
+            } else if c > zero() {
+                upper.push(iq);
+            } else {
+                lower.push(iq);
+            }
+        }
+        for u in &upper {
+            let au = u.expr.coeff(v); // > 0
+            for l in &lower {
+                if budget == 0 {
+                    return None; // FM blow-up: no core, caller uses the full block
+                }
+                budget -= 1;
+                let al = l.expr.coeff(v); // < 0
+                // resolvent = (-al)·U + (au)·L  (v cancels), keeping strictness.
+                let mut e = u.expr.scale(&al.neg());
+                e.add_scaled(&l.expr, &au);
+                let mut origin = u.origin.clone();
+                origin.extend(l.origin.iter().copied());
+                let tagged = IneqP {
+                    expr: e,
+                    strict: u.strict || l.strict,
+                    origin,
+                };
+                if let Some(core) = false_core(&tagged) {
+                    return Some(core);
+                }
+                next.push(tagged);
+            }
+        }
+        ineqs = next;
+    }
+
+    // No variables remain and no false constant ineq was ever derived: the system
+    // is feasible over the rationals — no rational conflict core.
+    None
+}
+
 /// Decide feasibility of `constraints` over the rationals and, if satisfiable,
 /// return a concrete satisfying assignment.
 ///
@@ -674,6 +784,53 @@ mod tests {
     }
     fn y() -> AstId {
         AstId(1001)
+    }
+    fn z() -> AstId {
+        AstId(1002)
+    }
+
+    #[test]
+    fn core_contradictory_bounds() {
+        // 0: x ≤ 1  (x - 1 ≤ 0);  1: x ≥ 2  (2 - x ≤ 0).  Core = {0, 1}.
+        let x_le1 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(1))));
+        let x_ge2 = Constraint::le(LinExpr::constant(rat(2)).sub(&LinExpr::var(x())));
+        assert_eq!(feasible_core(&[x_le1, x_ge2]), Some(alloc::vec![0, 1]));
+    }
+
+    #[test]
+    fn core_three_constraint_farkas() {
+        // 0: x + y ≤ 0;  1: x ≥ 1 (-x + 1 ≤ 0);  2: y ≥ 1 (-y + 1 ≤ 0).
+        // Sum of all three: 2 ≤ 0, infeasible. Core = {0, 1, 2}.
+        let sum_le0 = Constraint::le(LinExpr::var(x()).add(&LinExpr::var(y())));
+        let x_ge1 = Constraint::le(LinExpr::var(x()).neg().add(&LinExpr::constant(rat(1))));
+        let y_ge1 = Constraint::le(LinExpr::var(y()).neg().add(&LinExpr::constant(rat(1))));
+        assert_eq!(
+            feasible_core(&[sum_le0, x_ge1, y_ge1]),
+            Some(alloc::vec![0, 1, 2])
+        );
+    }
+
+    #[test]
+    fn core_excludes_irrelevant_constraint() {
+        // 0: x ≤ 1;  1: x ≥ 2 (contradictory);  2: z ≤ 5 (irrelevant).
+        // Core must be {0, 1} and must NOT contain 2.
+        let x_le1 = Constraint::le(LinExpr::var(x()).sub(&LinExpr::constant(rat(1))));
+        let x_ge2 = Constraint::le(LinExpr::constant(rat(2)).sub(&LinExpr::var(x())));
+        let z_le5 = Constraint::le(LinExpr::var(z()).sub(&LinExpr::constant(rat(5))));
+        let core = feasible_core(&[x_le1, x_ge2, z_le5]).expect("infeasible");
+        assert_eq!(core, alloc::vec![0, 1]);
+        assert!(!core.contains(&2));
+    }
+
+    #[test]
+    fn core_none_when_feasible() {
+        // x ≥ 0, y ≥ 0, x + y ≤ 1 is feasible → no rational conflict core.
+        let x_ge0 = Constraint::le(LinExpr::var(x()).neg());
+        let y_ge0 = Constraint::le(LinExpr::var(y()).neg());
+        let sum = LinExpr::var(x())
+            .add(&LinExpr::var(y()))
+            .sub(&LinExpr::constant(rat(1)));
+        assert_eq!(feasible_core(&[x_ge0, y_ge0, Constraint::le(sum)]), None);
     }
 
     #[test]

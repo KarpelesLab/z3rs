@@ -23005,14 +23005,19 @@ impl Context {
         // at y=2). A confirmed linear model is a real `sat` — and `check_model`'s
         // own `sat` on the still-nonlinear `y·q` is not trustworthy, so try the
         // witness whenever the verdict is not a sound `unsat`.
-        if res != SmtResult::Unsat
+        // A goal with a symbolic (possibly-zero) divisor: its lifted div/mod
+        // remainder is a free term (div-by-zero is unspecified), so a `sat` the
+        // nonlinear witness derives over it is untrustworthy — only a refutation is
+        // sound. `div 0 a ≠ 0 ∧ (a²−a)/a = 0` is unsat (both are div(0,0) at a=0),
+        // but the free remainders let a nonlinear witness fake a `sat`.
+        let has_symbolic_div = res != SmtResult::Unsat
             && !self.symbolic_divisors.is_empty()
             && self
                 .m
                 .postorder(goal)
                 .iter()
-                .any(|t| self.symbolic_divisors.contains(t))
-        {
+                .any(|t| self.symbolic_divisors.contains(t));
+        if has_symbolic_div {
             if let Some(m) = self.try_divmod_witness(goal) {
                 return (SmtResult::Sat, Some(m));
             }
@@ -23044,6 +23049,22 @@ impl Context {
             let has_opaque_pow = self.m.postorder(lin).iter().any(|&t| {
                 self.m.is_app(t) && self.decl_name(self.m.app_decl(t)).as_deref() == Some("^")
             });
+            // Two `div`/`mod` terms sharing one *symbolic* divisor can coincide at a
+            // zero divisor: both become `op(_, 0)` and, if their dividends are equal
+            // there, denote the same unspecified value — yet the lifted free
+            // remainders let a nonlinear witness assign them inconsistent values,
+            // faking a `sat` (3896: `div 0 a ≠ 0 ∧ (a²−a)/a = 0`, unsat because at
+            // a=0 both are `div(0,0)`). Only a refutation is sound there. A *single*
+            // div-by-zero is genuinely free (z3 also `sat`), so it is not gated.
+            // The lift replaces the `div`/`mod` apps with fresh remainders, so detect
+            // the pattern from `symbolic_divmod` (the recorded `(a, divisor, q, r)`
+            // Euclidean tuples) rather than from the linearised goal.
+            let mut divisor_uses: BTreeMap<AstId, usize> = BTreeMap::new();
+            for &(_, divv, _, _) in &self.symbolic_divmod {
+                *divisor_uses.entry(divv).or_default() += 1;
+            }
+            let has_coincident_div = divisor_uses.values().any(|&n| n >= 2);
+            let untrustworthy_sat = has_opaque_pow || has_coincident_div;
             // A genuinely nonlinear residual in a *single* variable is decided
             // exactly by the univariate procedure (real-root isolation over the
             // reals; integer-root enumeration over the integers) — this is a
@@ -23054,7 +23075,7 @@ impl Context {
             // With an opaque power present only a returned `unsat` is trusted (a
             // free term can only make the system more satisfiable, never less).
             if let Some(r) = self.decide_nonlinear_definite(lin)
-                && (!has_opaque_pow || r == SmtResult::Unsat)
+                && (!untrustworthy_sat || r == SmtResult::Unsat)
             {
                 // A proven-sat integer goal has no model attached yet; try to
                 // produce a concrete witness so `(eval)`/`(get-model)` work.
@@ -23076,11 +23097,11 @@ impl Context {
             if self.nonlinear_icp_refutes(lin) || self.nla_saturate_refutes(lin) {
                 (SmtResult::Unsat, None)
             } else if let Some(m) = self.try_int_box_witness(lin)
-                && !has_opaque_pow
+                && !untrustworthy_sat
             {
                 (SmtResult::Sat, Some(m))
             } else if let Some(m) = self.try_nonlinear_witness(lin)
-                && !has_opaque_pow
+                && !untrustworthy_sat
             {
                 (SmtResult::Sat, Some(m))
             } else {

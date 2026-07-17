@@ -37,7 +37,8 @@ use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::tseitin::encode_tracking;
 use crate::smt::arith::{
-    Assignment, Constraint, LinExpr, Rel, SolveOutcome, model_with_diseqs_budgeted, project,
+    Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible_core, feasible_with_diseqs,
+    model_with_diseqs_budgeted, project,
 };
 use crate::smt::euf::{Egraph, ProofEgraph};
 
@@ -171,9 +172,13 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     // `unsat`.
                     TheoryOutcome::Conflict(core) => {
                         let core_set: BTreeSet<Lit> = core.iter().copied().collect();
-                        // Rebuild the EUF problem from *only* the core's atoms, each in
-                        // its asserted polarity (lit ∈ core ⇒ equality; ¬lit ∈ core ⇒
-                        // disequality).
+                        // Re-verify the core is *genuinely* inconsistent, restricted to
+                        // ONLY the atoms it names, via BOTH theories independently. The
+                        // core is trusted if EITHER theory confirms its atoms clash.
+                        //
+                        // EUF re-check: rebuild the EUF problem from only the core's
+                        // atoms, each in its asserted polarity (lit ∈ core ⇒ equality;
+                        // ¬lit ∈ core ⇒ disequality).
                         let mut ceqs: Vec<(AstId, AstId)> = Vec::new();
                         let mut cdiseqs: Vec<(AstId, AstId)> = Vec::new();
                         let mut croots: Vec<AstId> = Vec::new();
@@ -188,13 +193,43 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                                 croots.push(b);
                             }
                         }
-                        let mut g = Egraph::new(m, &croots);
-                        if !g.is_consistent(m, &ceqs, &cdiseqs) {
+                        let euf_bad = {
+                            let mut g = Egraph::new(m, &croots);
+                            !g.is_consistent(m, &ceqs, &cdiseqs)
+                        };
+                        // Arith re-check: rebuild the linear system from only the core's
+                        // arith atoms (asserted polarity) and confirm it is genuinely
+                        // infeasible over the rationals (plus diseq splits).
+                        let arith_bad = {
+                            let mut cons: Vec<Constraint> = Vec::new();
+                            let mut diseqs: Vec<LinExpr> = Vec::new();
+                            for atom in &arith_atoms {
+                                let holds = if core_set.contains(&atom.lit) {
+                                    true
+                                } else if core_set.contains(&!atom.lit) {
+                                    false
+                                } else {
+                                    continue; // atom not in the core
+                                };
+                                let diff = ast_to_lin(m, atom.a).sub(&ast_to_lin(m, atom.b));
+                                if atom.is_eq {
+                                    if holds {
+                                        cons.push(Constraint::eq(diff));
+                                    } else {
+                                        diseqs.push(diff);
+                                    }
+                                } else {
+                                    cons.push(comparison_constraint(atom.op, holds, diff));
+                                }
+                            }
+                            !feasible_with_diseqs(&cons, &diseqs)
+                        };
+                        if euf_bad || arith_bad {
                             // Verified inconsistent → learn the strong lemma ¬core.
                             let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
                             sat.add_clause(&clause);
                         } else {
-                            // Core not verified: fall back to the full block.
+                            // Core not verified by either theory: fall back to full block.
                             add_full_block(&mut sat, &euf_eq, &arith_atoms, &pred_atoms);
                         }
                     }
@@ -926,22 +961,31 @@ struct ArithSystem {
     cons: Vec<Constraint>,
     diseqs: Vec<LinExpr>,
     int_set: BTreeSet<AstId>,
+    /// For each entry of `cons`, the asserted-true SAT literal of the atom that
+    /// produced it (parallel to `cons`; only the atom-derived base constraints are
+    /// tracked — extensions appended in the Nelson–Oppen loop have no literal).
+    /// Used to map a [`feasible_core`] index back to a conflict-core literal.
+    con_lits: Vec<Lit>,
 }
 
 fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> ArithSystem {
     let mut cons: Vec<Constraint> = Vec::new();
     let mut diseqs: Vec<LinExpr> = Vec::new();
+    let mut con_lits: Vec<Lit> = Vec::new();
     for atom in atoms {
         let diff = ast_to_lin(m, atom.a).sub(&ast_to_lin(m, atom.b)); // a - b
         let holds = sat.model_holds(atom.lit);
         if atom.is_eq {
             if holds {
                 cons.push(Constraint::eq(diff)); // a = b
+                con_lits.push(atom.lit); // asserted true
             } else {
                 diseqs.push(diff); // a ≠ b (disjunctive)
             }
         } else {
             cons.push(comparison_constraint(atom.op, holds, diff));
+            // The literal true in the model: the atom itself, or its negation.
+            con_lits.push(if holds { atom.lit } else { !atom.lit });
         }
     }
     let mut int_set: BTreeSet<AstId> = BTreeSet::new();
@@ -955,6 +999,7 @@ fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Arit
         cons,
         diseqs,
         int_set,
+        con_lits,
     }
 }
 
@@ -1793,6 +1838,20 @@ fn theory_check(
     }
 
     let base = build_arith_system(m, arith_atoms, sat);
+
+    // Pure-arith pre-check (MVP scope): a *rational* Farkas contradiction among the
+    // asserted linear constraints yields a small conflict core — the original
+    // constraints with a nonzero Farkas coefficient, mapped back to their asserted
+    // SAT literals. Only the direct Fourier–Motzkin false derivation over the
+    // rationals is cored here; integer-only (Omega) infeasibility and disequality
+    // splits return `None` and fall through to the Nelson–Oppen loop below, which
+    // still returns the always-sound `Unsat`. Always re-verified by the soundness
+    // net in `check_model` before being trusted.
+    if let Some(core_idx) = feasible_core(&base.cons) {
+        let core: Vec<Lit> = core_idx.iter().map(|&i| base.con_lits[i]).collect();
+        return TheoryOutcome::Conflict(core);
+    }
+
     let interface = interface_terms(m, euf_roots);
 
     // Equalities shared across the theory boundary, grown to a fixpoint.
@@ -1810,6 +1869,7 @@ fn theory_check(
             cons: base.cons.clone(),
             diseqs: base.diseqs.clone(),
             int_set: base.int_set.clone(),
+            con_lits: base.con_lits.clone(),
         };
         sys.cons.extend(arith_extra.iter().cloned());
         let arith = arith_feasible(&sys, &mut *budget);
