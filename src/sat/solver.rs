@@ -738,6 +738,47 @@ mod tests {
     }
 
     #[test]
+    fn theory_lemma_clause_forces_implied_literal() {
+        // DPLL(T) reason-injection primitive (step A): a theory-propagated literal
+        // `b` implied by `a` is materialized as the globally-valid lemma
+        // `(¬a ∨ b)` and injected via `add_clause`. With `a` also asserted, solving
+        // must force `b`, and a full model must still satisfy every original clause
+        // (the lemma only prunes, never changes the verdict). Injection at level 0
+        // via `add_clause` gives exactly the semantics step B relies on.
+        let mut s = Solver::new();
+        let originals = [lits(&[1, 3]), lits(&[-3, 2, 4])];
+        for c in &originals {
+            s.add_clause(c);
+        }
+        s.add_clause(&lits(&[1])); // assert a (var 0)
+        s.add_clause(&lits(&[-1, 2])); // theory lemma (¬a ∨ b), b = var 1
+        assert_eq!(s.solve(), SatResult::Sat);
+        assert!(s.model_holds(Lit::pos(1)), "theory lemma must force b");
+        for c in &originals {
+            assert!(
+                c.iter().any(|&l| s.model_holds(l)),
+                "clause {c:?} unsatisfied"
+            );
+        }
+    }
+
+    #[test]
+    fn theory_lemma_injected_between_solves_is_incremental() {
+        // Injecting a theory lemma *after* a first SAT solve (the between-solves
+        // level-0 pattern of step B) must be honored on the next solve without any
+        // spurious unsat, and must not disturb an already-satisfiable base.
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1, 2])); // (a ∨ b)
+        assert_eq!(s.solve(), SatResult::Sat);
+        // Between solves, inject the valid implication (¬a ∨ b) and assert a.
+        s.add_clause(&lits(&[-1, 2]));
+        s.add_clause(&lits(&[1]));
+        assert_eq!(s.solve(), SatResult::Sat);
+        assert!(s.model_holds(Lit::pos(0)), "a must hold");
+        assert!(s.model_holds(Lit::pos(1)), "lemma must force b");
+    }
+
+    #[test]
     fn luby_sequence_prefix() {
         // Luby is 1-indexed: luby(1..).
         let seq: Vec<u64> = (1..=15).map(luby).collect();

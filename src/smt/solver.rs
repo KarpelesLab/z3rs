@@ -153,6 +153,14 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                 ) {
                     // Both theories consistent under this assignment → SAT.
                     TheoryOutcome::Sat(arith, euf) => {
+                        // Online-propagation increment (offline hook): derive EUF
+                        // equality atoms that the asserted equalities theory-entail
+                        // but that are not themselves asserted, and inject each as a
+                        // verified, globally-valid lemma clause so future solves
+                        // prune. Verdict-neutral — every injected clause is entailed
+                        // by the asserted equalities and independently re-verified
+                        // before injection (unverified candidates are dropped).
+                        propagate_euf_equalities(m, &euf_eq, &euf_roots, &mut sat);
                         let model = Model {
                             bools,
                             arith,
@@ -862,6 +870,110 @@ fn add_full_block(
     block.extend(arith_atoms.iter().map(|a| flip(a.lit, sat)));
     block.extend(pred_atoms.iter().map(|&(lit, _)| flip(lit, sat)));
     sat.add_clause(&block);
+}
+
+/// Cap on verified EUF equality propagations injected per theory-Sat round, and
+/// the largest EUF term universe for which propagation is attempted at all. These
+/// bound the extra per-round work; every injected clause is globally valid (its
+/// reason theory-entails the implied literal, independently re-verified), so
+/// verdicts are unaffected regardless of the caps.
+const MAX_EUF_PROPAGATIONS: usize = 64;
+const EUF_PROP_MAX_TERMS: usize = 256;
+
+/// On a consistent full model, derive EUF-equality atoms that the *asserted*
+/// equalities theory-entail but that are not themselves asserted true, and inject
+/// each as a verified, globally-valid lemma clause `(¬R ∨ p)` — where `p` is the
+/// atom's own (already tracked) [`Lit`] and `R` are the asserted-equality literals
+/// on the congruence proof path. Verdict-neutral: only clauses genuinely entailed
+/// by the asserted equalities are added, and each is re-verified by an INDEPENDENT
+/// e-graph (`R ∧ (u ≠ v)` must be EUF-inconsistent) before injection; any
+/// unverified candidate is silently dropped. Injection happens between solves at
+/// level 0 via [`Solver::add_clause`], so 1-UIP analysis resolves through it
+/// unchanged.
+///
+/// In the offline (lazy) loop this hook fires only when a tracked equality atom is
+/// entailed yet unasserted; a full consistent model decides every tracked atom
+/// consistently, so in practice it is a no-op here — the mechanism is what this
+/// increment establishes (online propagation, which exploits it, is future work).
+/// All reads of the SAT assignment are captured up front, because [`Solver::add_clause`]
+/// backtracks to level 0 and would otherwise corrupt later `model_holds` queries.
+fn propagate_euf_equalities(
+    m: &AstManager,
+    euf_eq: &[(Lit, AstId, AstId)],
+    euf_roots: &[AstId],
+    sat: &mut Solver,
+) {
+    // Bound the work: only attempt propagation over a small term universe.
+    if euf_roots.len() > EUF_PROP_MAX_TERMS || euf_eq.is_empty() {
+        return;
+    }
+    // Snapshot which equality atoms are asserted true BEFORE any injection (an
+    // `add_clause` backtracks the trail to level 0, invalidating later reads).
+    let asserted_true: Vec<bool> = euf_eq
+        .iter()
+        .map(|&(lit, _, _)| sat.model_holds(lit))
+        .collect();
+    // Asserted-true equalities, tagged by their `euf_eq` index (for explanations).
+    let asserted: Vec<(usize, AstId, AstId)> = euf_eq
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| asserted_true[i])
+        .map(|(id, &(_, a, b))| (id, a, b))
+        .collect();
+    if asserted.is_empty() {
+        return;
+    }
+    let mut pg = ProofEgraph::new(m, euf_roots);
+    pg.assert_eqs(m, &asserted);
+
+    // Collect verified lemma clauses first, then inject — keeps every `model_holds`
+    // read (via `asserted_true`) strictly before the first trail-resetting write.
+    let mut lemmas: Vec<Vec<Lit>> = Vec::new();
+    for (i, &(lit, a, b)) in euf_eq.iter().enumerate() {
+        if lemmas.len() >= MAX_EUF_PROPAGATIONS {
+            break;
+        }
+        // Only atoms not already asserted true whose two sides the asserted
+        // equalities force into one congruence class are candidates.
+        if asserted_true[i] || pg.class_of(m, a) != pg.class_of(m, b) {
+            continue;
+        }
+        // Reason R = asserted-equality atoms on the a–b congruence proof path.
+        let path_ids = pg.explain(m, a, b);
+        let r_eqs: Vec<(AstId, AstId)> = path_ids
+            .iter()
+            .map(|&id| (euf_eq[id].1, euf_eq[id].2))
+            .collect();
+        // SOUNDNESS NET (mandatory; mirrors the Conflict net in `check_model`):
+        // re-verify with an INDEPENDENT e-graph that R genuinely entails `a = b`,
+        // i.e. that `R ∧ (a ≠ b)` is EUF-inconsistent. Build a fresh graph from
+        // ONLY R's equalities plus the single disequality `a ≠ b`.
+        let mut roots: Vec<AstId> = Vec::with_capacity(r_eqs.len() * 2 + 2);
+        for &(x, y) in &r_eqs {
+            roots.push(x);
+            roots.push(y);
+        }
+        roots.push(a);
+        roots.push(b);
+        let verified = {
+            let mut g = Egraph::new(m, &roots);
+            !g.is_consistent(m, &r_eqs, &[(a, b)])
+        };
+        if !verified {
+            continue; // never inject an unverified lemma — drop it
+        }
+        // Globally-valid clause `(¬R ∨ p)`: p is the atom's own tracked literal in
+        // asserting position; each reason literal is asserted true, so negate it.
+        let mut clause: Vec<Lit> = Vec::with_capacity(path_ids.len() + 1);
+        clause.push(lit);
+        for &id in &path_ids {
+            clause.push(!euf_eq[id].0);
+        }
+        lemmas.push(clause);
+    }
+    for clause in &lemmas {
+        sat.add_clause(clause);
+    }
 }
 
 /// The shared (interface) terms of a combined problem: the arithmetic-sorted
