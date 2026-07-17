@@ -23427,6 +23427,13 @@ impl Context {
         self.icp_flatten_and(goal, &mut conjuncts);
         let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
         let mut constraints: Vec<(crate::math::polynomial::Polynomial, Rel)> = Vec::new();
+        // Track whether any conjunct failed to become a polynomial constraint. A
+        // dropped atom can only *further* restrict the system, so deciding over the
+        // retained subset is sound for `unsat` (a subset unsat refutes the whole)
+        // but NOT for `sat` (the dropped atom might contradict the witness) —
+        // `f2`: `1−c−b+a = 4c(a−b) ∧ a = b+9` reduces to `37c = 10` (unsat), but if
+        // the nonlinear equality is dropped only `a = b+9` remains ⇒ spurious sat.
+        let mut dropped = false;
         for atom in conjuncts {
             let (negated, a) = if self.m.is_not(atom) {
                 (true, self.m.app_args(atom)[0])
@@ -23435,6 +23442,16 @@ impl Context {
             };
             if let Some(c) = self.icp_atom(a, negated, &mut var_map) {
                 constraints.push((c.poly, c.rel));
+            } else if self
+                .m
+                .postorder(a)
+                .iter()
+                .any(|&t| self.m.is_uninterp_const(t) && self.m.is_arith_sort(self.m.get_sort(t)))
+            {
+                // Only a dropped atom that mentions an arith variable can constrain
+                // the system and thus invalidate a `sat`; a pure-boolean (or other
+                // arith-free) conjunct does not, so it is safe to ignore.
+                dropped = true;
             }
         }
         if var_map.is_empty() || constraints.is_empty() {
@@ -23487,7 +23504,12 @@ impl Context {
         } else {
             None
         };
+        // A dropped conjunct invalidates every `sat` conclusion below (the retained
+        // subset is weaker), while `unsat` of the subset still refutes the whole.
         if let Some(b) = verdict {
+            if b && dropped {
+                return None;
+            }
             return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
         }
         // Multivariate residual not otherwise decided. If it is over the reals
@@ -23495,15 +23517,16 @@ impl Context {
         // decision procedure; it returns a definite verdict or declines soundly.
         if k >= 2 && remaining_int.iter().all(|&b| !b) {
             match crate::nlsat::cad::cad_sat(&reduced, k) {
-                Some(true) => return Some(SmtResult::Sat),
+                Some(true) if !dropped => return Some(SmtResult::Sat),
                 Some(false) => return Some(SmtResult::Unsat),
-                None => {}
+                _ => {}
             }
         }
         // Otherwise, try to *prove sat* by fixing all-but-one variable to
         // candidate values and deciding the last univariately (a verified
-        // witness — sound).
-        if k >= 2 && crate::nlsat::elim::sat_by_fixing(&reduced, &remaining_int) {
+        // witness — sound). Skipped when a conjunct was dropped (the witness would
+        // not be checked against it).
+        if !dropped && k >= 2 && crate::nlsat::elim::sat_by_fixing(&reduced, &remaining_int) {
             return Some(SmtResult::Sat);
         }
         None
