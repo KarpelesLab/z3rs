@@ -39,7 +39,7 @@ use crate::sat::tseitin::encode_tracking;
 use crate::smt::arith::{
     Assignment, Constraint, LinExpr, Rel, SolveOutcome, model_with_diseqs_budgeted, project,
 };
-use crate::smt::euf::Egraph;
+use crate::smt::euf::{Egraph, ProofEgraph};
 
 use alloc::collections::BTreeSet;
 
@@ -162,13 +162,45 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     }
                     // Undecidable here: neither confirm SAT nor soundly block.
                     TheoryOutcome::Unknown => return (SmtResult::Unknown, None),
+                    // A strong conflict core. MANDATORY soundness net: re-verify the
+                    // core is *genuinely* inconsistent — restricted to only the atoms
+                    // it names — before learning `¬core`. If verification fails (an
+                    // explanation bug produced a bogus/incomplete core) we DISCARD it
+                    // and fall back to the full-assignment block, so a buggy
+                    // explanation can only ever weaken a lemma, never cause a wrong
+                    // `unsat`.
+                    TheoryOutcome::Conflict(core) => {
+                        let core_set: BTreeSet<Lit> = core.iter().copied().collect();
+                        // Rebuild the EUF problem from *only* the core's atoms, each in
+                        // its asserted polarity (lit ∈ core ⇒ equality; ¬lit ∈ core ⇒
+                        // disequality).
+                        let mut ceqs: Vec<(AstId, AstId)> = Vec::new();
+                        let mut cdiseqs: Vec<(AstId, AstId)> = Vec::new();
+                        let mut croots: Vec<AstId> = Vec::new();
+                        for &(lit, a, b) in &euf_eq {
+                            if core_set.contains(&lit) {
+                                ceqs.push((a, b));
+                                croots.push(a);
+                                croots.push(b);
+                            } else if core_set.contains(&!lit) {
+                                cdiseqs.push((a, b));
+                                croots.push(a);
+                                croots.push(b);
+                            }
+                        }
+                        let mut g = Egraph::new(m, &croots);
+                        if !g.is_consistent(m, &ceqs, &cdiseqs) {
+                            // Verified inconsistent → learn the strong lemma ¬core.
+                            let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
+                            sat.add_clause(&clause);
+                        } else {
+                            // Core not verified: fall back to the full block.
+                            add_full_block(&mut sat, &euf_eq, &arith_atoms, &pred_atoms);
+                        }
+                    }
                     // Definitively inconsistent → block this assignment and retry.
                     TheoryOutcome::Unsat => {
-                        let mut block: Vec<Lit> =
-                            euf_eq.iter().map(|&(lit, _, _)| flip(lit, &sat)).collect();
-                        block.extend(arith_atoms.iter().map(|a| flip(a.lit, &sat)));
-                        block.extend(pred_atoms.iter().map(|&(lit, _)| flip(lit, &sat)));
-                        sat.add_clause(&block);
+                        add_full_block(&mut sat, &euf_eq, &arith_atoms, &pred_atoms);
                     }
                 }
             }
@@ -779,6 +811,22 @@ fn decorate_sign(
 
 fn flip(lit: Lit, sat: &Solver) -> Lit {
     if sat.model_holds(lit) { !lit } else { lit }
+}
+
+/// The always-sound fallback conflict clause: flip *every* theory literal of the
+/// current assignment, forbidding exactly this full Boolean model. Used for
+/// conflicts with no (trusted) core — arith / Nelson–Oppen / predicate clashes,
+/// and any core the soundness net rejected.
+fn add_full_block(
+    sat: &mut Solver,
+    euf_eq: &[(Lit, AstId, AstId)],
+    arith_atoms: &[ArithAtom],
+    pred_atoms: &[(Lit, AstId)],
+) {
+    let mut block: Vec<Lit> = euf_eq.iter().map(|&(lit, _, _)| flip(lit, sat)).collect();
+    block.extend(arith_atoms.iter().map(|a| flip(a.lit, sat)));
+    block.extend(pred_atoms.iter().map(|&(lit, _)| flip(lit, sat)));
+    sat.add_clause(&block);
 }
 
 /// The shared (interface) terms of a combined problem: the arithmetic-sorted
@@ -1670,7 +1718,15 @@ fn arith_entails_eq(
 enum TheoryOutcome {
     /// Consistent: a rational assignment plus the congruence closure (for models).
     Sat(Assignment, Egraph),
-    /// Definitively inconsistent — the assignment must be blocked.
+    /// Definitively inconsistent, with a **conflict core**: the currently-asserted
+    /// theory literals (in their asserted-true polarity) whose conjunction alone is
+    /// inconsistent. The SMT loop learns `¬core` (a strong lemma) instead of
+    /// blocking the whole assignment. Only produced for conflicts explainable
+    /// purely from asserted EUF equalities + congruence; always re-verified by the
+    /// soundness net before being trusted.
+    Conflict(Vec<Lit>),
+    /// Definitively inconsistent — the assignment must be blocked (the always-sound
+    /// fallback, used for arith / Nelson–Oppen / predicate-clash conflicts).
     Unsat,
     /// Inconclusive (the arithmetic search gave up).
     Unknown,
@@ -1704,6 +1760,38 @@ fn theory_check(
             diseqs.push((a, b));
         }
     }
+
+    // Proof-producing pre-check for a *pure-EUF* conflict (MVP scope): an asserted
+    // disequality whose two sides congruence-closure of the asserted equalities
+    // forces into one class. Its explanation names exactly the input equalities on
+    // the proof path, yielding a small conflict core = those equality literals plus
+    // the violated disequality's own literal (in asserted polarity). Anything that
+    // needs arithmetic-implied equalities, feasibility, or the predicate clash is
+    // left to the Nelson–Oppen loop below (which returns the always-sound `Unsat`).
+    {
+        let id_eqs: Vec<(usize, AstId, AstId)> = euf_eq
+            .iter()
+            .enumerate()
+            .filter(|&(_, &(lit, _, _))| sat.model_holds(lit))
+            .map(|(id, &(_, a, b))| (id, a, b))
+            .collect();
+        let mut pg = ProofEgraph::new(m, euf_roots);
+        pg.assert_eqs(m, &id_eqs);
+        for &(lit, a, b) in euf_eq {
+            if !sat.model_holds(lit) && pg.class_of(m, a) == pg.class_of(m, b) {
+                // core: the equalities forcing a≈b (asserted true) + this diseq
+                // (asserted as ¬(a=b), i.e. the negated atom literal).
+                let mut core: Vec<Lit> = pg
+                    .explain(m, a, b)
+                    .into_iter()
+                    .map(|id| euf_eq[id].0)
+                    .collect();
+                core.push(!lit);
+                return TheoryOutcome::Conflict(core);
+            }
+        }
+    }
+
     let base = build_arith_system(m, arith_atoms, sat);
     let interface = interface_terms(m, euf_roots);
 
