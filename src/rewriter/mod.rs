@@ -20,6 +20,7 @@
 //! substitution; euf and the bit-blaster live in the SMT engine)
 
 pub mod arith_rewriter;
+pub mod array_rewriter;
 pub mod bool_rewriter;
 pub mod bv_rewriter;
 pub mod nnf;
