@@ -1671,6 +1671,15 @@ struct Context {
     /// Parametric (polymorphic) datatype templates: name → (type parameters,
     /// constructor s-expressions). Monomorphized on use, e.g. `(Pair Int Bool)`.
     param_datatypes: BTreeMap<String, (Vec<String>, Vec<SExpr>)>,
+    /// Monomorphized parametric-datatype instances: concrete sort → (base name,
+    /// argument sorts), so the internal `Tree!12` prints as `(Tree Bool)`.
+    mono_datatypes: BTreeMap<AstId, (String, Vec<AstId>)>,
+    /// Every declaration registered under a given name, in registration order.
+    /// A datatype constructor/selector name may be *overloaded* across
+    /// monomorphic instances (`value : (Tree Int) → Int` and `(Tree Bool) →
+    /// Bool`); an application resolves to the candidate whose domain matches its
+    /// argument sorts, matching z3's overload resolution.
+    overloads: BTreeMap<String, Vec<AstId>>,
     /// Array `lambda` closures: array term → (bound-variable placeholders, body).
     /// `(select (lambda ((x S)) body) i)` beta-reduces to `body[x:=i]`.
     lambdas: BTreeMap<AstId, (Vec<AstId>, AstId)>,
@@ -2701,6 +2710,8 @@ impl Context {
             dt_depth: BTreeMap::new(),
             tester_of: BTreeMap::new(),
             param_datatypes: BTreeMap::new(),
+            mono_datatypes: BTreeMap::new(),
+            overloads: BTreeMap::new(),
             lambdas: BTreeMap::new(),
             maps: BTreeMap::new(),
             as_arrays: BTreeMap::new(),
@@ -3930,6 +3941,9 @@ impl Context {
         let sort = self.m.mk_uninterpreted_sort(Symbol::new(&mono));
         self.sorts.insert(mono.clone(), sort);
         self.sort_order.push(mono);
+        // Remember the applied form so the model prints `(Tree Bool)`, not `Tree!12`.
+        self.mono_datatypes
+            .insert(sort, (name.to_string(), arg_sorts.clone()));
         // Substitute the type parameters by the concrete argument sort exprs in
         // every constructor field, then build the instance.
         let subst: Vec<(String, SExpr)> = params.into_iter().zip(args.iter().cloned()).collect();
@@ -3967,6 +3981,7 @@ impl Context {
                     let d = self.m.mk_func_decl(Symbol::new(cname), &[], sort);
                     let cid = self.m.mk_const(d);
                     self.funcs.insert(cname.clone(), d);
+                    self.overloads.entry(cname.clone()).or_default().push(d);
                     self.decl_order.push(cname.clone());
                     ctor_ids.push(cid);
                 }
@@ -3980,11 +3995,13 @@ impl Context {
                     .collect::<Result<_, _>>()?;
                 let cdecl = self.m.mk_func_decl(Symbol::new(cname), &field_sorts, sort);
                 self.funcs.insert(cname.clone(), cdecl);
+                self.overloads.entry(cname.clone()).or_default().push(cdecl);
                 self.decl_order.push(cname.clone());
                 let mut sel_decls = Vec::new();
                 for ((fname, _), &fsort) in fields.iter().zip(&field_sorts) {
                     let sdecl = self.m.mk_func_decl(Symbol::new(fname), &[sort], fsort);
                     self.funcs.insert(fname.clone(), sdecl);
+                    self.overloads.entry(fname.clone()).or_default().push(sdecl);
                     self.decl_order.push(fname.clone());
                     sel_decls.push(sdecl);
                 }
@@ -4002,11 +4019,13 @@ impl Context {
                         .collect::<Result<_, _>>()?;
                     let cdecl = self.m.mk_func_decl(Symbol::new(cname), &field_sorts, sort);
                     self.funcs.insert(cname.clone(), cdecl);
+                    self.overloads.entry(cname.clone()).or_default().push(cdecl);
                     self.decl_order.push(cname.clone());
                     let mut sel_decls = Vec::new();
                     for ((fname, _), &fsort) in fields.iter().zip(&field_sorts) {
                         let sdecl = self.m.mk_func_decl(Symbol::new(fname), &[sort], fsort);
                         self.funcs.insert(fname.clone(), sdecl);
+                        self.overloads.entry(fname.clone()).or_default().push(sdecl);
                         self.decl_order.push(fname.clone());
                         sel_decls.push(sdecl);
                     }
@@ -4098,6 +4117,152 @@ impl Context {
             return Some(r);
         }
         Some(render_fp(bits, eb, sb))
+    }
+
+    /// The set of every declaration that is a datatype constructor, selector, or
+    /// tester (across enums, records, and general datatypes). These are part of a
+    /// datatype declaration, not user-declared functions, so `get-model` skips them.
+    fn datatype_member_decls(&self) -> BTreeSet<AstId> {
+        let mut set = BTreeSet::new();
+        for ctors in self.datatypes.values() {
+            for (cdecl, sels, tdecl) in ctors {
+                set.insert(*cdecl);
+                set.extend(sels.iter().copied());
+                set.insert(*tdecl);
+            }
+        }
+        for (cdecl, sels) in self.records.values() {
+            set.insert(*cdecl);
+            set.extend(sels.iter().copied());
+        }
+        for ids in self.enums.values() {
+            for &cid in ids {
+                if let Some(app) = self.m.app(cid) {
+                    set.insert(app.decl);
+                }
+            }
+        }
+        set.extend(self.tester_of.values().copied());
+        set
+    }
+
+    /// The name of the constructor `cdecl`.
+    fn ctor_name(&self, cdecl: AstId) -> Option<String> {
+        self.m
+            .func_decl(cdecl)
+            .and_then(|d| d.name.as_str())
+            .map(str::to_string)
+    }
+
+    /// Does a constructor named `name` occur in more than one datatype sort (as
+    /// with a polymorphic `nil` shared by `(TreeList Int)` and `(TreeList Bool)`)?
+    /// Such a nullary constructor must be printed as `(as name sort)` to
+    /// disambiguate, matching z3.
+    fn ctor_name_ambiguous(&self, name: &str) -> bool {
+        let mut count = 0usize;
+        let named = |&d: &AstId| {
+            self.m
+                .func_decl(d)
+                .and_then(|f| f.name.as_str())
+                .is_some_and(|n| n == name)
+        };
+        for ctors in self.datatypes.values() {
+            if ctors.iter().any(|(cd, _, _)| named(cd)) {
+                count += 1;
+            }
+        }
+        for (cd, _) in self.records.values() {
+            if named(cd) {
+                count += 1;
+            }
+        }
+        for ids in self.enums.values() {
+            if ids
+                .iter()
+                .any(|&c| self.m.app(c).is_some_and(|a| named(&a.decl)))
+            {
+                count += 1;
+            }
+        }
+        count > 1
+    }
+
+    /// If `id` has a datatype (or record) sort, render its model value as the
+    /// constructor term z3 prints: `(node 21 (as nil (TreeList Int)))`. The
+    /// constructor is found from its tester's value under `model`; each field is
+    /// the model value of the corresponding selector applied to `id`, rendered
+    /// recursively. A nullary constructor prints as `(as C sort)` when its name is
+    /// shared across instantiations, else bare (`nil`, `leaf`, an enum literal).
+    fn dt_model_value(&mut self, model: &mut Model, id: AstId) -> Option<String> {
+        let sort = self.m.get_sort(id);
+        // General datatype: pick the constructor whose tester holds; if the value
+        // is unconstrained (no tester forced), fall back to a nullary constructor
+        // (z3's datatype factory likewise completes with a base constructor).
+        if let Some(ctors) = self.datatypes.get(&sort).cloned() {
+            let chosen = ctors
+                .iter()
+                .find(|(_, _, tdecl)| {
+                    let tester = self.m.mk_app(*tdecl, &[id]);
+                    matches!(model.eval(&self.m, tester), Value::Bool(true))
+                })
+                .or_else(|| ctors.iter().find(|(_, sels, _)| sels.is_empty()));
+            let (cdecl, sels, _) = chosen?;
+            return self.render_ctor(model, *cdecl, sels, id, sort);
+        }
+        // Record/tuple: a single constructor, always applicable.
+        if let Some((cdecl, sels)) = self.records.get(&sort).cloned() {
+            return self.render_ctor(model, cdecl, &sels, id, sort);
+        }
+        None
+    }
+
+    /// Render a constructor application `(C field₀ …)` for `id` under `model`,
+    /// reading each field from its selector's model value (rendered recursively).
+    fn render_ctor(
+        &mut self,
+        model: &mut Model,
+        cdecl: AstId,
+        sels: &[AstId],
+        id: AstId,
+        sort: AstId,
+    ) -> Option<String> {
+        let name = self.ctor_name(cdecl)?;
+        if sels.is_empty() {
+            // Nullary: `(as C sort)` when ambiguous across instances, else bare.
+            if self.ctor_name_ambiguous(&name) {
+                return Some(alloc::format!("(as {name} {})", self.sort_display(sort)));
+            }
+            return Some(name);
+        }
+        let mut out = alloc::format!("({name}");
+        for &sd in sels {
+            let field = self.m.mk_app(sd, &[id]);
+            out.push(' ');
+            out.push_str(&self.model_term_render(model, field));
+        }
+        out.push(')');
+        Some(out)
+    }
+
+    /// Render a term's model value through the full value stack, including the
+    /// datatype constructor-term form for datatype/record-sorted terms.
+    fn model_term_render(&mut self, model: &mut Model, id: AstId) -> String {
+        if let Some(cps) = self.str_value(id) {
+            return smt_string_literal(&cps);
+        }
+        if let Some(s) = self.str_model_value(model, id) {
+            return s;
+        }
+        if let Some(s) = self.dt_model_value(model, id) {
+            return s;
+        }
+        if let Some(s) = self.enum_value_name(model, id) {
+            return s;
+        }
+        if let Some(s) = self.fp_model_value(model, id) {
+            return s;
+        }
+        model.value_string(&self.m, id)
     }
 
     /// If `id` has an enum sort, the name of the constructor it equals under
@@ -23968,18 +24133,26 @@ impl Context {
             domain: Vec<AstId>,
             range: AstId,
         }
+        // Datatype constructors, selectors, and testers are part of a datatype
+        // declaration, not user functions: z3 never prints them in a model.
+        let dt_members = self.datatype_member_decls();
+        let mut seen = BTreeSet::new();
         let decls: Vec<Decl> = self
             .decl_order
             .iter()
-            .map(|name| {
+            .filter(|name| seen.insert((*name).clone())) // dedup: each name once
+            .filter_map(|name| {
                 let d = self.funcs[name];
+                if dt_members.contains(&d) {
+                    return None;
+                }
                 let fd = self.m.func_decl(d).unwrap();
-                Decl {
+                Some(Decl {
                     name: name.clone(),
                     d,
                     domain: fd.domain.clone(),
                     range: fd.range,
-                }
+                })
             })
             .collect();
         let mut model = self.last_model.take().unwrap();
@@ -24017,13 +24190,7 @@ impl Context {
                     continue; // array interpretations not yet emitted (invalid)
                 }
                 let c = self.m.mk_const(decl.d);
-                let v = self
-                    .str_value(c)
-                    .map(|cps| smt_string_literal(&cps))
-                    .or_else(|| self.str_model_value(&mut model, c))
-                    .or_else(|| self.enum_value_name(&mut model, c))
-                    .or_else(|| self.fp_model_value(&mut model, c))
-                    .unwrap_or_else(|| model.value_string(&self.m, c));
+                let v = self.model_term_render(&mut model, c);
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} () {sort_name}\n    {v})",
@@ -24065,6 +24232,15 @@ impl Context {
             .map(|(k, _)| k)
         {
             return alloc::format!("(_ FloatingPoint {eb} {sb})");
+        }
+        // A monomorphized parametric datatype prints in applied form: `(Tree Bool)`.
+        if let Some((base, args)) = self.mono_datatypes.get(&sort) {
+            let params = args
+                .iter()
+                .map(|&a| self.sort_display(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            return alloc::format!("({base} {params})");
         }
         self.m
             .sort(sort)
@@ -25996,6 +26172,30 @@ impl Context {
                 Ok(app)
             }
             name => {
+                // Overloaded datatype constructor/selector: several declarations
+                // share this name across monomorphic instances (`value` over
+                // `(Tree Int)` vs `(Tree Bool)`). Resolve to the candidate whose
+                // domain matches the argument sorts, as z3 does — otherwise the
+                // stale `funcs` entry (the last-registered instance) would apply a
+                // wrong-sorted selector and leave the real one unconstrained.
+                if let Some(cands) = self.overloads.get(name)
+                    && cands.len() > 1
+                {
+                    let arg_sorts: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
+                    if let Some(d) = cands
+                        .iter()
+                        .copied()
+                        .find(|&d| self.m.func_decl(d).is_some_and(|fd| fd.domain == arg_sorts))
+                    {
+                        if args.len() == 1 && self.m.is_ite(args[0]) {
+                            let s = self.m.get_sort(args[0]);
+                            if self.datatypes.contains_key(&s) || self.records.contains_key(&s) {
+                                return Ok(self.apply_unary_over_ite(d, args[0]));
+                            }
+                        }
+                        return Ok(self.m.mk_app(d, &args));
+                    }
+                }
                 if let Some(d) = self.funcs.get(name).copied() {
                     // A datatype/record selector applied to an `ite` distributes:
                     // `sel(ite(c,a,b)) = ite(c, sel(a), sel(b))`. This lets a
