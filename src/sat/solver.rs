@@ -24,6 +24,56 @@ pub enum SatResult {
 /// Sentinel `reason`: a decision literal or a top-level fact (no antecedent).
 const REASON_NONE: i32 = -1;
 
+/// Value of literal `l` under the raw per-variable assignment `assign` — the
+/// free-function form of [`Solver::lit_value`], so a [`TheoryHook`] closure can
+/// read the current assignment without borrowing the solver through a method.
+#[inline]
+fn lit_value_from(assign: &[LBool], l: Lit) -> LBool {
+    match assign[l.var() as usize] {
+        LBool::Undef => LBool::Undef,
+        LBool::True => LBool::from_bool(!l.sign()),
+        LBool::False => LBool::from_bool(l.sign()),
+    }
+}
+
+/// Theory implications and/or a conflict discovered at a propagation fixpoint,
+/// returned by [`TheoryHook::propagate`].
+pub struct TheoryProp {
+    /// `(p, reason)` pairs: literal `p` is theory-implied by the conjunction of
+    /// `reason`, whose literals must ALL currently be true. The solver
+    /// materializes the globally-valid clause `(p ∨ ¬reason…)` and enqueues `p`.
+    pub implied: Vec<(Lit, Vec<Lit>)>,
+    /// A set of currently-true literals that are jointly theory-inconsistent.
+    /// The solver materializes `¬conflict` (all-false) and runs 1-UIP analysis.
+    pub conflict: Option<Vec<Lit>>,
+}
+
+/// A theory participating in online DPLL(T) propagation. The SAT solver calls
+/// [`TheoryHook::propagate`] whenever Boolean propagation reaches a fixpoint,
+/// before branching — mirroring z3's `extension::unit_propagate`
+/// (`sat/sat_solver.cpp:989-1011`, gated by `should_propagate` `:1847`).
+///
+/// SOUNDNESS CONTRACT: every returned implication `(p, R)` must have all of `R`
+/// currently true and `R` must genuinely theory-entail `p`; every returned
+/// `conflict` must be currently-true literals that are jointly theory-
+/// inconsistent. The solver turns these into learnt clauses that conflict
+/// analysis resolves through, so an unsound return is an unsound lemma —
+/// implementers MUST independently verify each implication/conflict.
+pub trait TheoryHook {
+    /// Called at the Boolean fixpoint. `val(l)` gives `l`'s current value.
+    fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp;
+}
+
+/// Outcome of one theory-propagation pass (see [`Solver::theory_pass`]).
+enum TheoryPass {
+    /// A conflict clause was materialized; its index is ready for `analyze`.
+    Conflict(usize),
+    /// At least one literal was enqueued — re-run Boolean propagation.
+    Progress,
+    /// Nothing to do — safe to branch.
+    Idle,
+}
+
 /// A CDCL SAT solver.
 pub struct Solver {
     assign: Vec<LBool>,
@@ -424,7 +474,7 @@ impl Solver {
     /// undo an assumption yields [`SatResult::Unsat`].
     pub fn solve_assumptions(&mut self, assumptions: &[Lit]) -> SatResult {
         // Unbounded search never runs out of budget, so `None` is impossible.
-        self.search(assumptions, u64::MAX)
+        self.search(assumptions, u64::MAX, None)
             .unwrap_or(SatResult::Unsat)
     }
 
@@ -432,10 +482,97 @@ impl Solver {
     /// budget is exhausted (the caller treats that as `unknown`), so a
     /// hard-but-decidable instance cannot hang the solver.
     pub fn solve_budgeted(&mut self, max_conflicts: u64) -> Option<SatResult> {
-        self.search(&[], max_conflicts)
+        self.search(&[], max_conflicts, None)
     }
 
-    fn search(&mut self, assumptions: &[Lit], max_conflicts: u64) -> Option<SatResult> {
+    /// Solve with an online DPLL(T) theory: `theory` is consulted at every
+    /// Boolean propagation fixpoint (before branching) to propagate implied
+    /// literals and detect theory conflicts early. See [`TheoryHook`] for the
+    /// soundness contract. Learnt clauses (including materialized theory lemmas)
+    /// are retained, so repeated calls remain incremental.
+    pub fn solve_with_theory(&mut self, theory: &mut dyn TheoryHook) -> SatResult {
+        self.search(&[], u64::MAX, Some(theory))
+            .unwrap_or(SatResult::Unsat)
+    }
+
+    /// Attach an all-false clause (a theory conflict `¬C`, or a falsified
+    /// implication `(p ∨ ¬R)`) and return its index for [`Solver::analyze`].
+    /// Returns `None` for a degenerate (<2-literal) clause, which the caller
+    /// then ignores rather than mis-handle.
+    fn attach_conflict_clause(&mut self, lits: Vec<Lit>) -> Option<usize> {
+        if lits.len() < 2 {
+            return None;
+        }
+        for &l in &lits {
+            self.ensure_var(l.var());
+        }
+        let cref = self.clauses.len();
+        self.attach_clause(lits, true);
+        Some(cref)
+    }
+
+    /// Run one online theory-propagation pass at the Boolean fixpoint — the port
+    /// of z3 `extension::unit_propagate`. For each theory implication `(p, R)`:
+    /// `p` already true → nothing; `p` currently false → conflict via the
+    /// all-false `(p ∨ ¬R)`; `p` unassigned → materialize `(p ∨ ¬R)` and
+    /// `enqueue(p, …)`. A theory `conflict` `C` becomes the all-false `¬C`.
+    /// Every clause is a globally-valid theory lemma (the hook's soundness
+    /// contract), so conflict analysis resolves through it soundly.
+    fn theory_pass(&mut self, th: &mut dyn TheoryHook) -> TheoryPass {
+        let prop = {
+            let assign = &self.assign;
+            th.propagate(&|l| lit_value_from(assign, l))
+        };
+        if let Some(c) = prop.conflict {
+            let neg: Vec<Lit> = c.iter().map(|&l| !l).collect();
+            if let Some(cref) = self.attach_conflict_clause(neg) {
+                return TheoryPass::Conflict(cref);
+            }
+        }
+        let mut progress = false;
+        for (p, r) in prop.implied {
+            self.ensure_var(p.var());
+            match lit_value_from(&self.assign, p) {
+                LBool::True => {}
+                LBool::False => {
+                    let mut clause = alloc::vec![p];
+                    clause.extend(r.iter().map(|&l| !l));
+                    if let Some(cref) = self.attach_conflict_clause(clause) {
+                        return TheoryPass::Conflict(cref);
+                    }
+                }
+                LBool::Undef => {
+                    let mut clause = alloc::vec![p];
+                    clause.extend(r.iter().map(|&l| !l));
+                    if clause.len() == 1 {
+                        if self.enqueue(p, REASON_NONE) {
+                            progress = true;
+                        }
+                    } else {
+                        for &l in &clause {
+                            self.ensure_var(l.var());
+                        }
+                        let cref = self.clauses.len();
+                        self.attach_clause(clause, true);
+                        self.enqueue(p, cref as i32);
+                        progress = true;
+                    }
+                }
+            }
+        }
+        if progress {
+            TheoryPass::Progress
+        } else {
+            TheoryPass::Idle
+        }
+    }
+
+    fn search(
+        &mut self,
+        assumptions: &[Lit],
+        max_conflicts: u64,
+        mut theory: Option<&mut dyn TheoryHook>,
+    ) -> Option<SatResult> {
         if !self.ok {
             return Some(SatResult::Unsat);
         }
@@ -455,7 +592,27 @@ impl Solver {
         let mut restart_limit = luby(luby_index) * 100;
 
         loop {
-            if let Some(confl) = self.propagate() {
+            // Determine the conflict source this iteration: Boolean propagation
+            // first, then — only at the Boolean fixpoint with all assumptions
+            // placed — one online theory-propagation pass (port of z3
+            // `propagate_core`/`should_propagate`, `sat_solver.cpp:1002,1847`).
+            let confl: Option<usize> = if let Some(c) = self.propagate() {
+                Some(c)
+            } else if self.decision_level() >= n_assump {
+                match theory.as_deref_mut() {
+                    Some(th) => match self.theory_pass(th) {
+                        TheoryPass::Conflict(c) => Some(c),
+                        // Enqueued implications: re-run Boolean propagation.
+                        TheoryPass::Progress => continue,
+                        TheoryPass::Idle => None,
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+
+            if let Some(confl) = confl {
                 if self.decision_level() == 0 {
                     self.ok = false;
                     return Some(SatResult::Unsat);
@@ -547,6 +704,97 @@ mod tests {
         v.iter()
             .map(|&x| Lit::new(x.unsigned_abs() - 1, x < 0))
             .collect()
+    }
+
+    /// Mock online theory: whenever `a` is true, implies `b` with reason `[a]`
+    /// (models the constraint `a → b`). Exercises the [`TheoryHook`] propagation
+    /// path — the solver must materialize `(¬a ∨ b)` and enqueue `b` mid-search.
+    struct ImplyHook {
+        a: Lit,
+        b: Lit,
+    }
+    impl TheoryHook for ImplyHook {
+        fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp {
+            let mut implied = Vec::new();
+            if val(self.a) == LBool::True && val(self.b) != LBool::True {
+                implied.push((self.b, alloc::vec![self.a]));
+            }
+            TheoryProp {
+                implied,
+                conflict: None,
+            }
+        }
+    }
+
+    /// Mock online theory: `a ∧ b` is theory-inconsistent. Exercises the
+    /// conflict path — the solver must materialize `¬(a ∧ b)` and analyze it.
+    struct ConflictHook {
+        a: Lit,
+        b: Lit,
+    }
+    impl TheoryHook for ConflictHook {
+        fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp {
+            let conflict = if val(self.a) == LBool::True && val(self.b) == LBool::True {
+                Some(alloc::vec![self.a, self.b])
+            } else {
+                None
+            };
+            TheoryProp {
+                implied: Vec::new(),
+                conflict,
+            }
+        }
+    }
+
+    #[test]
+    fn theory_propagation_forces_and_chains() {
+        // The theory implies `b` from `a` mid-search; that must feed Boolean
+        // propagation so a downstream clause `(¬b ∨ c)` also fires.
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1])); // a (var 0) asserted
+        s.add_clause(&lits(&[-2, 3])); // (¬b ∨ c): b (var 1) → c (var 2)
+        let mut hook = ImplyHook {
+            a: Lit::pos(0),
+            b: Lit::pos(1),
+        };
+        assert_eq!(s.solve_with_theory(&mut hook), SatResult::Sat);
+        assert!(s.model_holds(Lit::pos(1)), "theory must force b");
+        assert!(
+            s.model_holds(Lit::pos(2)),
+            "b→c must propagate after the theory forces b"
+        );
+    }
+
+    #[test]
+    fn theory_conflict_yields_unsat_at_level_zero() {
+        // `a` and `b` forced true by units; the theory declares `a ∧ b` a
+        // conflict at level 0 → unsat.
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1])); // a
+        s.add_clause(&lits(&[2])); // b
+        let mut hook = ConflictHook {
+            a: Lit::pos(0),
+            b: Lit::pos(1),
+        };
+        assert_eq!(s.solve_with_theory(&mut hook), SatResult::Unsat);
+    }
+
+    #[test]
+    fn theory_conflict_forces_backtrack_to_model() {
+        // Nothing forces `a`/`b`; the theory conflict `a ∧ b` must be learnt
+        // mid-search and backtracked, yielding a model that respects it. `(a ∨ d)`
+        // keeps the problem satisfiable (e.g. via `d`).
+        let mut s = Solver::new();
+        s.add_clause(&lits(&[1, 3])); // (a ∨ d)
+        let mut hook = ConflictHook {
+            a: Lit::pos(0),
+            b: Lit::pos(1),
+        };
+        assert_eq!(s.solve_with_theory(&mut hook), SatResult::Sat);
+        assert!(
+            !(s.model_holds(Lit::pos(0)) && s.model_holds(Lit::pos(1))),
+            "model must respect the theory conflict a ∧ b"
+        );
     }
 
     #[test]
