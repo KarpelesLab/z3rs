@@ -3483,7 +3483,8 @@ impl Context {
                 // full decision pipeline (and model recording) applies.
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
                 self.last_assumptions.clear();
-                let (res, model) = if !is_using && list.len() > 1 {
+                let plain = is_using || list.len() <= 1;
+                let (res, mut model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
                     for a in &list[1..] {
                         let id = self.term(a)?;
@@ -3496,6 +3497,18 @@ impl Context {
                 } else {
                     self.optimize()
                 };
+                // z3 completes division-by-zero to 0 in the model. On the plain
+                // (assumption-free, non-optimize) `sat` path, prefer that completion
+                // when it is consistent (see `complete_div0`).
+                if plain
+                    && res == SmtResult::Sat
+                    && model.is_some()
+                    && self.objectives.is_empty()
+                    && self.soft.is_empty()
+                    && let Some(better) = self.complete_div0()
+                {
+                    model = Some(better);
+                }
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -17654,6 +17667,62 @@ impl Context {
     /// universal, so an `unsat` result is sound; but the instantiation is
     /// incomplete, so a `sat` result in the presence of universals is reported
     /// as a sound `unknown`.
+    /// The `/`/`div`/`mod` subterms in the current assertions whose divisor is a
+    /// literal zero. Division by zero is unspecified in SMT-LIB; z3 completes the
+    /// result to 0 in the model (its `/0`/`div0`/`mod0` functions default to 0).
+    fn div_by_zero_subterms(&self) -> Vec<AstId> {
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for &a in &self.assertions {
+            for t in self.m.postorder(a) {
+                if !self.m.is_app(t) {
+                    continue;
+                }
+                if !matches!(
+                    self.decl_name(self.m.app_decl(t)).as_deref(),
+                    Some("/") | Some("div") | Some("mod")
+                ) {
+                    continue;
+                }
+                let args = self.m.app_args(t);
+                if args.len() == 2
+                    && self.m.as_numeral(args[1]).is_some_and(|v| v.is_zero())
+                    && seen.insert(t)
+                {
+                    out.push(t);
+                }
+            }
+        }
+        out
+    }
+
+    /// z3's division-by-zero model completion. After a `sat`, pin every
+    /// literal-zero-divisor subterm to 0 and re-solve; if still `sat`, the
+    /// resulting model matches z3's completion (2561: `v = (0.0 = 1.0/0.0)` → z3
+    /// reports `v = true`, since `1.0/0.0` completes to `0`). If pinning is
+    /// inconsistent — the formula forces the result ≠ 0, e.g.
+    /// `(not (= 0.0 (/ 1.0 0.0)))`, which must stay `sat` — the re-solve is `unsat`
+    /// and the original model stands. Sound either way: a returned model still
+    /// satisfies every assertion (the pins are extra constraints).
+    fn complete_div0(&mut self) -> Option<Model> {
+        let pins = self.div_by_zero_subterms();
+        if pins.is_empty() {
+            return None;
+        }
+        let n = self.assertions.len();
+        for &t in &pins {
+            let is_int = self.m.is_int_sort(self.m.get_sort(t));
+            let zero = self
+                .m
+                .mk_numeral(Rational::from_integer(Int::from(0)), is_int);
+            let eq = self.m.mk_eq(t, zero);
+            self.assertions.push(eq);
+        }
+        let (res, model) = self.check_sat();
+        self.assertions.truncate(n);
+        if res == SmtResult::Sat { model } else { None }
+    }
+
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
         // A single-predicate Constrained Horn Clause system (a transition system
         // `Init/τ/Bad`) is decided by bounded model checking (for `unsat`, a
