@@ -11938,6 +11938,88 @@ impl Context {
     /// try a small concrete value for each divisor variable; substituting it makes
     /// the Euclidean product `b·q` linear, so a confirmed (non-nonlinear) `sat` is
     /// a real model. Returns `None` if no small divisor works.
+    /// Real-division witness: concretise the symbolic real divisors of `goal` to
+    /// small NONZERO values and, once the residual is linear (`q·b` becomes
+    /// `q·value`), decide it. Finds `sat` for goals a linear real solver reaches
+    /// only after the divisors are fixed — e.g. `a/b = 1/(c·b) + d ∧ d > 1`
+    /// (b=c=1 ⇒ `a = 1 + d`). Only nonzero divisors are tried, so no
+    /// division-by-zero (and thus no `/0`-consistency) is involved — a `sat` on
+    /// the linear residual is a genuine model.
+    fn try_realdiv_witness(&mut self, goal: AstId) -> Option<Model> {
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let divs: Vec<AstId> = {
+            let mut s: BTreeSet<AstId> = BTreeSet::new();
+            for &(_, b, _) in &self.symbolic_realdiv {
+                if present.contains(&b) && self.m.is_uninterp_const(b) {
+                    s.insert(b);
+                }
+            }
+            s.into_iter().collect()
+        };
+        if divs.is_empty() || divs.len() > 3 {
+            return None;
+        }
+        // Candidate nonzero values, plus the goal's nonzero integer constants.
+        let mut vals: Vec<i64> = alloc::vec![1, 2, 3, -1, -2, -3, 4, 5, -4, -5];
+        for &t in &present {
+            if let Some(i) = self
+                .m
+                .as_numeral(t)
+                .and_then(|r| r.to_integer())
+                .and_then(|v| v.to_i64())
+                && i != 0
+                && i.abs() <= 1000
+                && !vals.contains(&i)
+            {
+                vals.push(i);
+            }
+        }
+        vals.truncate(20);
+        // Per-divisor numeral (respect the divisor's sort — Int or Real).
+        let is_int: Vec<bool> = divs
+            .iter()
+            .map(|&d| self.m.is_int_sort(self.m.get_sort(d)))
+            .collect();
+        // Witnessable sats use small divisors, found in the first combinations;
+        // keep the search cheap so real-division-heavy goals don't time out.
+        const MAX_TRIES: usize = 120;
+        let mut idx = alloc::vec![0usize; divs.len()];
+        let mut tries = 0;
+        loop {
+            if tries >= MAX_TRIES {
+                return None;
+            }
+            tries += 1;
+            let subst: Vec<(AstId, AstId)> = divs
+                .iter()
+                .enumerate()
+                .map(|(k, &d)| {
+                    let n = Rational::from_integer(Int::from(vals[idx[k]]));
+                    (d, self.m.mk_numeral(n, is_int[k]))
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if !self.arith_nonlinear(g)
+                && let (SmtResult::Sat, m) = check_model(&self.m, g)
+            {
+                return m;
+            }
+            let mut k = 0;
+            loop {
+                if k == divs.len() {
+                    return None;
+                }
+                idx[k] += 1;
+                if idx[k] < vals.len() {
+                    break;
+                }
+                idx[k] = 0;
+                k += 1;
+            }
+        }
+    }
+
     fn try_divmod_witness(&mut self, goal: AstId) -> Option<Model> {
         let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
         let divs: Vec<AstId> = self
@@ -23208,6 +23290,17 @@ impl Context {
             if self.divmod_complete_unsat(goal) {
                 return (SmtResult::Unsat, None);
             }
+        }
+        // Real-division analogue: concretise symbolic real divisors to nonzero
+        // values and decide the linear residual (e.g. `a/b = 1/(c·b) + d ∧ d>1`).
+        if res != SmtResult::Unsat
+            && !self.symbolic_realdiv.is_empty()
+            && self.symbolic_realdiv.iter().any(|&(_, b, _)| {
+                self.m.is_uninterp_const(b) && self.m.postorder(goal).contains(&b)
+            })
+            && let Some(m) = self.try_realdiv_witness(goal)
+        {
+            return (SmtResult::Sat, Some(m));
         }
         if res != SmtResult::Unsat && self.arith_nonlinear(goal) {
             // First, try to *linearize*: a variable pinned by an equality
