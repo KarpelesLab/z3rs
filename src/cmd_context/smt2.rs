@@ -968,6 +968,11 @@ struct LiftCtx {
     toint: BTreeMap<AstId, AstId>,
     /// Memo of `(/ a b)` terms (symbolic divisor) → their quotient constant.
     rdiv: BTreeMap<AstId, AstId>,
+    /// Dividends occurring in ≥2 distinct `div`/`mod` terms — the only case where
+    /// two zero-divisor results can coincide, so only these get `div0`/`mod0`
+    /// consistency axioms (a lone zero-divisor term is genuinely free, and
+    /// emitting the axiom for every term needlessly bloats div/mod-heavy goals).
+    coincident_dividends: BTreeSet<AstId>,
 }
 
 /// An s-expression.
@@ -1817,6 +1822,16 @@ struct Context {
     /// identity `q = k` when the dividend is a product `d·k` and `d` is provably
     /// nonzero (`(/ (x·y) y) = x`).
     symbolic_realdiv: Vec<(AstId, AstId, AstId)>,
+    /// Shared `Int → Int` uninterpreted functions for division/modulo by zero.
+    /// SMT-LIB leaves `div a 0` / `mod a 0` unspecified, but z3 models them as
+    /// `div0(a)` / `mod0(a)` — FUNCTIONS OF THE DIVIDEND — so all zero-divisor
+    /// results with the same dividend agree (consistency). Created lazily.
+    int_div0_decl: Option<AstId>,
+    int_mod0_decl: Option<AstId>,
+    /// Re-entrancy guard for `try_divmod_witness`: set while it recursively
+    /// decides a divisor-concretised residual, so nested `decide_inner` calls do
+    /// not re-enter the witness search (which would risk unbounded recursion).
+    in_divmod_witness: bool,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -2755,6 +2770,9 @@ impl Context {
             symbolic_divisors: BTreeSet::new(),
             symbolic_divmod: Vec::new(),
             symbolic_realdiv: Vec::new(),
+            int_div0_decl: None,
+            int_mod0_decl: None,
+            in_divmod_witness: false,
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
@@ -3605,6 +3623,44 @@ impl Context {
         k
     }
 
+    /// The shared `Int → Int` uninterpreted `div0` function (z3's division-by-zero
+    /// term is a function of the dividend, so `div a 0` = `div0(a)` is consistent
+    /// across all zero-divisor occurrences with the same dividend).
+    fn div0_decl(&mut self) -> AstId {
+        if let Some(d) = self.int_div0_decl {
+            return d;
+        }
+        let int = self.m.mk_int_sort();
+        let d = self.m.mk_func_decl(Symbol::new("!div0!"), &[int], int);
+        self.int_div0_decl = Some(d);
+        d
+    }
+
+    /// The shared `Int → Int` uninterpreted `mod0` function (see [`Self::div0_decl`]).
+    fn mod0_decl(&mut self) -> AstId {
+        if let Some(d) = self.int_mod0_decl {
+            return d;
+        }
+        let int = self.m.mk_int_sort();
+        let d = self.m.mk_func_decl(Symbol::new("!mod0!"), &[int], int);
+        self.int_mod0_decl = Some(d);
+        d
+    }
+
+    /// Bind the quotient/remainder of a division by zero to `div0(a)` / `mod0(a)`,
+    /// so two zero-divisor terms with the same dividend `a` denote the same value
+    /// (EUF congruence), even when their divisors are syntactically different
+    /// (a literal `0` vs an alias `dv = 0`). Without this, each gets an
+    /// independent free quotient and a nonlinear witness can pick inconsistent
+    /// values for what is really one `div0(a)`.
+    fn divmod_zero_consistency(&mut self, a: AstId, q: AstId, r: AstId) -> (AstId, AstId) {
+        let d0 = self.div0_decl();
+        let m0 = self.mod0_decl();
+        let qv = self.m.mk_app(d0, &[a]);
+        let rv = self.m.mk_app(m0, &[a]);
+        (self.m.mk_eq(q, qv), self.m.mk_eq(r, rv))
+    }
+
     /// If `t` is `(div a n)` or `(mod a n)` with a constant integer divisor
     /// `n ≠ 0`, return the shared `(q, r)` for `a`,`n`, creating and constraining
     /// them (`a = n·q + r`, `0 ≤ r < |n|`) on first use.
@@ -3633,7 +3689,16 @@ impl Context {
                 ctx.defs.push(self.m.mk_lt(r, abs_n));
             }
             Some(_) => {
-                // Division by the literal 0 is unconstrained in SMT-LIB: q, r free.
+                // Division by the literal 0 is unspecified in SMT-LIB, but z3's
+                // div0/mod0 are functions of the dividend: pin `q = div0(a)`,
+                // `r = mod0(a)` so distinct zero-divisor terms with the same
+                // dividend agree (consistency). Only needed when the dividend is
+                // shared by ≥2 div/mod terms.
+                if ctx.coincident_dividends.contains(&a) {
+                    let (qeq, req) = self.divmod_zero_consistency(a, q, r);
+                    ctx.defs.push(qeq);
+                    ctx.defs.push(req);
+                }
             }
             None => {
                 // For a *compound* divisor expression, alias it to a fresh
@@ -3685,6 +3750,17 @@ impl Context {
                     ctx.defs.push(self.m.mk_implies(bne0, q1));
                     let r0 = self.m.mk_eq(r, zero);
                     ctx.defs.push(self.m.mk_implies(bne0, r0));
+                }
+                // When the divisor is zero, pin `q = div0(a)`, `r = mod0(a)` so this
+                // term agrees with every other zero-divisor term of the same
+                // dividend (consistency — see `divmod_zero_consistency`). Only when
+                // the dividend is shared by ≥2 div/mod terms.
+                if ctx.coincident_dividends.contains(&a) {
+                    let (qeq, req) = self.divmod_zero_consistency(a, q, r);
+                    let ib0 = self.m.mk_implies(beq0, qeq);
+                    ctx.defs.push(ib0);
+                    let ib1 = self.m.mk_implies(beq0, req);
+                    ctx.defs.push(ib1);
                 }
             }
         }
@@ -11920,6 +11996,16 @@ impl Context {
             }
         }
         const MAX_TRIES: usize = 800;
+        // Budget for recursively deciding a *nonlinear* divisor-concretised
+        // residual. An aliased product divisor `dv = a·b` set to 0 leaves
+        // `0 = a·b ∧ …` (nonlinear, but decidable sat — e.g. `a = 0`), which the
+        // linear check below rejects. Decide such residuals with the full engine,
+        // bounded so the ≤MAX_TRIES loop cannot blow up and guarded so the nested
+        // decide never re-enters this witness search. Sound because a returned,
+        // verified model of the residual is a model of the original (and
+        // div-by-zero consistency, `divmod_zero_consistency`, keeps coincident
+        // zero-divisor terms from being witnessed to inconsistent values).
+        let mut nl_budget: u32 = if self.in_divmod_witness { 0 } else { 6 };
         let mut idx = alloc::vec![0usize; divs.len()];
         let mut tries = 0;
         loop {
@@ -11936,10 +12022,18 @@ impl Context {
             let g = crate::rewriter::simplify(&mut self.m, g);
             // Only trust the verdict once the concretised goal is linear (the
             // nonlinear `b·q` is now `value·q`); then a `sat` is a genuine model.
-            if !self.arith_nonlinear(g)
-                && let (SmtResult::Sat, m) = check_model(&self.m, g)
-            {
-                return m;
+            if !self.arith_nonlinear(g) {
+                if let (SmtResult::Sat, m) = check_model(&self.m, g) {
+                    return m;
+                }
+            } else if nl_budget > 0 {
+                nl_budget -= 1;
+                self.in_divmod_witness = true;
+                let r = self.decide_inner(g);
+                self.in_divmod_witness = false;
+                if let (SmtResult::Sat, Some(m)) = r {
+                    return Some(m);
+                }
             }
             let mut k = 0;
             loop {
@@ -17644,12 +17738,30 @@ impl Context {
                 self.m.mk_and(&parts)
             }
         };
+        // Dividends shared by ≥2 distinct div/mod terms need div0/mod0 consistency.
+        let mut div_terms_by_dividend: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
+        for t in self.m.postorder(base) {
+            if self.m.is_app(t)
+                && matches!(self.m.arith_op(t), Some(ArithOp::Idiv) | Some(ArithOp::Mod))
+            {
+                let args = self.m.app_args(t);
+                if args.len() == 2 {
+                    div_terms_by_dividend.entry(args[0]).or_default().insert(t);
+                }
+            }
+        }
+        let coincident_dividends: BTreeSet<AstId> = div_terms_by_dividend
+            .into_iter()
+            .filter(|(_, terms)| terms.len() >= 2)
+            .map(|(a, _)| a)
+            .collect();
         let mut ctx = LiftCtx {
             defs: Vec::new(),
             cache: BTreeMap::new(),
             dm: BTreeMap::new(),
             toint: BTreeMap::new(),
             rdiv: BTreeMap::new(),
+            coincident_dividends,
         };
         let lifted = self.lift_terms(base, &mut ctx);
         if ctx.defs.is_empty() {
