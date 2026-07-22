@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/z3rs/compare/v0.0.8...v0.0.9) - 2026-07-22
+
+### Other
+
+- cancel quotient×divisor in products (nla-saturation), closes 3255
+- raise witness variable cap 3->4, closes nl55/3607/3244
+- leave-one-free witness pass, closes nl32/3237/3249
+- real-division witness (concretise symbolic divisors), closes 2919/3886
+- div-by-zero consistency (div0/mod0), unblocking nonlinear-divisor witness
+- complete division-by-zero to 0 (z3 convention, closes 2561)
+- *(T)* online theory-propagation hook in the SAT search loop (step D1)
+- *(T)* verified EUF equality-propagation mechanism (online-propagation step 1)
+- Fix wrong-sat: don't trust a nonlinear sat when a constraining atom was dropped
+- Farkas conflict cores (DPLL(T) 1b) + fix nonlinear div-by-zero spurious sat
+- EUF theory conflict cores (first online-DPLL(T) increment)
+- Datatype model: constructor-term values, applied sort names, overload resolution
+- complete uninterpreted-function interpretations in get-model (port z3 func_interp)
+- port z3 array_rewriter core rules (new array_rewriter module)
+- port z3 bv_rewriter constant folding + identities (new bv_rewriter module)
+- enable the verified witness for bit-vector element sequences (closes 2417)
+- fold bit-vector constant equalities (port z3 bv_rewriter::mk_eq_core)
+- raise witness-search var cap 3->4 (closes 3500)
+- Fix wrong-unsat: guard prefixof/suffixof leading-char axiom by the predicate
+- extend verified witness search (int.to.str, literal/index candidates)
+- inline v = (str.++ ...) bindings so substr-of-concat peels (2533)
+- fold out-of-range str.substr / negative str.at to "" (issue-1366)
+- fold str.prefixof of a provable front-prefix to true (issue-1566)
+- (re.* R) matches every string when R accepts every single char
+- Fix wrong verdicts: CHC engines silently ignored the ground assertions
+- Fix wrong-unsat in multi-predicate CHC; add finite model finding
+- generalise from enums/datatypes to any finite sort, and see distinct
+- recognise perfect-square polynomials as nonnegative (closes nl26)
+- refute by polynomial saturation + monomial abstraction (nlsat::nla)
+- Ackermannize uninterpreted predicates; underspecified bv div-by-zero
+- Format is_closed_over tuple (fix CI fmt check)
+- Decide closed universals by refuting not-phi with the ground solver
+- Reduce nested trivial/finite quantifiers instead of opaque unknown
+- push not through top-level quantifiers (¬∃⇒∀, ¬∀⇒∃)
+- Fold abs idempotence and reflexive equality (a=a -> true)
+- Logic-aware sorts: reject Array outside array logics (t174)
+- report malformed quantifier (wrong body count) like z3, then resync
+- :print-success / :smtlib2-compliant: print 'success' per successful command
+- report unknown (set-logic X) as z3's unsupported + ignoring-comment
+- report unknown symbols as z3's (error …) and continue
+- simplify command-loop parse-error handling (clippy)
+- source positions + command-level error recovery
+- Revert "Arith: bound sin/cos/tanh to [-1, 1]"
+- bound sin/cos/tanh to [-1, 1]
+- pull integer offsets from to_int, distribute to_real over +
+- decide ground store-chain equality pointwise
+- macro-finder — free-macro universals don't gate a sat
+- treat narrow bit-vectors as a finite domain
+- expand finite-domain foralls to ground conjunctions
+- run the nonlinear machinery on undecided goals, not only sat
+- fold x^(-k) = ite(x=0, 0, 1/x^k) on a real base (z3 semantics)
+- Nonlinear witness: enumerate up to 3 nonlinear-critical vars
+- fold bv2nat((_ int2bv n) t) = t mod 2^n
+- suffixof ⇒ tail-substring identity axiom
+- fold =/distinct of two string literals (z3 simplify parity)
+- Fix same spurious-sat in the sequence concat split
+- Fix spurious sat: str-concat split ignored literal parts
+- port z3 seq_rewriter replace rules + concat normal form
+- peel leading operands of (str.substr (str.++ …) 0 n)
+- witness a record whose bit-vector / float field is pinned
+
 ## [0.0.8](https://github.com/KarpelesLab/z3rs/compare/v0.0.7...v0.0.8) - 2026-07-10
 
 ### Other
