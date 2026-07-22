@@ -23692,6 +23692,60 @@ impl Context {
                 return Some(model);
             }
         }
+        // Second pass: leave ONE nonlinear variable FREE and fix the rest over the
+        // grid. A product `v·w` with `w` fixed is linear in the free `v`, so
+        // `check_model` then solves `v` over the reals — catching sats the
+        // all-fixed integer grid misses (nl32 `a·b`: fix `a=0`, leave `b` free ⇒
+        // `0 < b < 1`, satisfied by `b = 1/2`). Budgeted so the search stays cheap.
+        let mut budget: u32 = 200;
+        for free in 0..nl_vars.len() {
+            let others: Vec<AstId> = nl_vars
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != free)
+                .map(|(_, &v)| v)
+                .collect();
+            if others.is_empty() {
+                continue; // a lone nonlinear var never linearises by fixing others
+            }
+            let ototal = side.pow(others.len() as u32);
+            for idx in 0..ototal {
+                if budget == 0 {
+                    return None;
+                }
+                budget -= 1;
+                let mut rem = idx;
+                let subst: Vec<(AstId, AstId)> = others
+                    .iter()
+                    .map(|&v| {
+                        let d = (rem % side) as i64 - b;
+                        rem /= side;
+                        let lit = if self.m.is_int_sort(self.m.get_sort(v)) {
+                            self.m.mk_int(d)
+                        } else {
+                            self.m.mk_real(d)
+                        };
+                        (v, lit)
+                    })
+                    .collect();
+                let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+                let g = crate::rewriter::simplify(&mut self.m, g);
+                // The free variable may still occur nonlinearly (e.g. `v²`); trust
+                // only a residual the substitution fully linearised.
+                if self.arith_nonlinear(g) {
+                    continue;
+                }
+                if let (SmtResult::Sat, m) = check_model(&self.m, g) {
+                    let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                    for &(v, val) in &subst {
+                        if let Some(r) = self.m.as_numeral(val) {
+                            model.set_arith(v, r);
+                        }
+                    }
+                    return Some(model);
+                }
+            }
+        }
         None
     }
 
