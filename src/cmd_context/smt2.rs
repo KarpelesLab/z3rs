@@ -23653,14 +23653,19 @@ impl Context {
                 }
             }
         }
-        if nl_vars.is_empty() || nl_vars.len() > 3 {
+        if nl_vars.is_empty() || nl_vars.len() > 4 {
             return None;
         }
         // Grid half-width shrinks with the variable count so the product of
-        // enumerations stays bounded (17 / 17² / 11³ candidates).
-        let b: i64 = if nl_vars.len() >= 3 { 5 } else { 8 };
+        // enumerations stays bounded (17 / 17² / 11³ / 5⁴ candidates); the 4-var
+        // case additionally caps the first pass so it never dominates runtime.
+        let b: i64 = match nl_vars.len() {
+            4 => 2,
+            3 => 5,
+            _ => 8,
+        };
         let side = (2 * b + 1) as usize;
-        let total = side.pow(nl_vars.len() as u32);
+        let total = side.pow(nl_vars.len() as u32).min(700);
         for idx in 0..total {
             let mut rem = idx;
             let subst: Vec<(AstId, AstId)> = nl_vars
