@@ -12209,6 +12209,93 @@ impl Context {
         axioms
     }
 
+    /// Cancel a quotient against its own divisor inside a product:
+    /// `(* … (/ a b) … b …) → (* … a …)` when `b ≠ 0` is provable from the goal's
+    /// top-level conjuncts (`(/ a b)·b = a` for `b ≠ 0`). This is nla-saturation
+    /// the polynomial engine misses: it reduces 3255
+    /// `r2·(r2/r1)·r1 = 0.207 ∧ (distinct r1 0 …)` to `r2² = 0.207`, which the
+    /// univariate real-root decision then settles. Sound: gated on a provable
+    /// `b ≠ 0`, where the identity holds exactly.
+    fn realdiv_product_cancel(&mut self, goal: AstId) -> AstId {
+        // Top-level conjuncts feed the `b ≠ 0` check.
+        let mut top: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                top.push(t);
+            }
+        }
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        self.rdc_rewrite(goal, &top, &mut memo)
+    }
+
+    fn rdc_rewrite(&mut self, t: AstId, top: &[AstId], memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let result = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let args: Vec<AstId> = self
+                .m
+                .app_args(t)
+                .to_vec()
+                .into_iter()
+                .map(|a| self.rdc_rewrite(a, top, memo))
+                .collect();
+            let rebuilt = self.m.mk_app(decl, &args);
+            if self.m.arith_op(rebuilt) == Some(ArithOp::Mul) {
+                self.rdc_cancel_mul(rebuilt, top)
+            } else {
+                rebuilt
+            }
+        } else {
+            t
+        };
+        memo.insert(t, result);
+        result
+    }
+
+    /// Cancel every `(/ a b)`×`b` pair (b provably nonzero) among a product's
+    /// factors, replacing the pair with `a`.
+    fn rdc_cancel_mul(&mut self, mul: AstId, top: &[AstId]) -> AstId {
+        let mut factors: Vec<AstId> = self.m.app_args(mul).to_vec();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            'outer: for i in 0..factors.len() {
+                if self.m.arith_op(factors[i]) != Some(ArithOp::Div) {
+                    continue;
+                }
+                let da = self.m.app_args(factors[i]);
+                if da.len() != 2 {
+                    continue;
+                }
+                let (a, b) = (da[0], da[1]);
+                if !self.divisor_nonzero(b, top) {
+                    continue;
+                }
+                for j in 0..factors.len() {
+                    if j != i && factors[j] == b {
+                        let (lo, hi) = (i.min(j), i.max(j));
+                        factors.remove(hi);
+                        factors.remove(lo);
+                        factors.push(a);
+                        changed = true;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        match factors.len() {
+            1 => factors[0],
+            _ => self.m.mk_mul(&factors),
+        }
+    }
+
     /// Exact-quotient identity for real `/`: when the dividend is a product
     /// `d·k` and the divisor `d` is provably nonzero, `(/ (d·k) d) = k` (real
     /// division is exact). The nonlinear `q·d = d·k` identity leaves both products
@@ -12525,6 +12612,16 @@ impl Context {
                         ArithOp::Ge if k <= -1 => return true,
                         _ => {}
                     }
+                }
+            }
+            // `(distinct … d … 0 …)`: all args pairwise distinct, so `d ≠ 0`.
+            if self.m.is_distinct(c) {
+                let args = self.m.app_args(c);
+                let has_zero = args
+                    .iter()
+                    .any(|&x| self.m.as_numeral(x).map(|r| r.is_zero()) == Some(true));
+                if has_zero && args.contains(&d) {
+                    return true;
                 }
             }
         }
@@ -17953,6 +18050,10 @@ impl Context {
             conj.extend(instances);
             self.m.mk_and(&conj)
         };
+        // Cancel `quotient × its divisor` inside products (`(/ a b)·b → a`, b≠0)
+        // before lifting, so a goal like 3255 `r2·(r2/r1)·r1 = 0.207` reduces to
+        // `r2² = 0.207` for the nonlinear decision.
+        combined = self.realdiv_product_cancel(combined);
         // Pure-modular decision on the raw goal (before any axioms with implications
         // are added, which the evaluator can't read): evaluate over residue
         // combinations in [0, lcm). Complete when every variable occurs only under
