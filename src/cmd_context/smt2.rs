@@ -25666,38 +25666,60 @@ impl Context {
                             .map_err(|_| "fp.to_ubv/sbv: bad width".to_string())?;
                         let rm = self.term(&l[1])?;
                         let x = self.term(&l[2])?;
-                        if (1..=63).contains(&m)
-                            && let Some(rmc) = self.rm_code(rm)
+                        if (1..=64).contains(&m)
                             && let Some(&(bits, eb, sb)) = self.fp_of.get(&x)
                         {
-                            // Constant FP input and constant rounding mode: either an
-                            // exact in-range integer (folded), or an UNSPECIFIED result
-                            // (NaN/∞ ⇒ no real value, or a finite value out of range).
-                            // z3 models the unspecified case as an uninterpreted value
-                            // distinguished by the full application, so cache a free
-                            // bit-vector by `(signed, m, rm, x)` — congruent, and free to
-                            // take any value (matching z3, yielding a real `sat`).
-                            let folded = Self::fp_real_value(bits, eb, sb)
-                                .and_then(|r| Self::round_rational_to_int(&r, rmc))
-                                .filter(|&v| {
-                                    if signed {
-                                        let hi = 1i64 << (m - 1);
-                                        v >= -hi && v < hi
-                                    } else {
-                                        v >= 0 && (m == 64 || v < (1i64 << m))
-                                    }
-                                });
-                            if let Some(v) = folded {
-                                return Ok(self.m.mk_bv_numeral(Int::from(v), m));
+                            // Constant FP input: fold to the rounded integer when it is
+                            // *determined*, else model the UNSPECIFIED result (NaN/∞ ⇒
+                            // no real value, or a finite value out of range) as a free
+                            // bit-vector keyed by `(signed, m, rm, x)` — congruent, and
+                            // free to take any value (matching z3, yielding a real `sat`).
+                            // A *constant* rounding mode rounds any finite value; a
+                            // *symbolic* rounding mode still determines the result when
+                            // the value is already integral (rounding an integer is the
+                            // identity for every mode) — this covers `to_ubv`/`to_sbv` of
+                            // an exact integer regardless of the rounding mode.
+                            let rval = Self::fp_real_value(bits, eb, sb);
+                            let rmc_opt = self.rm_code(rm);
+                            let v_opt: Option<i64> = match (&rval, rmc_opt) {
+                                (Some(r), Some(rmc)) => Self::round_rational_to_int(r, rmc),
+                                (Some(r), None) if r.is_integer() => {
+                                    r.to_integer().and_then(|i| i.to_i64())
+                                }
+                                _ => None,
+                            };
+                            if let Some(v) = v_opt {
+                                let v128 = v as i128;
+                                let in_range = if signed {
+                                    let hi = 1i128 << (m - 1);
+                                    v128 >= -hi && v128 < hi
+                                } else {
+                                    v128 >= 0 && v128 < (1i128 << m)
+                                };
+                                if in_range {
+                                    return Ok(self.m.mk_bv_numeral(Int::from(v), m));
+                                }
                             }
-                            let key = (signed, m, rm, x);
-                            if let Some(&t) = self.fp_to_bv_unspec.get(&key) {
+                            // Unspecified — a NaN/∞ input (no real value, for any rm), or
+                            // a finite value out of range (a determined integer outside
+                            // the target width). NOT unspecified: a symbolic rm over a
+                            // finite *non-integer* value (rm-dependent) — fall through to
+                            // the bit-blast circuit / `unknown` gate.
+                            let unspecified = match (&rval, rmc_opt) {
+                                (None, _) => true,
+                                (Some(_), Some(_)) => true,
+                                (Some(r), None) => r.is_integer(),
+                            };
+                            if unspecified {
+                                let key = (signed, m, rm, x);
+                                if let Some(&t) = self.fp_to_bv_unspec.get(&key) {
+                                    return Ok(t);
+                                }
+                                let s = self.m.mk_bv_sort(m);
+                                let t = self.fresh_const(s);
+                                self.fp_to_bv_unspec.insert(key, t);
                                 return Ok(t);
                             }
-                            let s = self.m.mk_bv_sort(m);
-                            let t = self.fresh_const(s);
-                            self.fp_to_bv_unspec.insert(key, t);
-                            return Ok(t);
                         }
                         // Symbolic input (or symbolic rounding mode): first try the
                         // exact bit-blast circuit (port of z3 `mk_to_bv`), which is a
