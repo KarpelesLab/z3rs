@@ -16936,6 +16936,183 @@ impl Context {
         Some(result)
     }
 
+    /// Bit-blast `fp.to_sbv`/`fp.to_ubv` on a symbolic operand into an `m`-bit
+    /// bit-vector term (port of z3's `fpa2bv_converter::mk_to_bv`, `is_signed =
+    /// signed`). The rounding mode must be constant (its per-mode branches
+    /// collapse at build time via `fp_rounding_decision`). Returns `None` for
+    /// unsupported formats/widths so the caller keeps the sound `unknown` gate.
+    ///
+    /// NaN/∞, an unsigned negative input, and any out-of-range rounded value map
+    /// to the UNSPECIFIED result: a *free* (uninterpreted, congruent) `m`-bit BV
+    /// keyed by `(signed, m, rm, x)` — never a pinned value — so `sat` stays
+    /// sound while the finite in-range case equals the exact conversion.
+    fn fp_to_bv_bv(&mut self, signed: bool, m: u32, rm: AstId, x: AstId) -> Option<AstId> {
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        // `fp_unpack_norm` implements only the `eb <= sb` case; bias/unpack need
+        // eb,sb >= 2. Keep the total width within the u64 the FP helpers assume.
+        if eb < 2 || sb < 2 || eb > sb || eb + sb > 64 || !(1..=63).contains(&m) {
+            return None;
+        }
+        let rm_c = self.rm_code(rm)?; // constant rounding mode only
+        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let bvx = self.fp_to_bv(x)?;
+        let w = eb + sb;
+
+        let bv0 = self.m.mk_bv(0, 1);
+        let bv1 = self.m.mk_bv(1, 1);
+
+        // Classification (z3 mk_is_nan/inf/zero/neg) on the packed bits.
+        let expf = self.m.mk_bv_extract(w - 2, sb - 1, bvx);
+        let sigf = self.m.mk_bv_extract(sb - 2, 0, bvx);
+        let sbit = self.m.mk_bv_extract(w - 1, w - 1, bvx);
+        let ez = self.m.mk_bv(0, eb);
+        let eo = self.m.mk_bvnot(ez);
+        let sz = self.m.mk_bv(0, sb - 1);
+        let exp_ones = self.m.mk_eq(expf, eo);
+        let exp_zero = self.m.mk_eq(expf, ez);
+        let sig_zero = self.m.mk_eq(sigf, sz);
+        let sig_nz = self.m.mk_not(sig_zero);
+        let x_is_nan = self.m.mk_and(&[exp_ones, sig_nz]);
+        let x_is_inf = self.m.mk_and(&[exp_ones, sig_zero]);
+        let x_is_zero = self.m.mk_and(&[exp_zero, sig_zero]);
+        let x_is_neg = self.m.mk_eq(sbit, bv1);
+
+        // unpack(x, normalize=true): sgn[1], sig[sb], exp[eb] unbiased, lz[eb].
+        let (sgn, sig0, exp, lz) = self.fp_unpack_norm(bvx, eb, sb);
+
+        // sig is of the form +-[1].[sig]; pad to at least m+3 bits.
+        let (sig, sig_sz) = if sb < m + 3 {
+            let pad = self.m.mk_bv(0, m + 3 - sb);
+            (self.m.mk_bv_concat(sig0, pad), m + 3)
+        } else {
+            (sig0, sb)
+        };
+
+        // exp_m_lz = sign_extend(2, exp) - zero_extend(2, lz)   [eb+2 bits]
+        let se_exp = self.m.mk_bv_sign_extend(2, exp);
+        let ze_lz = self.m.mk_bv_zero_extend(2, lz);
+        let exp_m_lz = self.m.mk_bvsub(se_exp, ze_lz);
+
+        // big_sig = [...m+2 zeros...][sig][0]   [big_sig_sz = sig_sz+m+3 bits]
+        let ze_sig = self.m.mk_bv_zero_extend(m + 2, sig);
+        let big_sig = self.m.mk_bv_concat(ze_sig, bv0);
+        let big_sig_sz = sig_sz + m + 3;
+
+        let zero_eb2 = self.m.mk_bv(0, eb + 2);
+        let is_neg_shift = self.m.mk_bvsle(exp_m_lz, zero_eb2);
+        let neg_emlz = self.m.mk_bvneg(exp_m_lz);
+        let shift0 = self.m.mk_ite(is_neg_shift, neg_emlz, exp_m_lz); // eb+2 bits
+
+        // Resize `shift` to big_sig_sz bits. For `eb <= sb` the source unbiased
+        // exponent guarantees `eb+2 < big_sig_sz`, so only the zero-extend arm is
+        // reachable; the `>` arm (z3's high-bit-cap) can never trigger — refuse it.
+        let shift1 = if eb + 2 < big_sig_sz {
+            self.m.mk_bv_zero_extend(big_sig_sz - (eb + 2), shift0)
+        } else if eb + 2 == big_sig_sz {
+            shift0
+        } else {
+            return None;
+        };
+
+        // Cap the shift at m+2 (any larger shifts everything past the int part).
+        let shift_limit = self.m.mk_bv((m + 2) as i64, big_sig_sz);
+        let le_limit = self.m.mk_bvule(shift1, shift_limit);
+        let shift = self.m.mk_ite(le_limit, shift1, shift_limit);
+
+        let lshr = self.m.mk_bvlshr(big_sig, shift);
+        let shl = self.m.mk_bvshl(big_sig, shift);
+        let bss = self.m.mk_ite(is_neg_shift, lshr, shl); // big_sig_shifted
+
+        // int_part [m+3 bits], then last/round/sticky just below it.
+        let int_part = self
+            .m
+            .mk_bv_extract(big_sig_sz - 1, big_sig_sz - (m + 3), bss);
+        let last = self
+            .m
+            .mk_bv_extract(big_sig_sz - (m + 3), big_sig_sz - (m + 3), bss);
+        let round = self
+            .m
+            .mk_bv_extract(big_sig_sz - (m + 4), big_sig_sz - (m + 4), bss);
+        let stickies = self.m.mk_bv_extract(big_sig_sz - (m + 5), 0, bss);
+        let sticky = self.fp_redor(stickies); // 1 bit
+
+        let rd = self.fp_rounding_decision(rm3, sgn, last, round, sticky); // 1 bit
+        let inc = self.m.mk_bv_zero_extend(m + 2, rd); // m+3 bits
+        let pre_rounded0 = self.m.mk_bvadd(int_part, inc); // m+3 bits
+
+        let incd = self.m.mk_eq(rd, bv1);
+        let zero_m3 = self.m.mk_bv(0, m + 3);
+        let pr_is_zero = self.m.mk_eq(pre_rounded0, zero_m3);
+        let ovfl0 = self.m.mk_and(&[incd, pr_is_zero]);
+
+        // Range check (and, for signed, apply the two's-complement sign).
+        let (in_range, pre_rounded) = if !signed {
+            // ul = 2^m - 1  (zero_extend(3, neg(1:m))).
+            let one_m = self.m.mk_bv(1, m);
+            let neg_one_m = self.m.mk_bvneg(one_m);
+            let ul = self.m.mk_bv_zero_extend(3, neg_one_m); // m+3 bits
+            let not_neg = self.m.mk_not(x_is_neg);
+            let nn_or_z = self.m.mk_or(&[not_neg, pr_is_zero]);
+            let not_ovfl = self.m.mk_not(ovfl0);
+            let ule_ul = self.m.mk_bvule(pre_rounded0, ul);
+            let ir = self.m.mk_and(&[nn_or_z, not_ovfl, ule_ul]);
+            (ir, pre_rounded0)
+        } else {
+            // ll = -2^(m-1)  (sign_extend(3, 1·0^(m-1))).
+            let ll = if m > 1 {
+                let z = self.m.mk_bv(0, m - 1);
+                self.m.mk_bv_concat(bv1, z) // m bits
+            } else {
+                bv1 // 1 bit
+            };
+            let ll = self.m.mk_bv_sign_extend(3, ll); // m+3 bits
+            // ul = 2^(m-1) - 1.
+            let ul = if m > 1 {
+                let one_m1 = self.m.mk_bv(1, m - 1);
+                let neg = self.m.mk_bvneg(one_m1);
+                self.m.mk_bv_zero_extend(4, neg) // (m-1)+4 = m+3 bits
+            } else {
+                self.m.mk_bv(0, 4) // m+3 == 4 when m == 1
+            };
+            // Also overflow if the magnitude went negative (exceeded 2^(m+2)).
+            let one_m3 = self.m.mk_bv(1, m + 3);
+            let neg_one_m3 = self.m.mk_bvneg(one_m3);
+            let sle_neg = self.m.mk_bvsle(pre_rounded0, neg_one_m3);
+            let ovfl = self.m.mk_or(&[ovfl0, sle_neg]);
+            // Apply the sign (two's complement) for a negative input.
+            let neg_pr = self.m.mk_bvneg(pre_rounded0);
+            let pr = self.m.mk_ite(x_is_neg, neg_pr, pre_rounded0);
+            let not_ovfl = self.m.mk_not(ovfl);
+            let ll_le = self.m.mk_bvsle(ll, pr);
+            let le_ul = self.m.mk_bvsle(pr, ul);
+            let ir = self.m.mk_and(&[not_ovfl, ll_le, le_ul]);
+            (ir, pr)
+        };
+
+        let rounded = self.m.mk_bv_extract(m - 1, 0, pre_rounded); // m bits
+
+        // Unspecified: a *free* congruent BV keyed by the application. Same key
+        // space as the constant path (`fp_to_bv_unspec`) so identical
+        // applications share the value; never a pinned value → `sat` stays sound.
+        let key = (signed, m, rm, x);
+        let unspec = if let Some(&u) = self.fp_to_bv_unspec.get(&key) {
+            u
+        } else {
+            let s = self.m.mk_bv_sort(m);
+            let u = self.fresh_const(s);
+            self.fp_to_bv_unspec.insert(key, u);
+            u
+        };
+
+        // result = ite(c1, unspec, ite(c2, 0, ite(!in_range, unspec, rounded)))
+        let not_ir = self.m.mk_not(in_range);
+        let r = self.m.mk_ite(not_ir, unspec, rounded);
+        let zero_m = self.m.mk_bv(0, m);
+        let r = self.m.mk_ite(x_is_zero, zero_m, r);
+        let c1 = self.m.mk_or(&[x_is_nan, x_is_inf]);
+        Some(self.m.mk_ite(c1, unspec, r))
+    }
+
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
@@ -25522,10 +25699,16 @@ impl Context {
                             self.fp_to_bv_unspec.insert(key, t);
                             return Ok(t);
                         }
-                        // Symbolic input (or symbolic rounding mode): a genuine
-                        // conversion whose value we cannot fold. Gate to a sound
-                        // `unknown` (a free bit-vector would be unsound — it must equal
-                        // the real conversion of the eventual FP value).
+                        // Symbolic input (or symbolic rounding mode): first try the
+                        // exact bit-blast circuit (port of z3 `mk_to_bv`), which is a
+                        // pure-BV term the QF_BV engine decides. `None` (unsupported
+                        // format/width/rm) falls back to the sound `unknown` gate.
+                        if let Some(t) = self.fp_to_bv_bv(signed, m, rm, x) {
+                            return Ok(t);
+                        }
+                        // A genuine conversion whose value we cannot fold. Gate to a
+                        // sound `unknown` (a free bit-vector would be unsound — it must
+                        // equal the real conversion of the eventual FP value).
                         let s = self.m.mk_bv_sort(m);
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
