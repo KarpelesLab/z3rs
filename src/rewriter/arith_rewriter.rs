@@ -64,6 +64,20 @@ pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Optio
         Some(m.mk_numeral(acc, is_int))
     } else if kind == ArithOp::Uminus as DeclKind {
         Some(m.mk_numeral(-&nums[0], is_int))
+    } else if kind == ArithOp::Div as DeclKind {
+        // Real division of numerals folds to a single rational numeral, mirroring
+        // z3's `arith_rewriter::mk_div_core` (a `rational` carries `9/70` as ONE
+        // value, not a `(/ 9 70)` application). Without this the quotient stays a
+        // division node that `as_numeral`/`arith_nonlinear` misread as a non-numeral
+        // nonlinear term. Division by zero is unspecified — left unfolded.
+        let mut acc = nums[0].clone();
+        for n in &nums[1..] {
+            if n.is_zero() {
+                return None;
+            }
+            acc = &acc / n;
+        }
+        Some(m.mk_numeral(acc, false))
     } else if kind == ArithOp::Le as DeclKind {
         Some(bool_of(m, nums[0] <= nums[1]))
     } else if kind == ArithOp::Lt as DeclKind {
