@@ -1800,6 +1800,21 @@ struct Context {
     /// Bit-vector representation of a symbolic FP term (`fp_to_bv`), so equality
     /// and the classification predicates bit-blast through the QF_BV engine.
     fp_bv: BTreeMap<AstId, AstId>,
+    /// While `> 0` (parsing inside a quantifier body), FP operations are kept as
+    /// opaque *deferred* symbolic nodes rather than bit-blasted eagerly. Mirrors
+    /// z3's architecture: parsing keeps FP as symbolic theory terms and the
+    /// `fpa2bv` conversion runs later, as a whole-goal pass — here `fpa_blast`,
+    /// applied to each ground instance *after* quantifier instantiation. Eager
+    /// parse-time blasting ties an FP op to a fresh bit-vector disconnected from
+    /// the binder, so `substitute` cannot reach it (see the deferral in `fp_op`).
+    fp_defer_depth: u32,
+    /// The interned per-`(op, domain)` declarations used for deferred FP nodes,
+    /// so `fpa_blast` can recognise a deferred application and recover its op.
+    fp_deferred_decls: BTreeSet<AstId>,
+    /// `(op, domain sorts) → interned deferred decl`, so the same deferred FP op
+    /// over the same argument sorts hash-conses to one application (a substituted
+    /// instance stays congruent with the body it came from).
+    fp_deferred_by_op: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
     /// `(Seq E)` sorts, keyed by element sort.
     seq_sorts: BTreeMap<AstId, AstId>,
     /// Sequence terms with a known element list (built from `seq.unit`/`++`/
@@ -2764,6 +2779,9 @@ impl Context {
             fp_of: BTreeMap::new(),
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
+            fp_defer_depth: 0,
+            fp_deferred_decls: BTreeSet::new(),
+            fp_deferred_by_op: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
             seq_of: BTreeMap::new(),
             seq_empty: BTreeMap::new(),
@@ -17115,6 +17133,97 @@ impl Context {
 
     /// Build/fold a floating-point operation. Only `Float64` operands with the
     /// `RNE` rounding mode fold (via `f64`); anything else is a sound `unknown`.
+    /// Build a *deferred* symbolic FP node for `op(args)` when `op` is one this
+    /// pass supports keeping symbolic through quantifier instantiation. Returns
+    /// `None` for ops not (yet) deferrable, so `fp_op` blasts them eagerly as
+    /// before. The node is a plain application of a stable per-`(op, domain)`
+    /// declaration (so a substituted copy hash-conses to the same shape) and is
+    /// marked opaque (`str_symbolic`) — if it ever reaches `decide` unlowered, the
+    /// goal soundly gates to `unknown` rather than treating it as a free value.
+    fn mk_deferred_fp(&mut self, op: &str, args: &[AstId]) -> Option<AstId> {
+        // Bool-returning predicates: classifications and comparisons. (Arithmetic
+        // FP ops in quantifier bodies are rarer; left to the eager path for now.)
+        let is_pred = matches!(
+            op,
+            "fp.isNaN"
+                | "fp.isInfinite"
+                | "fp.isZero"
+                | "fp.isNormal"
+                | "fp.isSubnormal"
+                | "fp.isNegative"
+                | "fp.isPositive"
+                | "fp.eq"
+                | "fp.lt"
+                | "fp.leq"
+                | "fp.gt"
+                | "fp.geq"
+        );
+        if !is_pred {
+            return None;
+        }
+        // Every argument must be FP-sorted (a classification/comparison operand);
+        // otherwise this is not a shape we can lower by re-running `fp_op`.
+        if !args
+            .iter()
+            .all(|&a| self.fp_format_of(self.m.get_sort(a)).is_some())
+        {
+            return None;
+        }
+        let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
+        let key = (alloc::string::String::from(op), domain.clone());
+        let decl = if let Some(&d) = self.fp_deferred_by_op.get(&key) {
+            d
+        } else {
+            let bool_sort = self.m.mk_bool_sort();
+            let name = alloc::format!("!fpq!{op}");
+            let d = self.m.mk_func_decl(Symbol::new(&name), &domain, bool_sort);
+            self.fp_deferred_by_op.insert(key, d);
+            self.fp_deferred_decls.insert(d);
+            d
+        };
+        let app = self.m.mk_app(decl, args);
+        self.str_symbolic.insert(app);
+        Some(app)
+    }
+
+    /// Lower every deferred FP node (`mk_deferred_fp`) in `t` to its bit-blasted
+    /// form by re-running `fp_op` with deferral disabled, bottom-up. This is z3's
+    /// `fpa2bv` conversion applied as a term pass — run on each ground instance
+    /// after quantifier substitution, when the operands are concrete FP terms the
+    /// circuit can blast. Non-deferred subterms are rebuilt unchanged.
+    fn fpa_blast(&mut self, t: AstId) -> AstId {
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for id in self.m.postorder(t) {
+            let Some(app) = self.m.app(id) else {
+                memo.insert(id, id);
+                continue;
+            };
+            let decl = app.decl;
+            let args: Vec<AstId> = app.args.iter().map(|c| memo[c]).collect();
+            let deferred = self.fp_deferred_decls.contains(&decl);
+            let rebuilt = if deferred {
+                // Recover the op from the interned decl name (`!fpq!<op>`) and
+                // blast it with the (already-lowered) concrete arguments.
+                let name = self.decl_name(decl).unwrap_or_default();
+                let opname = name.strip_prefix("!fpq!").unwrap_or(&name).to_string();
+                let saved = self.fp_defer_depth;
+                self.fp_defer_depth = 0;
+                let r = self.fp_op(&opname, &args);
+                self.fp_defer_depth = saved;
+                match r {
+                    Ok(v) => v,
+                    Err(_) => self.m.mk_app(decl, &args),
+                }
+            } else if args.iter().zip(app.args.iter()).any(|(a, b)| a != b) {
+                self.m.mk_app(decl, &args)
+            } else {
+                id
+            };
+            memo.insert(id, rebuilt);
+        }
+        memo[&t]
+    }
+
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
         // fp.* ops take a rounding-mode first argument for the rounding ops.
         let rne = |ctx: &Self, a: AstId| {
@@ -17123,6 +17232,15 @@ impl Context {
                 .is_some_and(|n| n == "RNE" || n == "roundNearestTiesToEven")
         };
         let f64_bits = |v: f64| v.to_bits();
+        // Inside a quantifier body, keep the FP op symbolic (deferred) instead of
+        // bit-blasting it now over a fresh bit-vector the binder can't reach.
+        // `fpa_blast` lowers it once instantiation has substituted ground FP
+        // arguments. Unsupported ops fall through to the eager path (no change).
+        if self.fp_defer_depth > 0
+            && let Some(d) = self.mk_deferred_fp(op, args)
+        {
+            return Ok(d);
+        }
         match op {
             "fp.add" | "fp.sub" | "fp.mul" | "fp.div" if args.len() == 3 => {
                 if let (true, Some(a), Some(b)) =
@@ -18207,7 +18325,12 @@ impl Context {
         // below already declines, so the fast path only ever legitimately applies
         // when the ground side is empty. Require exactly that.
         let ground_trivial = self.assertions.iter().all(|&a| self.m.is_true(a));
+        // Deferred FP predicates (`mk_deferred_fp`) look like uninterpreted Horn
+        // predicates but have fixed FP semantics — the CHC engines would wrongly
+        // read `∀a. fp.isNaN a` as a satisfiable free-predicate fact. Keep such
+        // universals on the instantiation path (which lowers and refutes them).
         if ground_trivial
+            && self.fp_deferred_decls.is_empty()
             && !self.universals.is_empty()
             && let Some(r) = self
                 .solve_chc()
@@ -20680,7 +20803,11 @@ impl Context {
             vars.push(ph);
         }
         self.scopes.push(scope);
+        // Keep FP ops in the body symbolic (deferred) so instantiation can reach
+        // the binder; `fpa_blast` lowers each ground instance later.
+        self.fp_defer_depth += 1;
         let result = self.term(body);
+        self.fp_defer_depth -= 1;
         self.scopes.pop();
         Ok((vars, result?))
     }
@@ -20980,7 +21107,21 @@ impl Context {
         for (vars, _) in &universals {
             for &v in vars {
                 let s = self.m.get_sort(v);
-                if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
+                // An FP binder: seed the special values (±0, ±∞, NaN) as refutation
+                // candidates, so a classification/comparison universal can be
+                // falsified by a concrete witness (e.g. `∀a. fp.isNaN a` is refuted
+                // by `+zero`). The FP domain stays infinite → still seed-only, so a
+                // `sat` over it remains a sound `unknown`.
+                if let Some((eb, sb)) = self.fp_format_of(s) {
+                    let had_ground = by_sort.get(&s).is_some_and(|e| !e.is_empty());
+                    for name in ["+zero", "-zero", "+oo", "-oo", "NaN"] {
+                        let c = self.fp_special(name, eb, sb);
+                        by_sort.entry(s).or_default().insert(c);
+                    }
+                    if !had_ground {
+                        seeded_sorts.insert(s);
+                    }
+                } else if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
                     let rep = self.fresh_const(s);
                     by_sort.entry(s).or_default().insert(rep);
                     seeded_sorts.insert(s);
@@ -21008,7 +21149,12 @@ impl Context {
                     for binding in self.ematch_set(set, &vs, &by_decl) {
                         let subst: Vec<(AstId, AstId)> =
                             vars.iter().map(|&v| (v, binding[&v])).collect();
-                        let raw = substitute(&mut self.m, *body, &subst);
+                        let mut raw = substitute(&mut self.m, *body, &subst);
+                        // Lower any deferred FP nodes now that the binder is a
+                        // concrete FP term (z3's fpa2bv, applied per instance).
+                        if !self.fp_deferred_decls.is_empty() {
+                            raw = self.fpa_blast(raw);
+                        }
                         // Alternate arithmetic/Boolean simplification with
                         // datatype folding so selector/tester chains collapse.
                         let mut inst = crate::rewriter::simplify(&mut self.m, raw);
@@ -21122,7 +21268,12 @@ impl Context {
                 }
                 for combo in combos {
                     let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
-                    let raw = substitute(&mut self.m, *body, &subst);
+                    let mut raw = substitute(&mut self.m, *body, &subst);
+                    // Lower any deferred FP nodes now that the binder is a concrete
+                    // FP term (z3's fpa2bv, applied per instance).
+                    if !self.fp_deferred_decls.is_empty() {
+                        raw = self.fpa_blast(raw);
+                    }
                     // Simplify the instance: constant `ite` conditions and ground
                     // arithmetic fold away, so recursive definitions bottom out
                     // (e.g. `f(0) = ite(0≤0, 0, f(-1))` collapses to `0`) instead
