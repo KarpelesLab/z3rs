@@ -15747,6 +15747,19 @@ impl Context {
         Self::real_to_fp_bits(&r, eb, sb, 0)
     }
 
+    /// The packed bits of `r` in the `(eb, sb)` format when `r` is *exactly*
+    /// representable — so every rounding mode yields the same value. Returns
+    /// `None` when `r` needs rounding (the result is then rounding-mode dependent)
+    /// or is out of range. Lets `to_fp`/`to_fp_unsigned` of an exact integer fold
+    /// even under a *symbolic* rounding mode (e.g. 65504 → the max Float16).
+    fn fp_exact_bits(r: &Rational, eb: u32, sb: u32) -> Option<u64> {
+        let bits = Self::real_to_fp_bits(r, eb, sb, 4)?; // RTZ reference
+        match Self::fp_real_value(bits, eb, sb) {
+            Some(v) if &v == r => Some(bits),
+            _ => None,
+        }
+    }
+
     /// Round a real (rational) constant to the `(eb, sb)` floating-point format
     /// under rounding mode `rm` (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ), returning the
     /// packed bit pattern. Handles zero, normals, subnormals, and overflow→inf/
@@ -25650,59 +25663,63 @@ impl Context {
                         let x = self.term(&l[if has_rm { 2 } else { 1 }])?;
                         if has_rm {
                             let rm = self.term(&l[1])?;
-                            // Round a constant real/int to the target format under a
-                            // constant rounding mode — bit-exact for any (eb,sb).
-                            // Ternary form `((_ to_fp eb sb) RM sig exp)` denotes the
-                            // real `sig * 2^exp` (z3 extension); fold that value too.
-                            if let Some(rmc) = self.rm_code(rm) {
-                                let base = self.m.as_numeral(x);
-                                let r_opt: Option<Rational> = if l.len() == 4 {
-                                    let e = self.term(&l[3])?;
-                                    match (
-                                        base,
-                                        self.m
-                                            .as_numeral(e)
-                                            .and_then(|r| r.to_integer())
-                                            .and_then(|i| i.to_i64()),
-                                    ) {
-                                        (Some(b), Some(ei)) if ei.unsigned_abs() <= 100_000 => {
-                                            Some(b.mul(&Rational::power_of_two(ei as i32)))
-                                        }
-                                        _ => None,
+                            // Source *real* value of a constant operand, independent
+                            // of the rounding mode: a real/int numeral, the ternary
+                            // `((_ to_fp eb sb) RM sig exp)` = `sig · 2^exp` (z3
+                            // extension), or a constant bit-vector read as a signed
+                            // (`to_fp`) / unsigned (`to_fp_unsigned`) machine integer.
+                            let base = self.m.as_numeral(x);
+                            let r_opt: Option<Rational> = if l.len() == 4 {
+                                let e = self.term(&l[3])?;
+                                match (
+                                    base,
+                                    self.m
+                                        .as_numeral(e)
+                                        .and_then(|r| r.to_integer())
+                                        .and_then(|i| i.to_i64()),
+                                ) {
+                                    (Some(b), Some(ei)) if ei.unsigned_abs() <= 100_000 => {
+                                        Some(b.mul(&Rational::power_of_two(ei as i32)))
                                     }
+                                    _ => None,
+                                }
+                            } else if base.is_some() {
+                                base
+                            } else if l.len() == 3
+                                && let Some(m_w) = self.m.bv_sort_width(self.m.get_sort(x))
+                                && let Some(val) = self.m.bv_numeral_value(x)
+                            {
+                                let two = Int::from(2);
+                                let mut uval = Int::from(0);
+                                for i in 0..m_w {
+                                    if val.bit(i) {
+                                        uval = uval.add(&two.pow(i));
+                                    }
+                                }
+                                let is_unsigned =
+                                    matches!(&qid[1], SExpr::Atom(a) if a == "to_fp_unsigned");
+                                let ival = if !is_unsigned && m_w > 0 && val.bit(m_w - 1) {
+                                    uval.sub(&two.pow(m_w))
                                 } else {
-                                    base
+                                    uval
                                 };
-                                if let Some(r) = r_opt
+                                Some(Rational::from_integer(ival))
+                            } else {
+                                None
+                            };
+                            if let Some(r) = r_opt {
+                                // Exactly representable ⇒ rounding-mode independent:
+                                // fold even under a *symbolic* rounding mode (this is
+                                // what makes `to_fp_unsigned RM1 65504 = to_fp_unsigned
+                                // RM2 65504` provable for RM1 ≠ RM2).
+                                if let Some(bits) = Self::fp_exact_bits(&r, eb, sb) {
+                                    return Ok(self.mk_fp(bits, eb, sb));
+                                }
+                                // Otherwise needs a constant rounding mode.
+                                if let Some(rmc) = self.rm_code(rm)
                                     && let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc)
                                 {
                                     return Ok(self.mk_fp(bits, eb, sb));
-                                }
-                                // `((_ to_fp eb sb) RM bv)` converts a *signed*
-                                // machine integer to FP; `to_fp_unsigned` an
-                                // unsigned one. Fold a constant bit-vector.
-                                if l.len() == 3
-                                    && let Some(m_w) = self.m.bv_sort_width(self.m.get_sort(x))
-                                    && let Some(val) = self.m.bv_numeral_value(x)
-                                {
-                                    let two = Int::from(2);
-                                    let mut uval = Int::from(0);
-                                    for i in 0..m_w {
-                                        if val.bit(i) {
-                                            uval = uval.add(&two.pow(i));
-                                        }
-                                    }
-                                    let is_unsigned =
-                                        matches!(&qid[1], SExpr::Atom(a) if a == "to_fp_unsigned");
-                                    let ival = if !is_unsigned && m_w > 0 && val.bit(m_w - 1) {
-                                        uval.sub(&two.pow(m_w))
-                                    } else {
-                                        uval
-                                    };
-                                    let r = Rational::from_integer(ival);
-                                    if let Some(bits) = Self::real_to_fp_bits(&r, eb, sb, rmc) {
-                                        return Ok(self.mk_fp(bits, eb, sb));
-                                    }
                                 }
                             }
                             // Float → float format conversion.
