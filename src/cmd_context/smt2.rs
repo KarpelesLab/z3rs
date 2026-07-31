@@ -1808,6 +1808,9 @@ struct Context {
     /// parse-time blasting ties an FP op to a fresh bit-vector disconnected from
     /// the binder, so `substitute` cannot reach it (see the deferral in `fp_op`).
     fp_defer_depth: u32,
+    /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
+    /// is congruent — two occurrences with equal arguments share one term.
+    fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
     /// The interned per-`(op, domain)` declarations used for deferred FP nodes,
     /// so `fpa_blast` can recognise a deferred application and recover its op.
     fp_deferred_decls: BTreeSet<AstId>,
@@ -2780,6 +2783,7 @@ impl Context {
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
             fp_defer_depth: 0,
+            fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
@@ -17521,6 +17525,15 @@ impl Context {
 
     /// A fresh uninterpreted term for a symbolic FP operation, gated to `unknown`.
     fn symbolic_fp(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // An FP operation is a function: the same op over the same arguments has
+        // the same (if unspecified, still fixed) value. Cache by `(op, args)` so
+        // two occurrences share one term — congruent, matching z3's uninterpreted
+        // `fpa.to_real`/… Without this, `fp.to_real(NaN) = fp.to_real(NaN)` would
+        // be two independent free reals (a missed unsat, e.g. fp-conversions-41).
+        let key = (alloc::string::String::from(op), args.to_vec());
+        if let Some(&t) = self.fp_symbolic_cache.get(&key) {
+            return Ok(t);
+        }
         let sort = match op {
             "fp.eq" | "fp.lt" | "fp.leq" | "fp.gt" | "fp.geq" | "fp.isNaN" | "fp.isInfinite"
             | "fp.isZero" | "fp.isNormal" | "fp.isSubnormal" | "fp.isNegative"
@@ -17534,6 +17547,7 @@ impl Context {
         let d = self.m.mk_func_decl(Symbol::new(&name), &domain, sort);
         let app = self.m.mk_app(d, args);
         self.str_symbolic.insert(app);
+        self.fp_symbolic_cache.insert(key, app);
         Ok(app)
     }
 
