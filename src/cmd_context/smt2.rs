@@ -1547,6 +1547,15 @@ fn render_sexpr(s: &SExpr) -> String {
     }
 }
 
+/// Whether any atom anywhere in `s` contains the substring `needle` (used to
+/// spot a tactic name like `nlsat` inside a `check-sat-using` tactic term).
+fn sexpr_mentions(s: &SExpr, needle: &str) -> bool {
+    match s {
+        SExpr::Atom(a) => a.contains(needle),
+        SExpr::List(l) => l.iter().any(|e| sexpr_mentions(e, needle)),
+    }
+}
+
 fn parse_one(
     toks: &[String],
     positions: &[(u32, u32)],
@@ -1808,6 +1817,12 @@ struct Context {
     /// parse-time blasting ties an FP op to a fresh bit-vector disconnected from
     /// the binder, so `substitute` cannot reach it (see the deferral in `fp_op`).
     fp_defer_depth: u32,
+    /// Set for a `(check-sat-using …)` whose tactic requests `nlsat` (e.g.
+    /// `qfnra-nlsat`). z3's *plain* `check-sat` leaves a transcendental goal like
+    /// `sin x < −1` `unknown`, but `qfnra-nlsat` decides it; gating the trig
+    /// range bounds on this flag mirrors that tactic-dependent completeness (so
+    /// trig-bounds → unsat while plain sine9 stays unknown, byte-matching z3).
+    nlsat_requested: bool,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -2783,6 +2798,7 @@ impl Context {
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
             fp_defer_depth: 0,
+            nlsat_requested: false,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -3523,6 +3539,10 @@ impl Context {
                 // full decision pipeline (and model recording) applies.
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
                 self.last_assumptions.clear();
+                // A `check-sat-using` tactic that names `nlsat` unlocks the trig
+                // range bounds (see `nlsat_requested`); reset for the next check.
+                self.nlsat_requested =
+                    is_using && list.get(1).is_some_and(|t| sexpr_mentions(t, "nlsat"));
                 let plain = is_using || list.len() <= 1;
                 let (res, mut model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
@@ -18408,6 +18428,7 @@ impl Context {
         let mut cong = self.divmod_congruence_axioms(combined);
         cong.extend(self.realdiv_congruence_axioms(combined));
         cong.extend(self.mod_multiple_axioms(combined));
+        cong.extend(self.trig_bound_axioms(combined));
         if !cong.is_empty() {
             cong.push(combined);
             combined = self.m.mk_and(&cong);
@@ -26320,6 +26341,43 @@ impl Context {
     /// The declaration name of a function/constant.
     fn decl_name(&self, decl: AstId) -> Option<String> {
         Some(self.m.func_decl(decl)?.name.as_str()?.to_string())
+    }
+
+    /// Range bounds for the bounded transcendental functions occurring in `goal`:
+    /// `sin`/`cos` ∈ [−1, 1] and `tanh` ∈ (−1, 1) (emitted as the sound weak
+    /// bounds [−1, 1]). z3rs leaves these opaque, so without the bound a goal like
+    /// `sin θ < −1` stays `unknown`; with it the opaque real is contradicted and
+    /// the goal refutes (trig-bounds, issue #680). Sound: every real argument maps
+    /// into the stated range.
+    fn trig_bound_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        // Only under an `nlsat` tactic — z3's plain `check-sat` leaves these
+        // `unknown`, so emitting the bound there would over-decide and lose
+        // byte-parity (sine9).
+        if !self.nlsat_requested {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            let Some(app) = self.m.app(t) else { continue };
+            if app.args.len() != 1 {
+                continue;
+            }
+            let is_trig = self
+                .decl_name(app.decl)
+                .as_deref()
+                .is_some_and(|n| matches!(n, "sin" | "cos" | "tanh"));
+            if !is_trig || !seen.insert(t) {
+                continue;
+            }
+            let neg1 = self.m.mk_numeral(Rational::from(-1i64), false);
+            let one = self.m.mk_numeral(Rational::from(1i64), false);
+            let lo = self.m.mk_ge(t, neg1);
+            let hi = self.m.mk_le(t, one);
+            out.push(lo);
+            out.push(hi);
+        }
+        out
     }
 
     /// A term that is an application of a symbolic FP-operation marker decl
