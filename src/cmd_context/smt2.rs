@@ -6854,6 +6854,19 @@ impl Context {
                 .iter()
                 .map(|&a| self.select_expand_map(a, idx))
                 .collect();
+            // Multi-dimensional map: `(_ map f)` operates on the array *range*, so
+            // for a k-index array (curried as nested arrays here) selecting one
+            // index yields another `(_ map f)` over the selected sub-arrays; `f`
+            // applies only once the operands reach its (scalar) domain. Refutes
+            // t150 (`(_ map foo)` over `(Array Int Int Int)`).
+            if selects
+                .iter()
+                .any(|&s| self.m.is_array_sort(self.m.get_sort(s)))
+            {
+                let t = self.fresh_const(self.m.get_sort(selects[0]));
+                self.maps.insert(t, (fname, selects));
+                return t;
+            }
             if let Ok(applied) = self.apply(&fname, selects) {
                 return applied;
             }
@@ -18510,6 +18523,83 @@ impl Context {
         Some(f)
     }
 
+    /// If some recorded universal is a *free macro* `∀x̄. f(x̄) = rhs` defining the
+    /// function `decl`, return `(head_args, rhs)` — the head's argument list (the
+    /// bound variables, in order) and the definition body.
+    fn free_macro_def(&self, decl: AstId) -> Option<(Vec<AstId>, AstId)> {
+        for (vars, body) in &self.universals {
+            if self.macro_head(vars, *body) != Some(decl) {
+                continue;
+            }
+            if self.m.is_eq(*body) && self.m.app_args(*body).len() == 2 {
+                let a = self.m.app_args(*body);
+                for (head, rhs) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.app(head).is_some_and(|ap| ap.decl == decl) {
+                        return Some((self.m.app_args(head).to_vec(), rhs));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Inline every *free macro* `∀x̄. f(x̄) = rhs` into `goal`, replacing each
+    /// application `f(t̄)` by `rhs[x̄ := t̄]`. Sound and complete — a free macro is a
+    /// total definition of `f`. Needed when `f` applications only materialise
+    /// *after* quantifier instantiation ran, e.g. produced by `map`/`select`
+    /// expansion (t150): the macro would otherwise never be applied to them.
+    fn inline_free_macros(&mut self, goal: AstId) -> AstId {
+        let mut defs: BTreeMap<AstId, (Vec<AstId>, AstId)> = BTreeMap::new();
+        for (vars, body) in self.universals.clone() {
+            if let Some(decl) = self.macro_head(&vars, body)
+                && let Some(def) = self.free_macro_def(decl)
+            {
+                defs.insert(decl, def);
+            }
+        }
+        if defs.is_empty() {
+            return goal;
+        }
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        self.inline_macros_rec(goal, &defs, &mut memo, 0)
+    }
+
+    fn inline_macros_rec(
+        &mut self,
+        t: AstId,
+        defs: &BTreeMap<AstId, (Vec<AstId>, AstId)>,
+        memo: &mut BTreeMap<AstId, AstId>,
+        depth: u32,
+    ) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let out = match self.m.app(t) {
+            Some(app) if !app.args.is_empty() => {
+                let decl = app.decl;
+                let raw_args = app.args.to_vec();
+                let args: Vec<AstId> = raw_args
+                    .iter()
+                    .map(|&a| self.inline_macros_rec(a, defs, memo, depth))
+                    .collect();
+                if let Some((params, rhs)) = defs.get(&decl).cloned()
+                    && params.len() == args.len()
+                    && depth < 32
+                {
+                    let sub: Vec<(AstId, AstId)> = params.into_iter().zip(args).collect();
+                    let inst = crate::rewriter::substitute(&mut self.m, rhs, &sub);
+                    // `rhs` cannot mention `decl`, but may use another macro; re-inline.
+                    self.inline_macros_rec(inst, defs, memo, depth + 1)
+                } else {
+                    self.m.mk_app(decl, &args)
+                }
+            }
+            _ => t,
+        };
+        memo.insert(t, out);
+        out
+    }
+
     /// Every recorded universal is a *free macro* defining an uninterpreted
     /// function that is used nowhere else (no ground assertion, no other
     /// universal). Such a set is always satisfiable — define each function by its
@@ -22867,6 +22957,23 @@ impl Context {
             let Some((fname, arrays)) = self.maps.get(m).cloned() else {
                 continue;
             };
+            // A *multi-dimensional* map applies `f` to the array range, so a single
+            // `select` yields another map, not `f(...)`. Detected by the element
+            // sort of a source array still being an array. For those, substitute the
+            // bound variable *by the map* (when it is a plain constant), so
+            // `expand_map_selects`' push-through resolves nested reads down to the
+            // scalar level — the pointwise-`f(a[i]…)=b[i]` axiom below is ill-sorted
+            // and would drop the map relation (a wrong `sat`, t150).
+            let elem_is_array = self
+                .m
+                .array_sort_params(self.m.get_sort(arrays[0]))
+                .is_some_and(|(_, elem)| self.m.is_array_sort(elem));
+            if elem_is_array {
+                if self.m.is_uninterp_const(*b) {
+                    subst.push((*b, *m));
+                }
+                continue;
+            }
             for &i in &indices {
                 // A const-array source reads its value at any index; resolve it so
                 // `f` sees the constant (`(_ map +) (const 1) (const 2)` → +(1,2)).
@@ -22893,7 +23000,11 @@ impl Context {
         }
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         axioms.push(g);
-        let out = self.m.mk_and(&axioms);
+        let out = if axioms.len() == 1 {
+            axioms[0]
+        } else {
+            self.m.mk_and(&axioms)
+        };
         crate::rewriter::simplify(&mut self.m, out)
     }
 
@@ -23449,7 +23560,13 @@ impl Context {
             // Decide any map-array *equality* pointwise (extensionality), so the
             // De Morgan / commutativity identities over `(_ map f)` don't hit the
             // conservative map-array `unknown` gate below.
-            self.fold_map_equalities(g)
+            let g = self.fold_map_equalities(g);
+            // Inline free-macro functions into the applications the map expansion
+            // just created (`(_ map foo) …` over a `∀x,y. foo(x,y)=x+y`): those
+            // appear past the point instantiation ran, so the definition must be
+            // substituted here. Also collapses the now-redundant `foo` enumeration
+            // instances to `true`, keeping the goal within `check_model`'s reach.
+            self.inline_free_macros(g)
         };
         // Eager UNSAT check for variable-bound ground datatype selector chains:
         // inline `v = <ground ctor>` to a fixpoint and fold the selector towers, then
