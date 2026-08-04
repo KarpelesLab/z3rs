@@ -26417,6 +26417,32 @@ impl Context {
                     .iter()
                     .map(|a| self.term(a))
                     .collect::<Result<_, _>>()?;
+                // A chained equality `(= … c₁ … c₂ …)` with two *distinct* numeral
+                // constants anywhere is `false` — all operands must be equal, so
+                // `c₁ = c₂` is required. z3 folds this in `simplify`; doing it here
+                // (not just for a top-level assertion) keeps a nested occurrence
+                // from surviving and dragging an otherwise-dead subterm — e.g. a
+                // division whose divisor a later `≠ 0` then makes the goal nonlinear
+                // (3253: `(= 0.0 (/ r8 (/ c r8)) 0.62829 r12)` inside an `xor`).
+                if head == "=" && args.len() >= 2 {
+                    let mut num: Option<Rational> = None;
+                    let mut clash = false;
+                    for &a in &args {
+                        if let Some(n) = self.m.as_numeral(a) {
+                            match &num {
+                                Some(p) if *p != n => {
+                                    clash = true;
+                                    break;
+                                }
+                                None => num = Some(n),
+                                _ => {}
+                            }
+                        }
+                    }
+                    if clash {
+                        return Ok(self.m.mk_false());
+                    }
+                }
                 // Fold equality / disequality of two string literals (z3 does this
                 // in simplify): distinct literals are unequal. Prevents a downstream
                 // rewrite from equating two distinct literals, which the EUF — which
