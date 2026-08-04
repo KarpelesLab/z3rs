@@ -17463,6 +17463,197 @@ impl Context {
         memo[&t]
     }
 
+    /// Is `t` the transcendental constant `pi`?
+    fn is_pi(&self, t: AstId) -> bool {
+        self.m.app(t).is_some_and(|a| a.args.is_empty())
+            && self.decl_name(self.m.app_decl(t)).as_deref() == Some("pi")
+    }
+
+    /// The constant rational `c` when `t = c·pi` (a product of numerals and
+    /// exactly one `pi`, possibly negated); `None` for any other term (which then
+    /// stays in a trig argument's residual — including a non-constant `pi·z`).
+    fn pi_coeff(&self, t: AstId) -> Option<Rational> {
+        use crate::ast::ArithOp;
+        let mut stack = alloc::vec![t];
+        let mut coeff = Rational::from_integer(Int::from(1));
+        let mut pi_count = 0u32;
+        while let Some(f) = stack.pop() {
+            if self.is_pi(f) {
+                pi_count += 1;
+            } else if let Some(n) = self.m.as_numeral(f) {
+                coeff = &coeff * &n;
+            } else {
+                let op = self.m.arith_op(f)?;
+                let a = self.m.app_args(f);
+                match op {
+                    ArithOp::Mul => stack.extend_from_slice(a),
+                    ArithOp::Uminus if a.len() == 1 => {
+                        coeff = -&coeff;
+                        stack.push(a[0]);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+        (pi_count == 1).then_some(coeff)
+    }
+
+    /// Whether `t` denotes an integer value (`Int`-sorted, or `(to_real i)` of an
+    /// `Int`). Used to spot a full-period `π` multiple `2π·(integer)`.
+    fn is_int_valued(&self, t: AstId) -> bool {
+        use crate::ast::ArithOp;
+        if self.m.is_int_sort(self.m.get_sort(t)) {
+            return true;
+        }
+        self.m.arith_op(t) == Some(ArithOp::ToReal)
+            && self
+                .m
+                .app_args(t)
+                .first()
+                .is_some_and(|&a| self.m.is_int_sort(self.m.get_sort(a)))
+    }
+
+    /// Whether `t` is a removable whole-period `π` multiple: `c·π·(integer factors)`
+    /// with `c` an integer that is even for `sin`/`cos` (a multiple of `2π`) or any
+    /// integer for `tan` (period `π`). Non-integer factors (a real variable) make
+    /// it non-removable.
+    fn period_multiple(&self, t: AstId, is_tan: bool) -> bool {
+        use crate::ast::ArithOp;
+        let mut stack = alloc::vec![t];
+        let mut coeff = Rational::from_integer(Int::from(1));
+        let mut pi_count = 0u32;
+        let mut has_int_factor = false;
+        while let Some(f) = stack.pop() {
+            if self.is_pi(f) {
+                pi_count += 1;
+            } else if let Some(n) = self.m.as_numeral(f) {
+                coeff = &coeff * &n;
+            } else if self.m.arith_op(f) == Some(ArithOp::Mul) {
+                stack.extend_from_slice(self.m.app_args(f));
+            } else if self.m.arith_op(f) == Some(ArithOp::Uminus) && self.m.app_args(f).len() == 1 {
+                coeff = -&coeff;
+                stack.push(self.m.app_args(f)[0]);
+            } else if self.is_int_valued(f) {
+                has_int_factor = true;
+            } else {
+                return false;
+            }
+        }
+        if pi_count != 1 || !has_int_factor {
+            return false;
+        }
+        let Some(ci) = coeff.to_integer().and_then(|i| i.to_i64()) else {
+            return false;
+        };
+        is_tan || ci % 2 == 0
+    }
+
+    /// Reduce `sin`/`cos`/`tan` of an argument by stripping the constant multiple
+    /// `kπ` and applying periodicity/phase (z3's `arith_rewriter`): `sin(θ+2π)=sin
+    /// θ`, `sin(θ+π)=−sin θ`, `sin(θ+π/2)=cos θ`, `tan(θ+π)=tan θ`, … Only clean
+    /// integer/half-integer `k` reduce; `None` otherwise (stays opaque).
+    fn trig_reduce(&mut self, op: &str, arg: AstId) -> Option<AstId> {
+        use crate::ast::ArithOp;
+        // Flatten the argument sum (order-preserving), splitting off the constant
+        // `π` coefficient `k` from the residual `θ`.
+        fn flatten_add(ctx: &Context, t: AstId, out: &mut Vec<AstId>) {
+            if ctx.m.arith_op(t) == Some(ArithOp::Add) {
+                for &a in ctx.m.app_args(t) {
+                    flatten_add(ctx, a, out);
+                }
+            } else {
+                out.push(t);
+            }
+        }
+        let mut terms = Vec::new();
+        flatten_add(self, arg, &mut terms);
+        let mut k = Rational::from_integer(Int::from(0));
+        let mut residual: Vec<AstId> = Vec::new();
+        let mut found = false;
+        for &t in &terms {
+            if let Some(c) = self.pi_coeff(t) {
+                k = &k + &c;
+                found = true;
+            } else if self.period_multiple(t, op == "tan") {
+                // A full-period multiple (`2π·integer`, or `π·integer` for tan)
+                // leaves the value unchanged — drop it.
+                found = true;
+            } else {
+                residual.push(t);
+            }
+        }
+        if !found || residual.is_empty() {
+            return None;
+        }
+        // (swap-to-cofunction, negate) for the reduced phase, or `None` if `k` is
+        // not a clean multiple. `tan` has period π, so it reduces mod 1.
+        let two = Rational::from_integer(Int::from(2));
+        let half = Rational::new(Int::from(1), Int::from(2));
+        let three_half = Rational::new(Int::from(3), Int::from(2));
+        let one = Rational::from_integer(Int::from(1));
+        let zero = Rational::from_integer(Int::from(0));
+        if op == "tan" {
+            // k mod 1 must be 0 (period π).
+            let frac = &k - &Rational::from_integer(k.floor());
+            if frac != zero {
+                return None;
+            }
+            let theta = self.mk_sum(&residual);
+            return Some(self.mk_trig("tan", theta));
+        }
+        // Reduce k into [0, 2), then map (op, phase) → (result function, negate):
+        //   sin(θ+π/2)=cos θ   cos(θ+π/2)=−sin θ
+        //   sin(θ+π)  =−sin θ  cos(θ+π)  =−cos θ
+        //   sin(θ+3π/2)=−cos θ cos(θ+3π/2)= sin θ
+        let m = &k - &(&two * &Rational::from_integer((&k / &two).floor()));
+        let (result_op, negate) = if m == zero {
+            (op, false)
+        } else if m == half {
+            if op == "sin" {
+                ("cos", false)
+            } else {
+                ("sin", true)
+            }
+        } else if m == one {
+            (op, true)
+        } else if m == three_half {
+            if op == "sin" {
+                ("cos", true)
+            } else {
+                ("sin", false)
+            }
+        } else {
+            return None;
+        };
+        let theta = self.mk_sum(&residual);
+        let base = self.mk_trig(result_op, theta);
+        if negate {
+            let neg1 = self.m.mk_numeral(-&one, false);
+            Some(self.m.mk_mul(&[neg1, base]))
+        } else {
+            Some(base)
+        }
+    }
+
+    /// Build a residual sum term from `parts` (assumed non-empty).
+    fn mk_sum(&mut self, parts: &[AstId]) -> AstId {
+        if parts.len() == 1 {
+            parts[0]
+        } else {
+            self.m.mk_add(parts)
+        }
+    }
+
+    /// Build the opaque `sin`/`cos`/`tan` of `theta` (a real-sorted term).
+    fn mk_trig(&mut self, op: &str, theta: AstId) -> AstId {
+        let real = self.m.mk_real_sort();
+        let s0 = self.m.get_sort(theta);
+        let d = self.m.mk_func_decl(Symbol::new(op), &[s0], real);
+        let app = self.m.mk_app(d, &[theta]);
+        self.str_symbolic.insert(app);
+        app
+    }
+
     fn fp_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
         // fp.* ops take a rounding-mode first argument for the rounding ops.
         let rne = |ctx: &Self, a: AstId| {
@@ -25741,6 +25932,14 @@ impl Context {
                     let d = self.m.mk_func_decl(Symbol::new(rm_canonical(name)), &[], s);
                     Ok(self.m.mk_const(d))
                 }
+                // `pi` — the transcendental constant, an opaque real. Only the
+                // symbolic constant is needed (for `sin`/`cos` argument reduction
+                // by periodicity); its value is never computed.
+                "pi" if self.lookup_bound("pi").is_none() && !self.funcs.contains_key("pi") => {
+                    let real = self.m.mk_real_sort();
+                    let d = self.m.mk_func_decl(Symbol::new("pi"), &[], real);
+                    Ok(self.m.mk_const(d))
+                }
                 name => {
                     if let Some(id) = self.lookup_bound(name) {
                         return Ok(id);
@@ -27441,6 +27640,16 @@ impl Context {
             | "asinh" | "acosh" | "atanh" | "exp" | "log"
                 if args.len() == 1 && !self.funcs.contains_key(head) =>
             {
+                // `sin`/`cos`/`tan` argument reduction by periodicity/phase: strip
+                // the constant multiple `kπ` of the argument (k a rational),
+                // rewriting via `sin(θ+2π)=sin θ`, `sin(θ+π)=-sin θ`,
+                // `sin(θ+π/2)=cos θ`, … (z3's arith_rewriter). Non-constant `π`
+                // terms (`πz`) stay in the residual.
+                if matches!(head, "sin" | "cos" | "tan")
+                    && let Some(t) = self.trig_reduce(head, args[0])
+                {
+                    return Ok(t);
+                }
                 let real = self.m.mk_real_sort();
                 let s0 = self.m.get_sort(args[0]);
                 let d = self.m.mk_func_decl(Symbol::new(head), &[s0], real);
