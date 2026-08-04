@@ -15839,6 +15839,86 @@ impl Context {
         }
     }
 
+    /// The *rounding-mode-independent* result bits of `a op b` on two concrete
+    /// `(eb, sb)` FP constants, when there is one: an exact finite result, or an
+    /// IEEE special case (NaN/±∞/±0 from NaN/∞/0 operands). Returns `None` when the
+    /// result would need rounding (rounding-mode dependent) or has a mode-dependent
+    /// zero sign (an exact-zero `add`/`sub` sum). Lets FP arithmetic fold under a
+    /// *symbolic* rounding mode / any format (6593).
+    fn fp_arith_exact(op: &str, ab: u64, bb: u64, eb: u32, sb: u32) -> Option<u64> {
+        let w = eb + sb;
+        let mant = sb - 1;
+        let sign_bit = 1u64 << (w - 1);
+        let class = |bits: u64| -> (bool, bool, bool, bool) {
+            let exp = (bits >> mant) & ((1u64 << eb) - 1);
+            let sig = bits & ((1u64 << mant) - 1);
+            let expo = exp == (1u64 << eb) - 1;
+            (
+                expo && sig != 0,       // NaN
+                expo && sig == 0,       // ∞
+                exp == 0 && sig == 0,   // ±0
+                (bits & sign_bit) != 0, // negative
+            )
+        };
+        let nan_bits = (((1u64 << eb) - 1) << mant) | (1u64 << (mant - 1));
+        let inf_bits = |neg: bool| (if neg { sign_bit } else { 0 }) | (((1u64 << eb) - 1) << mant);
+        let zero_bits = |neg: bool| if neg { sign_bit } else { 0 };
+        // `sub` is `add` with the second operand negated (flip its sign bit).
+        let bb = if op == "fp.sub" { bb ^ sign_bit } else { bb };
+        let opk = if op == "fp.sub" { "fp.add" } else { op };
+        let (an, ai, az, asg) = class(ab);
+        let (bn, bi, bz, bsg) = class(bb);
+        if an || bn {
+            return Some(nan_bits);
+        }
+        let xor = asg ^ bsg;
+        match opk {
+            "fp.add" => {
+                if ai && bi {
+                    return Some(if asg == bsg { inf_bits(asg) } else { nan_bits });
+                }
+                if ai {
+                    return Some(inf_bits(asg));
+                }
+                if bi {
+                    return Some(inf_bits(bsg));
+                }
+                let r = Self::fp_real_value(ab, eb, sb)? + Self::fp_real_value(bb, eb, sb)?;
+                if r.is_zero() {
+                    return None; // exact-zero sum: sign is rounding-mode dependent (RTN → −0)
+                }
+                Self::fp_exact_bits(&r, eb, sb)
+            }
+            "fp.mul" => {
+                if (ai && bz) || (az && bi) {
+                    return Some(nan_bits);
+                }
+                if ai || bi {
+                    return Some(inf_bits(xor));
+                }
+                if az || bz {
+                    return Some(zero_bits(xor));
+                }
+                let r = Self::fp_real_value(ab, eb, sb)? * Self::fp_real_value(bb, eb, sb)?;
+                Self::fp_exact_bits(&r, eb, sb)
+            }
+            "fp.div" => {
+                if (ai && bi) || (az && bz) {
+                    return Some(nan_bits);
+                }
+                if ai || bz {
+                    return Some(inf_bits(xor)); // ∞/finite or finite/0
+                }
+                if bi || az {
+                    return Some(zero_bits(xor)); // finite/∞ or 0/finite
+                }
+                let r = Self::fp_real_value(ab, eb, sb)? / Self::fp_real_value(bb, eb, sb)?;
+                Self::fp_exact_bits(&r, eb, sb)
+            }
+            _ => None,
+        }
+    }
+
     /// Round a real (rational) constant to the `(eb, sb)` floating-point format
     /// under rounding mode `rm` (0=RNE,1=RNA,2=RTP,3=RTN,4=RTZ), returning the
     /// packed bit pattern. Handles zero, normals, subnormals, and overflow→inf/
@@ -17335,6 +17415,17 @@ impl Context {
         }
         match op {
             "fp.add" | "fp.sub" | "fp.mul" | "fp.div" if args.len() == 3 => {
+                // Concrete operands whose result is exact or an IEEE special case
+                // fold regardless of the rounding mode (incl. a symbolic one), for
+                // any format — before the `f64`/blast paths that need a constant rm.
+                if let (Some(&(ab, eb, sb)), Some(&(bb, eb2, sb2))) =
+                    (self.fp_of.get(&args[1]), self.fp_of.get(&args[2]))
+                    && eb == eb2
+                    && sb == sb2
+                    && let Some(bits) = Self::fp_arith_exact(op, ab, bb, eb, sb)
+                {
+                    return Ok(self.mk_fp(bits, eb, sb));
+                }
                 if let (true, Some(a), Some(b)) =
                     (rne(self, args[0]), self.fp64(args[1]), self.fp64(args[2]))
                 {
@@ -17498,14 +17589,15 @@ impl Context {
                 self.symbolic_fp(op, args)
             }
             "fp.eq" | "fp.lt" | "fp.leq" | "fp.gt" | "fp.geq" if args.len() == 2 => {
-                if let (Some(a), Some(b)) = (self.fp64(args[0]), self.fp64(args[1])) {
-                    let r = match op {
-                        "fp.eq" => a == b,
-                        "fp.lt" => a < b,
-                        "fp.leq" => a <= b,
-                        "fp.gt" => a > b,
-                        _ => a >= b,
-                    };
+                // Two concrete FP constants of any format fold by value (NaN,
+                // ±∞, ±0 handled), so an `fp.geq(+oo, m)` guarding an `ite`
+                // collapses instead of blasting (6593).
+                if let (Some(&(xb, eb, sb)), Some(&(yb, eb2, sb2))) =
+                    (self.fp_of.get(&args[0]), self.fp_of.get(&args[1]))
+                    && eb == eb2
+                    && sb == sb2
+                    && let Some(r) = Self::fp_compare_const(op, xb, yb, eb, sb)
+                {
                     return Ok(self.mk_bool(r));
                 }
                 // Bit-blast the comparison: `fp.eq` via equality + zero handling,
@@ -25862,6 +25954,10 @@ impl Context {
                         // bit-vector as FP — no rounding mode).
                         let has_rm = l.len() > 2;
                         let x = self.term(&l[if has_rm { 2 } else { 1 }])?;
+                        // Simplify the source so a folded-but-unreduced operand
+                        // (e.g. `(ite true 0.5 0.0)` after its condition folded) is
+                        // seen as the numeral it is, enabling the constant fold (6593).
+                        let x = crate::rewriter::simplify(&mut self.m, x);
                         if has_rm {
                             let rm = self.term(&l[1])?;
                             // Source *real* value of a constant operand, independent
