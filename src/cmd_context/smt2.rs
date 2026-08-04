@@ -4840,6 +4840,48 @@ impl Context {
     /// smallest distinct value `≥` its bound and confirm with `check_model` (so any
     /// sum/other constraints are verified). Decides e.g. `distinct a…e ∧ Σ ≤ 10 ∧
     /// all ≥ 0` sat via 0,1,2,3,4.
+    /// SAT witness for a `to_fp` of a *free* real: `((_ to_fp eb sb) rm x)` where
+    /// both the rounding mode `rm` and the real source `x` are symbolic and occur
+    /// nowhere else. As `x` ranges over the reals (any `rm`), the conversion hits
+    /// exactly the non-NaN FP values of the format, so the opaque marker can be
+    /// treated as a *free non-NaN FP*: replace it and re-decide. A resulting `sat`
+    /// is a real `sat` (choose `x` = the model value's real, `rm` = RNE). Closes
+    /// `+oo = to_fp(v, x)` (fp-conversions 6553): `x` huge overflows to `+oo`.
+    fn try_to_fp_free_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        for (&t, &(rm, x, eb, sb, _uns)) in &self.fp_conv.clone() {
+            if !present.contains(&t) || sb < 2 {
+                continue;
+            }
+            // Source must be a *real* (an integer source only reaches integer
+            // values; a bit-vector source is a different marker).
+            let xs = self.m.get_sort(x);
+            if !self.m.is_arith_sort(xs) || self.m.is_int_sort(xs) {
+                continue;
+            }
+            // `rm` and `x` must be free — occur only inside this marker. Replace
+            // `t` by a fresh FP and confirm neither remains.
+            let fps = self.fp_sort(eb, sb);
+            let fresh = self.fresh_const(fps);
+            let g1 = crate::rewriter::substitute(&mut self.m, goal, &[(t, fresh)]);
+            let after: BTreeSet<AstId> = self.m.postorder(g1).into_iter().collect();
+            if after.contains(&x) || after.contains(&rm) {
+                continue;
+            }
+            // `to_fp` never yields NaN, so constrain the free FP to be non-NaN.
+            let Ok(isnan) = self.fp_op("fp.isNaN", &[fresh]) else {
+                continue;
+            };
+            let notnan = self.m.mk_not(isnan);
+            let g2 = self.m.mk_and(&[g1, notnan]);
+            let (res, model) = self.decide_inner(g2);
+            if res == SmtResult::Sat {
+                return Some((SmtResult::Sat, model));
+            }
+        }
+        None
+    }
+
     fn try_distinct_witness(&mut self, goal: AstId) -> Option<Model> {
         use crate::ast::ArithOp;
         let mut conj: Vec<AstId> = Vec::new();
@@ -22700,6 +22742,13 @@ impl Context {
             if r2 != SmtResult::Unknown {
                 return (r2, m2);
             }
+        }
+        // Fallback: a `to_fp` of a *free* real ranges over every non-NaN FP value,
+        // so replace such a marker by a free non-NaN FP and re-decide.
+        if res == SmtResult::Unknown
+            && let Some(r) = self.try_to_fp_free_witness(goal)
+        {
+            return r;
         }
         // Fallback: a distinct-integers-with-bounds witness (min distinct assignment).
         if res == SmtResult::Unknown
