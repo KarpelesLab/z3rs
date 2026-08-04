@@ -1823,6 +1823,9 @@ struct Context {
     /// range bounds on this flag mirrors that tactic-dependent completeness (so
     /// trig-bounds → unsat while plain sine9 stays unknown, byte-matching z3).
     nlsat_requested: bool,
+    /// Guards `try_disjunction_sat_witness` against unbounded re-entry when a
+    /// disjunct is itself a conjunction containing a disjunction.
+    disj_witness_active: bool,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -2799,6 +2802,7 @@ impl Context {
             fp_bv: BTreeMap::new(),
             fp_defer_depth: 0,
             nlsat_requested: false,
+            disj_witness_active: false,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -4880,6 +4884,69 @@ impl Context {
             }
         }
         None
+    }
+
+    /// SAT witness for a top-level disjunction: `(and … (or d₁ … dₙ) …)` is
+    /// satisfiable as soon as one `others ∧ dᵢ` is, so decide each in isolation.
+    /// This sidesteps an *opaque* disjunct (e.g. `X = fp.rem(X, Y)`) that gates the
+    /// whole goal to `unknown` even though a sibling disjunct is plainly satisfiable
+    /// (fp-operations). Sound: `dᵢ ⇒ (or …)`, and the sub-goal keeps every other
+    /// conjunct, so its model satisfies the full goal.
+    fn try_disjunction_sat_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        if self.disj_witness_active {
+            return None;
+        }
+        let mut conj: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                for &a in self.m.app_args(t) {
+                    stack.push(a);
+                }
+            } else {
+                conj.push(t);
+            }
+        }
+        let or_idx = conj.iter().position(|&c| self.m.is_or(c))?;
+        // Flatten the chosen disjunction.
+        let mut disj: Vec<AstId> = Vec::new();
+        let mut ds = alloc::vec![conj[or_idx]];
+        while let Some(t) = ds.pop() {
+            if self.m.is_or(t) {
+                for &a in self.m.app_args(t) {
+                    ds.push(a);
+                }
+            } else {
+                disj.push(t);
+            }
+        }
+        if !(2..=16).contains(&disj.len()) {
+            return None;
+        }
+        let others: Vec<AstId> = conj
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != or_idx)
+            .map(|(_, &c)| c)
+            .collect();
+        self.disj_witness_active = true;
+        let mut result = None;
+        for &d in &disj {
+            let mut parts = others.clone();
+            parts.push(d);
+            let sub = if parts.len() == 1 {
+                parts[0]
+            } else {
+                self.m.mk_and(&parts)
+            };
+            let (res, model) = self.decide(sub);
+            if res == SmtResult::Sat {
+                result = Some((SmtResult::Sat, model));
+                break;
+            }
+        }
+        self.disj_witness_active = false;
+        result
     }
 
     fn try_distinct_witness(&mut self, goal: AstId) -> Option<Model> {
@@ -22839,6 +22906,14 @@ impl Context {
         // so replace such a marker by a free non-NaN FP and re-decide.
         if res == SmtResult::Unknown
             && let Some(r) = self.try_to_fp_free_witness(goal)
+        {
+            return r;
+        }
+        // Fallback: a top-level disjunction is SAT as soon as one disjunct is —
+        // decide each in isolation, sidestepping an opaque disjunct that otherwise
+        // gates the whole goal to `unknown` (fp-operations).
+        if res == SmtResult::Unknown
+            && let Some(r) = self.try_disjunction_sat_witness(goal)
         {
             return r;
         }
