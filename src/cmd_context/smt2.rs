@@ -20480,9 +20480,13 @@ impl Context {
         }
         let neg = self.m.mk_not(body);
         match check_model(&self.m, neg).0 {
-            SmtResult::Sat => Some(false),
+            // `check_model` treats a nonlinear term (`a·a`) as a free variable, so
+            // its `sat` on a nonlinear `¬body` (`a·a < 0`) is spurious — it would
+            // "refute" the *valid* `∀a. a·a ≥ 0`. Only trust a `sat` (a refutation)
+            // when `¬body` is linear; an `unsat` (validity) is always sound.
+            SmtResult::Sat if !self.arith_nonlinear(neg) => Some(false),
             SmtResult::Unsat => Some(true),
-            SmtResult::Unknown => None,
+            _ => None,
         }
     }
 
