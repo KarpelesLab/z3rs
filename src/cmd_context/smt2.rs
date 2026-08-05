@@ -26664,6 +26664,25 @@ impl Context {
                         return Ok(self.m.mk_false());
                     }
                 }
+                // A chained *strict* inequality `(> … x … x …)` / `(< …)` with two
+                // equal operands is `false`: the strict chain forces `x > x` (resp.
+                // `x < x`). Folded at parse so a nested occurrence collapses instead
+                // of keeping an opaque operand alive (3458: `(> (tanh r2) r0 (tanh
+                // r2))` inside an `xor`). (Non-strict `>=`/`<=` allow equality, so
+                // they are not folded.)
+                if (head == ">" || head == "<") && args.len() >= 2 {
+                    let mut repeat = false;
+                    for i in 0..args.len() {
+                        for j in (i + 1)..args.len() {
+                            if args[i] == args[j] {
+                                repeat = true;
+                            }
+                        }
+                    }
+                    if repeat {
+                        return Ok(self.m.mk_false());
+                    }
+                }
                 // Fold equality / disequality of two string literals (z3 does this
                 // in simplify): distinct literals are unequal. Prevents a downstream
                 // rewrite from equating two distinct literals, which the EUF — which
