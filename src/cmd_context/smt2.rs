@@ -21655,6 +21655,24 @@ impl Context {
                     if !had_ground {
                         seeded_sorts.insert(s);
                     }
+                } else if self.m.is_arith_sort(s) {
+                    // Seed arithmetic binders with the small constants 0, 1, −1 as
+                    // refutation candidates (like z3), so an enumeration-only
+                    // universal the linear QE cannot take (one with a division,
+                    // `∀r,a,va. r/a ≤ va`) is still refuted by a concrete false
+                    // instance (a=1, va=0 ⇒ 1 ≤ 0). The domain stays infinite, so a
+                    // `sat` over it remains a sound `unknown` (seed-only). Sound: an
+                    // instance is a consequence of the universal, so a false one is
+                    // a genuine refutation.
+                    let had_ground = by_sort.get(&s).is_some_and(|e| !e.is_empty());
+                    let is_int = self.m.is_int_sort(s);
+                    for v in [0i64, 1, -1] {
+                        let c = self.m.mk_numeral(Rational::from(v), is_int);
+                        by_sort.entry(s).or_default().insert(c);
+                    }
+                    if !had_ground {
+                        seeded_sorts.insert(s);
+                    }
                 } else if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
                     let rep = self.fresh_const(s);
                     by_sort.entry(s).or_default().insert(rep);
