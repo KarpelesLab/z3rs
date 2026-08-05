@@ -26664,22 +26664,41 @@ impl Context {
                         return Ok(self.m.mk_false());
                     }
                 }
-                // A chained *strict* inequality `(> … x … x …)` / `(< …)` with two
-                // equal operands is `false`: the strict chain forces `x > x` (resp.
-                // `x < x`). Folded at parse so a nested occurrence collapses instead
-                // of keeping an opaque operand alive (3458: `(> (tanh r2) r0 (tanh
-                // r2))` inside an `xor`). (Non-strict `>=`/`<=` allow equality, so
-                // they are not folded.)
-                if (head == ">" || head == "<") && args.len() >= 2 {
-                    let mut repeat = false;
-                    for i in 0..args.len() {
+                // A chained comparison `(op x₁ … xₙ)` is `⋀ xᵢ op xᵢ₊₁`, so by
+                // transitivity every earlier operand relates to every later one.
+                // It is `false` when a pair of numeral constants at positions i<j
+                // violates that transitive relation, or (for the strict `>`/`<`)
+                // when two operands are syntactically equal (`x > x`). Folded at
+                // parse so a nested occurrence collapses instead of keeping an
+                // opaque operand alive (3458: `(> (tanh r2) r0 (tanh r2))` in an
+                // `xor`; also `(<= a 3 2 a)`). z3 folds this in `simplify`.
+                if matches!(head.as_str(), ">" | "<" | ">=" | "<=") && args.len() >= 2 {
+                    let strict = head == ">" || head == "<";
+                    let desc = head == ">" || head == ">="; // descending chain
+                    let nums: Vec<Option<Rational>> =
+                        args.iter().map(|&a| self.m.as_numeral(a)).collect();
+                    let mut is_false = false;
+                    'pairs: for i in 0..args.len() {
                         for j in (i + 1)..args.len() {
-                            if args[i] == args[j] {
-                                repeat = true;
+                            if strict && args[i] == args[j] {
+                                is_false = true;
+                                break 'pairs;
+                            }
+                            if let (Some(ci), Some(cj)) = (&nums[i], &nums[j]) {
+                                let ok = match (desc, strict) {
+                                    (true, true) => ci > cj,
+                                    (true, false) => ci >= cj,
+                                    (false, true) => ci < cj,
+                                    (false, false) => ci <= cj,
+                                };
+                                if !ok {
+                                    is_false = true;
+                                    break 'pairs;
+                                }
                             }
                         }
                     }
-                    if repeat {
+                    if is_false {
                         return Ok(self.m.mk_false());
                     }
                 }
