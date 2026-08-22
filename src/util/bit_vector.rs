@@ -79,17 +79,13 @@ impl BitVector {
 
     /// Clear all bits and set the length to zero (keeps capacity).
     pub fn reset(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
         self.num_bits = 0;
     }
 
     /// Zero every bit, keeping the length.
     pub fn fill0(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
     }
 
     /// Grow the backing store so that `n` words are available (zero-filled).
