@@ -26647,6 +26647,7 @@ impl Context {
                 // (3253: `(= 0.0 (/ r8 (/ c r8)) 0.62829 r12)` inside an `xor`).
                 if head == "=" && args.len() >= 2 {
                     let mut num: Option<Rational> = None;
+                    let mut bv: Option<Int> = None;
                     let mut clash = false;
                     for &a in &args {
                         if let Some(n) = self.m.as_numeral(a) {
@@ -26656,6 +26657,17 @@ impl Context {
                                     break;
                                 }
                                 None => num = Some(n),
+                                _ => {}
+                            }
+                        } else if let Some(v) = self.m.bv_numeral_value(a) {
+                            // A bit-vector constant: two distinct ones make the
+                            // chained equality false (`(= #x2cf #x2cf #x149)`).
+                            match &bv {
+                                Some(p) if *p != v => {
+                                    clash = true;
+                                    break;
+                                }
+                                None => bv = Some(v),
                                 _ => {}
                             }
                         }
