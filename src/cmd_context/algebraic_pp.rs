@@ -447,7 +447,8 @@ fn alg_div(a: AlgVal, b: AlgVal) -> Option<AlgVal> {
 }
 
 /// `base ^ (p/q)` exactly. Rational base: `q`-th root of `base^p`. Irrational
-/// base: only integer exponents (a `q`-th root of an irrational is unsupported).
+/// base: integer exponents, and a square root (`q = 2`) of a non-negative value
+/// via `Algebraic::sqrt`; other roots of an irrational are unsupported.
 fn alg_power(base: AlgVal, e: &Rational) -> Option<AlgVal> {
     let p = e.numerator().to_i64()?;
     if p > i32::MAX as i64 || p < i32::MIN as i64 {
@@ -467,10 +468,18 @@ fn alg_power(base: AlgVal, e: &Rational) -> Option<AlgVal> {
             }
         }
         AlgVal::Alg(a) => {
+            let bp = alg_powi(&a, p as i32)?;
+            if q == 2 {
+                // Principal (non-negative) square root; real only for bp ≥ 0.
+                if bp.signum() < 0 {
+                    return None;
+                }
+                return Some(AlgVal::Alg(bp.sqrt()));
+            }
             if q != 1 {
                 return None;
             }
-            Some(AlgVal::Alg(alg_powi(&a, p as i32)?))
+            Some(AlgVal::Alg(bp))
         }
     }
 }
