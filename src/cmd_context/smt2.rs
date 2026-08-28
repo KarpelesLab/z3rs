@@ -3220,6 +3220,15 @@ impl Context {
                 if let Some(cps) = self.str_value(s) {
                     return Ok(Some(smt_string_literal(&cps)));
                 }
+                // Under `:pp.decimal true`, a ground irrational algebraic real
+                // (e.g. `(^ 2.0 (/ 1.0 2.0))` = √2) prints as a truncated decimal
+                // with a `?` suffix rather than the opaque `^` term.
+                if self.params.get_bool("pp.decimal", false) {
+                    let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+                    if let Some(d) = super::algebraic_pp::format_pp_decimal(&self.m, s, prec) {
+                        return Ok(Some(d));
+                    }
+                }
                 Ok(Some(self.m.pp(s)))
             }
             "apply" => {
