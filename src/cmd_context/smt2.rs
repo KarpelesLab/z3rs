@@ -3227,18 +3227,25 @@ impl Context {
                 if let Some(b) = super::algebraic_pp::fold_real_comparison(&self.m, s) {
                     return Ok(Some(if b { "true" } else { "false" }.to_string()));
                 }
+                // A trig function at a rational multiple of π evaluates to an exact
+                // algebraic value: a decimal under `:pp.decimal`, otherwise an exact
+                // rational or a `root-obj`.
+                let pp_decimal = self.params.get_bool("pp.decimal", false);
+                if let Some((name, c)) = self.trig_pi_arg(s) {
+                    if pp_decimal {
+                        let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+                        if let Some(d) = super::algebraic_pp::trig_pp_decimal(&name, &c, prec) {
+                            return Ok(Some(d));
+                        }
+                    } else if let Some(out) = super::algebraic_pp::trig_exact(&name, &c) {
+                        return Ok(Some(out));
+                    }
+                }
                 // Under `:pp.decimal true`, a ground irrational algebraic real
                 // (e.g. `(^ 2.0 (/ 1.0 2.0))` = √2) prints as a truncated decimal
                 // with a `?` suffix rather than the opaque `^` term.
-                if self.params.get_bool("pp.decimal", false) {
+                if pp_decimal {
                     let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
-                    // A trig function at a rational multiple of π evaluates to an
-                    // exact algebraic value, printed as its decimal.
-                    if let Some((name, c)) = self.trig_pi_arg(s)
-                        && let Some(d) = super::algebraic_pp::trig_pp_decimal(&name, &c, prec)
-                    {
-                        return Ok(Some(d));
-                    }
                     if let Some(d) = super::algebraic_pp::format_pp_decimal(&self.m, s, prec) {
                         return Ok(Some(d));
                     }
@@ -17522,7 +17529,7 @@ impl Context {
     }
 
     /// If `t = (fn arg)` for `fn ∈ {sin, cos, tan}` and `arg` is a rational
-    /// multiple `c·π` of π (or the numeral 0), returns `(fn, c)`. Used to
+    /// multiple `c·π` of π (with no constant term), returns `(fn, c)`. Used to
     /// evaluate a trig function at a rational multiple of π to its exact value.
     fn trig_pi_arg(&self, t: AstId) -> Option<(String, Rational)> {
         let a = self.m.app(t)?;
@@ -17533,12 +17540,77 @@ impl Context {
         if !matches!(name.as_str(), "sin" | "cos" | "tan") {
             return None;
         }
-        let arg = a.args[0];
-        let c = self.pi_coeff(arg).or_else(|| {
-            (self.m.as_numeral(arg).is_some_and(|r| r.is_zero()))
-                .then(|| Rational::from_integer(Int::from(0)))
-        })?;
-        Some((name, c))
+        // arg = coeff·π + constant; a rational multiple of π has constant 0.
+        let (coeff, konst) = self.pi_linear(a.args[0])?;
+        if !konst.is_zero() {
+            return None;
+        }
+        // z3 evaluates sin/cos/tan only at the special angles whose reduced
+        // denominator divides 12 (multiples of π/12); others stay opaque.
+        let denom = coeff.denominator().to_u64()?;
+        (denom != 0 && 12u64.is_multiple_of(denom)).then_some((name, coeff))
+    }
+
+    /// Decomposes a ground real term into `(coeff·π + constant)` where π occurs
+    /// linearly: returns `(coeff, constant)`, or `None` if the term is not such a
+    /// linear form (e.g. it contains a variable or a non-linear π occurrence).
+    fn pi_linear(&self, t: AstId) -> Option<(Rational, Rational)> {
+        use crate::ast::ArithOp;
+        let zero = Rational::from_integer(Int::from(0));
+        if self.is_pi(t) {
+            return Some((Rational::from_integer(Int::from(1)), zero));
+        }
+        if let Some(n) = self.m.as_numeral(t) {
+            return Some((zero, n));
+        }
+        let op = self.m.arith_op(t)?;
+        let args = self.m.app_args(t);
+        match op {
+            ArithOp::ToReal => self.pi_linear(*args.first()?),
+            ArithOp::Uminus if args.len() == 1 => {
+                let (c, k) = self.pi_linear(args[0])?;
+                Some((-c, -k))
+            }
+            ArithOp::Add => {
+                let mut c = zero.clone();
+                let mut k = zero;
+                for &a in args {
+                    let (ac, ak) = self.pi_linear(a)?;
+                    c = &c + &ac;
+                    k = &k + &ak;
+                }
+                Some((c, k))
+            }
+            ArithOp::Sub => {
+                let (mut c, mut k) = self.pi_linear(*args.first()?)?;
+                for &a in &args[1..] {
+                    let (ac, ak) = self.pi_linear(a)?;
+                    c = &c - &ac;
+                    k = &k - &ak;
+                }
+                Some((c, k))
+            }
+            ArithOp::Mul => {
+                // A product of numeric scalars and at most one π-bearing factor.
+                let mut scalar = Rational::from_integer(Int::from(1));
+                let mut pi_part: Option<(Rational, Rational)> = None;
+                for &a in args {
+                    let (ac, ak) = self.pi_linear(a)?;
+                    if ac.is_zero() {
+                        scalar = &scalar * &ak; // pure numeric factor
+                    } else if pi_part.is_none() {
+                        pi_part = Some((ac, ak));
+                    } else {
+                        return None; // π·π — not linear
+                    }
+                }
+                match pi_part {
+                    Some((pc, pk)) => Some((&scalar * &pc, &scalar * &pk)),
+                    None => Some((zero, scalar)),
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Whether `t` denotes an integer value (`Int`-sorted, or `(to_real i)` of an

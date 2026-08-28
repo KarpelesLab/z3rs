@@ -547,22 +547,14 @@ pub fn trig_pp_decimal(fname: &str, c: &Rational, precision: u32) -> Option<Stri
 /// pole (c ≡ 1/2 mod 1) is left unevaluated. This avoids algebraic division,
 /// which puremp 0.2.0 mishandles for a rational divisor.
 fn tan_pp_decimal(c: &Rational, precision: u32) -> Option<String> {
-    // r = c mod 1 in [0, 1) — tan has period π.
+    // Pole at c ≡ 1/2 mod 1.
     let r = c - &Rational::from_integer(c.floor());
-    let quarter = Rational::new(Int::from_i64(1), Int::from_i64(4));
-    let half = Rational::new(Int::from_i64(1), Int::from_i64(2));
-    let three_q = Rational::new(Int::from_i64(3), Int::from_i64(4));
-    if r.is_zero() {
-        return Some("0.0".into());
+    if r == Rational::new(Int::from_i64(1), Int::from_i64(2)) {
+        return None;
     }
-    if r == half {
-        return None; // pole
-    }
-    if r == quarter {
-        return Some("1.0".into());
-    }
-    if r == three_q {
-        return Some("(- 1.0)".into());
+    // Rational values (0, ±1) print as `N.0`.
+    if let Some(rat) = tan_rational(c) {
+        return Some(render_real_rational(&rat));
     }
     // Irrational: high-precision float value.
     let bits = (precision as u64 + 40) * 4 + 64;
@@ -603,6 +595,164 @@ fn format_trig_decimal(v: AlgVal, precision: u32) -> Option<String> {
         }
     };
     Some(if neg { format!("(- {body})") } else { body })
+}
+
+/// `cos(c·π)` / `sin(c·π)` rendered as z3 does without `:pp.decimal`: an exact
+/// real rational, or a `root-obj` for the irrational algebraic value. `tan` is not
+/// handled here (its algebraic form needs division, which puremp mishandles); a
+/// `tan` term is then left opaque.
+pub fn trig_exact(fname: &str, c: &Rational) -> Option<String> {
+    let half = Rational::new(Int::from_i64(1), Int::from_i64(2));
+    let v = match fname {
+        "cos" => cos_pi(c)?,
+        "sin" => cos_pi(&(&half - c))?,
+        // tan's rational values (0, ±1) are exact; its irrational values need a
+        // minimal polynomial we cannot form without algebraic division, so those
+        // stay opaque (no corpus file needs tan `root-obj`).
+        "tan" => return Some(render_real_rational(&tan_rational(c)?)),
+        _ => return None,
+    };
+    Some(match v {
+        AlgVal::Rat(r) => render_real_rational(&r),
+        AlgVal::Alg(a) => root_obj_string(&a)?,
+    })
+}
+
+/// The exact rational value of tan(c·π) when it is rational — 0 at integer
+/// multiples of π, ±1 at π/4 + kπ/2 (Niven's theorem) — else `None` (an
+/// irrational value or the pole at c ≡ 1/2 mod 1).
+fn tan_rational(c: &Rational) -> Option<Rational> {
+    let r = c - &Rational::from_integer(c.floor()); // c mod 1 (period π)
+    if r.is_zero() {
+        return Some(Rational::from_integer(Int::from_i64(0)));
+    }
+    let quarter = Rational::new(Int::from_i64(1), Int::from_i64(4));
+    let three_q = Rational::new(Int::from_i64(3), Int::from_i64(4));
+    if r == quarter {
+        return Some(Rational::from_integer(Int::from_i64(1)));
+    }
+    if r == three_q {
+        return Some(Rational::from_integer(Int::from_i64(-1)));
+    }
+    None
+}
+
+/// A rational rendered as a z3 real numeral: `N.0`, `(/ p.0 q.0)`, with a negative
+/// value wrapped `(- …)` (z3 never puts the sign inside the numerator).
+fn render_real_rational(r: &Rational) -> String {
+    let a = r.abs();
+    let body = match a.to_integer() {
+        Some(i) => format!("{i}.0"),
+        None => format!("(/ {}.0 {}.0)", a.numerator(), a.denominator()),
+    };
+    if r.is_negative() {
+        format!("(- {body})")
+    } else {
+        body
+    }
+}
+
+/// z3's `(root-obj <poly> <index>)` for an irrational algebraic number: its
+/// primitive integer minimal polynomial (positive leading coefficient) and the
+/// 1-based index of this root among that polynomial's real roots in increasing
+/// order. Uses only root isolation, factoring and polynomial evaluation — never
+/// algebraic arithmetic (which puremp 0.2.0 mishandles on crowded polynomials).
+fn root_obj_string(a: &Algebraic) -> Option<String> {
+    // Tighten the isolating interval so it excludes every other root of the
+    // defining polynomial (adjacent factors, incl. a spurious `x`/root-0 factor);
+    // otherwise an endpoint sitting on another root mis-selects the factor.
+    let mut aa = a.clone();
+    aa.refine_below(&Rational::power_of_two(-48));
+    let (lo, hi) = aa.interval();
+    // Minimal polynomial = the irreducible factor of the (squarefree) defining
+    // polynomial whose real root lies in this root's isolating interval.
+    let min_poly = a
+        .defining_polynomial()
+        .factor()
+        .into_iter()
+        .map(|(f, _)| f)
+        .find(|f| factor_has_root_in(f, lo, hi))?;
+    let ints = primitive_integer_coeffs(&min_poly)?;
+    // Index of this root among the factor's real roots (increasing order).
+    let af = a.to_f64();
+    let roots = Algebraic::real_roots_of(&min_poly);
+    let mut best_i = 0usize;
+    let mut best = f64::INFINITY;
+    for (i, r) in roots.iter().enumerate() {
+        let d = (r.to_f64() - af).abs();
+        if d < best {
+            best = d;
+            best_i = i;
+        }
+    }
+    Some(format!("(root-obj {} {})", poly_to_smt(&ints), best_i + 1))
+}
+
+/// Whether polynomial `f` has a real root within `[lo, hi]` (a sign change or a
+/// zero at an endpoint).
+fn factor_has_root_in(f: &Poly<Rational>, lo: &Rational, hi: &Rational) -> bool {
+    let sl = f.eval(lo).signum();
+    let sh = f.eval(hi).signum();
+    sl == 0 || sh == 0 || sl != sh
+}
+
+/// The coefficients of `p` cleared to primitive integers with a positive leading
+/// coefficient, in ascending degree order.
+fn primitive_integer_coeffs(p: &Poly<Rational>) -> Option<Vec<Int>> {
+    let coeffs = p.coeffs();
+    if coeffs.is_empty() {
+        return None;
+    }
+    let mut den_lcm = Int::from_i64(1);
+    for c in coeffs {
+        den_lcm = den_lcm.lcm(c.denominator());
+    }
+    let mut ints: Vec<Int> = coeffs
+        .iter()
+        .map(|c| {
+            let scale = den_lcm.div_rem_trunc(c.denominator()).0;
+            c.numerator() * &scale
+        })
+        .collect();
+    let mut g = Int::from_i64(0);
+    for x in &ints {
+        g = g.gcd(x);
+    }
+    if g.is_zero() {
+        return None;
+    }
+    for x in &mut ints {
+        *x = x.div_rem_trunc(&g).0;
+    }
+    if ints.last()?.is_negative() {
+        ints = ints.iter().map(|x| -x).collect();
+    }
+    Some(ints)
+}
+
+/// Formats integer polynomial coefficients (ascending degree) as z3's SMT sum
+/// `(+ (* c (^ x d)) … const)`, highest degree first.
+fn poly_to_smt(ints: &[Int]) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    for d in (0..ints.len()).rev() {
+        let c = &ints[d];
+        if c.is_zero() {
+            continue;
+        }
+        let coeff = if c.is_negative() {
+            format!("(- {})", -c)
+        } else {
+            format!("{c}")
+        };
+        terms.push(if d == 0 {
+            coeff
+        } else if d == 1 {
+            format!("(* {coeff} x)")
+        } else {
+            format!("(* {coeff} (^ x {d}))")
+        });
+    }
+    format!("(+ {})", terms.join(" "))
 }
 
 /// cos(c·π) as an exact rational-or-algebraic value.
@@ -664,6 +814,28 @@ mod tests {
 
     fn rat(n: i64, d: i64) -> Rational {
         Rational::new(Int::from_i64(n), Int::from_i64(d))
+    }
+
+    #[test]
+    fn trig_exact_root_obj_and_rational() {
+        use super::trig_exact;
+        use puremp::{Int, Rational};
+        let r = |n: i64, d: i64| Rational::new(Int::from_i64(n), Int::from_i64(d));
+        // cos(π/4) = 1/√2 → root 2 of 2x²−1.
+        assert_eq!(
+            trig_exact("cos", &r(1, 4)).unwrap(),
+            "(root-obj (+ (* 2 (^ x 2)) (- 1)) 2)"
+        );
+        // sin(π/3) = √3/2 → root 2 of 4x²−3.
+        assert_eq!(
+            trig_exact("sin", &r(1, 3)).unwrap(),
+            "(root-obj (+ (* 4 (^ x 2)) (- 3)) 2)"
+        );
+        // cos(2π/3) = −1/2 (rational).
+        assert_eq!(trig_exact("cos", &r(2, 3)).unwrap(), "(- (/ 1.0 2.0))");
+        // tan(π/4) = 1; tan(0) = 0.
+        assert_eq!(trig_exact("tan", &r(1, 4)).unwrap(), "1.0");
+        assert_eq!(trig_exact("tan", &r(0, 1)).unwrap(), "0.0");
     }
 
     #[test]
