@@ -3246,7 +3246,7 @@ impl Context {
                 // with a `?` suffix rather than the opaque `^` term.
                 if pp_decimal {
                     let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
-                    if let Some(d) = super::algebraic_pp::format_pp_decimal(&self.m, s, prec) {
+                    if let Some(d) = super::algebraic_pp::format_pp_decimal_rec(&self.m, s, prec) {
                         return Ok(Some(d));
                     }
                 }

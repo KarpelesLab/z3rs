@@ -60,6 +60,52 @@ pub fn format_pp_decimal(m: &AstManager, s: AstId, precision: u32) -> Option<Str
     }
 }
 
+/// Like [`format_pp_decimal`] but recurses through an arithmetic term so that an
+/// irrational algebraic *subterm* prints as its decimal while the surrounding
+/// structure is preserved — e.g. `(/ (^ 2.0 (/ 1.0 2.0)) 0.0)` (a division by
+/// zero that stays symbolic) renders as `(/ 1.4142135623? 0.0)`. Returns `None`
+/// if `s` contains no irrational algebraic subterm (the caller prints normally).
+/// Only rebuilds through `+ - * / ^` whose SMT form is a plain prefix application,
+/// so an unchanged subterm's `m.pp` output is reproduced exactly; rational
+/// numerals are never reformatted, so no already-passing output changes.
+pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option<String> {
+    if let Some(d) = format_pp_decimal(m, s, precision) {
+        return Some(d);
+    }
+    // Recurse only through arithmetic / power heads printed as `(op args…)`.
+    let head = arith_prefix_head(m, s)?;
+    let args = m.app_args(s);
+    let mut parts = Vec::with_capacity(args.len());
+    let mut changed = false;
+    for &a in args {
+        match format_pp_decimal_rec(m, a, precision) {
+            Some(fa) => {
+                changed = true;
+                parts.push(fa);
+            }
+            None => parts.push(m.pp(a)),
+        }
+    }
+    changed.then(|| format!("({head} {})", parts.join(" ")))
+}
+
+/// The prefix head symbol (`+ - * / ^`) if `s` is such an application, else
+/// `None`. These are exactly the heads z3rs prints as `(sym arg…)`.
+fn arith_prefix_head(m: &AstManager, s: AstId) -> Option<&'static str> {
+    if let Some(op) = m.arith_op(s) {
+        return match op {
+            ArithOp::Add => Some("+"),
+            ArithOp::Sub | ArithOp::Uminus => Some("-"),
+            ArithOp::Mul => Some("*"),
+            ArithOp::Div => Some("/"),
+            ArithOp::Power => Some("^"),
+            _ => None,
+        };
+    }
+    // The opaque `(^ base exp)` power UF.
+    (m.app(s)?.args.len() == 2 && m.func_decl(m.app_decl(s))?.name.as_str()? == "^").then_some("^")
+}
+
 /// Evaluates a ground real term, or `None` if it contains a variable / an
 /// unsupported operator / a division by zero.
 fn eval_real(m: &AstManager, s: AstId, bits: u64) -> Option<RealVal> {
