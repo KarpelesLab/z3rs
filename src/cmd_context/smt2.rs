@@ -3232,6 +3232,13 @@ impl Context {
                 // with a `?` suffix rather than the opaque `^` term.
                 if self.params.get_bool("pp.decimal", false) {
                     let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+                    // A trig function at a rational multiple of π evaluates to an
+                    // exact algebraic value, printed as its decimal.
+                    if let Some((name, c)) = self.trig_pi_arg(s)
+                        && let Some(d) = super::algebraic_pp::trig_pp_decimal(&name, &c, prec)
+                    {
+                        return Ok(Some(d));
+                    }
                     if let Some(d) = super::algebraic_pp::format_pp_decimal(&self.m, s, prec) {
                         return Ok(Some(d));
                     }
@@ -17512,6 +17519,26 @@ impl Context {
             }
         }
         (pi_count == 1).then_some(coeff)
+    }
+
+    /// If `t = (fn arg)` for `fn ∈ {sin, cos, tan}` and `arg` is a rational
+    /// multiple `c·π` of π (or the numeral 0), returns `(fn, c)`. Used to
+    /// evaluate a trig function at a rational multiple of π to its exact value.
+    fn trig_pi_arg(&self, t: AstId) -> Option<(String, Rational)> {
+        let a = self.m.app(t)?;
+        if a.args.len() != 1 {
+            return None;
+        }
+        let name = self.decl_name(self.m.app_decl(t))?;
+        if !matches!(name.as_str(), "sin" | "cos" | "tan") {
+            return None;
+        }
+        let arg = a.args[0];
+        let c = self.pi_coeff(arg).or_else(|| {
+            (self.m.as_numeral(arg).is_some_and(|r| r.is_zero()))
+                .then(|| Rational::from_integer(Int::from(0)))
+        })?;
+        Some((name, c))
     }
 
     /// Whether `t` denotes an integer value (`Int`-sorted, or `(to_real i)` of an

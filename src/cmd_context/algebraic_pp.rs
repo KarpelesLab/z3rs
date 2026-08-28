@@ -518,6 +518,145 @@ fn alg_powi(a: &Algebraic, p: i32) -> Option<Algebraic> {
     Some(if p < 0 { acc.recip() } else { acc })
 }
 
+// ---------------------------------------------------------------------------
+// Trigonometric values at rational multiples of π.
+//
+// z3's `simplify` evaluates `cos`/`sin`/`tan` at a rational multiple of π to the
+// exact algebraic number (`cos(π/4)` = 1/√2, `tan(π/3)` = √3, `cos(π/3)` = 1/2).
+// `cos(kπ/n)` is a root of the Chebyshev polynomial equation `T_n(x) = (−1)^k`;
+// we build `T_n(x) − (−1)^k`, isolate its real roots exactly, and select the one
+// matching the numeric value. `sin(cπ) = cos((1/2 − c)π)`; `tan = sin / cos`.
+// ---------------------------------------------------------------------------
+
+/// The `pp.decimal` rendering of `fn(c·π)` for `fn ∈ {cos, sin, tan}`, or `None`
+/// when the value is unsupported / `tan` hits a pole.
+pub fn trig_pp_decimal(fname: &str, c: &Rational, precision: u32) -> Option<String> {
+    let half = Rational::new(Int::from_i64(1), Int::from_i64(2));
+    match fname {
+        // cos(cπ) and sin(cπ) = cos((1/2 − c)π) are exact algebraic values.
+        "cos" => format_trig_decimal(cos_pi(c)?, precision),
+        "sin" => format_trig_decimal(cos_pi(&(&half - c))?, precision),
+        "tan" => tan_pp_decimal(c, precision),
+        _ => None,
+    }
+}
+
+/// The `pp.decimal` rendering of tan(c·π). By Niven's theorem the only rational
+/// values are 0 (at integer multiples of π) and ±1 (at π/4 + kπ/2); everything
+/// else is irrational and printed from a high-precision `Float::tan`. `tan` at a
+/// pole (c ≡ 1/2 mod 1) is left unevaluated. This avoids algebraic division,
+/// which puremp 0.2.0 mishandles for a rational divisor.
+fn tan_pp_decimal(c: &Rational, precision: u32) -> Option<String> {
+    // r = c mod 1 in [0, 1) — tan has period π.
+    let r = c - &Rational::from_integer(c.floor());
+    let quarter = Rational::new(Int::from_i64(1), Int::from_i64(4));
+    let half = Rational::new(Int::from_i64(1), Int::from_i64(2));
+    let three_q = Rational::new(Int::from_i64(3), Int::from_i64(4));
+    if r.is_zero() {
+        return Some("0.0".into());
+    }
+    if r == half {
+        return None; // pole
+    }
+    if r == quarter {
+        return Some("1.0".into());
+    }
+    if r == three_q {
+        return Some("(- 1.0)".into());
+    }
+    // Irrational: high-precision float value.
+    let bits = (precision as u64 + 40) * 4 + 64;
+    let pi = Float::pi(bits, RM);
+    let v = Float::from_rational(c, bits, RM)
+        .mul(&pi, bits, RM)
+        .tan(bits, RM);
+    let neg = v.is_sign_negative();
+    let mag = if neg {
+        Float::zero(bits).sub(&v, bits, RM)
+    } else {
+        v
+    };
+    let body = format_trunc(&mag.to_rational()?, precision).1;
+    Some(if neg { format!("(- {body})") } else { body })
+}
+
+/// The `pp.decimal` rendering of an exact trig value: an integer rational prints
+/// as `N.0`, a non-integer rational as its terminating decimal, an irrational as
+/// a truncated decimal with `?`. A negative value is wrapped `(- …)`.
+fn format_trig_decimal(v: AlgVal, precision: u32) -> Option<String> {
+    let (neg, body) = match v {
+        AlgVal::Rat(r) => {
+            let neg = r.is_negative();
+            let a = r.abs();
+            let body = match a.to_integer() {
+                Some(i) => format!("{i}.0"),
+                None => format_trunc(&a, precision).1,
+            };
+            (neg, body)
+        }
+        AlgVal::Alg(a) => {
+            let neg = a.signum() < 0;
+            let mag = if neg { a.neg() } else { a };
+            let bits = (precision as u64 + 40) * 4 + 64;
+            let fr = mag.to_float(bits, RM).to_rational()?;
+            (neg, format_trunc(&fr, precision).1)
+        }
+    };
+    Some(if neg { format!("(- {body})") } else { body })
+}
+
+/// cos(c·π) as an exact rational-or-algebraic value.
+fn cos_pi(c: &Rational) -> Option<AlgVal> {
+    let n = c.denominator().to_u64()?;
+    if n == 0 || n > 200 {
+        return None;
+    }
+    let n = n as u32;
+    // cos(kπ/n) is a root of `T_n(x) = (−1)^k`.
+    let sign = if c.numerator().is_even() { 1 } else { -1 };
+    let poly = chebyshev_t(n).sub(&Poly::constant(Rational::from_integer(Int::from_i64(sign))));
+    let target = float_cos_pi(c, 200);
+    let mut best: Option<Algebraic> = None;
+    let mut best_d = f64::INFINITY;
+    for r in Algebraic::real_roots_of(&poly) {
+        let d = (r.to_f64() - target).abs();
+        if d < best_d {
+            best_d = d;
+            best = Some(r);
+        }
+    }
+    let a = best?;
+    Some(if a.is_rational() {
+        AlgVal::Rat(a.interval().0.clone())
+    } else {
+        AlgVal::Alg(a)
+    })
+}
+
+/// A `f64` approximation of cos(c·π), used only to select the right isolated root.
+fn float_cos_pi(c: &Rational, bits: u64) -> f64 {
+    let pi = Float::pi(bits, RM);
+    let arg = Float::from_rational(c, bits, RM).mul(&pi, bits, RM);
+    arg.cos(bits, RM).to_f64()
+}
+
+/// The Chebyshev polynomial of the first kind `T_n(x)` over ℚ.
+fn chebyshev_t(n: u32) -> Poly<Rational> {
+    let one = Rational::from_integer(Int::from_i64(1));
+    let mut prev = Poly::constant(one.clone()); // T_0 = 1
+    if n == 0 {
+        return prev;
+    }
+    let mut cur = Poly::monomial(one, 1); // T_1 = x
+    let two_x = Poly::monomial(Rational::from_integer(Int::from_i64(2)), 1);
+    for _ in 1..n {
+        let next = two_x.mul(&cur).sub(&prev); // T_{m+1} = 2x·T_m − T_{m−1}
+        prev = cur;
+        cur = next;
+    }
+    cur
+}
+
 #[cfg(test)]
 mod tests {
     use super::format_trunc;
