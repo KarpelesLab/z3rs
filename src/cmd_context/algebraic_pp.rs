@@ -22,7 +22,9 @@ use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use alloc::format;
 use alloc::string::{String, ToString};
-use puremp::{Float, Int, Rational, RoundingMode};
+use alloc::vec::Vec;
+use core::cmp::Ordering;
+use puremp::{Algebraic, Float, Int, Poly, Rational, RoundingMode};
 
 const RM: RoundingMode = RoundingMode::Nearest;
 
@@ -267,6 +269,244 @@ fn format_trunc(v: &Rational, precision: u32) -> (bool, String) {
         out.push('?');
     }
     (neg, out)
+}
+
+// ---------------------------------------------------------------------------
+// Exact algebraic comparison folding.
+//
+// z3's `simplify` decides a comparison / equality between two ground real
+// constants — e.g. `(< (^ 2.0 (/ 1.0 2.0)) 2.0)` → `true` — using exact
+// algebraic-number arithmetic. z3rs leaves the `^` opaque, so the comparison
+// survives. `fold_real_comparison` reproduces the decision exactly via
+// `puremp::Algebraic`, so no floating-point rounding can give a wrong verdict.
+// ---------------------------------------------------------------------------
+
+/// A ground real value carried exactly: rational until an irrational root forces
+/// a lift to a full algebraic number.
+enum AlgVal {
+    Rat(Rational),
+    Alg(Algebraic),
+}
+
+impl AlgVal {
+    fn into_algebraic(self) -> Algebraic {
+        match self {
+            AlgVal::Rat(r) => Algebraic::from_rational(r),
+            AlgVal::Alg(a) => a,
+        }
+    }
+}
+
+/// `true`/`false` if `s` is a comparison or equality of two ground real
+/// constants; `None` otherwise (a variable, an unsupported operator, or a
+/// non-real comparison — left to the normal printer).
+pub fn fold_real_comparison(m: &AstManager, s: AstId) -> Option<bool> {
+    if m.is_eq(s) {
+        let args = m.app_args(s);
+        if args.len() != 2 || !m.is_arith_sort(m.get_sort(args[0])) {
+            return None;
+        }
+        let a = eval_algebraic(m, args[0])?.into_algebraic();
+        let b = eval_algebraic(m, args[1])?.into_algebraic();
+        return Some(a == b);
+    }
+    let op = m.arith_op(s)?;
+    let args = m.app_args(s);
+    if args.len() != 2 {
+        return None;
+    }
+    let ord = eval_algebraic(m, args[0])?
+        .into_algebraic()
+        .cmp(&eval_algebraic(m, args[1])?.into_algebraic());
+    Some(match op {
+        ArithOp::Lt => ord == Ordering::Less,
+        ArithOp::Le => ord != Ordering::Greater,
+        ArithOp::Gt => ord == Ordering::Greater,
+        ArithOp::Ge => ord != Ordering::Less,
+        _ => return None,
+    })
+}
+
+/// Exact algebraic value of a ground real term, or `None` for a variable / an
+/// unsupported operator / a real root that is not real (e.g. even root of a
+/// negative) / a q-th root of an irrational.
+fn eval_algebraic(m: &AstManager, s: AstId) -> Option<AlgVal> {
+    if let Some(r) = m.as_numeral(s) {
+        return Some(AlgVal::Rat(r));
+    }
+    if let Some((base_t, exp_t)) = power_uf_args(m, s) {
+        let base = eval_algebraic(m, base_t)?;
+        let e = eval_rational(m, exp_t)?;
+        return alg_power(base, &e);
+    }
+    let op = m.arith_op(s)?;
+    let args = m.app_args(s);
+    match op {
+        ArithOp::ToReal => eval_algebraic(m, *args.first()?),
+        ArithOp::Abs => Some(alg_abs(eval_algebraic(m, *args.first()?)?)),
+        ArithOp::Uminus => Some(alg_neg(eval_algebraic(m, *args.first()?)?)),
+        ArithOp::Add => {
+            let mut acc = eval_algebraic(m, *args.first()?)?;
+            for &a in &args[1..] {
+                acc = alg_add(acc, eval_algebraic(m, a)?);
+            }
+            Some(acc)
+        }
+        ArithOp::Sub => {
+            let mut acc = eval_algebraic(m, *args.first()?)?;
+            if args.len() == 1 {
+                return Some(alg_neg(acc));
+            }
+            for &a in &args[1..] {
+                acc = alg_sub(acc, eval_algebraic(m, a)?);
+            }
+            Some(acc)
+        }
+        ArithOp::Mul => {
+            let mut acc = eval_algebraic(m, *args.first()?)?;
+            for &a in &args[1..] {
+                acc = alg_mul(acc, eval_algebraic(m, a)?);
+            }
+            Some(acc)
+        }
+        ArithOp::Div => {
+            let mut acc = eval_algebraic(m, *args.first()?)?;
+            for &a in &args[1..] {
+                acc = alg_div(acc, eval_algebraic(m, a)?)?;
+            }
+            Some(acc)
+        }
+        ArithOp::Power => {
+            let base = eval_algebraic(m, *args.first()?)?;
+            let e = eval_rational(m, *args.get(1)?)?;
+            alg_power(base, &e)
+        }
+        _ => None,
+    }
+}
+
+fn eval_rational(m: &AstManager, s: AstId) -> Option<Rational> {
+    match eval_real(m, s, 128)? {
+        RealVal::Rat(r) => Some(r),
+        RealVal::Irr(_) => None,
+    }
+}
+
+fn alg_neg(v: AlgVal) -> AlgVal {
+    match v {
+        AlgVal::Rat(r) => AlgVal::Rat(-r),
+        AlgVal::Alg(a) => AlgVal::Alg(a.neg()),
+    }
+}
+
+fn alg_abs(v: AlgVal) -> AlgVal {
+    match v {
+        AlgVal::Rat(r) => AlgVal::Rat(r.abs()),
+        AlgVal::Alg(a) if a.signum() < 0 => AlgVal::Alg(a.neg()),
+        AlgVal::Alg(a) => AlgVal::Alg(a),
+    }
+}
+
+fn alg_add(a: AlgVal, b: AlgVal) -> AlgVal {
+    match (a, b) {
+        (AlgVal::Rat(x), AlgVal::Rat(y)) => AlgVal::Rat(&x + &y),
+        (a, b) => AlgVal::Alg(a.into_algebraic().add(&b.into_algebraic())),
+    }
+}
+
+fn alg_sub(a: AlgVal, b: AlgVal) -> AlgVal {
+    match (a, b) {
+        (AlgVal::Rat(x), AlgVal::Rat(y)) => AlgVal::Rat(&x - &y),
+        (a, b) => AlgVal::Alg(a.into_algebraic().sub(&b.into_algebraic())),
+    }
+}
+
+fn alg_mul(a: AlgVal, b: AlgVal) -> AlgVal {
+    match (a, b) {
+        (AlgVal::Rat(x), AlgVal::Rat(y)) => AlgVal::Rat(&x * &y),
+        (a, b) => AlgVal::Alg(a.into_algebraic().mul(&b.into_algebraic())),
+    }
+}
+
+fn alg_div(a: AlgVal, b: AlgVal) -> Option<AlgVal> {
+    Some(match (a, b) {
+        (AlgVal::Rat(x), AlgVal::Rat(y)) => {
+            if y.is_zero() {
+                return None;
+            }
+            AlgVal::Rat(&x / &y)
+        }
+        (a, b) => {
+            let ba = b.into_algebraic();
+            if ba.signum() == 0 {
+                return None;
+            }
+            AlgVal::Alg(a.into_algebraic().div(&ba))
+        }
+    })
+}
+
+/// `base ^ (p/q)` exactly. Rational base: `q`-th root of `base^p`. Irrational
+/// base: only integer exponents (a `q`-th root of an irrational is unsupported).
+fn alg_power(base: AlgVal, e: &Rational) -> Option<AlgVal> {
+    let p = e.numerator().to_i64()?;
+    if p > i32::MAX as i64 || p < i32::MIN as i64 {
+        return None;
+    }
+    let q = e.denominator().to_u64()?;
+    if q == 0 || q > 128 {
+        return None;
+    }
+    match base {
+        AlgVal::Rat(r) => {
+            let rp = r.pow(p as i32);
+            if q == 1 {
+                Some(AlgVal::Rat(rp))
+            } else {
+                Some(AlgVal::Alg(algebraic_nth_root(&rp, q as u32)?))
+            }
+        }
+        AlgVal::Alg(a) => {
+            if q != 1 {
+                return None;
+            }
+            Some(AlgVal::Alg(alg_powi(&a, p as i32)?))
+        }
+    }
+}
+
+/// The positive real `q`-th root of a positive rational `c`, as an exact
+/// algebraic number (root of `T^q − c`). `None` for a negative `c`.
+fn algebraic_nth_root(c: &Rational, q: u32) -> Option<Algebraic> {
+    if c.is_zero() {
+        return Some(Algebraic::from_int(Int::from_i64(0)));
+    }
+    if c.is_negative() {
+        return None;
+    }
+    let mut coeffs: Vec<Rational> = Vec::with_capacity(q as usize + 1);
+    coeffs.push(-c.clone());
+    for _ in 1..q {
+        coeffs.push(Rational::from_integer(Int::from_i64(0)));
+    }
+    coeffs.push(Rational::from_integer(Int::from_i64(1)));
+    let poly = Poly::new(coeffs);
+    Algebraic::real_roots_of(&poly)
+        .into_iter()
+        .find(|r| r.signum() > 0)
+}
+
+/// `a ^ p` for an integer `p` (repeated multiplication; reciprocal if negative).
+fn alg_powi(a: &Algebraic, p: i32) -> Option<Algebraic> {
+    if p == 0 {
+        return Some(Algebraic::from_int(Int::from_i64(1)));
+    }
+    let n = p.unsigned_abs();
+    let mut acc = a.clone();
+    for _ in 1..n {
+        acc = acc.mul(a);
+    }
+    Some(if p < 0 { acc.recip() } else { acc })
 }
 
 #[cfg(test)]

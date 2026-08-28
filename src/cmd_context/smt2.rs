@@ -3220,6 +3220,13 @@ impl Context {
                 if let Some(cps) = self.str_value(s) {
                     return Ok(Some(smt_string_literal(&cps)));
                 }
+                // A comparison / equality of two ground real constants (e.g.
+                // `(< (^ 2.0 (/ 1.0 2.0)) 2.0)`) decides via exact algebraic
+                // arithmetic — z3rs leaves the `^` opaque, so simplify keeps the
+                // comparison; fold it the way z3's simplify does.
+                if let Some(b) = super::algebraic_pp::fold_real_comparison(&self.m, s) {
+                    return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                }
                 // Under `:pp.decimal true`, a ground irrational algebraic real
                 // (e.g. `(^ 2.0 (/ 1.0 2.0))` = √2) prints as a truncated decimal
                 // with a `?` suffix rather than the opaque `^` term.
