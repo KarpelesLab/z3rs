@@ -362,6 +362,28 @@ fn render_bv_field(v: u64, w: u32) -> String {
     }
 }
 
+/// Render a concrete `w`-bit vector value under the `pp.bv-neg` / `pp.bv-literals`
+/// display options. With `pp.bv-neg`, a value whose top bit is set prints as
+/// `(bvneg <two's-complement negation>)`; with `pp.bv-literals` off, a literal
+/// prints as `(_ bv<decimal> w)` instead of `#x…`/`#b…`.
+fn render_bv_pp(v: &Int, w: u32, bv_neg: bool, bv_literals: bool) -> String {
+    let modulus = Int::from(1).mul_2k(w); // 2^w
+    let half = Int::from(1).mul_2k(w - 1); // 2^(w-1)
+    let negate = bv_neg && *v >= half;
+    let shown = if negate { &modulus - v } else { v.clone() };
+    let lit = if bv_literals {
+        // `shown` fits in `w` bits; render the low 64 bits per nibble/bit.
+        render_bv_field(shown.to_u64().unwrap_or(0), w)
+    } else {
+        alloc::format!("(_ bv{shown} {w})")
+    };
+    if negate {
+        alloc::format!("(bvneg {lit})")
+    } else {
+        lit
+    }
+}
+
 /// Render a floating-point bit pattern of format `(eb, sb)` the way z3's model
 /// printer does: the special values as `(_ NaN eb sb)` / `(_ ±oo eb sb)` /
 /// `(_ ±zero eb sb)`, and any finite value as `(fp #b<sign> <exp> <sig>)`.
@@ -3211,7 +3233,20 @@ impl Context {
                 let s = crate::rewriter::simplify(&mut self.m, folded);
                 // A ground bit-vector term folds to a concrete numeral (the
                 // th_rewriter itself does not constant-fold bit-vector ops).
-                if self.m.bv_sort_width(self.m.get_sort(s)).is_some() && self.is_fully_concrete(s) {
+                if let Some(w) = self.m.bv_sort_width(self.m.get_sort(s))
+                    && self.is_fully_concrete(s)
+                {
+                    // The `pp.bv-neg` / `pp.bv-literals` display options change how a
+                    // concrete bit-vector literal prints; apply them when set (else
+                    // the default `#x…`/`#b…` printer is used verbatim).
+                    let bv_neg = self.params.get_bool("pp.bv-neg", false);
+                    let bv_literals = self.params.get_bool("pp.bv-literals", true);
+                    if (bv_neg || !bv_literals)
+                        && w >= 1
+                        && let Some(v) = self.m.bv_numeral_value(s)
+                    {
+                        return Ok(Some(render_bv_pp(&v, w, bv_neg, bv_literals)));
+                    }
                     let mut model = Model::from_bv(BTreeMap::new());
                     return Ok(Some(model.value_string(&self.m, s)));
                 }
