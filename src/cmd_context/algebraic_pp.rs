@@ -43,50 +43,58 @@ impl RealVal {
     }
 }
 
-/// The `pp.decimal` rendering of a simplified term `s`, or `None` when `s` is not
-/// a ground irrational real (in which case the caller prints it normally).
-pub fn format_pp_decimal(m: &AstManager, s: AstId, precision: u32) -> Option<String> {
-    // Enough base-2 guard bits to make the first `precision` decimal digits of an
-    // irrational reliably correct (~3.33 bits/digit, plus a wide margin).
+/// The `pp.decimal` rendering of a ground real term, recursing through the
+/// arithmetic structure so that a real subterm prints as its decimal while the
+/// rest is preserved — e.g. `(/ (^ 2.0 (/ 1.0 2.0)) 0.0)` (a division by zero
+/// that stays symbolic) renders as `(/ 1.4142135623? 0.0)`. A ground real value
+/// (rational or irrational) formats directly; otherwise it recurses through the
+/// prefix heads `+ - * / ^`, printing any non-real subterm via the normal `m.pp`.
+/// Returns `None` when nothing was reformatted (the caller prints normally).
+pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option<String> {
     let bits = (precision as u64 + 40) * 4 + 64;
-    match eval_real(m, s, bits)? {
-        // Leave rationals to the normal printer.
-        RealVal::Rat(_) => None,
-        RealVal::Irr(f) => {
-            let v = f.to_rational()?;
-            let (neg, body) = format_trunc(&v, precision);
+    match eval_real(m, s, bits) {
+        Some(RealVal::Irr(f)) => {
+            let (neg, body) = format_trunc(&f.to_rational()?, precision);
             Some(if neg { format!("(- {body})") } else { body })
+        }
+        // A ground real rational; Int-sorted numerals are left to the normal
+        // printer (`pp.decimal` is a real-number display).
+        Some(RealVal::Rat(r)) => {
+            (!m.is_int_sort(m.get_sort(s))).then(|| format_real_decimal(&r, precision))
+        }
+        // Not a ground real: recurse through the prefix arithmetic heads.
+        None => {
+            let head = arith_prefix_head(m, s)?;
+            let args = m.app_args(s);
+            let mut parts = Vec::with_capacity(args.len());
+            let mut changed = false;
+            for &a in args {
+                match format_pp_decimal_rec(m, a, precision) {
+                    Some(fa) => {
+                        changed = true;
+                        parts.push(fa);
+                    }
+                    None => parts.push(m.pp(a)),
+                }
+            }
+            changed.then(|| format!("({head} {})", parts.join(" ")))
         }
     }
 }
 
-/// Like [`format_pp_decimal`] but recurses through an arithmetic term so that an
-/// irrational algebraic *subterm* prints as its decimal while the surrounding
-/// structure is preserved — e.g. `(/ (^ 2.0 (/ 1.0 2.0)) 0.0)` (a division by
-/// zero that stays symbolic) renders as `(/ 1.4142135623? 0.0)`. Returns `None`
-/// if `s` contains no irrational algebraic subterm (the caller prints normally).
-/// Only rebuilds through `+ - * / ^` whose SMT form is a plain prefix application,
-/// so an unchanged subterm's `m.pp` output is reproduced exactly; rational
-/// numerals are never reformatted, so no already-passing output changes.
-pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option<String> {
-    if let Some(d) = format_pp_decimal(m, s, precision) {
-        return Some(d);
+/// A real rational rendered under `:pp.decimal`: an integer as `N.0`, otherwise a
+/// truncated decimal (`0.5`, `0.3333333333?`), a negative wrapped `(- …)`.
+fn format_real_decimal(r: &Rational, precision: u32) -> String {
+    let a = r.abs();
+    let body = match a.to_integer() {
+        Some(i) => format!("{i}.0"),
+        None => format_trunc(&a, precision).1,
+    };
+    if r.is_negative() {
+        format!("(- {body})")
+    } else {
+        body
     }
-    // Recurse only through arithmetic / power heads printed as `(op args…)`.
-    let head = arith_prefix_head(m, s)?;
-    let args = m.app_args(s);
-    let mut parts = Vec::with_capacity(args.len());
-    let mut changed = false;
-    for &a in args {
-        match format_pp_decimal_rec(m, a, precision) {
-            Some(fa) => {
-                changed = true;
-                parts.push(fa);
-            }
-            None => parts.push(m.pp(a)),
-        }
-    }
-    changed.then(|| format!("({head} {})", parts.join(" ")))
 }
 
 /// The prefix head symbol (`+ - * / ^`) if `s` is such an application, else
