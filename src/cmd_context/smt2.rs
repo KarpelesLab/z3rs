@@ -17704,30 +17704,45 @@ impl Context {
     /// integer/half-integer `k` reduce; `None` otherwise (stays opaque).
     fn trig_reduce(&mut self, op: &str, arg: AstId) -> Option<AstId> {
         use crate::ast::ArithOp;
-        // Flatten the argument sum (order-preserving), splitting off the constant
-        // `π` coefficient `k` from the residual `θ`.
-        fn flatten_add(ctx: &Context, t: AstId, out: &mut Vec<AstId>) {
-            if ctx.m.arith_op(t) == Some(ArithOp::Add) {
-                for &a in ctx.m.app_args(t) {
-                    flatten_add(ctx, a, out);
+        // Flatten the argument sum (order-preserving) into signed terms, so a
+        // subtracted `π` multiple (`x − π`, `x − 2π`) is handled too.
+        fn flatten_signed(ctx: &Context, t: AstId, neg: bool, out: &mut Vec<(AstId, bool)>) {
+            match ctx.m.arith_op(t) {
+                Some(ArithOp::Add) => {
+                    for &a in ctx.m.app_args(t) {
+                        flatten_signed(ctx, a, neg, out);
+                    }
                 }
-            } else {
-                out.push(t);
+                Some(ArithOp::Sub) if !ctx.m.app_args(t).is_empty() => {
+                    let args = ctx.m.app_args(t).to_vec();
+                    flatten_signed(ctx, args[0], neg, out);
+                    for &a in &args[1..] {
+                        flatten_signed(ctx, a, !neg, out);
+                    }
+                }
+                Some(ArithOp::Uminus) if ctx.m.app_args(t).len() == 1 => {
+                    let a = ctx.m.app_args(t)[0];
+                    flatten_signed(ctx, a, !neg, out);
+                }
+                _ => out.push((t, neg)),
             }
         }
         let mut terms = Vec::new();
-        flatten_add(self, arg, &mut terms);
+        flatten_signed(self, arg, false, &mut terms);
         let mut k = Rational::from_integer(Int::from(0));
         let mut residual: Vec<AstId> = Vec::new();
         let mut found = false;
-        for &t in &terms {
+        for &(t, neg) in &terms {
             if let Some(c) = self.pi_coeff(t) {
-                k = &k + &c;
+                k = if neg { &k - &c } else { &k + &c };
                 found = true;
             } else if self.period_multiple(t, op == "tan") {
                 // A full-period multiple (`2π·integer`, or `π·integer` for tan)
-                // leaves the value unchanged — drop it.
+                // leaves the value unchanged — drop it (sign irrelevant).
                 found = true;
+            } else if neg {
+                // A negated symbolic residual can't be reconstructed cleanly here.
+                return None;
             } else {
                 residual.push(t);
             }

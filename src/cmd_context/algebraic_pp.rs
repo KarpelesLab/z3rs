@@ -97,8 +97,10 @@ fn format_real_decimal(r: &Rational, precision: u32) -> String {
     }
 }
 
-/// The prefix head symbol (`+ - * / ^`) if `s` is such an application, else
-/// `None`. These are exactly the heads z3rs prints as `(sym arg…)`.
+/// The prefix head symbol if `s` is an application z3rs prints as `(sym arg…)`:
+/// the arithmetic operators `+ - * / ^`, the opaque `^` power UF, and the
+/// transcendental function symbols (so a numeral inside e.g. `(tan (+ x (* 1/2
+/// pi)))` still formats). Returns `None` otherwise.
 fn arith_prefix_head(m: &AstManager, s: AstId) -> Option<&'static str> {
     if let Some(op) = m.arith_op(s) {
         return match op {
@@ -110,8 +112,15 @@ fn arith_prefix_head(m: &AstManager, s: AstId) -> Option<&'static str> {
             _ => None,
         };
     }
-    // The opaque `(^ base exp)` power UF.
-    (m.app(s)?.args.len() == 2 && m.func_decl(m.app_decl(s))?.name.as_str()? == "^").then_some("^")
+    // A non-indexed function application printed in plain prefix form: the `^`
+    // power UF and the transcendental functions.
+    match m.func_decl(m.app_decl(s))?.name.as_str()? {
+        "^" if m.app(s)?.args.len() == 2 => Some("^"),
+        "sin" => Some("sin"),
+        "cos" => Some("cos"),
+        "tan" => Some("tan"),
+        _ => None,
+    }
 }
 
 /// Evaluates a ground real term, or `None` if it contains a variable / an
