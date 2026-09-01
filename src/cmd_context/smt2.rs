@@ -1446,6 +1446,18 @@ fn z3_command_error(msg: &str, toks: &[String], positions: &[(u32, u32)]) -> Opt
             "(error \"line {l} column {c}: unknown sort '{name}'\")"
         ));
     }
+    // Ill-sorted recursive definition. z3 reports it once the whole command is
+    // parsed: for `define-fun-rec` at the command's closing paren (the last
+    // token), for `define-funs-rec` at the bodies-list closing paren (the
+    // second-to-last token, before the command close).
+    if msg.starts_with("invalid function definition, sort mismatch.") {
+        let idx = match toks.get(1).map(String::as_str) {
+            Some("define-funs-rec") if positions.len() >= 2 => positions.len() - 2,
+            _ => positions.len().saturating_sub(1),
+        };
+        let (l, c) = positions.get(idx).copied().unwrap_or((0, 0));
+        return Some(alloc::format!("(error \"line {l} column {c}: {msg}\")"));
+    }
     None
 }
 
@@ -21734,11 +21746,23 @@ impl Context {
             scope.push((pname, ph));
             vars.push(ph);
         }
+        let range = self.m.func_decl(decl).expect("rec fun decl").range;
         let app = self.m.mk_app(decl, &vars);
         self.scopes.push(scope);
         let body = self.term(body);
         self.scopes.pop();
-        let axiom = self.m.mk_eq(app, body?);
+        let body = body?;
+        // z3 rejects a recursive definition whose body sort differs from the
+        // declared range (well-sortedness of `define-fun(s)-rec`).
+        let body_sort = self.m.get_sort(body);
+        if body_sort != range {
+            return Err(alloc::format!(
+                "invalid function definition, sort mismatch. Expcected {} but function body has sort {}",
+                self.sort_display(range),
+                self.sort_display(body_sort)
+            ));
+        }
+        let axiom = self.m.mk_eq(app, body);
         if vars.is_empty() {
             self.assertions.push(axiom);
             self.assert_names.push(None);
