@@ -1341,6 +1341,84 @@ fn parse_root_obj_poly(
     }
 }
 
+/// Parse a `root-obj` univariate polynomial (over the local variable `x`) from an
+/// already-parsed s-expression — the term-path counterpart of
+/// [`parse_root_obj_poly`], which works on the raw token stream. Accepts `x`,
+/// integer numerals, and `+ - * ^` applications; rejects any other symbol
+/// (crucially, no declaration of `x` is required and none leaks).
+fn sexpr_root_obj_poly(s: &SExpr) -> Result<Poly<Rational>, String> {
+    match s {
+        SExpr::Atom(a) => {
+            if a == "x" {
+                Ok(Poly::monomial(Rational::from_integer(Int::from(1)), 1))
+            } else if let Some((r, _)) = parse_numeral(a) {
+                if r.to_integer().is_some() {
+                    Ok(Poly::constant(r))
+                } else {
+                    Err("invalid univariate polynomial, integer coefficient expected".to_string())
+                }
+            } else {
+                Err("invalid univariate polynomial, variable 'x' expected".to_string())
+            }
+        }
+        SExpr::List(l) if !l.is_empty() => {
+            let head = match &l[0] {
+                SExpr::Atom(h) => h.as_str(),
+                _ => return Err("invalid univariate polynomial, symbol expected".to_string()),
+            };
+            let nargs = l.len() - 1;
+            match head {
+                "+" | "-" | "*" => {
+                    if nargs == 0 {
+                        return Err(alloc::format!(
+                            "invalid univariate polynomial, '{head}' operator expects at least one argument"
+                        ));
+                    }
+                    let mut acc = sexpr_root_obj_poly(&l[1])?;
+                    if head == "-" && nargs == 1 {
+                        acc = acc.neg();
+                    }
+                    for a in &l[2..] {
+                        let arg = sexpr_root_obj_poly(a)?;
+                        acc = match head {
+                            "+" => acc.add(&arg),
+                            "-" => acc.sub(&arg),
+                            _ => acc.mul(&arg),
+                        };
+                    }
+                    Ok(acc)
+                }
+                "^" => {
+                    if nargs != 2 {
+                        return Err(
+                            "invalid univariate polynomial, '^' operator expects two arguments"
+                                .to_string(),
+                        );
+                    }
+                    let base = sexpr_root_obj_poly(&l[1])?;
+                    let exp = match &l[2] {
+                        SExpr::Atom(e) => root_obj_exponent(e).ok_or_else(|| {
+                            "invalid univariate polynomial, exponent must be an unsigned integer"
+                                .to_string()
+                        })?,
+                        _ => {
+                            return Err(
+                                "invalid univariate polynomial, exponent must be an unsigned integer"
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    Ok(poly_pow(&base, exp))
+                }
+                _ => {
+                    Err("invalid univariate polynomial, '+', '-', '^' or '*' expected".to_string())
+                }
+            }
+        }
+        _ => Err("invalid univariate polynomial".to_string()),
+    }
+}
+
 /// The exponent of a `(^ x k)` term: a numeral whose value is a non-negative
 /// machine integer (z3 accepts e.g. `2.0`; rejects `2.5` and negatives).
 fn root_obj_exponent(t: &str) -> Option<u32> {
@@ -3535,6 +3613,11 @@ impl Context {
                 let t = self.term(&list[1])?;
                 let folded = self.dt_fold(t);
                 let s = crate::rewriter::simplify(&mut self.m, folded);
+                // Fold any ground algebraic (in)equalities buried inside the term
+                // (e.g. `(not (= (root-obj …) 0.0))`) to `true`/`false` via exact
+                // algebraic arithmetic, then re-simplify — so a Boolean context
+                // around such an atom collapses the way z3's `simplify` does.
+                let s = self.fold_ground_algebraic_atoms(s);
                 // A ground bit-vector term folds to a concrete numeral (the
                 // th_rewriter itself does not constant-fold bit-vector ops).
                 if let Some(w) = self.m.bv_sort_width(self.m.get_sort(s))
@@ -3578,6 +3661,18 @@ impl Context {
                         }
                     } else if let Some(out) = super::algebraic_pp::trig_exact(&name, &c) {
                         return Ok(Some(out));
+                    }
+                }
+                // A ground algebraic real built from a nested `root-obj` (possibly
+                // combined with rationals, e.g. `(+ (root-obj …) 1.0)`) is folded
+                // to its exact value and re-canonicalised: a rational numeral, or
+                // the minimal-polynomial `root-obj` (a decimal under `:pp.decimal`).
+                {
+                    let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+                    if let Some(d) =
+                        super::algebraic_pp::render_root_obj_term(&self.m, s, pp_decimal, prec)
+                    {
+                        return Ok(Some(d));
                     }
                 }
                 // Under `:pp.decimal true`, a ground irrational algebraic real
@@ -3690,12 +3785,25 @@ impl Context {
                     return Err("eval requires a preceding satisfiable check-sat".to_string());
                 }
                 let id = self.term(&list[1])?;
+                // Fold ground algebraic (in)equalities (e.g. over a nested
+                // `root-obj`) to `true`/`false` before model evaluation, matching
+                // z3's exact algebraic decision.
+                let id = self.fold_ground_algebraic_atoms(id);
                 // An asserted formula (a top-level conjunct of the assertions)
                 // holds in every satisfying model, so its value is `true`
                 // regardless of the concrete model recorded — and `(not …)` of one
                 // is `false`. Genuine: the check-sat returned `sat`.
                 if let Some(b) = self.asserted_truth(id) {
                     return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                }
+                // A ground algebraic real containing a nested `root-obj` evaluates
+                // to its exact value (model-independent) rather than the opaque node.
+                let pp_decimal = self.params.get_bool("pp.decimal", false);
+                let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+                if let Some(d) =
+                    super::algebraic_pp::render_root_obj_term(&self.m, id, pp_decimal, prec)
+                {
+                    return Ok(Some(d));
                 }
                 let mut model = self.last_model.take().unwrap();
                 let v = self
@@ -26679,6 +26787,65 @@ impl Context {
         })
     }
 
+    /// Build the opaque algebraic-constant term for a nested `(root-obj poly
+    /// index)`. Parses the univariate polynomial (over the local variable `x`,
+    /// which is *not* a declared constant) and the 1-based root index, then encodes
+    /// them in a real-sorted uninterpreted `root-obj` node (coefficient numerals
+    /// ascending by degree, followed by the index) that the algebraic evaluator
+    /// decodes. See `algebraic_pp::root_obj_node`.
+    fn term_root_obj(&mut self, args: &[SExpr]) -> Result<AstId, String> {
+        if args.len() != 2 {
+            return Err("invalid root-obj, (poly index) expected".to_string());
+        }
+        let poly = sexpr_root_obj_poly(&args[0])?;
+        if poly.is_zero() {
+            return Err(
+                "invalid root object, polynomial must not be the zero polynomial".to_string(),
+            );
+        }
+        let index = match &args[1] {
+            SExpr::Atom(t) => match classify_root_obj_index(t) {
+                RootIndex::Valid(u) => u,
+                RootIndex::TooSmall => {
+                    return Err("invalid root-obj, index must be >= 1".to_string());
+                }
+                RootIndex::TooBig => {
+                    return Err(
+                        "invalid root-obj, index must fit in an unsigned machine integer"
+                            .to_string(),
+                    );
+                }
+                RootIndex::NotInt => {
+                    return Err("invalid root-obj, (unsigned) integer expected".to_string());
+                }
+            },
+            _ => return Err("invalid root-obj, (unsigned) integer expected".to_string()),
+        };
+        Ok(self.mk_root_obj_node(&poly, index))
+    }
+
+    /// Encode an algebraic constant `root-obj(poly, index)` as an opaque
+    /// real-sorted node: the coefficient numerals (ascending by degree) followed by
+    /// the 1-based index, under an uninterpreted `root-obj` declaration.
+    fn mk_root_obj_node(&mut self, poly: &Poly<Rational>, index: usize) -> AstId {
+        let int_sort = self.m.mk_int_sort();
+        let real_sort = self.m.mk_real_sort();
+        let coeffs = poly.coeffs();
+        let mut args: Vec<AstId> = Vec::with_capacity(coeffs.len() + 1);
+        let mut domain: Vec<AstId> = Vec::with_capacity(coeffs.len() + 1);
+        for c in coeffs {
+            let is_int = c.is_integer();
+            args.push(self.m.mk_numeral(c.clone(), is_int));
+            domain.push(if is_int { int_sort } else { real_sort });
+        }
+        args.push(self.m.mk_int(index as i64));
+        domain.push(int_sort);
+        let decl = self
+            .m
+            .mk_func_decl(Symbol::new("root-obj"), &domain, real_sort);
+        self.m.mk_app(decl, &args)
+    }
+
     /// Build a term from an s-expression.
     fn term(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
@@ -27267,6 +27434,15 @@ impl Context {
                     "str.to.re" => "str.to_re".to_string(),
                     _ => head,
                 };
+                if head == "root-obj" {
+                    // `(root-obj poly index)` as a nested term: an algebraic
+                    // constant. The polynomial's variable `x` is local to the
+                    // form (never a declared constant), so we parse it here into an
+                    // opaque real-sorted node carrying the polynomial + index; the
+                    // algebraic evaluator (`algebraic_pp::eval_algebraic`) decodes
+                    // it back to its exact `Algebraic` value.
+                    return self.term_root_obj(&l[1..]);
+                }
                 if head == "let" {
                     if l.len() != 3 {
                         return Err("let: expected (let (bindings) body)".to_string());

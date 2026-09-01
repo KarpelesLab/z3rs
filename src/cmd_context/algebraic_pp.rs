@@ -681,6 +681,28 @@ fn eval_real(m: &AstManager, s: AstId, bits: u64) -> Option<RealVal> {
     }
 }
 
+/// Decode an internal `(root-obj c0 c1 … cn index)` node — the opaque
+/// algebraic-constant term the parser builds for a nested `root-obj` — into its
+/// polynomial (rational coefficients ascending by degree) and 1-based root index.
+/// The node is an uninterpreted application named `root-obj` whose leading args
+/// are numeral coefficients and whose last arg is the integer index.
+pub(crate) fn root_obj_node(m: &AstManager, s: AstId) -> Option<(Poly<Rational>, usize)> {
+    let a = m.app(s)?;
+    if m.func_decl(m.app_decl(s))?.name.as_str()? != "root-obj" {
+        return None;
+    }
+    if a.args.len() < 2 {
+        return None;
+    }
+    let (coeff_ids, idx_id) = a.args.split_at(a.args.len() - 1);
+    let index = m.as_numeral(idx_id[0])?.to_integer()?.to_u64()? as usize;
+    let mut coeffs = Vec::with_capacity(coeff_ids.len());
+    for &c in coeff_ids {
+        coeffs.push(m.as_numeral(c)?);
+    }
+    Some((Poly::new(coeffs), index))
+}
+
 /// The two arguments of an opaque `(^ base exp)` power UF, if `s` is one.
 fn power_uf_args(m: &AstManager, s: AstId) -> Option<(AstId, AstId)> {
     let a = m.app(s)?;
@@ -871,6 +893,19 @@ pub fn fold_real_comparison(m: &AstManager, s: AstId) -> Option<bool> {
 fn eval_algebraic(m: &AstManager, s: AstId) -> Option<AlgVal> {
     if let Some(r) = m.as_numeral(s) {
         return Some(AlgVal::Rat(r));
+    }
+    // A nested `(root-obj poly idx)` parsed as an opaque algebraic-constant term
+    // (see `Context::mk_root_obj_node`): decode its polynomial + 1-based index and
+    // return the exact algebraic value of that real root.
+    if let Some((poly, index)) = root_obj_node(m, s) {
+        let a = Algebraic::real_roots_of(&poly)
+            .into_iter()
+            .nth(index.checked_sub(1)?)?;
+        return Some(if a.is_rational() {
+            AlgVal::Rat(a.interval().0.clone())
+        } else {
+            AlgVal::Alg(a)
+        });
     }
     if let Some((base_t, exp_t)) = power_uf_args(m, s) {
         let base = eval_algebraic(m, base_t)?;
@@ -1344,17 +1379,7 @@ pub fn root_obj_value(
         });
     }
     if pp_decimal {
-        // z3's `display_decimal` hack: refine the isolating interval to width
-        // `< 2^-(precision*4)` and truncate the magnitude's UPPER endpoint (not a
-        // round-to-nearest value), so a value just below a decimal boundary rounds
-        // its last kept digit up exactly as z3 does.
-        let mut r = a.clone();
-        r.refine_below(&Rational::power_of_two(-((precision as i32) * 4)));
-        let (lo, hi) = r.interval();
-        let neg = a.signum() < 0;
-        let upper_mag = if neg { -lo.clone() } else { hi.clone() };
-        let (_neg, body) = format_trunc(&upper_mag, precision);
-        return Ok(if neg { format!("(- {body})") } else { body });
+        return Ok(format_algebraic_decimal(a, precision));
     }
     // Irrational, non-decimal: the canonical minimal-polynomial `root-obj` form.
     // `root_obj_string` is total for a genuine irrational real root; the decimal
@@ -1366,6 +1391,59 @@ pub fn root_obj_value(
         let (neg, body) = format_trunc(&fr, precision);
         if neg { format!("(- {body})") } else { body }
     }))
+}
+
+/// The `:pp.decimal` rendering of an irrational algebraic number, via z3's
+/// `display_decimal` hack: refine the isolating interval to width `< 2^-(4·prec)`
+/// and truncate the magnitude's UPPER endpoint (not a round-to-nearest value), so
+/// a value just below a decimal boundary rounds its last kept digit up exactly as
+/// z3 does. A negative value is wrapped `(- …)`.
+fn format_algebraic_decimal(a: &Algebraic, precision: u32) -> String {
+    let mut r = a.clone();
+    r.refine_below(&Rational::power_of_two(-((precision as i32) * 4)));
+    let (lo, hi) = r.interval();
+    let neg = a.signum() < 0;
+    let upper_mag = if neg { -lo.clone() } else { hi.clone() };
+    let (_neg, body) = format_trunc(&upper_mag, precision);
+    if neg { format!("(- {body})") } else { body }
+}
+
+/// Whether `s` mentions an internal `root-obj` node anywhere in its structure.
+fn contains_root_obj(m: &AstManager, s: AstId) -> bool {
+    m.postorder(s)
+        .into_iter()
+        .any(|t| root_obj_node(m, t).is_some())
+}
+
+/// Render a ground real term that contains a `root-obj` node the way z3's
+/// `simplify` canonicalises it: fold the whole expression to its exact algebraic
+/// value and print it — a rational as a real numeral (or truncated decimal under
+/// `:pp.decimal`), an irrational as the canonical minimal-polynomial `root-obj`
+/// form (or its truncated decimal under `:pp.decimal`). Returns `None` when the
+/// term is not a ground algebraic real or mentions no `root-obj` node (so ordinary
+/// terms are left to the normal printer untouched).
+pub fn render_root_obj_term(
+    m: &AstManager,
+    s: AstId,
+    pp_decimal: bool,
+    precision: u32,
+) -> Option<String> {
+    if !m.is_arith_sort(m.get_sort(s)) || !contains_root_obj(m, s) {
+        return None;
+    }
+    let a = eval_algebraic(m, s)?.into_algebraic();
+    Some(if a.is_rational() {
+        let r = a.interval().0.clone();
+        if pp_decimal {
+            format_real_decimal(&r, precision)
+        } else {
+            render_real_rational(&r)
+        }
+    } else if pp_decimal {
+        format_algebraic_decimal(&a, precision)
+    } else {
+        root_obj_string(&a)?
+    })
 }
 
 /// cos(c·π) as an exact rational-or-algebraic value.
