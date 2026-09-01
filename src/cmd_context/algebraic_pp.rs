@@ -794,28 +794,103 @@ fn primitive_integer_coeffs(p: &Poly<Rational>) -> Option<Vec<Int>> {
 }
 
 /// Formats integer polynomial coefficients (ascending degree) as z3's SMT sum
-/// `(+ (* c (^ x d)) … const)`, highest degree first.
+/// `(+ (* c (^ x d)) … const)`, highest degree first. Matches z3's exact
+/// rendering: a coefficient of 1 on `x^d` is elided (`(^ x d)`, or `x` for d=1),
+/// a coefficient of −1 becomes `(* (- 1) …)`, a negative constant `(- c)`.
 fn poly_to_smt(ints: &[Int]) -> String {
+    let one = Int::from_i64(1);
+    let neg_one = Int::from_i64(-1);
     let mut terms: Vec<String> = Vec::new();
     for d in (0..ints.len()).rev() {
         let c = &ints[d];
         if c.is_zero() {
             continue;
         }
-        let coeff = if c.is_negative() {
-            format!("(- {})", -c)
-        } else {
-            format!("{c}")
+        // The `x`-power factor for this degree (`None` for the constant term).
+        let xpow = match d {
+            0 => None,
+            1 => Some("x".to_string()),
+            _ => Some(format!("(^ x {d})")),
         };
-        terms.push(if d == 0 {
-            coeff
-        } else if d == 1 {
-            format!("(* {coeff} x)")
-        } else {
-            format!("(* {coeff} (^ x {d}))")
-        });
+        let term = match xpow {
+            None => {
+                if c.is_negative() {
+                    format!("(- {})", -c)
+                } else {
+                    format!("{c}")
+                }
+            }
+            Some(xp) if *c == one => xp,
+            Some(xp) if *c == neg_one => format!("(* (- 1) {xp})"),
+            Some(xp) if c.is_negative() => format!("(* (- {}) {xp})", -c),
+            Some(xp) => format!("(* {c} {xp})"),
+        };
+        terms.push(term);
     }
     format!("(+ {})", terms.join(" "))
+}
+
+/// A `root-obj` outcome that z3 reports as an error; the caller attaches the
+/// source position (both surface only after the polynomial and index parse).
+pub enum RootObjErr {
+    /// The polynomial is identically zero.
+    Zero,
+    /// The polynomial has fewer than `index` distinct real roots.
+    Insufficient,
+}
+
+/// Evaluate `(root-obj <poly> <index>)` to z3's `(simplify …)` rendering: a real
+/// numeral for a rational root, a truncated decimal (with `?`) under
+/// `:pp.decimal`, or the minimal-polynomial `(root-obj …)` form for an irrational
+/// root. `poly` carries integer (rational) coefficients ascending by degree;
+/// `index` is 1-based. Uses only root isolation, factoring and evaluation — never
+/// the algebraic arithmetic puremp 0.2.0 mishandles on non-minimal polynomials.
+pub fn root_obj_value(
+    poly: &Poly<Rational>,
+    index: usize,
+    pp_decimal: bool,
+    precision: u32,
+) -> Result<String, RootObjErr> {
+    if poly.is_zero() {
+        return Err(RootObjErr::Zero);
+    }
+    let roots = Algebraic::real_roots_of(poly);
+    if index == 0 || index > roots.len() {
+        return Err(RootObjErr::Insufficient);
+    }
+    let a = &roots[index - 1];
+    if a.is_rational() {
+        // The interval has collapsed to the exact rational value.
+        let r = a.interval().0.clone();
+        return Ok(if pp_decimal {
+            format_real_decimal(&r, precision)
+        } else {
+            render_real_rational(&r)
+        });
+    }
+    if pp_decimal {
+        // z3's `display_decimal` hack: refine the isolating interval to width
+        // `< 2^-(precision*4)` and truncate the magnitude's UPPER endpoint (not a
+        // round-to-nearest value), so a value just below a decimal boundary rounds
+        // its last kept digit up exactly as z3 does.
+        let mut r = a.clone();
+        r.refine_below(&Rational::power_of_two(-((precision as i32) * 4)));
+        let (lo, hi) = r.interval();
+        let neg = a.signum() < 0;
+        let upper_mag = if neg { -lo.clone() } else { hi.clone() };
+        let (_neg, body) = format_trunc(&upper_mag, precision);
+        return Ok(if neg { format!("(- {body})") } else { body });
+    }
+    // Irrational, non-decimal: the canonical minimal-polynomial `root-obj` form.
+    // `root_obj_string` is total for a genuine irrational real root; the decimal
+    // fallback is defensive and unreachable here.
+    Ok(root_obj_string(a).unwrap_or_else(|| {
+        let bits = (precision as u64 + 40) * 4 + 64;
+        let zero = Rational::from_integer(Int::from_i64(0));
+        let fr = a.to_float(bits, RM).to_rational().unwrap_or(zero);
+        let (neg, body) = format_trunc(&fr, precision);
+        if neg { format!("(- {body})") } else { body }
+    }))
 }
 
 /// cos(c·π) as an exact rational-or-algebraic value.

@@ -23,7 +23,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use puremp::{Int, Rational};
+use puremp::{Int, Poly, Rational};
 
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
@@ -1063,6 +1063,21 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
             ));
             continue;
         }
+        // `(simplify (root-obj …))`: z3's SMT2 parser handles `root-obj` as a
+        // special constructor, evaluating the algebraic root and reporting
+        // parse/validation errors at the scanner's exact source column. Handle it
+        // straight from the token stream so the columns match z3 byte-for-byte.
+        if is_simplify_root_obj(&toks[cmd_start..p]) {
+            let pp_decimal = ctx.params.get_bool("pp.decimal", false);
+            let prec = ctx.params.get_uint("pp.decimal-precision", 10) as u32;
+            out.push(eval_simplify_root_obj(
+                &toks[cmd_start..p],
+                &positions[cmd_start..p],
+                pp_decimal,
+                prec,
+            ));
+            continue;
+        }
         match ctx.command(&form) {
             Ok(Some(resp)) => out.push(resp),
             // A state-changing command that produced no output prints `success`
@@ -1122,6 +1137,283 @@ fn supported_logic(s: &str) -> bool {
         || has_fpa
         || has_datatype
         || has_finite_sets
+}
+
+/// Whether a command's tokens form `(simplify (root-obj …))` with `root-obj` as
+/// the direct argument — the shape z3's SMT2 parser dispatches to `parse_root_obj`.
+fn is_simplify_root_obj(ct: &[String]) -> bool {
+    ct.len() >= 4 && ct[0] == "(" && ct[1] == "simplify" && ct[2] == "(" && ct[3] == "root-obj"
+}
+
+/// The token index of the `)` matching the `(` at `open` (balanced input).
+fn matching_close(ct: &[String], open: usize) -> usize {
+    let mut depth = 0i32;
+    for (i, t) in ct.iter().enumerate().skip(open) {
+        match t.as_str() {
+            "(" => depth += 1,
+            ")" => {
+                depth -= 1;
+                if depth == 0 {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    ct.len().saturating_sub(1)
+}
+
+/// The number of top-level s-expression children in `ct[start..close]`.
+fn count_children(ct: &[String], start: usize, close: usize) -> usize {
+    let mut i = start;
+    let mut n = 0;
+    while i < close {
+        if ct[i] == "(" {
+            i = matching_close(ct, i) + 1;
+        } else {
+            i += 1;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// The result of classifying a `root-obj` index token (a syntactic integer, per
+/// z3's `check_int` on the scanner token, then range-checked as z3 does).
+enum RootIndex {
+    Valid(usize),
+    /// Not a syntactic integer token (float, symbol, `(`, `#…`, `+1`, …).
+    NotInt,
+    /// A negative value, or one exceeding an unsigned machine integer (u32).
+    TooBig,
+    /// The value 0 (indices are 1-based).
+    TooSmall,
+}
+
+/// Classify a `root-obj` index token exactly as z3's parser does: `check_int`
+/// requires a signed-integer scanner token (`-?[0-9]+`), then the value must be a
+/// nonzero unsigned machine integer.
+fn classify_root_obj_index(t: &str) -> RootIndex {
+    let (neg, digits) = match t.strip_prefix('-') {
+        Some(d) => (true, d),
+        None => (false, t),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return RootIndex::NotInt;
+    }
+    let is_zero = digits.bytes().all(|b| b == b'0');
+    if neg {
+        return if is_zero {
+            RootIndex::TooSmall
+        } else {
+            RootIndex::TooBig
+        };
+    }
+    if is_zero {
+        return RootIndex::TooSmall;
+    }
+    match digits.parse::<u64>() {
+        Ok(v) if v <= u32::MAX as u64 => RootIndex::Valid(v as usize),
+        _ => RootIndex::TooBig,
+    }
+}
+
+/// `base^k` for a univariate polynomial (repeated multiplication; `k = 0` → 1).
+fn poly_pow(base: &Poly<Rational>, k: u32) -> Poly<Rational> {
+    let mut acc = Poly::constant(Rational::from_integer(Int::from(1)));
+    for _ in 0..k {
+        acc = acc.mul(base);
+    }
+    acc
+}
+
+/// Port of z3's `sexpr2upolynomial`: build the univariate polynomial over ℚ from
+/// the token stream, consuming exactly one s-expression starting at `*i`. On error
+/// returns `(token-index, message)` positioned exactly where z3's scanner sits:
+/// the offending atom's token, or a composite's closing `)`.
+fn parse_root_obj_poly(
+    ct: &[String],
+    i: &mut usize,
+) -> Result<Poly<Rational>, (usize, &'static str)> {
+    let t = ct[*i].as_str();
+    if t == "(" {
+        let open = *i;
+        let close = matching_close(ct, open);
+        let head = ct[open + 1].as_str();
+        // The first child must be a symbol (not a composite, and not empty `()`).
+        if head == "(" || head == ")" {
+            return Err((close, "invalid univariate polynomial, symbol expected"));
+        }
+        let nargs = count_children(ct, open + 2, close);
+        match head {
+            "+" | "-" | "*" => {
+                if nargs == 0 {
+                    let m = match head {
+                        "+" => {
+                            "invalid univariate polynomial, '+' operator expects at least one argument"
+                        }
+                        "-" => {
+                            "invalid univariate polynomial, '-' operator expects at least one argument"
+                        }
+                        _ => {
+                            "invalid univariate polynomial, '*' operator expects at least one argument"
+                        }
+                    };
+                    return Err((close, m));
+                }
+                *i = open + 2; // first argument
+                let mut acc = parse_root_obj_poly(ct, i)?;
+                if head == "-" && nargs == 1 {
+                    acc = acc.neg();
+                }
+                for _ in 1..nargs {
+                    let arg = parse_root_obj_poly(ct, i)?;
+                    acc = match head {
+                        "+" => acc.add(&arg),
+                        "-" => acc.sub(&arg),
+                        _ => acc.mul(&arg),
+                    };
+                }
+                *i = close + 1; // past the closing `)`
+                Ok(acc)
+            }
+            "^" => {
+                if nargs != 2 {
+                    return Err((
+                        close,
+                        "invalid univariate polynomial, '^' operator expects two arguments",
+                    ));
+                }
+                *i = open + 2; // base
+                let base = parse_root_obj_poly(ct, i)?;
+                let etok = *i;
+                // The exponent must be a numeral whose value is an unsigned machine
+                // integer; a composite exponent is reported at its closing `)`.
+                let exp = if ct[etok] == "(" {
+                    return Err((
+                        matching_close(ct, etok),
+                        "invalid univariate polynomial, exponent must be an unsigned integer",
+                    ));
+                } else {
+                    match root_obj_exponent(ct[etok].as_str()) {
+                        Some(k) => k,
+                        None => {
+                            return Err((
+                                etok,
+                                "invalid univariate polynomial, exponent must be an unsigned integer",
+                            ));
+                        }
+                    }
+                };
+                *i = close + 1;
+                Ok(poly_pow(&base, exp))
+            }
+            _ => Err((
+                close,
+                "invalid univariate polynomial, '+', '-', '^' or '*' expected",
+            )),
+        }
+    } else if t.starts_with('#') {
+        // A bit-vector / other non-symbol, non-numeral atom (z3's fallthrough).
+        let tok = *i;
+        *i += 1;
+        Err((tok, "invalid univariate polynomial, unexpected "))
+    } else if let Some((r, _)) = parse_numeral(t) {
+        let tok = *i;
+        *i += 1;
+        if r.to_integer().is_some() {
+            Ok(Poly::constant(r))
+        } else {
+            Err((
+                tok,
+                "invalid univariate polynomial, integer coefficient expected",
+            ))
+        }
+    } else {
+        // A symbol: only the polynomial variable `x` is allowed.
+        let tok = *i;
+        *i += 1;
+        if t == "x" {
+            Ok(Poly::monomial(Rational::from_integer(Int::from(1)), 1))
+        } else {
+            Err((tok, "invalid univariate polynomial, variable 'x' expected"))
+        }
+    }
+}
+
+/// The exponent of a `(^ x k)` term: a numeral whose value is a non-negative
+/// machine integer (z3 accepts e.g. `2.0`; rejects `2.5` and negatives).
+fn root_obj_exponent(t: &str) -> Option<u32> {
+    let (r, _) = parse_numeral(t)?;
+    let i = r.to_integer()?;
+    let v = i.to_i64()?;
+    if (0..=u32::MAX as i64).contains(&v) {
+        Some(v as u32)
+    } else {
+        None
+    }
+}
+
+/// Parse, validate and evaluate `(simplify (root-obj <poly> <index>))` directly
+/// from the command's tokens (`ct`) and their source positions (`cpos`), so every
+/// error column matches z3's scanner exactly. Returns the response line: a value,
+/// or a positioned `(error …)`.
+fn eval_simplify_root_obj(
+    ct: &[String],
+    cpos: &[(u32, u32)],
+    pp_decimal: bool,
+    precision: u32,
+) -> String {
+    let ro_open = 2usize; // `(` of the root-obj application
+    let ro_close = matching_close(ct, ro_open);
+    let err = |tok: usize, msg: &str| -> String {
+        let (l, c) = cpos.get(tok).copied().unwrap_or((0, 0));
+        alloc::format!("(error \"line {l} column {c}: {msg}\")")
+    };
+    // The polynomial is the first argument, at token index 4.
+    let mut i = 4usize;
+    let poly = match parse_root_obj_poly(ct, &mut i) {
+        Ok(p) => p,
+        Err((tok, m)) => return err(tok, m),
+    };
+    // The index token immediately follows the polynomial.
+    let idx_tok = i;
+    let index = match classify_root_obj_index(ct.get(idx_tok).map_or(")", |s| s.as_str())) {
+        RootIndex::Valid(u) => u,
+        RootIndex::NotInt => {
+            return err(idx_tok, "invalid root-obj, (unsigned) integer expected");
+        }
+        RootIndex::TooBig => {
+            return err(
+                idx_tok,
+                "invalid root-obj, index must fit in an unsigned machine integer",
+            );
+        }
+        RootIndex::TooSmall => return err(idx_tok, "invalid root-obj, index must be >= 1"),
+    };
+    // After the index z3 expects the root-obj's closing `)`.
+    let after = idx_tok + 1;
+    if ct.get(after).map(String::as_str) != Some(")") {
+        let got = ct.get(after).map_or("", |s| s.as_str());
+        return err(
+            after,
+            &alloc::format!("invalid root-obj, ')' expected got {got}"),
+        );
+    }
+    // Evaluate. The zero-poly / insufficient-roots errors surface after the
+    // root-obj `)` is consumed, so z3 reports them at the following token (here the
+    // enclosing `simplify` closing paren).
+    match super::algebraic_pp::root_obj_value(&poly, index, pp_decimal, precision) {
+        Ok(s) => s,
+        Err(super::algebraic_pp::RootObjErr::Zero) => err(
+            ro_close + 1,
+            "invalid root object, polynomial must not be the zero polynomial",
+        ),
+        Err(super::algebraic_pp::RootObjErr::Insufficient) => err(
+            ro_close + 1,
+            "invalid root object, polynomial does have sufficient roots",
+        ),
+    }
 }
 
 /// Translate a recoverable command error into z3's `(error "line L column C: …")`
@@ -30208,6 +30500,65 @@ mod tests {
                  (assert (forall ((x Int)) (=> (<= (* 2 x) a) (<= x 3))))(check-sat)")
             .unwrap(),
             alloc::vec!["unknown"]
+        );
+    }
+
+    #[test]
+    fn root_obj_values_and_errors() {
+        // Rational roots render as real numerals.
+        assert_eq!(
+            run("(simplify (root-obj x 1))").unwrap(),
+            alloc::vec!["0.0"]
+        );
+        assert_eq!(
+            run("(simplify (root-obj (+ (* 2 x) 1) 1))").unwrap(),
+            alloc::vec!["(- (/ 1.0 2.0))"]
+        );
+        // An irrational root prints its primitive minimal polynomial (positive
+        // leading coefficient), reduced from a reducible / scaled input.
+        assert_eq!(
+            run("(simplify (root-obj (- (^ x 5) x 1) 1))").unwrap(),
+            alloc::vec!["(root-obj (+ (^ x 5) (* (- 1) x) (- 1)) 1)"]
+        );
+        assert_eq!(
+            run("(simplify (root-obj (* 2 (+ (^ x 3) (* 2 (^ x 2)) (- 1))) 1))").unwrap(),
+            alloc::vec!["(root-obj (+ (^ x 2) x (- 1)) 1)"]
+        );
+        // Under :pp.decimal an irrational root prints a truncated decimal with `?`.
+        assert_eq!(
+            run("(set-option :pp.decimal true)\
+                 (simplify (root-obj (+ (^ x 2) (- 2)) 2))")
+            .unwrap(),
+            alloc::vec!["1.4142135623?"]
+        );
+        // Errors carry z3's exact line/column (0-based, on line >= 2 here).
+        assert_eq!(
+            run("\n(simplify (root-obj 0 1))").unwrap(),
+            alloc::vec![
+                "(error \"line 2 column 24: invalid root object, polynomial must not be the zero polynomial\")"
+            ]
+        );
+        assert_eq!(
+            run("\n(simplify (root-obj 1 1))").unwrap(),
+            alloc::vec![
+                "(error \"line 2 column 24: invalid root object, polynomial does have sufficient roots\")"
+            ]
+        );
+        assert_eq!(
+            run("\n(simplify (root-obj (+ (^ x 2) 2)) 1)").unwrap(),
+            alloc::vec![
+                "(error \"line 2 column 33: invalid root-obj, (unsigned) integer expected\")"
+            ]
+        );
+        assert_eq!(
+            run("\n(simplify (root-obj x 0))").unwrap(),
+            alloc::vec!["(error \"line 2 column 22: invalid root-obj, index must be >= 1\")"]
+        );
+        assert_eq!(
+            run("\n(simplify (root-obj y 1))").unwrap(),
+            alloc::vec![
+                "(error \"line 2 column 20: invalid univariate polynomial, variable 'x' expected\")"
+            ]
         );
     }
 
