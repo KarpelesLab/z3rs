@@ -145,7 +145,7 @@ pub fn cad_sat(constraints: &[(Polynomial, Rel)], num_vars: usize) -> Option<boo
 /// sign-invariant unconditionally (Collins 1975, corrected by Hong). Adding these
 /// extra polynomials only refines cells, so soundness is preserved; this returns
 /// `None` only on the resource cap (`MAX_PROJ`, checked by the caller).
-fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>> {
+pub(crate) fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>> {
     let mut proj: Vec<Polynomial> = Vec::new();
     // Make each polynomial squarefree in the main variable when it is univariate
     // in `var` (cheap reduction, e.g. the trivially-true axiom `y² ≥ 0` becomes
@@ -242,7 +242,7 @@ fn squarefree_main(f: &Polynomial, var: Var) -> Polynomial {
 }
 
 /// Remove zero and nonzero-constant polynomials and duplicates.
-fn clean(polys: Vec<Polynomial>) -> Vec<Polynomial> {
+pub(crate) fn clean(polys: Vec<Polynomial>) -> Vec<Polynomial> {
     let mut out: Vec<Polynomial> = Vec::new();
     for p in polys {
         if p.is_zero() || p.as_constant().is_some() {
@@ -262,7 +262,7 @@ fn clean(polys: Vec<Polynomial>) -> Vec<Polynomial> {
 /// keeps a *small* defining polynomial (its own squarefree factor). Multiplying
 /// everything into one product would give each root the whole high-degree product
 /// as its defining polynomial, blowing up every downstream resultant.
-fn base_samples(polys: &[Polynomial]) -> Vec<Alg> {
+pub(crate) fn base_samples(polys: &[Polynomial]) -> Vec<Alg> {
     let mut roots: Vec<Alg> = Vec::new();
     for f in polys {
         let u = poly_to_upoly(f, 0);
@@ -341,7 +341,7 @@ fn rational_between(rs: &mut [Alg], i: usize) -> Rational {
 /// sample by each root (section) and a rational between/around them (sectors).
 /// Returns `None` only if a fiber polynomial's root elimination degenerates
 /// without being a genuine nullification (see [`roots_at`]) — a sound decline.
-fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec<Vec<Alg>>> {
+pub(crate) fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec<Vec<Alg>>> {
     let mut roots: Vec<Alg> = Vec::new();
     for f in polys {
         for r in roots_at(f, sample, var)? {

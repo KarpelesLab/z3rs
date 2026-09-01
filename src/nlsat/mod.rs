@@ -14,7 +14,9 @@ pub mod elim;
 pub mod icp;
 pub mod nla;
 pub mod realclosure;
+pub mod search;
 pub mod univariate;
 
 pub use icp::{Constraint, Rel, refute};
+pub use search::{NlResult, nlsat_decide};
 pub use univariate::decide as decide_univariate;
