@@ -3573,7 +3573,42 @@ impl Context {
                 // with a `?` suffix rather than the opaque `^` term.
                 if pp_decimal {
                     let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
-                    if let Some(d) = super::algebraic_pp::format_pp_decimal_rec(&self.m, s, prec) {
+                    // `(simplify term :max-degree N)` limits how far algebraic
+                    // constants combine (z3's default is 64).
+                    let md = Self::simplify_max_degree(list);
+                    // A `+`/`*` of constants and symbolic terms: combine the
+                    // algebraic constants the way z3's rewriter does. This runs on
+                    // the *source* arguments (in source order) because the
+                    // rewriter reorders and merges the rational constants, losing
+                    // the order z3's grouping depends on.
+                    if let SExpr::List(inner) = &list[1]
+                        && let Some(SExpr::Atom(head)) = inner.first()
+                        && (head == "+" || head == "*")
+                        && inner.len() > 1
+                    {
+                        let is_add = head == "+";
+                        let mut ok = true;
+                        let mut arg_ids = Vec::with_capacity(inner.len() - 1);
+                        for a in &inner[1..] {
+                            match self.term(a) {
+                                Ok(id) => arg_ids.push(id),
+                                Err(_) => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if ok
+                            && let Some(d) = super::algebraic_pp::format_pp_arith(
+                                &self.m, is_add, &arg_ids, prec, md,
+                            )
+                        {
+                            return Ok(Some(d));
+                        }
+                    }
+                    if let Some(d) =
+                        super::algebraic_pp::format_pp_decimal_rec(&self.m, s, prec, md)
+                    {
                         return Ok(Some(d));
                     }
                 }
@@ -17853,6 +17888,22 @@ impl Context {
             }
         }
         (pi_count == 1).then_some(coeff)
+    }
+
+    /// The `:max-degree N` option of a `(simplify term …)` command, defaulting to
+    /// z3's `64` when absent or unparseable.
+    fn simplify_max_degree(list: &[SExpr]) -> usize {
+        let mut it = list.iter();
+        while let Some(part) = it.next() {
+            if let SExpr::Atom(k) = part
+                && k == ":max-degree"
+                && let Some(SExpr::Atom(v)) = it.next()
+                && let Ok(n) = v.parse::<usize>()
+            {
+                return n;
+            }
+        }
+        super::algebraic_pp::DEFAULT_MAX_DEGREE
     }
 
     /// If `t = (fn arg)` for `fn ∈ {sin, cos, tan}` and `arg` is a rational

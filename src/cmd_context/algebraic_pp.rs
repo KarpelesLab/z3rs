@@ -50,10 +50,18 @@ impl RealVal {
 /// (rational or irrational) formats directly; otherwise it recurses through the
 /// prefix heads `+ - * / ^`, printing any non-real subterm via the normal `m.pp`.
 /// Returns `None` when nothing was reformatted (the caller prints normally).
-pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option<String> {
+pub fn format_pp_decimal_rec(
+    m: &AstManager,
+    s: AstId,
+    precision: u32,
+    max_degree: usize,
+) -> Option<String> {
     let bits = (precision as u64 + 40) * 4 + 64;
     match eval_real(m, s, bits) {
-        Some(RealVal::Irr(f)) => {
+        // An irrational algebraic constant is only rendered as a decimal when its
+        // algebraic degree is within `:max-degree` (z3's rewriter refuses to
+        // evaluate a higher-degree algebraic constant, leaving the `^` symbolic).
+        Some(RealVal::Irr(f)) if value_degree_le(m, s, max_degree) => {
             let (neg, body) = format_trunc(&f.to_rational()?, precision);
             Some(if neg { format!("(- {body})") } else { body })
         }
@@ -62,14 +70,15 @@ pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option
         Some(RealVal::Rat(r)) => {
             (!m.is_int_sort(m.get_sort(s))).then(|| format_real_decimal(&r, precision))
         }
-        // Not a ground real: recurse through the prefix arithmetic heads.
-        None => {
+        // Not a ground real (or an over-degree irrational left symbolic): recurse
+        // through the prefix arithmetic heads.
+        _ => {
             let head = arith_prefix_head(m, s)?;
             let args = m.app_args(s);
             let mut parts = Vec::with_capacity(args.len());
             let mut changed = false;
             for &a in args {
-                match format_pp_decimal_rec(m, a, precision) {
+                match format_pp_decimal_rec(m, a, precision, max_degree) {
                     Some(fa) => {
                         changed = true;
                         parts.push(fa);
@@ -80,6 +89,472 @@ pub fn format_pp_decimal_rec(m: &AstManager, s: AstId, precision: u32) -> Option
             changed.then(|| format!("({head} {})", parts.join(" ")))
         }
     }
+}
+
+/// z3's default `:max-degree` for algebraic-constant combining in `simplify`.
+pub const DEFAULT_MAX_DEGREE: usize = 64;
+
+/// Feasibility caps for computing the *exact* algebraic degree of an accumulated
+/// constant. Below the cap the degree is computed exactly (via `Algebraic`);
+/// above it the cheap product-of-degrees upper bound is trusted. Sums build a
+/// dense minimal polynomial (expensive to factor) so their cap is small; a
+/// product of radicals stays a sparse `xⁿ − c` and factors cheaply.
+const EXACT_DEG_CAP_ADD: usize = 8;
+const EXACT_DEG_CAP_MUL: usize = 128;
+
+/// Whether an irrational root term `s` is evaluated under `:max-degree`. z3 gates
+/// on the *syntactic* root order (the exponent denominator, e.g. `9^(1/4)` counts
+/// as degree 4 even though its value √3 is degree 2), not the reduced algebraic
+/// degree.
+fn value_degree_le(m: &AstManager, s: AstId, max_degree: usize) -> bool {
+    syntactic_deg_bound(m, s)
+        .map(|b| b <= max_degree)
+        .unwrap_or(false)
+}
+
+/// A cheap upper bound on the algebraic degree of a ground real term: the product
+/// of the operand bounds, with a root `base^(p/q)` contributing `deg(base)·q`.
+/// `None` if the term is not a supported ground real expression.
+fn syntactic_deg_bound(m: &AstManager, s: AstId) -> Option<usize> {
+    if m.as_numeral(s).is_some() {
+        return Some(1);
+    }
+    if let Some((base, exp)) = power_uf_args(m, s) {
+        let bb = syntactic_deg_bound(m, base)?;
+        let q = eval_rational(m, exp)?.denominator().to_u64()? as usize;
+        return Some(bb.saturating_mul(q.max(1)));
+    }
+    let op = m.arith_op(s)?;
+    let args = m.app_args(s);
+    match op {
+        ArithOp::ToReal | ArithOp::Abs | ArithOp::Uminus => syntactic_deg_bound(m, *args.first()?),
+        ArithOp::Add | ArithOp::Sub | ArithOp::Mul | ArithOp::Div => {
+            let mut acc = 1usize;
+            for &a in args {
+                acc = acc.saturating_mul(syntactic_deg_bound(m, a)?);
+            }
+            Some(acc)
+        }
+        ArithOp::Power => {
+            let bb = syntactic_deg_bound(m, *args.first()?)?;
+            let q = eval_rational(m, *args.get(1)?)?.denominator().to_u64()? as usize;
+            Some(bb.saturating_mul(q.max(1)))
+        }
+        _ => None,
+    }
+}
+
+/// The exact algebraic degree of the value of ground real term `s` (the degree of
+/// its minimal polynomial), or `None` if it is not a supported ground real.
+fn value_exact_degree(m: &AstManager, s: AstId) -> Option<usize> {
+    Some(alg_min_degree(&eval_algebraic(m, s)?.into_algebraic()))
+}
+
+/// The degree of an algebraic number's minimal polynomial: the irreducible factor
+/// of its (squarefree) defining polynomial whose real root falls in the number's
+/// isolating interval.
+fn alg_min_degree(a: &Algebraic) -> usize {
+    if a.is_rational() {
+        return 1;
+    }
+    let mut aa = a.clone();
+    aa.refine_below(&Rational::power_of_two(-60));
+    let (lo, hi) = aa.interval();
+    for (f, _) in a.defining_polynomial().factor() {
+        if factor_has_root_in(&f, lo, hi) {
+            return f.degree().unwrap_or(1);
+        }
+    }
+    a.defining_polynomial().degree().unwrap_or(1)
+}
+
+/// A finalized constant group's value: an exact rational, or a high-precision
+/// irrational Float.
+enum GroupVal {
+    Rat(Rational),
+    Irr(Float),
+}
+
+/// One group of combined constant addends/factors: its value, the source
+/// position of its first constant, and whether it merged two or more constants
+/// (a fresh combined numeral) versus a single original constant.
+struct Group {
+    val: GroupVal,
+    first_slot: usize,
+    merged: bool,
+}
+
+/// An evaluable ground constant argument (with its source-argument position).
+struct ConstArg {
+    val: RealVal,
+    deg: usize,
+    expr: AstId,
+    pos: usize,
+}
+
+/// A symbolic addend/factor: a coefficient times a body term. In a sum, like
+/// bodies are merged (coefficients summed); in a product every factor is kept.
+/// `first_pos` is the source position of its first occurrence.
+struct SymTerm {
+    coeff: Rational,
+    body: AstId,
+    first_pos: usize,
+}
+
+/// Combine and render the constant addends/factors of a `+`/`*` term the way
+/// z3's `simplify` does under `:pp.decimal`, honoring `:max-degree`.
+///
+/// z3 folds a sum/product's ground algebraic constants into combined algebraic
+/// numbers (subject to the degree bound) and prints them among the symbolic
+/// terms. z3rs's rewriter leaves them separate *and* reorders/merges the rational
+/// constants, destroying the source order z3's grouping depends on — so we work
+/// from the original source arguments `args`, in source order. Returns `None`
+/// when there is no evaluable constant to combine (the caller then falls back to
+/// the generic recursive formatter on the simplified term).
+pub fn format_pp_arith(
+    m: &AstManager,
+    is_add: bool,
+    args: &[AstId],
+    precision: u32,
+    max_degree: usize,
+) -> Option<String> {
+    let bits = (precision as u64 + 40) * 4 + 64;
+    let mut consts: Vec<ConstArg> = Vec::new();
+    let mut syms: Vec<SymTerm> = Vec::new();
+    for (pos, &a) in args.iter().enumerate() {
+        let is_const = match eval_real(m, a, bits) {
+            Some(val) => {
+                // Evaluability is gated on the syntactic root order (z3's metric),
+                // but the accumulator degree `deg` uses the reduced algebraic
+                // degree so an independent sum of roots is combined tightly.
+                let (evaluable, deg) = match &val {
+                    RealVal::Rat(_) => (true, 1),
+                    RealVal::Irr(_) => match syntactic_deg_bound(m, a) {
+                        Some(b) if b <= max_degree => (true, value_exact_degree(m, a).unwrap_or(b)),
+                        _ => (false, 0),
+                    },
+                };
+                if evaluable {
+                    consts.push(ConstArg {
+                        val,
+                        deg,
+                        expr: a,
+                        pos,
+                    });
+                }
+                evaluable
+            }
+            None => false,
+        };
+        if !is_const {
+            add_symbolic(m, a, pos, is_add, &mut syms);
+        }
+    }
+
+    // A sum with no constant to combine: let the generic formatter print it in
+    // source order. A product with no constant still needs its factors sorted, so
+    // it continues below.
+    if consts.is_empty() && is_add {
+        return None;
+    }
+
+    // Greedily accumulate constants left-to-right (source order); break when the
+    // running accumulator's algebraic degree would exceed the bound.
+    let mut groups: Vec<Group> = Vec::new();
+    let mut i = 0;
+    while i < consts.len() {
+        let mut val = clone_real(&consts[i].val);
+        let mut dc = consts[i].deg;
+        let mut absorbed = alloc::vec![consts[i].expr];
+        let first_pos = consts[i].pos;
+        let mut j = i + 1;
+        while j < consts.len() {
+            if !cur_degree_le(m, dc, &absorbed, max_degree, is_add) {
+                break;
+            }
+            val = if is_add {
+                add(val, clone_real(&consts[j].val), bits)
+            } else {
+                mul(val, clone_real(&consts[j].val), bits)
+            };
+            dc = dc.saturating_mul(consts[j].deg);
+            absorbed.push(consts[j].expr);
+            j += 1;
+        }
+        groups.push(Group {
+            val: finalize_group(m, val, &absorbed, dc, is_add),
+            first_slot: first_pos,
+            merged: absorbed.len() > 1,
+        });
+        i = j;
+    }
+
+    let result = if is_add {
+        assemble_sum(m, &syms, &groups, precision, max_degree)
+    } else {
+        assemble_product(m, &syms, &groups, precision, max_degree)
+    };
+    match result.len() {
+        0 => Some(if is_add { "0.0" } else { "1.0" }.to_string()),
+        1 => Some(result.into_iter().next().unwrap()),
+        _ => {
+            let head = if is_add { "+" } else { "*" };
+            Some(format!("({head} {})", result.join(" ")))
+        }
+    }
+}
+
+/// Record a symbolic (or over-degree) argument. In a sum, merge it into a like
+/// body (summing coefficients); in a product, keep every factor separate.
+fn add_symbolic(m: &AstManager, a: AstId, pos: usize, is_add: bool, syms: &mut Vec<SymTerm>) {
+    let (coeff, body) = extract_monomial(m, a);
+    if is_add && let Some(t) = syms.iter_mut().find(|t| t.body == body) {
+        t.coeff = &t.coeff + &coeff;
+        return;
+    }
+    syms.push(SymTerm {
+        coeff,
+        body,
+        first_pos: pos,
+    });
+}
+
+/// Split a monomial into `(coefficient, body)`: a leading numeral factor of a
+/// binary `*`, or the `−1` of a unary minus; otherwise `(1, term)`.
+fn extract_monomial(m: &AstManager, a: AstId) -> (Rational, AstId) {
+    if let Some(op) = m.arith_op(a) {
+        let args = m.app_args(a);
+        match op {
+            ArithOp::Uminus if args.len() == 1 => {
+                let (c, b) = extract_monomial(m, args[0]);
+                return (-c, b);
+            }
+            ArithOp::Mul if args.len() == 2 => {
+                if m.as_numeral(args[0]).is_some() && m.as_numeral(args[1]).is_none() {
+                    return (m.as_numeral(args[0]).unwrap(), args[1]);
+                }
+                if m.as_numeral(args[1]).is_some() && m.as_numeral(args[0]).is_none() {
+                    return (m.as_numeral(args[1]).unwrap(), args[0]);
+                }
+            }
+            _ => {}
+        }
+    }
+    (Rational::from_integer(Int::from_i64(1)), a)
+}
+
+fn clone_real(v: &RealVal) -> RealVal {
+    match v {
+        RealVal::Rat(r) => RealVal::Rat(r.clone()),
+        RealVal::Irr(f) => RealVal::Irr(f.clone()),
+    }
+}
+
+/// Whether the current accumulator's algebraic degree is `≤ max_degree`, using
+/// the product-of-degrees bound `dc` when it already suffices, else the exact
+/// degree (only when feasibly small).
+fn cur_degree_le(
+    m: &AstManager,
+    dc: usize,
+    absorbed: &[AstId],
+    max_degree: usize,
+    is_add: bool,
+) -> bool {
+    if dc <= max_degree {
+        return true;
+    }
+    let cap = if is_add {
+        EXACT_DEG_CAP_ADD
+    } else {
+        EXACT_DEG_CAP_MUL
+    };
+    if dc > cap {
+        // Too expensive to factor; trust the bound (tight for independent
+        // radicals) and treat the degree as `dc > max_degree`.
+        return false;
+    }
+    match combine_alg(m, absorbed, is_add) {
+        Some(av) => alg_min_degree(&av.into_algebraic()) <= max_degree,
+        None => false,
+    }
+}
+
+/// Finalize a group: detect when combined irrationals collapse to an exact
+/// rational (e.g. `√2·√2 = 2`, `√2 − √2 = 0`), so it is placed and rendered as a
+/// rational.
+fn finalize_group(
+    m: &AstManager,
+    val: RealVal,
+    absorbed: &[AstId],
+    dc: usize,
+    is_add: bool,
+) -> GroupVal {
+    match val {
+        RealVal::Rat(r) => GroupVal::Rat(r),
+        RealVal::Irr(f) => {
+            let cap = if is_add {
+                EXACT_DEG_CAP_ADD
+            } else {
+                EXACT_DEG_CAP_MUL
+            };
+            // A single element is already exact via `eval_real`; only a genuine
+            // multi-element combination can hide a rational.
+            if absorbed.len() > 1
+                && dc <= cap
+                && let Some(av) = combine_alg(m, absorbed, is_add)
+            {
+                let a = av.into_algebraic();
+                if a.is_rational() {
+                    return GroupVal::Rat(a.interval().0.clone());
+                }
+            }
+            GroupVal::Irr(f)
+        }
+    }
+}
+
+/// Fold `eval_algebraic` over the group's absorbed constant expressions with the
+/// group's operation, giving the exact algebraic value.
+fn combine_alg(m: &AstManager, exprs: &[AstId], is_add: bool) -> Option<AlgVal> {
+    let mut acc = eval_algebraic(m, *exprs.first()?)?;
+    for &e in &exprs[1..] {
+        let v = eval_algebraic(m, e)?;
+        acc = if is_add {
+            alg_add(acc, v)
+        } else {
+            alg_mul(acc, v)
+        };
+    }
+    Some(acc)
+}
+
+/// The `pp.decimal` rendering of a finalized group value.
+fn render_group(val: &GroupVal, precision: u32) -> String {
+    match val {
+        GroupVal::Rat(r) => format_real_decimal(r, precision),
+        GroupVal::Irr(f) => match f.to_rational() {
+            Some(r) => {
+                let (neg, body) = format_trunc(&r, precision);
+                if neg { format!("(- {body})") } else { body }
+            }
+            None => "0.0".to_string(),
+        },
+    }
+}
+
+/// Assemble a sum: rational groups first; then the non-final irrational groups
+/// interleaved with the symbolic terms by source position; the final irrational
+/// group last (z3 emits the freshly-combined trailing constant after the symbolic
+/// terms). Symbolic terms keep source (first-occurrence) order.
+fn assemble_sum(
+    m: &AstManager,
+    syms: &[SymTerm],
+    groups: &[Group],
+    precision: u32,
+    max_degree: usize,
+) -> Vec<String> {
+    let mut front: Vec<String> = Vec::new();
+    // Single original constants keep their source position; freshly-combined
+    // (merged) groups are emitted after the symbolic terms when any exist.
+    let mut positional: Vec<(usize, String)> = Vec::new();
+    let mut merged: Vec<(usize, String)> = Vec::new();
+    for g in groups {
+        let s = render_group(&g.val, precision);
+        match &g.val {
+            GroupVal::Rat(r) if r.is_zero() => {}
+            GroupVal::Rat(_) => front.push(s),
+            GroupVal::Irr(_) if g.merged => merged.push((g.first_slot, s)),
+            GroupVal::Irr(_) => positional.push((g.first_slot, s)),
+        }
+    }
+    let syms_present = syms.iter().any(|t| !t.coeff.is_zero());
+    let mut out = front;
+    if syms_present {
+        // Interleave single constants with the symbolic terms by source position,
+        // then append the merged groups (in first-absorbed order) at the end.
+        for t in syms.iter().filter(|t| !t.coeff.is_zero()) {
+            positional.push((
+                t.first_pos,
+                render_monomial(m, &t.coeff, t.body, precision, max_degree),
+            ));
+        }
+        positional.sort_by_key(|(p, _)| *p);
+        merged.sort_by_key(|(p, _)| *p);
+        out.extend(positional.into_iter().map(|(_, s)| s));
+        out.extend(merged.into_iter().map(|(_, s)| s));
+    } else {
+        // A pure-constant sum: order every group by its first-absorbed position.
+        positional.append(&mut merged);
+        positional.sort_by_key(|(p, _)| *p);
+        out.extend(positional.into_iter().map(|(_, s)| s));
+    }
+    out
+}
+
+/// Assemble a product: the combined constant groups first (in accumulation
+/// order, dropping a unit coefficient; a zero collapses the product), then the
+/// symbolic factors ordered by declaration identity (so repeated variables group
+/// together, `x y x` → `x x y`).
+fn assemble_product(
+    m: &AstManager,
+    syms: &[SymTerm],
+    groups: &[Group],
+    precision: u32,
+    max_degree: usize,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for g in groups {
+        match &g.val {
+            GroupVal::Rat(r) if r.is_zero() => return alloc::vec!["0.0".to_string()],
+            GroupVal::Rat(r) if is_one(r) => {}
+            _ => out.push(render_group(&g.val, precision)),
+        }
+    }
+    let mut sorted: Vec<&SymTerm> = syms.iter().filter(|t| !t.coeff.is_zero()).collect();
+    sorted.sort_by_key(|t| product_key(m, t.body));
+    for t in sorted {
+        out.push(render_monomial(m, &t.coeff, t.body, precision, max_degree));
+    }
+    out
+}
+
+/// The ordering key for a product factor: a variable (nullary constant) sorts by
+/// its declaration identity — z3rs creates the constant node lazily on first use,
+/// so its own ast id reflects use order, but z3 orders by declaration order,
+/// which the function-declaration id preserves.
+fn product_key(m: &AstManager, body: AstId) -> AstId {
+    if let Some(a) = m.app(body)
+        && a.args.is_empty()
+    {
+        return m.app_decl(body);
+    }
+    body
+}
+
+/// Render a `coefficient · body` monomial: `body`, `(- body)`, or `(* c body)`.
+fn render_monomial(
+    m: &AstManager,
+    coeff: &Rational,
+    body: AstId,
+    precision: u32,
+    max_degree: usize,
+) -> String {
+    let bstr = format_pp_decimal_rec(m, body, precision, max_degree).unwrap_or_else(|| m.pp(body));
+    if is_one(coeff) {
+        bstr
+    } else if is_neg_one(coeff) {
+        format!("(- {bstr})")
+    } else {
+        format!("(* {} {bstr})", format_real_decimal(coeff, precision))
+    }
+}
+
+fn is_one(r: &Rational) -> bool {
+    r.numerator() == r.denominator()
+}
+
+fn is_neg_one(r: &Rational) -> bool {
+    r.is_negative() && is_one(&r.abs())
 }
 
 /// A real rational rendered under `:pp.decimal`: an integer as `N.0`, otherwise a
