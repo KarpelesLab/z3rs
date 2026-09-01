@@ -3989,6 +3989,7 @@ impl Context {
                 Ok(Some(verdict_word(res).to_string()))
             }
             "get-value" => self.get_value(list).map(Some),
+            "get-consequences" => self.get_consequences(list).map(Some),
             "get-model" => self.get_model().map(Some),
             "get-unsat-core" => self.get_unsat_core().map(Some),
             "get-proof" => self.get_proof().map(Some),
@@ -26000,6 +26001,178 @@ impl Context {
             }
         }
         true
+    }
+
+    /// `(get-consequences (A1 … An) (V1 … Vm))` — after a satisfiability check of
+    /// the assertions under the assumption cube `A1 … An`, report every literal
+    /// over a query variable `Vi` that is *entailed*, as `(=> cube literal)` where
+    /// `cube` is a minimal subset of the assumptions still forcing the literal.
+    ///
+    /// A literal `L` is a consequence iff `assertions ∧ assumptions ∧ ¬L` is
+    /// `unsat`; this is checked directly per candidate (unknown never entails, so
+    /// the result is sound). Candidates: for a `Bool` variable, each polarity; for
+    /// a finite-enum variable, the value it takes in the model (any other value
+    /// would make the negated-equality check satisfiable). Output ordering mirrors
+    /// z3: positives ascending, then negatives descending, keyed by the atom's
+    /// identity (an existing Bool atom keeps its declaration position; a freshly
+    /// built equality atom follows query order).
+    fn get_consequences(&mut self, list: &[SExpr]) -> Result<String, String> {
+        let asm_exprs = match list.get(1) {
+            Some(SExpr::List(a)) => a,
+            _ => return Err("get-consequences: expected an assumption list".to_string()),
+        };
+        let var_exprs = match list.get(2) {
+            Some(SExpr::List(v)) => v,
+            _ => return Err("get-consequences: expected a variable list".to_string()),
+        };
+        // Resolve assumptions to (render, term), preserving input order.
+        let mut assumptions: Vec<(String, AstId)> = Vec::with_capacity(asm_exprs.len());
+        for a in asm_exprs {
+            let id = self.term(a)?;
+            assumptions.push((render_sexpr(a), id));
+        }
+        let asm_ids: Vec<AstId> = assumptions.iter().map(|&(_, id)| id).collect();
+
+        // Heading check under the assumptions; its verdict leads the output.
+        let (res, model) = self.check_with(&asm_ids);
+        self.last_verdict = Some(res);
+        self.last_model = model;
+        if res != SmtResult::Sat {
+            return Ok(alloc::format!("{}\n", verdict_word(res)));
+        }
+
+        // Ordering key mirroring z3's Boolean-variable index: a declared Bool atom
+        // keeps its declaration position (its `AstId`); a `(var = value)` proxy is
+        // minted during this command, so it sorts after every declared atom and in
+        // query order. Deriving `Ord` gives `Bool < Dt`, each sorted by its field.
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Key {
+            Bool(AstId),
+            Dt(usize),
+        }
+        struct Cons {
+            positive: bool,
+            key: Key,
+            literal: String,
+            cube: String,
+        }
+        let mut found: Vec<Cons> = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        for (qpos, v) in var_exprs.iter().enumerate() {
+            let vid = self.term(v)?;
+            if !seen.insert(vid) {
+                continue; // duplicate query variable
+            }
+            let vsort = self.m.get_sort(vid);
+            let vrender = render_sexpr(v);
+            if self.m.is_bool_sort(vsort) {
+                // The variable is a consequence iff exactly one polarity is forced.
+                let nv = self.m.mk_not(vid);
+                if self.entails(&asm_ids, nv) {
+                    let cube = self.consequence_cube(&assumptions, nv);
+                    found.push(Cons {
+                        positive: true,
+                        key: Key::Bool(vid),
+                        literal: vrender,
+                        cube,
+                    });
+                } else if self.entails(&asm_ids, vid) {
+                    let cube = self.consequence_cube(&assumptions, vid);
+                    found.push(Cons {
+                        positive: false,
+                        key: Key::Bool(vid),
+                        literal: alloc::format!("(not {vrender})"),
+                        cube,
+                    });
+                }
+            } else if let Some(ctors) = self.enums.get(&vsort).cloned() {
+                // The variable's model value is the only entailment candidate: any
+                // other value would satisfy the negated-equality check.
+                let cand = self.last_model.take().and_then(|mut mdl| {
+                    let c = ctors
+                        .iter()
+                        .copied()
+                        .find(|&c| mdl.terms_equal(&self.m, vid, c));
+                    self.last_model = Some(mdl);
+                    c
+                });
+                if let Some(c) = cand {
+                    let eq = self.m.mk_eq(vid, c);
+                    let neq = self.m.mk_not(eq);
+                    if self.entails(&asm_ids, neq) {
+                        let cname = self
+                            .m
+                            .func_decl(self.m.app_decl(c))
+                            .and_then(|fd| fd.name.as_str().map(str::to_string))
+                            .unwrap_or_default();
+                        let cube = self.consequence_cube(&assumptions, neq);
+                        found.push(Cons {
+                            positive: true,
+                            key: Key::Dt(qpos),
+                            literal: alloc::format!("(= {vrender} {cname})"),
+                            cube,
+                        });
+                    }
+                }
+            }
+            // Other sorts are not enumerated: no consequence reported.
+        }
+
+        // Positives ascending by atom identity, then negatives descending.
+        let mut positives: Vec<&Cons> = found.iter().filter(|c| c.positive).collect();
+        positives.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut negatives: Vec<&Cons> = found.iter().filter(|c| !c.positive).collect();
+        negatives.sort_by(|a, b| b.key.cmp(&a.key));
+
+        let lines: Vec<String> = positives
+            .iter()
+            .chain(negatives.iter())
+            .map(|c| alloc::format!("(=> {} {})", c.cube, c.literal))
+            .collect();
+        let verdict = verdict_word(res);
+        if lines.is_empty() {
+            Ok(alloc::format!("{verdict}\n"))
+        } else {
+            Ok(alloc::format!("{verdict}\n\n{}", lines.join("\n")))
+        }
+    }
+
+    /// Whether `assertions ∧ assumptions ∧ extra` is `unsat` — i.e. the assertions
+    /// with the assumption cube entail `¬extra`. `unknown` is treated as *not*
+    /// entailed, keeping consequence detection sound.
+    fn entails(&mut self, assumptions: &[AstId], extra: AstId) -> bool {
+        let mut probe = assumptions.to_vec();
+        probe.push(extra);
+        self.check_with(&probe).0 == SmtResult::Unsat
+    }
+
+    /// A minimal subset of `assumptions` (in input order) that, together with the
+    /// assertions and `neg_lit = ¬L`, is still `unsat` — the entailment cube for
+    /// the literal `L`. Rendered as `true` (empty), the lone assumption, or
+    /// `(and a1 a2 …)`.
+    fn consequence_cube(&mut self, assumptions: &[(String, AstId)], neg_lit: AstId) -> String {
+        let n = assumptions.len();
+        let mut keep: Vec<usize> = (0..n).collect();
+        for i in 0..n {
+            if !keep.contains(&i) {
+                continue;
+            }
+            let trial: Vec<AstId> = keep
+                .iter()
+                .copied()
+                .filter(|&j| j != i)
+                .map(|j| assumptions[j].1)
+                .collect();
+            if self.entails(&trial, neg_lit) {
+                keep.retain(|&j| j != i);
+            }
+        }
+        let parts: Vec<&str> = keep.iter().map(|&j| assumptions[j].0.as_str()).collect();
+        match parts.len() {
+            0 => "true".to_string(),
+            1 => parts[0].to_string(),
+            _ => alloc::format!("(and {})", parts.join(" ")),
+        }
     }
 
     fn get_value(&mut self, list: &[SExpr]) -> Result<String, String> {
