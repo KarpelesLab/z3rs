@@ -25042,6 +25042,15 @@ impl Context {
                 Some(false) => return Some(SmtResult::Unsat),
                 _ => {}
             }
+            // Model-constructing nlsat search decides cases upfront CAD declines
+            // (more variables, depth-first). Same sound contract: `Sat` carries a
+            // witness re-verified exactly against every atom, `Unsat` is a complete
+            // cover, and it declines (no verdict) on any inexactness or cap.
+            match crate::nlsat::nlsat_decide(k, &reduced) {
+                crate::nlsat::NlResult::Sat(_) if !dropped => return Some(SmtResult::Sat),
+                crate::nlsat::NlResult::Unsat => return Some(SmtResult::Unsat),
+                _ => {}
+            }
         }
         // Otherwise, try to *prove sat* by fixing all-but-one variable to
         // candidate values and deciding the last univariately (a verified
