@@ -7,11 +7,92 @@
 //! - [x] Datalog (`datalog_frontend.cpp`) — `-dl`
 //! - [x] DRAT (`drat_frontend.cpp`)       — `-drat <cnf> <proof>`
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 
 use z3rs::cmd_context::run_smt2;
 use z3rs::sat::{SatResult, check_drat_text, parse_dimacs};
 use z3rs::util::lbool::LBool;
+use z3rs::util::memory;
+
+/// Global allocator that accounts every allocation against a process-wide byte
+/// counter and enforces an optional hard ceiling (`-memory:<MB>` /
+/// `Z3RS_MEMORY_LIMIT_MB`). Once the ceiling is reached an allocation is refused
+/// (returns null), so the process aborts cleanly at the cap instead of ballooning
+/// and letting the kernel OOM-killer take out unrelated processes. z3rs otherwise
+/// has no memory bound; this mirrors z3's memory manager. With no limit set it is
+/// just a pair of relaxed atomic counters (no behaviour change).
+struct TrackingAlloc;
+
+unsafe impl GlobalAlloc for TrackingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if !memory::try_alloc(layout.size()) {
+            return core::ptr::null_mut();
+        }
+        let p = unsafe { System.alloc(layout) };
+        if p.is_null() {
+            memory::on_dealloc(layout.size());
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        if !memory::try_alloc(layout.size()) {
+            return core::ptr::null_mut();
+        }
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if p.is_null() {
+            memory::on_dealloc(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        memory::on_dealloc(layout.size());
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let old = layout.size();
+        if new_size > old && !memory::try_alloc(new_size - old) {
+            return core::ptr::null_mut();
+        }
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if p.is_null() {
+            // The reallocation failed: undo the growth charge (the old block is
+            // still live and still accounted for).
+            if new_size > old {
+                memory::on_dealloc(new_size - old);
+            }
+        } else if new_size < old {
+            memory::on_dealloc(old - new_size);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static GLOBAL: TrackingAlloc = TrackingAlloc;
+
+/// Apply a memory ceiling from `-memory:<MB>` args and the `Z3RS_MEMORY_LIMIT_MB`
+/// environment variable (the argument wins). `0`/absent = unlimited.
+fn apply_memory_limit(args: &[String]) {
+    let mut mb: Option<usize> = std::env::var("Z3RS_MEMORY_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok());
+    for a in args {
+        if let Some(n) = a
+            .strip_prefix("-memory:")
+            .or_else(|| a.strip_prefix("-memory="))
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            mb = Some(n);
+        }
+    }
+    if let Some(mb) = mb {
+        memory::set_limit_mb(mb);
+    }
+}
 
 fn print_version() {
     println!(
@@ -184,6 +265,10 @@ fn main() -> ExitCode {
 fn run_main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // A memory ceiling so a runaway allocation aborts this process cleanly at the
+    // cap rather than exhausting the machine (see `TrackingAlloc`).
+    apply_memory_limit(&args);
+
     if args.is_empty() {
         print_usage();
         return ExitCode::SUCCESS;
@@ -207,6 +292,7 @@ fn run_main() -> ExitCode {
             "-dl" => force_datalog = true,
             "-drat" => force_drat = true,
             "-smt2" | "-in" => {} // format hints; inferred from extension otherwise
+            other if other.starts_with("-memory:") || other.starts_with("-memory=") => {} // handled by apply_memory_limit
             other if other.starts_with('-') => {
                 eprintln!("z3rs: unknown option {other:?}");
                 return ExitCode::from(1);

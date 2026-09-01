@@ -39,6 +39,7 @@
 pub mod bit_vector;
 pub mod hash;
 pub mod lbool;
+pub mod memory;
 pub mod params;
 pub mod rlimit;
 pub mod symbol;
