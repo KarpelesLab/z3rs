@@ -24419,8 +24419,43 @@ impl Context {
         crate::rewriter::simplify(&mut self.m, g)
     }
 
+    /// Fold every ground algebraic (in)equality atom in `goal` to `true`/`false`
+    /// via exact algebraic arithmetic (`fold_real_comparison`). Only *ground*
+    /// atoms fold (a variable makes `fold_real_comparison` decline), so this is
+    /// sound and equisatisfiability-preserving; it lets an assertion over
+    /// irrational algebraic roots collapse to a Boolean the solver can refute.
+    fn fold_ground_algebraic_atoms(&mut self, goal: AstId) -> AstId {
+        let mut folds: Vec<(AstId, bool)> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if let Some(b) = super::algebraic_pp::fold_real_comparison(&self.m, t) {
+                folds.push((t, b));
+            }
+        }
+        if folds.is_empty() {
+            return goal;
+        }
+        let subst: Vec<(AstId, AstId)> = folds
+            .into_iter()
+            .map(|(t, b)| {
+                let v = if b {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                };
+                (t, v)
+            })
+            .collect();
+        let g = substitute(&mut self.m, goal, &subst);
+        crate::rewriter::simplify(&mut self.m, g)
+    }
+
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        // Fold ground algebraic (in)equalities — e.g. `(0.375^¼)² = (0.375²)^¼`
+        // (both √0.375, so `true`) — to `true`/`false` via exact algebraic
+        // arithmetic, so an assertion like `(not (= …))` collapses to `false`
+        // (unsat). z3rs otherwise leaves the `^` roots opaque and declines.
+        let goal = self.fold_ground_algebraic_atoms(goal);
         // A record variable with (partly) pinned fields — including a bit-vector or
         // float field, which otherwise forces the bit-blast gate to `unknown` — is
         // witnessed by constructing `x = C(pinned/default fields)` and verifying.
