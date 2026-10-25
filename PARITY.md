@@ -78,6 +78,12 @@ and captured as a regression test:
 - an FP `ite` blasted to a fresh, unconstrained bit-vector, so the selector never
   tied the result to the chosen branch (`fp.eq(ite(b,x,+0),+0) ∧ b ∧ isNormal x`
   reported `sat` not `unsat`) — now blasted to a bit-vector `ite` of the branches
+- array axioms whose key terms the rewriter folds away: `select(const v, j)`
+  and a read at a store's own index vanish, so congruence lost `A = const 1 ⇒
+  A[2] = 1` and `x = 2 ⇒ store(…, 2, 4)[x] = 4` (`A0 = const 0 ∧ A1 = const 1
+  ∧ store(A0,2,3) = store(A1,2,3)` and `6 = store(const 2, 2, 4)[x]` reported
+  `sat` not `unsat`) — now the congruence, both read-over-write directions and
+  a default index are stated as axioms that survive folding
 - (plus earlier datatype selector-trigger and FP free-BV bugs)
 
 Every one was a **wrong definite verdict** caught by differential fuzzing before

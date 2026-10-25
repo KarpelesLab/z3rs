@@ -23422,6 +23422,51 @@ impl Context {
             axioms.push(self.m.mk_or(&[eq_ab, neq_reads])); // a=b ∨ a[k]≠b[k]
             indices.push(k);
         }
+        // A "default" index per infinite index sort, distinct from every index
+        // above. Equisatisfiable: a model gives the finitely many index terms
+        // finitely many values, and an Int/Real sort always has another one left.
+        // It lets the axioms see an array *away from* its written indices:
+        // `A = const 0 ∧ B = const 1 ∧ store(A,2,3) = store(B,2,3)` is refuted
+        // only at an index other than 2, which nothing else guarantees exists
+        // (every Skolem may equal 2). Plays the role of z3's array default.
+        if !array_eqs.is_empty() {
+            let mut sorts: Vec<AstId> = Vec::new();
+            for &(a, _) in &array_eqs {
+                if let Some((s, _)) = self.m.array_sort_params(self.m.get_sort(a))
+                    && self.m.is_arith_sort(s)
+                    && !sorts.contains(&s)
+                {
+                    sorts.push(s);
+                }
+            }
+            for s in sorts {
+                let w = self.fresh_const(s);
+                for &j in &indices {
+                    if self.m.get_sort(j) == s {
+                        let eq = self.m.mk_eq(w, j);
+                        axioms.push(self.m.mk_not(eq));
+                    }
+                }
+                indices.push(w);
+            }
+        }
+        // Congruence: `a = b ⇒ a[j] = b[j]` at every index. The congruence closure
+        // would derive it from the `select` terms below — but the rewriter folds
+        // `select(const v, j)` to `v` and reads over a `store` at a concrete
+        // index, deleting exactly the terms it needs: `A = const 1 ∧
+        // store(B,2,3) = store(A,5,3)` lost both `A[2] = 1` and the stores'
+        // agreement at 2, and came back `sat` (2549). Stated directly, each
+        // instance survives folding as a real constraint (`A = const 1 ⇒ A[2] = 1`).
+        for &(a, b) in &array_eqs {
+            let eq_ab = self.m.mk_eq(a, b);
+            let ne_ab = self.m.mk_not(eq_ab);
+            for &j in &indices {
+                let sel_a = self.select_expand_map(a, j);
+                let sel_b = self.select_expand_map(b, j);
+                let eq_reads = self.m.mk_eq(sel_a, sel_b);
+                axioms.push(self.m.mk_or(&[ne_ab, eq_reads])); // a≠b ∨ a[j]=b[j]
+            }
+        }
         // Constant array: select(const(v), j) = v for every index j (including
         // the extensionality Skolems).
         for &ca in &const_arrays {
@@ -23448,6 +23493,13 @@ impl Context {
                 let eq_reads = self.m.mk_eq(sel_st_j, sel_a_j);
                 let row2 = self.m.mk_or(&[eq_ij, eq_reads]);
                 axioms.push(row2);
+                // `i = j ⇒ st[j] = v` too, not left to congruence with `st[i]`:
+                // the rewriter folds `st[i] = v` away (and may rewrite `st`
+                // itself), deleting that term — `6 = store(const 2, 2, 4)[x]`
+                // then had no `x = 2 ⇒ … = 4` link and came back `sat`.
+                let ne_ij = self.m.mk_not(eq_ij);
+                let eq_v = self.m.mk_eq(sel_st_j, v);
+                axioms.push(self.m.mk_or(&[ne_ij, eq_v]));
             }
         }
         axioms
@@ -29224,6 +29276,42 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn array_store_equality_over_distinct_constants_is_unsat() {
+        // z3test 2549: `A0 = const 0`, `A1 = const 1` differ at every index, so
+        // no two stores into them can be equal. The rewriter folds away the
+        // `select(const v, j)` / read-over-write terms the congruence closure
+        // needed; this used to come back `sat` (for different store indices even
+        // before the simplex exposed the same-index case).
+        let head = "(declare-const A0 (Array Int Int)) (declare-const A1 (Array Int Int))
+            (assert (= A0 ((as const (Array Int Int)) 0)))
+            (assert (= A1 ((as const (Array Int Int)) 1)))";
+        for (eq, want) in [
+            ("(= (store A0 2 3) (store A1 2 3))", "unsat"),
+            ("(= (store A0 2 3) (store A1 5 3))", "unsat"),
+            (
+                "(= (store (store A0 2 1) 4 1) (store (store A1 2 0) 4 0))",
+                "unsat",
+            ),
+            ("(= (store A0 2 3) (store A0 2 3))", "sat"),
+        ] {
+            let script = alloc::format!("{head} (assert {eq}) (check-sat)");
+            assert_eq!(run(&script).unwrap(), alloc::vec![want], "{eq}");
+        }
+        // A read at a symbolic index of a folded store chain: `x = 2` must still
+        // force the stored 4 (fuzz-found; the literal `st[2] = 4` fact is folded
+        // away), so neither 6 nor a free value is possible.
+        let script = "(declare-const x Int)
+            (assert (= 6 (select (store (store ((as const (Array Int Int)) 2) 0 2) 2 4) x)))
+            (check-sat)";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        // Equal stores over *unconstrained* different bases stay satisfiable
+        // (the new axioms must not refute them).
+        let script = "(declare-const a (Array Int Int)) (declare-const b (Array Int Int))
+            (assert (= (store a 1 5) (store b 1 5))) (assert (not (= a b))) (check-sat)";
+        assert_ne!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
