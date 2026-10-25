@@ -24,7 +24,7 @@ use crate::util::symbol::Symbol;
 
 /// `2^w`.
 fn pow2(w: u32) -> Int {
-    Int::from(1).mul_2k(w)
+    Int::from(1).mul_2k(u64::from(w))
 }
 
 /// `2^w - 1` (the all-ones value of a `w`-bit vector).
@@ -35,7 +35,7 @@ fn allones_int(w: u32) -> Int {
 /// Interpret the unsigned value `u` (in `[0, 2^w)`) as a `w`-bit signed integer.
 /// Mirrors `bv_util::norm(v, w, /*signed=*/true)`.
 fn to_signed(u: &Int, w: u32) -> Int {
-    if u.bit(w - 1) {
+    if u.bit(u64::from(w - 1)) {
         u.sub(&pow2(w))
     } else {
         u.clone()
@@ -163,7 +163,7 @@ fn fold_add(m: &mut AstManager, args: &[AstId], w: u32) -> AstId {
             None => syms.push(a),
         }
     }
-    let c = acc.mod_2k(w);
+    let c = acc.mod_2k(u64::from(w));
     let mut ops = syms;
     if !c.is_zero() || ops.is_empty() {
         let n = m.mk_bv_numeral(c, w);
@@ -182,7 +182,7 @@ fn fold_mul(m: &mut AstManager, args: &[AstId], w: u32) -> AstId {
             None => syms.push(a),
         }
     }
-    let c = acc.mod_2k(w);
+    let c = acc.mod_2k(u64::from(w));
     if c.is_zero() {
         return m.mk_bv_numeral(Int::from(0), w); // annihilator
     }
@@ -279,7 +279,7 @@ fn fold_xor(m: &mut AstManager, args: &[AstId], w: u32) -> AstId {
             }
         }
     }
-    let c = acc.mod_2k(w);
+    let c = acc.mod_2k(u64::from(w));
     let mut ops = syms;
     if !c.is_zero() || ops.is_empty() {
         let n = m.mk_bv_numeral(c, w);
@@ -295,7 +295,7 @@ fn fold_sub(m: &mut AstManager, args: &[AstId], nums: &[Option<Int>], w: u32) ->
         for n in &nums[1..] {
             acc = acc.sub(n.as_ref().unwrap());
         }
-        return Some(m.mk_bv_numeral(acc.mod_2k(w), w));
+        return Some(m.mk_bv_numeral(acc.mod_2k(u64::from(w)), w));
     }
     if args.len() == 2 {
         if args[0] == args[1] {
@@ -328,7 +328,7 @@ fn fold_shl(m: &mut AstManager, args: &[AstId], nums: &[Option<Int>], w: u32) ->
     }
     let r1 = nums[0].as_ref()?;
     let s = r2.to_u64()? as u32;
-    Some(m.mk_bv_numeral(r1.mul_2k(s).mod_2k(w), w))
+    Some(m.mk_bv_numeral(r1.mul_2k(u64::from(s)).mod_2k(u64::from(w)), w))
 }
 
 /// `bvlshr` (`mk_bv_lshr`): `x >> 0 = x`; `x >> k = 0` when `k >= w`; constant fold.
@@ -342,7 +342,7 @@ fn fold_lshr(m: &mut AstManager, args: &[AstId], nums: &[Option<Int>], w: u32) -
     }
     let r1 = nums[0].as_ref()?;
     let s = r2.to_u64()? as u32;
-    Some(m.mk_bv_numeral(r1.div_2k_trunc(s), w)) // r1 < 2^w, so already in range
+    Some(m.mk_bv_numeral(r1.div_2k_trunc(u64::from(s)), w)) // r1 < 2^w, so already in range
 }
 
 /// `bvashr` (`mk_bv_ashr`): `x >> 0 = x`; sign-filling constant fold.
@@ -352,14 +352,14 @@ fn fold_ashr(m: &mut AstManager, args: &[AstId], nums: &[Option<Int>], w: u32) -
         return Some(args[0]);
     }
     let r1 = nums[0].as_ref()?;
-    let sign = r1.bit(w - 1);
+    let sign = r1.bit(u64::from(w - 1));
     if *r2 >= Int::from(w as i64) {
         // shift out everything: replicate the sign bit across the width.
         let v = if sign { allones_int(w) } else { Int::from(0) };
         return Some(m.mk_bv_numeral(v, w));
     }
     let s = r2.to_u64()? as u32;
-    let shifted = r1.div_2k_trunc(s);
+    let shifted = r1.div_2k_trunc(u64::from(s));
     let v = if sign {
         // fill the top s bits with ones: mask = 2^w - 2^(w-s).
         let mask = pow2(w).sub(&pow2(w - s));
@@ -403,7 +403,7 @@ fn fold_concat(m: &mut AstManager, args: &[AstId], nums: &[Option<Int>]) -> Opti
     let (hi, lo) = (nums[0].as_ref()?, nums[1].as_ref()?);
     let wb = m.bv_sort_width(m.get_sort(args[1]))?;
     let wa = m.bv_sort_width(m.get_sort(args[0]))?;
-    let v = hi.mul_2k(wb).add(lo); // lo < 2^wb, so this is (hi << wb) | lo
+    let v = hi.mul_2k(u64::from(wb)).add(lo); // lo < 2^wb, so this is (hi << wb) | lo
     Some(m.mk_bv_numeral(v, wa + wb))
 }
 
@@ -422,7 +422,10 @@ fn fold_extract(
     }
     let v = nums[0].as_ref()?;
     let newsz = high - low + 1;
-    Some(m.mk_bv_numeral(v.div_2k_trunc(low).mod_2k(newsz), newsz))
+    Some(m.mk_bv_numeral(
+        v.div_2k_trunc(u64::from(low)).mod_2k(u64::from(newsz)),
+        newsz,
+    ))
 }
 
 /// `(_ zero_extend k)` (`mk_zero_extend`): `k = 0` identity and numeral fold

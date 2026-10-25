@@ -345,7 +345,7 @@ impl<'a> BitBlaster<'a> {
         let result = if let Some(val) = self.m.bv_numeral_value(t) {
             (0..width)
                 .map(|i| {
-                    if val.bit(i as u32) {
+                    if val.bit(i as u64) {
                         self.true_lit
                     } else {
                         !self.true_lit

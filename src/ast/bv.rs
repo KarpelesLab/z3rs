@@ -112,7 +112,7 @@ impl AstManager {
     pub fn mk_bv_numeral(&mut self, value: Int, width: u32) -> AstId {
         let sort = self.mk_bv_sort(width);
         let fid = self.bv_fid();
-        let value = value.mod_2k(width); // reduce to [0, 2^width)
+        let value = value.mod_2k(u64::from(width)); // reduce to [0, 2^width)
         let name = Symbol::new(&alloc::format!("bv{value}"));
         let info = DeclInfo::new(
             fid,

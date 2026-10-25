@@ -335,9 +335,9 @@ fn to_signed(v: &Int, w: u32) -> Int {
     if w == 0 {
         return v.clone();
     }
-    let half = Int::from(2).pow(w - 1);
+    let half = Int::from(2).pow(u64::from(w - 1));
     if *v >= half {
-        v.sub(&Int::from(2).pow(w))
+        v.sub(&Int::from(2).pow(u64::from(w)))
     } else {
         v.clone()
     }
@@ -367,8 +367,8 @@ fn render_bv_field(v: u64, w: u32) -> String {
 /// `(bvneg <two's-complement negation>)`; with `pp.bv-literals` off, a literal
 /// prints as `(_ bv<decimal> w)` instead of `#x…`/`#b…`.
 fn render_bv_pp(v: &Int, w: u32, bv_neg: bool, bv_literals: bool) -> String {
-    let modulus = Int::from(1).mul_2k(w); // 2^w
-    let half = Int::from(1).mul_2k(w - 1); // 2^(w-1)
+    let modulus = Int::from(1).mul_2k(u64::from(w)); // 2^w
+    let half = Int::from(1).mul_2k(u64::from(w - 1)); // 2^(w-1)
     let negate = bv_neg && *v >= half;
     let shown = if negate { &modulus - v } else { v.clone() };
     let lit = if bv_literals {
@@ -4753,7 +4753,7 @@ impl Context {
             let width = eb + sb;
             let mut bits = 0u64;
             for i in 0..width {
-                if v.bit(i) {
+                if v.bit(u64::from(i)) {
                     bits |= 1u64 << i;
                 }
             }
@@ -5039,12 +5039,12 @@ impl Context {
                     let two = Int::from(2);
                     let mut uval = Int::from(0);
                     for i in 0..w {
-                        if bv.bit(i) {
-                            uval = uval.add(&two.pow(i));
+                        if bv.bit(u64::from(i)) {
+                            uval = uval.add(&two.pow(u64::from(i)));
                         }
                     }
-                    let ival = if !uns && w > 0 && bv.bit(w - 1) {
-                        uval.sub(&two.pow(w))
+                    let ival = if !uns && w > 0 && bv.bit(u64::from(w - 1)) {
+                        uval.sub(&two.pow(u64::from(w)))
                     } else {
                         uval
                     };
@@ -5133,7 +5133,7 @@ impl Context {
         if let Some(val) = self.m.bv_numeral_value(t) {
             let mut bits = 0u64;
             for i in 0..w {
-                if val.bit(i) {
+                if val.bit(u64::from(i)) {
                     bits |= 1u64 << i;
                 }
             }
@@ -27201,14 +27201,15 @@ impl Context {
                                 let two = Int::from(2);
                                 let mut uval = Int::from(0);
                                 for i in 0..m_w {
-                                    if val.bit(i) {
-                                        uval = uval.add(&two.pow(i));
+                                    if val.bit(u64::from(i)) {
+                                        uval = uval.add(&two.pow(u64::from(i)));
                                     }
                                 }
                                 let is_unsigned =
                                     matches!(&qid[1], SExpr::Atom(a) if a == "to_fp_unsigned");
-                                let ival = if !is_unsigned && m_w > 0 && val.bit(m_w - 1) {
-                                    uval.sub(&two.pow(m_w))
+                                let ival = if !is_unsigned && m_w > 0 && val.bit(u64::from(m_w - 1))
+                                {
+                                    uval.sub(&two.pow(u64::from(m_w)))
                                 } else {
                                     uval
                                 };
@@ -28500,7 +28501,7 @@ impl Context {
                     let mut val = Int::from(0);
                     for (i, &a) in args.iter().enumerate() {
                         if m.is_true(a) {
-                            val = &val + &Int::from(2).pow(i as u32);
+                            val = &val + &Int::from(2).pow(i as u64);
                         }
                     }
                     return Ok(m.mk_bv_numeral(val, n));

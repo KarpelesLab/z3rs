@@ -370,10 +370,10 @@ impl Model {
     /// Fold a bit-vector term to its concrete value (reduced mod `2^width`).
     fn eval_bv_full(&mut self, m: &AstManager, t: AstId, width: u32) -> Int {
         if let Some((v, _)) = self.bv.get(&t) {
-            return v.mod_2k(width);
+            return v.mod_2k(u64::from(width));
         }
         if let Some(v) = m.bv_numeral_value(t) {
-            return v.mod_2k(width);
+            return v.mod_2k(u64::from(width));
         }
         if m.is_ite(t) {
             let a = m.app_args(t).to_vec();
@@ -393,36 +393,36 @@ impl Model {
             match op {
                 BvOp::Neg => {
                     let a = ev(self, m, args[0]);
-                    return Int::from(0).sub(&a).mod_2k(width);
+                    return Int::from(0).sub(&a).mod_2k(u64::from(width));
                 }
                 BvOp::Add => {
                     let mut acc = Int::from(0);
                     for &x in &args {
                         acc = acc.add(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::Sub => {
                     let mut acc = ev(self, m, args[0]);
                     for &x in &args[1..] {
                         acc = acc.sub(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::Mul => {
                     let mut acc = Int::from(1);
                     for &x in &args {
                         acc = acc.mul(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::Udiv => {
                     let a = ev(self, m, args[0]);
                     let b = ev(self, m, args[1]);
                     return if b.is_zero() {
-                        Int::from(1).mul_2k(width).sub(&Int::from(1)) // all ones
+                        Int::from(1).mul_2k(u64::from(width)).sub(&Int::from(1)) // all ones
                     } else {
-                        a.div_trunc(&b).mod_2k(width)
+                        a.div_trunc(&b).mod_2k(u64::from(width))
                     };
                 }
                 BvOp::Urem => {
@@ -431,62 +431,66 @@ impl Model {
                     return if b.is_zero() {
                         a
                     } else {
-                        a.rem_trunc(&b).mod_2k(width)
+                        a.rem_trunc(&b).mod_2k(u64::from(width))
                     };
                 }
                 BvOp::BAnd => {
-                    let mut acc = Int::from(1).mul_2k(width).sub(&Int::from(1));
+                    let mut acc = Int::from(1).mul_2k(u64::from(width)).sub(&Int::from(1));
                     for &x in &args {
                         acc = acc.bitand(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::BOr => {
                     let mut acc = Int::from(0);
                     for &x in &args {
                         acc = acc.bitor(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::BXor => {
                     let mut acc = Int::from(0);
                     for &x in &args {
                         acc = acc.bitxor(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::BNot => {
                     let a = ev(self, m, args[0]);
-                    return a.bitnot(width).mod_2k(width);
+                    return a.bitnot(width).mod_2k(u64::from(width));
                 }
                 BvOp::Concat => {
                     let mut acc = Int::from(0);
                     for &x in &args {
                         let w = argw(m, x);
-                        acc = acc.mul_2k(w).bitor(&ev(self, m, x));
+                        acc = acc.mul_2k(u64::from(w)).bitor(&ev(self, m, x));
                     }
-                    return acc.mod_2k(width);
+                    return acc.mod_2k(u64::from(width));
                 }
                 BvOp::ZeroExt => {
-                    return ev(self, m, args[0]).mod_2k(width);
+                    return ev(self, m, args[0]).mod_2k(u64::from(width));
                 }
                 BvOp::SignExt => {
                     let w0 = argw(m, args[0]);
                     let a = ev(self, m, args[0]);
                     let signed = to_signed_int(&a, w0);
-                    return signed.mod_2k(width);
+                    return signed.mod_2k(u64::from(width));
                 }
                 BvOp::Extract => {
                     if let Some((high, low)) = m.bv_extract_params(t) {
                         let a = ev(self, m, args[0]);
-                        return a.div_2k_trunc(low).mod_2k(high - low + 1);
+                        return a
+                            .div_2k_trunc(u64::from(low))
+                            .mod_2k(u64::from(high - low + 1));
                     }
                 }
                 BvOp::Shl => {
                     let a = ev(self, m, args[0]);
                     let sh = ev(self, m, args[1]);
                     return match sh.to_i64() {
-                        Some(k) if (k as u32) < width => a.mul_2k(k as u32).mod_2k(width),
+                        Some(k) if (k as u32) < width => {
+                            a.mul_2k(k as u64).mod_2k(u64::from(width))
+                        }
                         _ => Int::from(0),
                     };
                 }
@@ -494,7 +498,7 @@ impl Model {
                     let a = ev(self, m, args[0]);
                     let sh = ev(self, m, args[1]);
                     return match sh.to_i64() {
-                        Some(k) if (k as u32) < width => a.div_2k_trunc(k as u32),
+                        Some(k) if (k as u32) < width => a.div_2k_trunc(k as u64),
                         _ => Int::from(0),
                     };
                 }
@@ -504,12 +508,12 @@ impl Model {
                     let sh = ev(self, m, args[1]);
                     return match sh.to_i64() {
                         Some(k) if (k as u32) < width => signed
-                            .div_floor(&Int::from(1).mul_2k(k as u32))
-                            .mod_2k(width),
+                            .div_floor(&Int::from(1).mul_2k(k as u64))
+                            .mod_2k(u64::from(width)),
                         _ => {
                             // shift ≥ width: fill with the sign bit.
-                            if a.bit(width - 1) {
-                                Int::from(1).mul_2k(width).sub(&Int::from(1))
+                            if a.bit(u64::from(width - 1)) {
+                                Int::from(1).mul_2k(u64::from(width)).sub(&Int::from(1))
                             } else {
                                 Int::from(0)
                             }
@@ -787,9 +791,9 @@ impl Value {
 
 /// The signed (two's-complement) integer value of an unsigned `width`-bit value.
 fn to_signed_int(v: &Int, width: u32) -> Int {
-    let v = v.mod_2k(width);
-    if width > 0 && v.bit(width - 1) {
-        v.sub(&Int::from(1).mul_2k(width))
+    let v = v.mod_2k(u64::from(width));
+    if width > 0 && v.bit(u64::from(width - 1)) {
+        v.sub(&Int::from(1).mul_2k(u64::from(width)))
     } else {
         v
     }
@@ -798,13 +802,13 @@ fn to_signed_int(v: &Int, width: u32) -> Int {
 /// Render a bit-vector value as `#x…` when the width is a multiple of 4, else
 /// `#b…` (matching Z3's output convention).
 fn render_bv(v: &Int, width: u32) -> alloc::string::String {
-    let v = v.mod_2k(width);
+    let v = v.mod_2k(u64::from(width));
     if width > 0 && width.is_multiple_of(4) {
         let mut s = alloc::string::String::from("#x");
         for nibble in (0..width / 4).rev() {
             let mut d = 0u8;
             for b in 0..4 {
-                if v.bit(nibble * 4 + b) {
+                if v.bit(u64::from(nibble * 4 + b)) {
                     d |= 1 << b;
                 }
             }
@@ -814,7 +818,7 @@ fn render_bv(v: &Int, width: u32) -> alloc::string::String {
     } else {
         let mut s = alloc::string::String::from("#b");
         for i in (0..width).rev() {
-            s.push(if v.bit(i) { '1' } else { '0' });
+            s.push(if v.bit(u64::from(i)) { '1' } else { '0' });
         }
         s
     }

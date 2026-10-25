@@ -46,13 +46,13 @@ fn pp_numeral(r: &Rational, is_int: bool, out: &mut String) {
 /// Render a bit-vector numeral like z3: `#x…` when the width is a multiple of 4,
 /// otherwise `#b…`.
 fn pp_bv(v: &Int, width: u32, out: &mut String) {
-    let v = v.mod_2k(width);
+    let v = v.mod_2k(u64::from(width));
     if width > 0 && width.is_multiple_of(4) {
         out.push_str("#x");
         for nibble in (0..width / 4).rev() {
             let mut d = 0u8;
             for b in 0..4 {
-                if v.bit(nibble * 4 + b) {
+                if v.bit(u64::from(nibble * 4 + b)) {
                     d |= 1 << b;
                 }
             }
@@ -61,7 +61,7 @@ fn pp_bv(v: &Int, width: u32, out: &mut String) {
     } else {
         out.push_str("#b");
         for i in (0..width).rev() {
-            out.push(if v.bit(i) { '1' } else { '0' });
+            out.push(if v.bit(u64::from(i)) { '1' } else { '0' });
         }
     }
 }
