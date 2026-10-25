@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/z3rs/compare/v0.0.9...v0.0.10) - 2026-09-01
+
+### Other
+
+- parse root-obj as a first-class algebraic term (closes nl-simp)
+- Bind process memory: a counting global allocator with an optional hard ceiling
+- reject an ill-sorted recursive definition (closes rec)
+- implement (get-consequences ...) (closes consequences, consequence_fd)
+- combine algebraic constants in pp.decimal sums/products (closes 210, 212)
+- fold ground algebraic (in)equalities in the goal (closes root-pre)
+- implement root-obj input constructor for (simplify …) (closes t217)
+- wire the model-constructing search as a sound CAD fallback
+- add model-constructing search (nlsat_decide) over QF_NRA
+
 ## [0.0.9](https://github.com/KarpelesLab/z3rs/compare/v0.0.8...v0.0.9) - 2026-08-31
 
 ### Other
