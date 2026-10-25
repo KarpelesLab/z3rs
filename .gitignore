@@ -10,3 +10,6 @@
 /fuzz/corpus/
 /fuzz/artifacts/
 fuzz/Cargo.lock
+
+# library crate: lockfile not tracked
+/Cargo.lock
