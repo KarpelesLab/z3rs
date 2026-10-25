@@ -29311,7 +29311,7 @@ mod tests {
         // (the new axioms must not refute them).
         let script = "(declare-const a (Array Int Int)) (declare-const b (Array Int Int))
             (assert (= (store a 1 5) (store b 1 5))) (assert (not (= a b))) (check-sat)";
-        assert_ne!(run(script).unwrap(), alloc::vec!["unsat"]);
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]

@@ -24,7 +24,7 @@ conveniences. It aims to be behaviourally faithful to upstream Z3.
 >
 > - a hash-consing AST, a simplifying rewriter, a **CDCL SAT core** (DIMACS), and a
 >   **lazy DPLL(T)** engine with **bidirectional Nelson–Oppen** combination;
-> - **QF_UF** (congruence closure), **QF_LIA/LRA** (Fourier–Motzkin + Omega +
+> - **QF_UF** (congruence closure), **QF_LIA/LRA** (bounded simplex + Omega +
 >   branch-and-bound), **QF_BV** (full bit-blasting), **arrays** (read-over-write,
 >   extensionality, const/`map`/`lambda`), **datatypes** (recursive, mutual,
 >   parametric; occurs-check, enum pigeonhole);

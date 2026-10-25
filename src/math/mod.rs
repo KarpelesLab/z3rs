@@ -6,7 +6,7 @@
 //! ## Upstream C++ components to port
 //! - [x] `z3/src/math/polynomial` → [`polynomial`] (multivariate over `Rational`)
 //! - [x] `z3/src/math/interval` → [`interval`] (rational interval arithmetic)
-//! - [ ] `z3/src/simplex`
+//! - [x] `z3/src/math/simplex` → [`simplex`] (bounded simplex, Bland's rule, δ-rationals)
 //! - [ ] `z3/src/dd`
 //! - [ ] `z3/src/hilbert`
 //! - [ ] `z3/src/subpaving`
@@ -18,6 +18,7 @@
 pub mod interval;
 pub mod polynomial;
 pub mod resultant;
+pub mod simplex;
 pub mod upoly;
 
 pub use interval::{Bound, Interval};

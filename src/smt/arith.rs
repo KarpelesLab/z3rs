@@ -1,22 +1,25 @@
-//! A linear real arithmetic theory core — Fourier–Motzkin variable elimination.
+//! A linear real arithmetic theory core.
 //!
 //! Decides feasibility of a conjunction of linear constraints over the rationals
 //! (the LRA relaxation): each constraint is `Σ cᵢ·xᵢ + k  ⋈  0` with `⋈ ∈ {≤, <,
-//! =}`. This is the sound, complete theory check the DPLL(T) loop will call for
-//! arithmetic atoms (the counterpart of Z3's `theory_lra` / `simplex`); it is
-//! exponential in the worst case but simple and exact. A simplex core replaces
-//! it later for performance.
+//! =}`. This is the sound, complete theory check the DPLL(T) loop calls for
+//! arithmetic atoms (the counterpart of Z3's `theory_lra`): feasibility, models
+//! and conflict cores come from the bounded [`simplex`](crate::math::simplex);
+//! Fourier–Motzkin elimination remains for variable projection
+//! ([`project`]) and optimization ([`optimize`]).
 //!
 //! Over the integers this decides the real relaxation: it is sound for
 //! detecting unsatisfiability but not complete for `Int` (a real solution need
 //! not be integral).
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use puremp::{Int, Rational};
 
 use crate::ast::AstId;
+pub use crate::math::simplex::Check;
+use crate::math::simplex::{DeltaRat, Simplex};
 
 fn zero() -> Rational {
     Rational::from_integer(Int::from(0))
@@ -377,125 +380,194 @@ pub fn feasible(constraints: &[Constraint]) -> bool {
     model(constraints).is_some()
 }
 
-/// Work budget for [`feasible_core`]'s Fourier–Motzkin elimination. On exhaustion
+/// Pivot budget for [`feasible_core`]'s simplex. On exhaustion
 /// the search returns `None` (no core), so the caller falls back to the always
 /// sound full-assignment block — a bounded blow-up can only weaken a lemma.
 const FEASIBLE_CORE_BUDGET: u64 = 200_000;
 
-/// Provenance-tracked Fourier–Motzkin: like [`feasible`] over the rationals, but
-/// when the system is infeasible via a **direct FM false derivation** it returns
-/// the set of original constraint indices whose Farkas combination produced the
-/// contradiction — the conflict core (Z3's `theory_arith` conflict = the
-/// constraints with a nonzero Farkas coefficient). `None` when no rational
-/// contradiction is derived.
+/// The conflict core of a rationally infeasible system: the indices of a subset
+/// of `constraints` that is already infeasible — Z3's `theory_lra` conflict, the
+/// constraints with a nonzero Farkas coefficient (read off the simplex row that
+/// cannot be repaired). `None` when the system is feasible over the rationals, or
+/// the budget ran out (the caller then uses the always-sound full block).
 ///
-/// **MVP scope:** only the pure `≤ / < / =` case over the RATIONALS (the direct FM
-/// false derivation). It does NOT core disequality splits or integer-only (Omega)
-/// infeasibility — for a system that is rational-feasible (so FM derives no
-/// contradiction) it returns `None` even if the integer test would refute it, and
-/// the caller then uses the full block. [`feasible`]/[`feasible_with_diseqs`] are
-/// left untouched and remain the sound/complete deciders.
-///
-/// Provenance: each original constraint `i`'s ineqs start tagged `{i}`; when a
-/// lower and an upper bound are combined during elimination the resolvent's tag is
-/// the UNION of the two operands' tags — exactly which original constraints the
-/// Farkas combination used. A derived constant ineq that is unsatisfiable (`c ≤ 0`
-/// with `c > 0`, or `c < 0` with `c ≥ 0`, over an empty variable set) is the
-/// contradiction; its tag is the returned core.
+/// Scope: the pure `≤ / < / =` case over the RATIONALS. It does NOT core
+/// disequality splits or integer-only infeasibility — [`feasible`] /
+/// [`feasible_with_diseqs`] remain the sound/complete deciders.
 pub fn feasible_core(constraints: &[Constraint]) -> Option<Vec<usize>> {
-    // A provenance-tagged inequality `expr ⋈ 0` plus the set of original
-    // constraint indices it descends from.
-    struct IneqP {
-        expr: LinExpr,
-        strict: bool,
-        origin: BTreeSet<usize>,
-    }
-    // A trivially-false constant ineq is a contradiction; report its origin set.
-    fn false_core(iq: &IneqP) -> Option<Vec<usize>> {
-        if iq.expr.is_constant() {
-            let k = iq.expr.const_term();
-            let violated = if iq.strict { *k >= zero() } else { *k > zero() };
-            if violated {
-                return Some(iq.origin.iter().copied().collect());
-            }
-        }
-        None
-    }
-
-    let mut ineqs: Vec<IneqP> = Vec::new();
-    for (i, c) in constraints.iter().enumerate() {
-        for iq in c.to_ineqs() {
-            let mut origin = BTreeSet::new();
-            origin.insert(i);
-            let tagged = IneqP {
-                expr: iq.expr,
-                strict: iq.strict,
-                origin,
-            };
-            if let Some(core) = false_core(&tagged) {
-                return Some(core);
-            }
-            ineqs.push(tagged);
-        }
-    }
-
     let mut budget = FEASIBLE_CORE_BUDGET;
-    // Eliminate variables one at a time (Fourier–Motzkin), unioning provenance.
-    while let Some(v) = ineqs.iter().find_map(|i| i.expr.vars().next()) {
-        let mut upper = Vec::new(); // coeff(v) > 0
-        let mut lower = Vec::new(); // coeff(v) < 0
-        let mut next: Vec<IneqP> = Vec::new(); // coeff(v) == 0
-        for iq in ineqs {
-            let c = iq.expr.coeff(v);
-            if c.is_zero() {
-                next.push(iq);
-            } else if c > zero() {
-                upper.push(iq);
-            } else {
-                lower.push(iq);
-            }
+    match simplex_solve(constraints, &mut budget) {
+        SimplexOutcome::Unsat(core) => Some(core),
+        _ => None,
+    }
+}
+
+/// The outcome of [`simplex_solve`].
+enum SimplexOutcome {
+    Sat(Assignment),
+    /// Infeasible, with the indices of a conflicting subset of the constraints.
+    Unsat(Vec<usize>),
+    Exhausted,
+}
+
+/// Decide `constraints` with the simplex. Bound tags are constraint indices, so
+/// a conflict maps straight back to a core. `budget` is charged one unit per
+/// constraint up front, then per pivot (see [`Simplex::check`]).
+fn simplex_solve(constraints: &[Constraint], budget: &mut u64) -> SimplexOutcome {
+    // Charge the tableau construction too, so a caller looping over many large
+    // systems (branch-and-bound, disequality splits, Nelson–Oppen probes) still
+    // drains its shared budget at a rate tied to the work actually done.
+    let setup = constraints.len() as u64;
+    if *budget < setup {
+        *budget = 0;
+        return SimplexOutcome::Exhausted;
+    }
+    *budget -= setup;
+    let mut lra = Lra::default();
+    for (tag, c) in constraints.iter().enumerate() {
+        let b = lra.prepare(c);
+        if let Err(core) = lra.assert(&b, tag) {
+            return SimplexOutcome::Unsat(core);
         }
-        for u in &upper {
-            let au = u.expr.coeff(v); // > 0
-            for l in &lower {
-                if budget == 0 {
-                    return None; // FM blow-up: no core, caller uses the full block
-                }
-                budget -= 1;
-                let al = l.expr.coeff(v); // < 0
-                // resolvent = (-al)·U + (au)·L  (v cancels), keeping strictness.
-                let mut e = u.expr.scale(&al.neg());
-                e.add_scaled(&l.expr, &au);
-                let mut origin = u.origin.clone();
-                origin.extend(l.origin.iter().copied());
-                let tagged = IneqP {
-                    expr: e,
-                    strict: u.strict || l.strict,
-                    origin,
-                };
-                if let Some(core) = false_core(&tagged) {
-                    return Some(core);
-                }
-                next.push(tagged);
-            }
+    }
+    match lra.check(budget) {
+        Check::Sat => SimplexOutcome::Sat(lra.model()),
+        Check::Unsat(core) => SimplexOutcome::Unsat(core),
+        Check::Exhausted => SimplexOutcome::Exhausted,
+    }
+}
+
+/// A linear constraint compiled to simplex bounds by [`Lra::prepare`].
+// Short-lived (prepared, then asserted); boxing `On` would only add an
+// allocation per constraint.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug)]
+pub enum LraBound {
+    /// A variable-free constraint, already decided.
+    Const(bool),
+    /// Bounds on one simplex variable (a structural variable, or the slack row
+    /// of a multi-variable form).
+    On {
+        var: usize,
+        lower: Option<DeltaRat>,
+        upper: Option<DeltaRat>,
+    },
+}
+
+/// An incremental linear real arithmetic solver over [`Constraint`]s — the
+/// shape of Z3's `theory_lra` over its simplex. Constraints are compiled once
+/// ([`prepare`](Lra::prepare)) and asserted under [`push`](Lra::push) /
+/// [`pop`](Lra::pop) scopes, so an online DPLL(T) hook can follow the SAT trail.
+/// Each multi-variable linear form gets one slack row, normalized by its first
+/// coefficient so that `x + y ≤ 3` and `−2x − 2y < 4` share it.
+#[derive(Default)]
+pub struct Lra {
+    sx: Simplex,
+    index: BTreeMap<AstId, usize>,
+    slacks: BTreeMap<Vec<(usize, Rational)>, usize>,
+}
+
+impl Lra {
+    fn var(&mut self, v: AstId) -> usize {
+        if let Some(&i) = self.index.get(&v) {
+            return i;
         }
-        ineqs = next;
+        let i = self.sx.mk_var();
+        self.index.insert(v, i);
+        i
     }
 
-    // No variables remain and no false constant ineq was ever derived: the system
-    // is feasible over the rationals — no rational conflict core.
-    None
+    /// Compile `c` to bounds, creating its variables / slack row as needed.
+    pub fn prepare(&mut self, c: &Constraint) -> LraBound {
+        let k = &c.expr.constant;
+        let terms: Vec<(AstId, Rational)> = c.expr.terms().map(|(v, a)| (v, a.clone())).collect();
+        let Some(((x0, a0), rest)) = terms.split_first() else {
+            return LraBound::Const(match c.rel {
+                Rel::Le => *k <= zero(),
+                Rel::Lt => *k < zero(),
+                Rel::Eq => k.is_zero(),
+            });
+        };
+        // a0·(form) + k ⋈ 0 with form = x0 + Σ (a/a0)·x  ⟹  form ⋈' −k/a0.
+        let x0 = self.var(*x0);
+        let var = if rest.is_empty() {
+            x0
+        } else {
+            let inv = a0.recip();
+            let mut form = alloc::vec![(x0, Rational::from_integer(Int::from(1)))];
+            for (x, a) in rest {
+                let xi = self.var(*x);
+                form.push((xi, a.mul(&inv)));
+            }
+            match self.slacks.get(&form) {
+                Some(&s) => s,
+                None => {
+                    let s = self.sx.add_row(&form);
+                    self.slacks.insert(form, s);
+                    s
+                }
+            }
+        };
+        let b = k.neg().div(a0);
+        let flip = a0.is_negative();
+        let (lower, upper) = match (c.rel, flip) {
+            (Rel::Le, false) => (None, Some(DeltaRat::new(b))),
+            (Rel::Le, true) => (Some(DeltaRat::new(b)), None),
+            (Rel::Lt, false) => (None, Some(DeltaRat::below(b))),
+            (Rel::Lt, true) => (Some(DeltaRat::above(b)), None),
+            (Rel::Eq, _) => (Some(DeltaRat::new(b.clone())), Some(DeltaRat::new(b))),
+        };
+        LraBound::On { var, lower, upper }
+    }
+
+    /// Assert a prepared constraint under `tag`. A directly clashing bound (or a
+    /// false constant constraint) is reported at once as a core of tags.
+    pub fn assert(&mut self, b: &LraBound, tag: usize) -> Result<(), Vec<usize>> {
+        match b {
+            LraBound::Const(true) => Ok(()),
+            LraBound::Const(false) => Err(alloc::vec![tag]),
+            LraBound::On { var, lower, upper } => {
+                if let Some(l) = lower {
+                    self.sx.assert_lower(*var, l.clone(), tag)?;
+                }
+                if let Some(u) = upper {
+                    self.sx.assert_upper(*var, u.clone(), tag)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Open a scope (see [`Simplex::push`]).
+    pub fn push(&mut self) {
+        self.sx.push();
+    }
+
+    /// Retract the bounds asserted since the matching [`push`](Lra::push).
+    pub fn pop(&mut self) {
+        self.sx.pop();
+    }
+
+    /// Restore feasibility (see [`Simplex::check`]).
+    pub fn check(&mut self, budget: &mut u64) -> Check {
+        self.sx.check(budget)
+    }
+
+    /// The current assignment of every structural variable (after a `Sat` check).
+    pub fn model(&self) -> Assignment {
+        // Slack rows are interleaved with structural variables in the simplex's
+        // numbering, so read each variable at its own index.
+        let vals = self.sx.model();
+        self.index
+            .iter()
+            .map(|(&v, &i)| (v, vals[i].clone()))
+            .collect()
+    }
 }
 
 /// Decide feasibility of `constraints` over the rationals and, if satisfiable,
-/// return a concrete satisfying assignment.
-///
-/// This runs Fourier–Motzkin elimination while recording, for each eliminated
-/// variable, the inequalities that mentioned it. Because FM projection is exact,
-/// a feasible system always admits a witness, reconstructed by back-substitution
-/// in reverse elimination order: with every later variable already fixed, each
-/// remaining bound on the current variable evaluates to a rational, and any point
-/// in the resulting interval works.
+/// return a concrete satisfying assignment (a simplex vertex, with any strict
+/// bound met by a small enough concrete `δ`).
 pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
     let mut unbounded = u64::MAX;
     match model_budgeted(constraints, &mut unbounded) {
@@ -504,104 +576,15 @@ pub fn model(constraints: &[Constraint]) -> Option<Assignment> {
     }
 }
 
-/// Like [`model`], but bounds the (worst-case doubly-exponential) Fourier–Motzkin
-/// elimination: `budget` is decremented per resolvent generated, and on
-/// exhaustion the search returns [`SolveOutcome::Exhausted`] rather than
-/// continuing. This keeps a single feasibility check terminating even when the
-/// constraint system blows up.
+/// Like [`model`], but bounded: `budget` is charged for the simplex's work,
+/// and on exhaustion the search returns [`SolveOutcome::Exhausted`] rather than
+/// continuing, so a single feasibility check always terminates.
 pub fn model_budgeted(constraints: &[Constraint], budget: &mut u64) -> SolveOutcome {
-    let mut ineqs: Vec<Ineq> = constraints.iter().flat_map(|c| c.to_ineqs()).collect();
-
-    // The inequalities that constrained each eliminated variable, newest last.
-    let mut history: Vec<(AstId, Vec<Ineq>)> = Vec::new();
-
-    // Eliminate variables one at a time (Fourier–Motzkin).
-    while let Some(v) = ineqs
-        .iter()
-        .find_map(|i| i.expr.coeffs.keys().next().copied())
-    {
-        let mut upper = Vec::new(); // coeff(v) > 0
-        let mut lower = Vec::new(); // coeff(v) < 0
-        let mut rest = Vec::new(); // coeff(v) == 0
-        for i in ineqs {
-            let c = i.expr.coeff(v);
-            if c.is_zero() {
-                rest.push(i);
-            } else if c > zero() {
-                upper.push(i);
-            } else {
-                lower.push(i);
-            }
-        }
-        let mut next = rest;
-        for u in &upper {
-            let au = u.expr.coeff(v); // > 0
-            for l in &lower {
-                if *budget == 0 {
-                    return SolveOutcome::Exhausted; // FM blow-up: give up
-                }
-                *budget -= 1;
-                let al = l.expr.coeff(v); // < 0
-                // resolvent = (-al)·U + (au)·L  (v cancels), keeping strictness.
-                let mut e = u.expr.scale(&al.neg());
-                e.add_scaled(&l.expr, &au);
-                next.push(Ineq {
-                    expr: e,
-                    strict: u.strict || l.strict,
-                });
-            }
-        }
-        // Record v's bounds for reconstruction, then continue on the rest.
-        let mut mentioning = upper;
-        mentioning.extend(lower);
-        history.push((v, mentioning));
-        ineqs = next;
+    match simplex_solve(constraints, budget) {
+        SimplexOutcome::Sat(a) => SolveOutcome::Sat(a),
+        SimplexOutcome::Unsat(_) => SolveOutcome::Unsat,
+        SimplexOutcome::Exhausted => SolveOutcome::Exhausted,
     }
-
-    // No variables remain: every ineq is `k ≤ 0` or `k < 0`. Infeasible if some
-    // constant violates its relation.
-    for i in &ineqs {
-        let k = &i.expr.constant;
-        let violated = if i.strict { *k >= zero() } else { *k > zero() };
-        if violated {
-            return SolveOutcome::Unsat;
-        }
-    }
-
-    // Feasible: back-substitute in reverse elimination order.
-    let mut assign: Assignment = BTreeMap::new();
-    for (v, bounds) in history.into_iter().rev() {
-        let mut lo: Option<(Rational, bool)> = None; // (value, strict)
-        let mut hi: Option<(Rational, bool)> = None;
-        for i in &bounds {
-            let cv = i.expr.coeff(v); // nonzero
-            // Evaluate the rest of the row (everything but v) at the fixed vars.
-            let mut r = i.expr.constant.clone();
-            for (u, c) in &i.expr.coeffs {
-                if *u != v {
-                    let uv = assign.get(u).cloned().unwrap_or_else(zero);
-                    r = &r + &(c * &uv);
-                }
-            }
-            // cv·v + r ⋈ 0  ⟺  v ⋈' -r/cv, flipping ⋈ when cv < 0.
-            let bound = &r.neg() / &cv;
-            if cv > zero() {
-                // v ≤ bound (or <)
-                hi = Some(match hi {
-                    Some((h, hs)) if h < bound || (h == bound && !hs) => (h, hs),
-                    _ => (bound, i.strict),
-                });
-            } else {
-                // v ≥ bound (or >)
-                lo = Some(match lo {
-                    Some((l, ls)) if l > bound || (l == bound && !ls) => (l, ls),
-                    _ => (bound, i.strict),
-                });
-            }
-        }
-        assign.insert(v, pick_between(lo, hi));
-    }
-    SolveOutcome::Sat(assign)
 }
 
 /// Project the variable `x` out of a conjunction of linear `constraints` by
@@ -851,6 +834,21 @@ mod tests {
             .sub(&LinExpr::constant(rat(1)));
         let sum_le1 = Constraint::le(sum);
         assert!(feasible(&[x_ge0, y_ge0, sum_le1]));
+    }
+
+    #[test]
+    fn model_reads_variables_past_interleaved_slack_rows() {
+        // Slack rows are numbered among the variables in creation order: here
+        // x, y, (x+y), z. The model must read z at its own index, not the slot
+        // a structural-first numbering would give it (a wrong-model bug).
+        let sum = LinExpr::var(x())
+            .add(&LinExpr::var(y()))
+            .sub(&LinExpr::constant(rat(1)));
+        let z_eq7 = Constraint::eq(LinExpr::var(z()).sub(&LinExpr::constant(rat(7))));
+        let cons = [Constraint::le(sum), z_eq7];
+        let m = model(&cons).expect("feasible");
+        assert_eq!(m[&z()], rat(7));
+        assert!(&m[&x()] + &m[&y()] <= rat(1));
     }
 
     #[test]

@@ -1842,32 +1842,71 @@ pub fn substitute_lin(e: &LinExpr, v: AstId, v_expr: &LinExpr) -> LinExpr {
     }
 }
 
-/// Does the arithmetic system *entail* `u = v`? `Some(true)` iff neither `u < v`
-/// nor `u > v` is consistent with it — i.e. every solution has `u = v`. `None` if
-/// the shared work `budget` was exhausted. Used to share implied equalities with
-/// the EUF theory (Nelson–Oppen).
+/// The answer of [`arith_entails_eq`].
+enum Entail {
+    /// Every solution has `u = v`.
+    Entailed,
+    /// A solution of the system (disequalities included) with `u ≠ v`.
+    Separated(Assignment),
+}
+
+/// Does the arithmetic system *entail* `u = v`? [`Entail::Entailed`] iff neither
+/// `u < v` nor `u > v` is consistent with it — i.e. every solution has `u = v`;
+/// otherwise the separating solution. `None` if the shared work `budget` was
+/// exhausted. Used to share implied equalities with the EUF theory
+/// (Nelson–Oppen).
 fn arith_entails_eq(
     m: &AstManager,
     sys: &ArithSystem,
     u: AstId,
     v: AstId,
     budget: &mut u64,
-) -> Option<bool> {
+) -> Option<Entail> {
     let diff = ast_to_lin(m, u).sub(&ast_to_lin(m, v)); // u - v
     let mut lt = sys.cons.clone();
     lt.push(Constraint::lt(diff.clone())); // u - v < 0
     match model_with_diseqs_budgeted(&lt, &sys.diseqs, budget) {
-        SolveOutcome::Sat(_) => return Some(false), // u < v possible ⇒ not entailed
+        SolveOutcome::Sat(w) => return Some(Entail::Separated(w)), // u < v possible
         SolveOutcome::Exhausted => return None,
         SolveOutcome::Unsat => {}
     }
     let mut gt = sys.cons.clone();
     gt.push(Constraint::lt(diff.neg())); // v - u < 0  ⟺  u - v > 0
     match model_with_diseqs_budgeted(&gt, &sys.diseqs, budget) {
-        SolveOutcome::Sat(_) => Some(false),
+        SolveOutcome::Sat(w) => Some(Entail::Separated(w)),
         SolveOutcome::Exhausted => None,
-        SolveOutcome::Unsat => Some(true), // neither side possible ⇒ entailed
+        SolveOutcome::Unsat => Some(Entail::Entailed), // neither side possible
     }
+}
+
+/// Move the feasible point `p` toward the feasible witness `w`:
+/// `p + t·(w − p)` for the first `t ∈ (0, 1]` that keeps every disequality of
+/// `sys` nonzero. Both points satisfy the (convex) constraints, so the blend
+/// does too; each disequality is linear in `t` and nonzero at `t = 0`, so it
+/// vanishes for at most one `t` — a few candidates always suffice. The blend
+/// separates every pair `w` separates that `p` had equal (`u − v` is then
+/// `t·(w_u − w_v) ≠ 0`), so one witness prunes many Nelson–Oppen queries
+/// rather than one. `None` only if no candidate worked (callers keep `p`).
+fn blend_point(sys: &ArithSystem, p: &Assignment, w: &Assignment) -> Option<Assignment> {
+    let zero = rat_zero();
+    let vars: BTreeSet<AstId> = p.keys().chain(w.keys()).copied().collect();
+    let pv = |a: &Assignment, x| a.get(&x).cloned().unwrap_or_else(rat_zero);
+    for den in 2..10i64 {
+        for num in 1..den {
+            let t = Rational::new(Int::from(num), Int::from(den));
+            let blended: Assignment = vars
+                .iter()
+                .map(|&x| {
+                    let (a, b) = (pv(p, x), pv(w, x));
+                    (x, a.add(&b.sub(&a).mul(&t)))
+                })
+                .collect();
+            if sys.diseqs.iter().all(|d| d.eval(&blended) != zero) {
+                return Some(blended);
+            }
+        }
+    }
+    None
 }
 
 /// The result of the combined theory check for one Boolean assignment.
@@ -1994,15 +2033,20 @@ fn theory_check(
         // decisive when there are many interface terms (Nelson–Oppen was redoing
         // ~n²/2 feasibility solves every round). Sound: a separating model proves
         // non-entailment exactly; equal-in-model pairs still get the full check.
-        let iface_vals: Option<Vec<Rational>> = match &arith {
-            Feas::Sat(a) => Some(
-                interface
-                    .iter()
-                    .map(|&t| ast_to_lin(m, t).eval(a))
-                    .collect(),
-            ),
+        let iface_of = |a: &Assignment| -> Vec<Rational> {
+            interface
+                .iter()
+                .map(|&t| ast_to_lin(m, t).eval(a))
+                .collect()
+        };
+        // A feasible point of `sys` whose interface values prove non-entailment;
+        // it starts at the arithmetic model and is blended toward each separating
+        // witness found below, so later pairs are pruned by it too.
+        let mut point: Option<Assignment> = match &arith {
+            Feas::Sat(a) => Some(a.clone()),
             _ => None,
         };
+        let mut iface_vals: Option<Vec<Rational>> = point.as_ref().map(iface_of);
         // Congruence closure augmented with the arithmetic-implied equalities.
         let mut all_eqs = eqs.clone();
         all_eqs.extend(euf_extra.iter().cloned());
@@ -2035,7 +2079,18 @@ fn theory_check(
                     false
                 } else {
                     match arith_entails_eq(m, &sys, u, v, &mut *budget) {
-                        Some(e) => e,
+                        Some(Entail::Entailed) => true,
+                        Some(Entail::Separated(w)) => {
+                            let next = match &point {
+                                Some(p) => blend_point(&sys, p, &w),
+                                None => Some(w),
+                            };
+                            if let Some(np) = next {
+                                iface_vals = Some(iface_of(&np));
+                                point = Some(np);
+                            }
+                            false
+                        }
                         None => return TheoryOutcome::Unknown, // work budget exhausted
                     }
                 };
