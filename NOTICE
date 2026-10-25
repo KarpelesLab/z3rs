@@ -9,7 +9,7 @@ It is a derivative work of Z3:
     Copyright (c) Microsoft Corporation
     Licensed under the MIT License.
     Source: https://github.com/Z3Prover/z3
-    Ported from Z3 version 4.17.0.
+    Ported from Z3 version 4.17.0; tracking Z3 5.0.0 behaviour.
 
 Substantial portions of z3rs are translations of Z3's C++ source into Rust.
 Algorithms, data-structure designs, module layout, heuristics, and comments

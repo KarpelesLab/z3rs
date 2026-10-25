@@ -43,8 +43,24 @@ pointers.
 
 ## Testing strategy (the spec is upstream Z3)
 
-The oracle is the C++ Z3 4.17.0 checked out in [`z3/`](z3/). Build it once,
-GMP-backed, and treat its output as ground truth.
+The oracle is the C++ Z3 **5.0.0** checked out in [`z3/`](z3/) (git-ignored).
+The port itself started from the 4.17.0 development line (upstream commit
+`f15584cda`, there is no `z3-4.17.0` tag); per-file "Ported from … (Z3 4.17.0)"
+headers record that origin. Build the oracle once, GMP-backed, and treat its
+output as ground truth.
+
+```sh
+git clone --filter=blob:none --branch z3-5.0.0 https://github.com/Z3Prover/z3.git z3
+```
+
+The byte-for-byte regression corpus is z3's own `z3test` repository, pinned to
+the last commit before the 5.0.0 release so its `.expected.out` files are 5.0.0
+behaviour (later commits add tests for unreleased features):
+
+```sh
+git clone https://github.com/Z3Prover/z3test.git z3test && git -C z3test checkout 4481ad4
+python3 scripts/z3test_diff.py          # needs `cargo build --release`
+```
 
 1. **Unit tests** — port `z3/src/test/*` into Rust `#[test]`s next to each module.
 2. **Numeral fuzzing (Phase 0)** — generate random operations over

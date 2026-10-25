@@ -9,7 +9,7 @@
 A **pure-Rust, `no_std`** port of the [Z3 theorem prover](https://github.com/Z3Prover/z3),
 free of any third-party or native dependency.
 
-`z3rs` reimplements Z3 (pinned at **v4.17.0**) as a single Rust crate with **no
+`z3rs` reimplements Z3 (tracking **v5.0.0**) as a single Rust crate with **no
 GMP, no C, no `-sys` crate**. Its only dependency is our own pure-Rust,
 dependency-free numeric core [`puremp`](https://github.com/KarpelesLab/puremp),
 so the resolved dependency tree is just `z3rs → puremp`. The library is
@@ -82,7 +82,7 @@ z3rs/
 │   └── api/                          # Phase 9
 ├── ROADMAP.md        # the master plan
 ├── PORTING.md        # how we translate C++ → Rust + testing strategy
-└── z3/               # upstream Z3 4.17.0 (reference oracle; git-ignored)
+└── z3/               # upstream Z3 5.0.0 (reference oracle; git-ignored)
 ```
 
 ## Build
