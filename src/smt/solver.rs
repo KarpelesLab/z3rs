@@ -986,12 +986,7 @@ fn propagate_euf_equalities(
 /// theories reason about, whose equalities they exchange in Nelson–Oppen —
 /// including compound terms like `(- y)`, not just leaf variables.
 fn interface_terms(m: &AstManager, euf_roots: &[AstId]) -> Vec<AstId> {
-    let mut euf_universe: BTreeSet<AstId> = BTreeSet::new();
-    for &r in euf_roots {
-        for t in m.postorder(r) {
-            euf_universe.insert(t);
-        }
-    }
+    let euf_universe: BTreeSet<AstId> = m.postorder_many(euf_roots).into_iter().collect();
     euf_universe
         .into_iter()
         .filter(|&t| m.is_arith_sort(m.get_sort(t)))

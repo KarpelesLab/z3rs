@@ -42,10 +42,8 @@ impl Egraph {
             parent: Vec::new(),
             app: Vec::new(),
         };
-        for &r in roots {
-            for t in m.postorder(r) {
-                g.intern(m, t);
-            }
+        for t in m.postorder_many(roots) {
+            g.intern(m, t);
         }
         g
     }
@@ -209,10 +207,8 @@ impl ProofEgraph {
             mark: Vec::new(),
             stamp: 0,
         };
-        for &r in roots {
-            for t in m.postorder(r) {
-                g.intern(m, t);
-            }
+        for t in m.postorder_many(roots) {
+            g.intern(m, t);
         }
         g
     }

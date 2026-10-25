@@ -51,6 +51,37 @@ impl AstManager {
         order
     }
 
+    /// All expressions reachable from any of `roots`, in post-order, each once —
+    /// one traversal with one `visited` array, so `n` roots cost `O(|AST| + n)`
+    /// rather than `n` full-size allocations. Equal to concatenating each root's
+    /// [`postorder`](Self::postorder) and dropping repeats: what earlier roots
+    /// visited is closed under children, so skipping it keeps the rest in order.
+    pub fn postorder_many(&self, roots: &[AstId]) -> Vec<AstId> {
+        let mut visited = alloc::vec![false; self.len()];
+        let mut order = Vec::new();
+        let mut stack: Vec<(AstId, bool)> = Vec::new();
+        for &root in roots {
+            stack.push((root, false));
+            while let Some((id, expanded)) = stack.pop() {
+                if visited[id.0 as usize] {
+                    continue;
+                }
+                if expanded {
+                    visited[id.0 as usize] = true;
+                    order.push(id);
+                } else {
+                    stack.push((id, true));
+                    for &c in self.expr_children(id) {
+                        if !visited[c.0 as usize] {
+                            stack.push((c, false));
+                        }
+                    }
+                }
+            }
+        }
+        order
+    }
+
     /// Visit every expression reachable from `root` once, in post-order.
     pub fn for_each_expr<F: FnMut(AstId)>(&self, root: AstId, mut f: F) {
         for id in self.postorder(root) {

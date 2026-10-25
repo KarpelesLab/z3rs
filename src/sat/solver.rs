@@ -84,6 +84,14 @@ pub struct Solver {
     polarity: Vec<bool>,
     activity: Vec<f64>,
     var_inc: f64,
+    /// Decision order: a binary max-heap of variables by (activity desc, index
+    /// asc) — the port of MiniSat/z3's `var_queue`. It may hold assigned
+    /// variables (dropped lazily when popped); every unassigned variable is in
+    /// it. `heap_pos[v]` is `v`'s slot, or `-1` when absent.
+    heap: Vec<Var>,
+    heap_pos: Vec<i32>,
+    /// Scratch `seen` marks for [`Solver::analyze`], kept all-false between calls.
+    seen: Vec<bool>,
 
     clauses: Vec<Vec<Lit>>,
     /// `watches[l.index()]` = clauses watching literal `~l` (MiniSat convention).
@@ -121,6 +129,9 @@ impl Solver {
             polarity: Vec::new(),
             activity: Vec::new(),
             var_inc: 1.0,
+            heap: Vec::new(),
+            heap_pos: Vec::new(),
+            seen: Vec::new(),
             clauses: Vec::new(),
             watches: Vec::new(),
             learnt: Vec::new(),
@@ -150,6 +161,9 @@ impl Solver {
         self.reason.push(REASON_NONE);
         self.polarity.push(false);
         self.activity.push(0.0);
+        self.heap_pos.push(-1);
+        self.seen.push(false);
+        self.heap_insert(v);
         self.watches.push(Vec::new()); // for the positive literal
         self.watches.push(Vec::new()); // for the negative literal
         v
@@ -367,6 +381,89 @@ impl Solver {
                 *a *= 1e-100;
             }
             self.var_inc *= 1e-100;
+            // Scaling is monotone, but underflow can merge two activities into
+            // a tie that the index then breaks the other way: rebuild the heap.
+            self.heap_rebuild();
+        } else if self.heap_pos[v] >= 0 {
+            self.heap_up(self.heap_pos[v] as usize); // activity only grew
+        }
+    }
+
+    /// Does `a` come before `b` in decision order? Highest activity first, ties
+    /// to the lowest index — the same choice the former linear scan made, so
+    /// the search (and every model it yields) is unchanged.
+    #[inline]
+    fn heap_before(&self, a: Var, b: Var) -> bool {
+        let (aa, ab) = (self.activity[a as usize], self.activity[b as usize]);
+        aa > ab || (aa == ab && a < b)
+    }
+
+    fn heap_insert(&mut self, v: Var) {
+        if self.heap_pos[v as usize] >= 0 {
+            return;
+        }
+        self.heap_pos[v as usize] = self.heap.len() as i32;
+        self.heap.push(v);
+        self.heap_up(self.heap.len() - 1);
+    }
+
+    fn heap_up(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            let pv = self.heap[parent];
+            if !self.heap_before(v, pv) {
+                break;
+            }
+            self.heap[i] = pv;
+            self.heap_pos[pv as usize] = i as i32;
+            i = parent;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v as usize] = i as i32;
+    }
+
+    fn heap_down(&mut self, mut i: usize) {
+        let v = self.heap[i];
+        let n = self.heap.len();
+        loop {
+            let l = 2 * i + 1;
+            if l >= n {
+                break;
+            }
+            let r = l + 1;
+            let c = if r < n && self.heap_before(self.heap[r], self.heap[l]) {
+                r
+            } else {
+                l
+            };
+            let cv = self.heap[c];
+            if !self.heap_before(cv, v) {
+                break;
+            }
+            self.heap[i] = cv;
+            self.heap_pos[cv as usize] = i as i32;
+            i = c;
+        }
+        self.heap[i] = v;
+        self.heap_pos[v as usize] = i as i32;
+    }
+
+    fn heap_pop(&mut self) -> Option<Var> {
+        let top = *self.heap.first()?;
+        let last = self.heap.pop().unwrap();
+        self.heap_pos[top as usize] = -1;
+        if !self.heap.is_empty() {
+            self.heap[0] = last;
+            self.heap_pos[last as usize] = 0;
+            self.heap_down(0);
+        }
+        Some(top)
+    }
+
+    fn heap_rebuild(&mut self) {
+        for i in (0..self.heap.len() / 2).rev() {
+            self.heap_down(i);
         }
     }
 
@@ -374,7 +471,7 @@ impl Solver {
     /// index 0) and the level to backjump to.
     fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32) {
         let cur_level = self.decision_level();
-        let mut seen = vec![false; self.num_vars()];
+        let mut seen = core::mem::take(&mut self.seen);
         let mut learnt: Vec<Lit> = vec![Lit::pos(0)]; // slot 0 reserved for the UIP
         let mut path_c = 0i32;
         let mut p: Option<Lit> = None;
@@ -414,6 +511,12 @@ impl Solver {
             confl = self.reason[pl.var() as usize] as usize;
         }
         learnt[0] = !p.unwrap();
+        // Restore the all-false invariant: the marks left set are exactly the
+        // lower-level literals collected into the clause.
+        for l in &learnt[1..] {
+            seen[l.var() as usize] = false;
+        }
+        self.seen = seen;
 
         // Backtrack level = second-highest level in the clause; move that literal
         // to position 1 so the learnt clause watches it.
@@ -444,23 +547,22 @@ impl Solver {
             self.assign[v] = LBool::Undef;
             self.polarity[v] = !l.sign(); // phase saving
             self.reason[v] = REASON_NONE;
+            self.heap_insert(v as Var);
         }
         self.qhead = target;
         self.trail_lim.truncate(level as usize);
     }
 
-    /// Pick the unassigned variable with the highest activity.
-    fn pick_branch_var(&self) -> Option<Var> {
-        let mut best: Option<(f64, Var)> = None;
-        for v in 0..self.num_vars() {
-            if self.assign[v] == LBool::Undef {
-                let a = self.activity[v];
-                if best.is_none_or(|(ba, _)| a > ba) {
-                    best = Some((a, v as Var));
-                }
+    /// Pick the unassigned variable with the highest activity (ties to the
+    /// lowest index). Assigned variables met on the way are dropped; they
+    /// re-enter on backtrack.
+    fn pick_branch_var(&mut self) -> Option<Var> {
+        while let Some(v) = self.heap_pop() {
+            if self.assign[v as usize] == LBool::Undef {
+                return Some(v);
             }
         }
-        best.map(|(_, v)| v)
+        None
     }
 
     /// Solve. On [`SatResult::Sat`], the assignment is a model.
