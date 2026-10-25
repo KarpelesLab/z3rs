@@ -20796,10 +20796,21 @@ impl Context {
             return RealOpt::Unknown; // not a pure conjunction of linear constraints
         };
         let obj_lin = ast_to_lin(&self.m, obj);
+        // `ast_to_lin` makes nonlinear/opaque subterms (`x*x`, `ite`, …) free
+        // variables and drops integrality, so unless every variable is a plain
+        // Real constant the LP is only a *relaxation*: its unboundedness or strict
+        // bound says nothing about the real problem (`x*x ≤ 4` would read as
+        // `maximize x = oo`). Only the solver-verified `Attained` survives that.
+        let exact = cons
+            .iter()
+            .flat_map(|c| c.expr.vars())
+            .chain(obj_lin.vars())
+            .all(|v| self.m.is_uninterp_const(v) && !self.m.is_int_sort(self.m.get_sort(v)));
         let real = self.m.mk_real_sort();
         let z = self.fresh_const(real);
         let mut budget: u64 = 200_000;
         match arith_optimize(&cons, &obj_lin, z, maximize, &mut budget) {
+            OptOutcome::Unbounded | OptOutcome::Bound(_) if !exact => RealOpt::Unknown,
             OptOutcome::Unbounded => RealOpt::Unbounded,
             OptOutcome::Attained(r) => {
                 // Verify: `obj` reaches r, and cannot pass it.
@@ -30737,6 +30748,37 @@ mod tests {
             "got {:?}",
             out[1]
         );
+    }
+
+    #[test]
+    fn real_optimization_over_a_relaxation_is_not_unbounded() {
+        // The LP treats `x*x` (or an Int under `to_real`) as unconstrained, so its
+        // unbounded / strict-bound outcome is only about a relaxation. Each of
+        // these used to report a wrong `oo` / `−oo` / `2.5 − ε`.
+        for (script, wrong) in [
+            (
+                "(declare-const x Real)(assert (<= (* x x) 4.0))(maximize x)",
+                "(x oo)",
+            ),
+            (
+                "(declare-const x Real)(assert (< (* x x) 2.0))(maximize x)",
+                "(x oo)",
+            ),
+            (
+                "(declare-const x Real)(declare-const y Real)\
+                 (assert (= (* x y) 1.0))(assert (> x 1.0))(minimize y)",
+                "(y (- oo))",
+            ),
+            (
+                "(declare-const n Int)(declare-const r Real)\
+                 (assert (= r (to_real n)))(assert (< r 2.5))(maximize r)",
+                "epsilon",
+            ),
+        ] {
+            let out = run(&alloc::format!("{script}(check-sat)(get-objectives)")).unwrap();
+            assert_eq!(out[0], "sat");
+            assert!(!out[1].contains(wrong), "{script}: got {:?}", out[1]);
+        }
     }
 
     #[test]
