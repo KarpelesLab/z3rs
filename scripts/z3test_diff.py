@@ -12,6 +12,7 @@ gap can be closed systematically:
   DECLINE         z3rs unknown where z3 was definite     (completeness gap)
   UNSUPPORTED     z3rs printed an error / unsupported    (missing feature)
   TIMEOUT         z3rs exceeded the time budget
+  Z3-BUG          expected output is a confirmed upstream z3 bug (KNOWN_Z3_BUGS)
   Z3-INDEFINITE   expected itself is unknown/empty       (skipped from the ratio)
 
 Usage: scripts/z3test_diff.py [subdir ...] [--timeout S] [--limit N] [--show K]
@@ -22,6 +23,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 Z3RS = os.path.join(ROOT, "target/release/z3rs")
 CORPUS = os.path.join(ROOT, "z3test")
 VERDICTS = {"sat", "unsat", "unknown"}
+
+# Corpus files whose `.expected.out` freezes a confirmed *wrong* z3 answer, so a
+# mismatch there is z3rs being right. Kept out of VERDICT (which must stay a pure
+# soundness signal) and out of the pass ratio. Path relative to CORPUS → reason.
+KNOWN_Z3_BUGS = {
+    "regressions/smt2/4008.smt2":
+        "z3#4008: fp.spacer.gpdr says sat on an unsafe system; z3 default "
+        "engine and z3rs say unsat (ground derivation in the unit test)",
+}
 
 
 def verdict_seq(text):
@@ -44,6 +54,8 @@ def run_one(smt2, timeout):
     prod_text = produced.decode("utf-8", "replace")
     if produced == expected:
         return ("PASS", smt2, exp_text, prod_text)
+    if os.path.relpath(smt2, CORPUS) in KNOWN_Z3_BUGS:
+        return ("Z3-BUG", smt2, exp_text, prod_text)
     prod_verd = verdict_seq(prod_text)
     # A z3rs error / unsupported construct.
     low = prod_text.lower()
@@ -90,15 +102,15 @@ def main():
     files.sort()
     if limit:
         files = files[:limit]
-    buckets = {k: [] for k in ("PASS", "FORMAT", "VERDICT", "DECLINE", "UNSUPPORTED", "TIMEOUT", "Z3-INDEFINITE")}
+    buckets = {k: [] for k in ("PASS", "FORMAT", "VERDICT", "DECLINE", "UNSUPPORTED", "TIMEOUT", "Z3-INDEFINITE", "Z3-BUG")}
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         for res in ex.map(lambda f: run_one(f, timeout), files):
             if res:
                 buckets[res[0]].append(res)
     total = sum(len(v) for v in buckets.values())
-    definite = total - len(buckets["Z3-INDEFINITE"])
+    definite = total - len(buckets["Z3-INDEFINITE"]) - len(buckets["Z3-BUG"])
     print(f"corpus: {total} files ({definite} with a definite z3 verdict)\n")
-    for k in ("PASS", "FORMAT", "DECLINE", "UNSUPPORTED", "VERDICT", "TIMEOUT", "Z3-INDEFINITE"):
+    for k in ("PASS", "FORMAT", "DECLINE", "UNSUPPORTED", "VERDICT", "TIMEOUT", "Z3-INDEFINITE", "Z3-BUG"):
         print(f"  {k:14} {len(buckets[k])}")
     print(f"\nbyte-for-byte PASS: {len(buckets['PASS'])}/{definite} "
           f"({100*len(buckets['PASS'])/max(1,definite):.1f}%)")

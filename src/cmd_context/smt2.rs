@@ -29631,6 +29631,30 @@ mod tests {
     }
 
     #[test]
+    fn chc_z3_issue_4008_unsafe_under_horn_tactic() {
+        // z3 issue #4008 ("Soundness bug in HORN logic"): this system is
+        // **unsafe** — rule 1 reaches `a(false,false,_,5,_,_,0,7,5)`, rule 2
+        // (f = bc, gd = true, gl = e = 7) reaches `a(false,true,_,7,_,_,_,_,7)`,
+        // which violates the query. z3 with `fp.spacer.gpdr` wrongly says `sat`
+        // under `check-sat-using horn` (and z3test froze that output); its default
+        // engine, and z3rs under both commands, correctly say `unsat`.
+        assert_eq!(
+            run("(set-option :fp.spacer.gpdr true)\
+                 (declare-fun a (Bool Bool Int Int Int Int Int Int Int) Bool)\
+                 (assert (forall ((b Int) (bc Bool) (bd Bool) (bk Int) (be Int) (bf Int) (bm Int) (bn Int))\
+                   (=> (= bc bd false) (= bk 0) (a bc bd bf b bm bn bk be b))))\
+                 (assert (forall ((bc Bool) (bd Bool) (bf Int) (bm Int) (bn Int) (bk Int) (b Int) (c Int)\
+                   (d Int) (g Int) (e Int) (f Bool) (gn Int) (ge Int) (gl Int) (gd Bool))\
+                   (=> (a bc bd bf b bm bn bk e b) (or (= f bc) (= bk 2)) (a f gd d gl c gn g ge e))))\
+                 (assert (forall ((bc Bool) (bd Bool) (bf Int) (bm Int) (bn Int) (bk Int) (be Int) (b Int))\
+                   (=> (a bc bd bf b bm bn bk be b) (or bc bd) false)))\
+                 (check-sat-using horn)(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat", "unsat"]
+        );
+    }
+
+    #[test]
     fn nonlinear_integer_equality_bounds_decide() {
         // Square bounds derived from a nonlinear EQUALITY box the integer
         // variables, so exhaustive search refutes/decides (was `unknown`).
