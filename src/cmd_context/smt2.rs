@@ -34,6 +34,36 @@ use crate::smt::{
     check_bv_model, check_model, feasible, linear_constraints, project, substitute_lin,
 };
 
+/// Optimization state carried between repeated `check-sat`s (z3's
+/// `m_box_index` / `m_pareto` / `m_pareto1`); any change to the assertions or
+/// objectives, or a `pop`, starts afresh.
+#[derive(Default)]
+enum OptIter {
+    #[default]
+    Fresh,
+    /// `box`: the per-objective models, and the next one to report.
+    Box {
+        models: Vec<Option<Model>>,
+        next: usize,
+    },
+    /// `pareto` over a single objective: the optimum was reported; next is `unsat`.
+    Pareto1,
+    /// `pareto`: the front enumeration so far.
+    Pareto(ParetoState),
+}
+
+/// The `pareto` enumeration: objectives `(term, maximize?)` (the MaxSAT penalty
+/// first when `user_start` is 1) and the base constraints — the penalty
+/// definition plus a "not dominated by" block per reported point.
+struct ParetoState {
+    objs: Vec<(AstId, bool)>,
+    user_start: usize,
+    base: Vec<AstId>,
+    /// Whether a front point has been reported (an `unsat` then means the
+    /// front is exhausted, not that the constraints are).
+    reported: bool,
+}
+
 /// The result of optimizing a real-valued objective.
 enum RealOpt {
     /// A proven-exact attained optimum.
@@ -2114,6 +2144,8 @@ struct Context {
     objectives: Vec<(AstId, bool, String)>,
     /// The rendered optimal value of each objective after the last `check-sat`.
     objective_values: Vec<String>,
+    /// `box`/`pareto` iteration state across repeated `check-sat`s.
+    opt_iter: OptIter,
     /// Soft constraints (`assert-soft`) as `(penalty indicator bool, weight)`;
     /// `check-sat` minimizes the total weight of the violated ones (MaxSAT).
     soft: Vec<(AstId, i64)>,
@@ -3175,6 +3207,7 @@ impl Context {
             universals: Vec::new(),
             objectives: Vec::new(),
             objective_values: Vec::new(),
+            opt_iter: OptIter::Fresh,
             soft: Vec::new(),
             soft_id: String::new(),
             penalty_value: None,
@@ -3390,6 +3423,20 @@ impl Context {
             SExpr::List(l) if !l.is_empty() => l,
             _ => return Err("expected a command list".to_string()),
         };
+        // z3's opt context restarts a box/pareto enumeration when the hard
+        // constraints or objectives change, or on `pop` (not on `push`).
+        if matches!(
+            Self::sym(&list[0])?,
+            "assert"
+                | "maximize"
+                | "minimize"
+                | "assert-soft"
+                | "pop"
+                | "reset"
+                | "reset-assertions"
+        ) {
+            self.opt_iter = OptIter::Fresh;
+        }
         match Self::sym(&list[0])? {
             "set-option" => {
                 // (set-option :name value) — store the option so get-option can
@@ -20676,15 +20723,43 @@ impl Context {
         Some(kept)
     }
 
-    /// Optimize the recorded objectives (integer, lexicographic in declaration
-    /// order) and return the model at the optimum. Each objective is bounded by
-    /// binary search; a non-integer objective or one not bounded within budget
-    /// is reported as `unknown` (or `oo`/`(- oo)` when provably unbounded).
+    /// Optimize the recorded objectives under `opt.priority` and return the
+    /// model at the optimum. `lex` (the default) optimizes in declaration order,
+    /// fixing each optimum before the next; `box` optimizes every objective
+    /// independently; `pareto` enumerates the Pareto front. A non-arithmetic
+    /// objective or one not bounded within budget is reported as `unknown` (or
+    /// `oo`/`(- oo)` when provably unbounded).
+    ///
+    /// Like z3's `opt::context::optimize`, `box` and `pareto` are stateful
+    /// across repeated `check-sat`s with no change in between: `box` answers
+    /// `sat` once per objective (each with that objective's model) and then
+    /// `unsat`; `pareto` answers `sat` once per front point and then `unsat`
+    /// (a single `pareto` objective: `sat`, then `unsat`). See [`OptIter`].
     fn optimize(&mut self) -> (SmtResult, Option<Model>) {
+        match core::mem::take(&mut self.opt_iter) {
+            OptIter::Fresh => {}
+            OptIter::Box { mut models, next } => {
+                if next < models.len() {
+                    let model = models[next].take();
+                    self.opt_iter = OptIter::Box {
+                        models,
+                        next: next + 1,
+                    };
+                    return (SmtResult::Sat, model);
+                }
+                return (SmtResult::Unsat, None);
+            }
+            OptIter::Pareto1 => return (SmtResult::Unsat, None),
+            OptIter::Pareto(st) => return self.pareto_step(st),
+        }
+        let pri = match self.params.get("opt.priority") {
+            Some(crate::util::ParamValue::Str(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let n_objs = self.objectives.len() + usize::from(!self.soft.is_empty());
         // The MaxSAT penalty (minimize the violated soft weight) is optimized
-        // first, then the user objectives, lexicographically. The penalty is
-        // bound to a fresh variable `pen = Σ(ite pᵢ wᵢ 0)`, threaded through the
-        // optimization via `fixed`.
+        // first, then the user objectives. The penalty is bound to a fresh
+        // variable `pen = Σ(ite pᵢ wᵢ 0)`, threaded through via `fixed`.
         let mut objs: Vec<(AstId, bool, String)> = Vec::new();
         let mut fixed: Vec<AstId> = Vec::new();
         if let Some(sum) = self.soft_penalty() {
@@ -20696,86 +20771,233 @@ impl Context {
         }
         let user_start = objs.len();
         objs.extend(self.objectives.clone());
+        if pri == "pareto" && n_objs >= 2 {
+            let st = ParetoState {
+                objs: objs.iter().map(|&(o, max, _)| (o, max)).collect(),
+                user_start,
+                base: fixed,
+                reported: false,
+            };
+            return self.pareto_step(st);
+        }
+        let boxed = pri == "box" && n_objs >= 2;
         let mut values = alloc::vec!["unknown".to_string(); objs.len()];
         let (res, mut model) = self.check_with(&fixed);
         if res != SmtResult::Sat {
-            self.objective_values = values.split_off(user_start);
+            self.set_objective_values(objs.len(), user_start, res);
             return (res, model);
         }
-        for (i, (obj, maximize, _)) in objs.iter().enumerate() {
-            let (obj, maximize) = (*obj, *maximize);
-            let osort = self.m.get_sort(obj);
-            if let Some(w) = self.m.bv_sort_width(osort) {
-                // Bit-vector objective: optimize the unsigned value by bisection
-                // over the fixed range [0, 2^w − 1]. z3 renders it as a decimal.
-                if let Some(v) = self.opt_bv_search(obj, maximize, w, &fixed) {
-                    values[i] = render_int(&v);
-                    let bv = self.m.mk_bv_numeral(v, w);
-                    let eq = self.m.mk_eq(obj, bv);
-                    fixed.push(eq);
-                    model = self.check_with(&fixed).1;
-                }
-                continue;
+        let base = fixed.clone();
+        let mut box_models = Vec::new();
+        for (i, &(obj, maximize, _)) in objs.iter().enumerate() {
+            if boxed {
+                // Independent objectives: each starts from the base constraints.
+                let mut f = base.clone();
+                let mut m = if i == 0 {
+                    model.take()
+                } else {
+                    self.check_with(&base).1
+                };
+                values[i] = self.optimize_one(obj, maximize, &mut f, &mut m);
+                box_models.push(m);
+            } else {
+                values[i] = self.optimize_one(obj, maximize, &mut fixed, &mut model);
             }
-            if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
-                // Real objective: Fourier–Motzkin optimum, then verify it.
-                match self.real_optimize(obj, maximize, &fixed) {
-                    RealOpt::Attained(r) => {
-                        values[i] = render_rational(&r);
-                        let rv = self.m.mk_numeral(r, false);
-                        let eq = self.m.mk_eq(obj, rv);
-                        fixed.push(eq);
-                        model = self.check_with(&fixed).1;
-                    }
-                    RealOpt::Supremum(r) => {
-                        // z3 form: max → r - ε, min → r + ε.
-                        values[i] = if maximize {
-                            alloc::format!("(+ {} (* (- 1.0) epsilon))", render_real(&r))
-                        } else {
-                            alloc::format!("(+ {} epsilon)", render_real(&r))
-                        };
-                    }
-                    RealOpt::Unbounded => {
-                        values[i] = if maximize {
-                            "oo".to_string()
-                        } else {
-                            "(- oo)".to_string()
-                        };
-                    }
-                    RealOpt::Unknown => {}
-                }
-                continue;
-            }
-            if !self.m.is_int_sort(self.m.get_sort(obj)) {
-                continue; // only Int/Real objectives are optimized
-            }
-            let v0 = match model.as_mut().map(|m| m.eval(&self.m, obj)) {
-                Some(Value::Num(r, _)) => r.numerator().clone(),
-                _ => continue,
+        }
+        if boxed {
+            model = box_models[0].take();
+            self.opt_iter = OptIter::Box {
+                models: box_models,
+                next: 1,
             };
-            match self.opt_int_search(obj, maximize, v0, &fixed) {
-                OptResult::Optimum(v) => {
-                    values[i] = render_int(&v);
-                    let iv = self.m.mk_numeral(Rational::from_integer(v), true);
-                    let eq = self.m.mk_eq(obj, iv);
-                    fixed.push(eq);
-                    model = self.check_with(&fixed).1;
-                }
-                OptResult::Unbounded => {
-                    values[i] = if maximize {
-                        "oo".to_string()
-                    } else {
-                        "(- oo)".to_string()
-                    };
-                }
-                OptResult::Unknown => {}
-            }
+        } else if pri == "pareto" {
+            self.opt_iter = OptIter::Pareto1;
         }
         // The MaxSAT penalty is reported as an anonymous objective, the user
         // objectives after it.
         self.objective_values = values.split_off(user_start);
         self.penalty_value = (user_start > 0).then(|| values[0].clone());
         (SmtResult::Sat, model)
+    }
+
+    /// Optimize one objective subject to the base assertions plus `fixed`,
+    /// starting from the feasible `model`. Returns its rendered value; an
+    /// attained optimum is appended to `fixed` and `model` moved onto it.
+    fn optimize_one(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        fixed: &mut Vec<AstId>,
+        model: &mut Option<Model>,
+    ) -> String {
+        let unknown = || "unknown".to_string();
+        let infinite = || if maximize { "oo" } else { "(- oo)" }.to_string();
+        let osort = self.m.get_sort(obj);
+        if let Some(w) = self.m.bv_sort_width(osort) {
+            // Bit-vector objective: optimize the unsigned value by bisection
+            // over the fixed range [0, 2^w − 1]. z3 renders it as a decimal.
+            let Some(v) = self.opt_bv_search(obj, maximize, w, fixed) else {
+                return unknown();
+            };
+            let bv = self.m.mk_bv_numeral(v.clone(), w);
+            let eq = self.m.mk_eq(obj, bv);
+            fixed.push(eq);
+            *model = self.check_with(fixed).1;
+            return render_int(&v);
+        }
+        if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
+            // Real objective: Fourier–Motzkin optimum, then verify it.
+            return match self.real_optimize(obj, maximize, fixed) {
+                RealOpt::Attained(r) => {
+                    let rv = self.m.mk_numeral(r.clone(), false);
+                    let eq = self.m.mk_eq(obj, rv);
+                    fixed.push(eq);
+                    *model = self.check_with(fixed).1;
+                    render_rational(&r)
+                }
+                // z3 form: max → r - ε, min → r + ε (a zero r is dropped).
+                RealOpt::Supremum(r) => match (maximize, r.numerator() == &Int::from(0)) {
+                    (true, true) => "(* (- 1.0) epsilon)".to_string(),
+                    (true, false) => alloc::format!("(+ {} (* (- 1.0) epsilon))", render_real(&r)),
+                    (false, true) => "epsilon".to_string(),
+                    (false, false) => alloc::format!("(+ {} epsilon)", render_real(&r)),
+                },
+                RealOpt::Unbounded => infinite(),
+                RealOpt::Unknown => unknown(),
+            };
+        }
+        if !self.m.is_int_sort(osort) {
+            return unknown(); // only Int/Real/BV objectives are optimized
+        }
+        let v0 = match model.as_mut().map(|m| m.eval(&self.m, obj)) {
+            Some(Value::Num(r, _)) => r.numerator().clone(),
+            _ => return unknown(),
+        };
+        match self.opt_int_search(obj, maximize, v0, fixed) {
+            OptResult::Optimum(v) => {
+                let iv = self.m.mk_numeral(Rational::from_integer(v.clone()), true);
+                let eq = self.m.mk_eq(obj, iv);
+                fixed.push(eq);
+                *model = self.check_with(fixed).1;
+                render_int(&v)
+            }
+            OptResult::Unbounded => infinite(),
+            OptResult::Unknown => unknown(),
+        }
+    }
+
+    /// One `pareto` `check-sat`: z3's guided improvement algorithm
+    /// (`opt::gia_pareto`). Find a model, then repeatedly demand one that
+    /// dominates it (no objective worse, some strictly better) until none
+    /// exists; that model is a front point. Block everything it dominates for
+    /// later calls and answer `sat`, or `unsat` once the front is exhausted.
+    /// An objective value that is not a rational/bit-vector numeral, or an
+    /// improvement chain past the round budget, answers `unknown`.
+    fn pareto_step(&mut self, mut st: ParetoState) -> (SmtResult, Option<Model>) {
+        const PARETO_ROUNDS: usize = 256;
+        let n = st.objs.len();
+        let (res, model) = self.check_with(&st.base);
+        // An exhausted front keeps reporting the last point's values.
+        if !(res == SmtResult::Unsat && st.reported) {
+            self.set_objective_values(n, st.user_start, res);
+        }
+        let mut model = match (res, model) {
+            (SmtResult::Sat, Some(m)) => m,
+            // A front point needs the model's objective values.
+            (SmtResult::Sat, None) => return (SmtResult::Unknown, None),
+            (res, _) => return (res, None),
+        };
+        let mut cur = st.base.clone();
+        let mut rounds = 0;
+        let vals = loop {
+            let mut vals = Vec::with_capacity(n);
+            for &(o, _) in &st.objs {
+                match model.eval(&self.m, o) {
+                    v @ (Value::Num(..) | Value::Bv(..)) => vals.push(v),
+                    _ => return (SmtResult::Unknown, None),
+                }
+            }
+            rounds += 1;
+            if rounds > PARETO_ROUNDS {
+                return (SmtResult::Unknown, None);
+            }
+            let mut gt = Vec::with_capacity(n);
+            for (&(o, max), v) in st.objs.iter().zip(&vals) {
+                let ge = self.pareto_cmp(o, max, v, true);
+                cur.push(ge);
+                let le = self.pareto_cmp(o, max, v, false);
+                gt.push(self.m.mk_not(le));
+            }
+            let better = self.m.mk_or(&gt);
+            cur.push(better);
+            match self.check_with(&cur) {
+                (SmtResult::Sat, Some(m)) => model = m,
+                (SmtResult::Unsat, _) => break vals,
+                _ => return (SmtResult::Unknown, None),
+            }
+        };
+        // Later points must not be dominated by (≤ on every objective) this one.
+        let le: Vec<AstId> = st
+            .objs
+            .iter()
+            .zip(&vals)
+            .map(|(&(o, max), v)| self.pareto_cmp(o, max, v, false))
+            .collect();
+        let all_le = self.m.mk_and(&le);
+        let block = self.m.mk_not(all_le);
+        st.base.push(block);
+        let mut rendered: Vec<String> = vals
+            .iter()
+            .map(|v| match v {
+                Value::Num(r, true) => render_int(r.numerator()),
+                Value::Num(r, false) => render_rational(r),
+                Value::Bv(b, _) => render_int(b),
+                _ => unreachable!(),
+            })
+            .collect();
+        self.objective_values = rendered.split_off(st.user_start);
+        self.penalty_value = (st.user_start > 0).then(|| rendered[0].clone());
+        st.reported = true;
+        self.opt_iter = OptIter::Pareto(st);
+        (SmtResult::Sat, Some(model))
+    }
+
+    /// Reset the `n` objective values (penalty first when `user_start` is 1)
+    /// after a non-`sat` optimize: z3 reports the unrestricted interval
+    /// `(interval (* (- 1) oo) oo)` once the hard constraints are `unsat`.
+    fn set_objective_values(&mut self, n: usize, user_start: usize, res: SmtResult) {
+        let v = if res == SmtResult::Unsat {
+            " (interval (* (- 1) oo) oo)"
+        } else {
+            "unknown"
+        };
+        self.objective_values = alloc::vec![v.to_string(); n - user_start];
+        self.penalty_value = (user_start > 0).then(|| v.to_string());
+    }
+
+    /// `o` at least as good as its model value `v` (`ge`), or at most as good:
+    /// z3's `opt::context::mk_ge` / `mk_le` (a minimize objective flips them).
+    fn pareto_cmp(&mut self, o: AstId, maximize: bool, v: &Value, ge: bool) -> AstId {
+        let up = ge == maximize; // `o ≥ v`, else `o ≤ v`
+        match v {
+            Value::Bv(b, w) => {
+                let k = self.m.mk_bv_numeral(b.clone(), *w);
+                if up {
+                    self.m.mk_bvule(k, o)
+                } else {
+                    self.m.mk_bvule(o, k)
+                }
+            }
+            Value::Num(r, is_int) => {
+                let k = self.m.mk_numeral(r.clone(), *is_int);
+                if up {
+                    self.m.mk_ge(o, k)
+                } else {
+                    self.m.mk_le(o, k)
+                }
+            }
+            _ => unreachable!(),
+        }
     }
 
     /// Optimize a real-valued objective by Fourier–Motzkin bound extraction, and
@@ -30889,6 +31111,63 @@ mod tests {
             run("(declare-const x Int)(assert (>= x 0))(maximize x)(check-sat)(get-objectives)")
                 .unwrap();
         assert!(out[1].contains("(x oo)"), "got {:?}", out[1]);
+    }
+
+    #[test]
+    fn box_priority_optimizes_independently_then_iterates() {
+        // Independent bounds (lex would fix x = 2 before minimizing it); one
+        // `sat` per objective, each with its own model, then `unsat`, then afresh.
+        let out = run("(set-option :opt.priority box)(declare-const x Int)\
+             (assert (<= 0 x 2))(maximize x)(minimize x)\
+             (check-sat)(get-objectives)(get-value (x))(check-sat)(get-value (x))\
+             (check-sat)(check-sat)")
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "(objectives\n (x 2)\n (x 0)\n)");
+        assert_eq!(out[2], "((x 2))");
+        assert_eq!(out[3], "sat");
+        assert_eq!(out[4], "((x 0))");
+        assert_eq!(&out[5..], ["unsat", "sat"]);
+        // A new assertion restarts the enumeration.
+        let out = run("(set-option :opt.priority box)(declare-const x Int)\
+             (assert (<= 0 x 2))(maximize x)(minimize x)\
+             (check-sat)(assert (<= x 1))(check-sat)(get-objectives)")
+        .unwrap();
+        assert_eq!(out[1], "sat");
+        assert_eq!(out[2], "(objectives\n (x 1)\n (x 0)\n)");
+    }
+
+    #[test]
+    fn pareto_priority_enumerates_the_front() {
+        let out = run("(set-option :opt.priority pareto)\
+             (declare-const x Int)(declare-const y Int)\
+             (assert (and (<= 0 x 2) (<= 0 y 2) (<= (+ x y) 2)))(maximize x)(maximize y)\
+             (check-sat)(get-objectives)(check-sat)(get-objectives)\
+             (check-sat)(get-objectives)(check-sat)")
+        .unwrap();
+        let mut front: Vec<&str> = (0..3)
+            .map(|i| {
+                assert_eq!(out[2 * i], "sat");
+                out[2 * i + 1].as_str()
+            })
+            .collect();
+        front.sort();
+        assert_eq!(
+            front,
+            [
+                "(objectives\n (x 0)\n (y 2)\n)",
+                "(objectives\n (x 1)\n (y 1)\n)",
+                "(objectives\n (x 2)\n (y 0)\n)",
+            ]
+        );
+        assert_eq!(out[6], "unsat");
+        // A single pareto objective: its optimum, then `unsat`.
+        let out = run("(set-option :opt.priority pareto)(declare-const x Int)\
+             (assert (<= x 3))(maximize x)(check-sat)(get-objectives)(check-sat)(check-sat)")
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "(objectives\n (x 3)\n)");
+        assert_eq!(&out[2..], ["unsat", "sat"]);
     }
 
     #[test]
