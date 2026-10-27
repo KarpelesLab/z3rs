@@ -1282,7 +1282,7 @@ pub extern "C" fn Z3_get_full_version() -> *const c_char {
     concat!(
         "z3rs ",
         env!("CARGO_PKG_VERSION"),
-        " (Z3 5.0.0 compatible)\0"
+        " (Z3 5.3.2 compatible)\0"
     )
     .as_ptr() as *const c_char
 }
@@ -1319,7 +1319,7 @@ pub extern "C" fn Z3_model_inc_ref(_c: *mut Z3rsZ3Context, _m: *const Z3rsModel)
 pub extern "C" fn Z3_model_dec_ref(_c: *mut Z3rsZ3Context, _m: *const Z3rsModel) {}
 
 /// `Z3_get_version(major, minor, build, revision)` — write the emulated Z3
-/// version (5.0.0.0). NULL out-pointers are skipped.
+/// version (5.3.2.0). NULL out-pointers are skipped.
 ///
 /// # Safety
 /// Each non-NULL pointer must be writable.
@@ -1335,10 +1335,10 @@ pub unsafe extern "C" fn Z3_get_version(
             *major = 5;
         }
         if !minor.is_null() {
-            *minor = 0;
+            *minor = 3;
         }
         if !build_number.is_null() {
-            *build_number = 0;
+            *build_number = 2;
         }
         if !revision_number.is_null() {
             *revision_number = 0;

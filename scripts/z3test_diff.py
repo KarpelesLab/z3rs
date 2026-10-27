@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Differential harness against the z3 regression corpus (z3test/, gitignored).
 
-The corpus is pinned to z3test commit 4481ad4, the last before the Z3 5.0.0
-release (see PORTING.md), so expected outputs are the 5.0.0 behaviour z3rs
+The corpus is pinned to z3test commit 55563df, the last before the Z3 5.3.2
+release (see PORTING.md), so expected outputs are the 5.3.2 behaviour z3rs
 tracks.
 
 For every `X.smt2` with a companion `X.expected.out`, run z3rs and compare its

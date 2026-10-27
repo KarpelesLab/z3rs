@@ -105,7 +105,7 @@ pub mod api;
 pub mod ffi;
 
 /// The upstream Z3 version this port tracks.
-pub const Z3_UPSTREAM_VERSION: &str = "5.0.0";
+pub const Z3_UPSTREAM_VERSION: &str = "5.3.2";
 
 /// z3rs crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

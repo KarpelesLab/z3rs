@@ -69,7 +69,7 @@ Z3_context Z3_mk_context(Z3_config cfg);
 Z3_context Z3_mk_context_rc(Z3_config cfg);
 void Z3_del_context(Z3_context c);
 
-/* Emulated Z3 version numbers (5.0.0.0). NULL out-pointers are skipped. */
+/* Emulated Z3 version numbers (5.3.2.0). NULL out-pointers are skipped. */
 void Z3_get_version(unsigned *major, unsigned *minor, unsigned *build_number,
                     unsigned *revision_number);
 

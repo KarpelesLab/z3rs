@@ -2,7 +2,7 @@
 
 > **Where we are.** The initial port is **complete** and the theory roadmap
 > (Phases A–J below) is **met**: `z3rs` is a single-crate, pure-Rust,
-> `no_std + alloc` reimplementation of Z3 (tracking **v5.0.0**; ported from 4.17.0) whose only
+> `no_std + alloc` reimplementation of Z3 (tracking **v5.3.2**; ported from 4.17.0) whose only
 > dependency is our own dependency-free numeric core,
 > [`puremp`](https://github.com/KarpelesLab/puremp). Every theory has a present,
 > **sound** implementation; across ~90k+ differential-fuzz scripts vs upstream z3
