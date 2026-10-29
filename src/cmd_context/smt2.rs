@@ -502,7 +502,7 @@ fn render_int(v: &Int) -> String {
         alloc::format!("{v}")
     }
 }
-use crate::util::symbol::Symbol;
+use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
 fn parse_numeral(s: &str) -> Option<(Rational, bool)> {
@@ -1973,6 +1973,14 @@ struct ParseErr {
 /// query terms).
 fn render_sexpr(s: &SExpr) -> String {
     match s {
+        // The tokenizer strips `|…|` from a quoted symbol; restore it. String
+        // literals, keywords, `#x`/`#b` numerals and decimals are not symbols.
+        SExpr::Atom(a)
+            if !a.starts_with(['"', ':', '#'])
+                && !a.chars().all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            crate::util::symbol::smt2_symbol(a).into_owned()
+        }
         SExpr::Atom(a) => a.clone(),
         SExpr::List(l) => {
             let inner: Vec<String> = l.iter().map(render_sexpr).collect();
@@ -26736,7 +26744,7 @@ impl Context {
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} () {sort_name}\n    {v})",
-                    decl.name
+                    smt2_symbol(&decl.name)
                 ));
             } else if let Some(body) = fn_bodies.get(&decl.d) {
                 // An n-ary function with a (jointly validated) constant interpretation.
@@ -26750,7 +26758,7 @@ impl Context {
                 let ret = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} ({params}) {ret}\n    {body})",
-                    decl.name
+                    smt2_symbol(&decl.name)
                 ));
             }
         }
@@ -31111,6 +31119,27 @@ mod tests {
             run("(declare-const x Int)(assert (>= x 0))(maximize x)(check-sat)(get-objectives)")
                 .unwrap();
         assert!(out[1].contains("(x oo)"), "got {:?}", out[1]);
+    }
+
+    #[test]
+    fn symbols_needing_bars_print_quoted() {
+        let out = run("(declare-const |a b| Int)(declare-const |m::i@4| Int)\
+             (assert (= |a b| 3))(assert (= |m::i@4| 2))(maximize |m::i@4|)\
+             (check-sat)(get-objectives)(get-model)")
+        .unwrap();
+        assert_eq!(out[1], "(objectives\n (|m::i@4| 2)\n)");
+        assert!(
+            out[2].contains("(define-fun |a b| () Int\n    3)"),
+            "{}",
+            out[2]
+        );
+        assert!(
+            out[2].contains("(define-fun |m::i@4| () Int\n    2)"),
+            "{}",
+            out[2]
+        );
+        assert_eq!(crate::util::symbol::smt2_symbol("x!0"), "x!0");
+        assert_eq!(crate::util::symbol::smt2_symbol("1x"), "|1x|");
     }
 
     #[test]

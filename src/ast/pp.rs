@@ -11,6 +11,8 @@ use crate::ast::AstId;
 use crate::ast::manager::AstManager;
 use crate::ast::node::AstNode;
 use core::fmt::Write;
+
+use crate::util::symbol::smt2_symbol;
 use puremp::{Int, Rational};
 
 /// Render an arithmetic numeral the way z3's SMT pretty-printer does:
@@ -115,7 +117,13 @@ impl AstManager {
                     out.push(')');
                     return;
                 }
-                let name = self.func_decl(a.decl).expect("app decl").name;
+                let fd = self.func_decl(a.decl).expect("app decl");
+                // A user (uninterpreted) symbol prints `|quoted|` when z3 would.
+                let name = if fd.info.family_id == crate::ast::NULL_FAMILY_ID {
+                    smt2_symbol(&alloc::format!("{}", fd.name)).into_owned()
+                } else {
+                    alloc::format!("{}", fd.name)
+                };
                 // The `if` builtin prints as SMT-LIB `ite`.
                 let is_ite = self.is_ite(id);
                 if a.args.is_empty() {
@@ -148,7 +156,7 @@ impl AstManager {
                     if i > 0 {
                         out.push(' ');
                     }
-                    let _ = write!(out, "({name} ");
+                    let _ = write!(out, "({} ", smt2_symbol(&alloc::format!("{name}")));
                     self.pp_into(sort, out);
                     out.push(')');
                 }
