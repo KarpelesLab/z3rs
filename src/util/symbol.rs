@@ -229,6 +229,37 @@ impl fmt::Debug for Symbol {
     }
 }
 
+/// Whether `c` may appear in an unquoted SMT-LIB 2 symbol
+/// (`is_smt2_simple_symbol_char` in `z3/src/util/smt2_util.cpp`).
+fn is_smt2_simple_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "~!@$%^&*_-+=<>.?/".contains(c)
+}
+
+/// Whether `s` must be printed `|quoted|` (`is_smt2_quoted_symbol` in
+/// `z3/src/util/smt2_util.cpp`): it starts with a digit or holds a character
+/// outside the simple-symbol set.
+pub fn is_smt2_quoted_symbol(s: &str) -> bool {
+    s.starts_with(|c: char| c.is_ascii_digit()) || !s.chars().all(is_smt2_simple_symbol_char)
+}
+
+/// `s` as z3 prints a symbol: bare when simple, else `|s|` with `|` and `\`
+/// escaped (`mk_smt2_quoted_symbol`).
+pub fn smt2_symbol(s: &str) -> alloc::borrow::Cow<'_, str> {
+    if !is_smt2_quoted_symbol(s) {
+        return alloc::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('|');
+    for c in s.chars() {
+        if c == '|' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('|');
+    alloc::borrow::Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,35 +313,4 @@ mod tests {
         assert!(Symbol::numeric(1) < Symbol::numeric(2));
         assert!(Symbol::new("a") < Symbol::new("b"));
     }
-}
-
-/// Whether `c` may appear in an unquoted SMT-LIB 2 symbol
-/// (`is_smt2_simple_symbol_char` in `z3/src/util/smt2_util.cpp`).
-fn is_smt2_simple_symbol_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || "~!@$%^&*_-+=<>.?/".contains(c)
-}
-
-/// Whether `s` must be printed `|quoted|` (`is_smt2_quoted_symbol` in
-/// `z3/src/util/smt2_util.cpp`): it starts with a digit or holds a character
-/// outside the simple-symbol set.
-pub fn is_smt2_quoted_symbol(s: &str) -> bool {
-    s.starts_with(|c: char| c.is_ascii_digit()) || !s.chars().all(is_smt2_simple_symbol_char)
-}
-
-/// `s` as z3 prints a symbol: bare when simple, else `|s|` with `|` and `\`
-/// escaped (`mk_smt2_quoted_symbol`).
-pub fn smt2_symbol(s: &str) -> alloc::borrow::Cow<'_, str> {
-    if !is_smt2_quoted_symbol(s) {
-        return alloc::borrow::Cow::Borrowed(s);
-    }
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('|');
-    for c in s.chars() {
-        if c == '|' || c == '\\' {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out.push('|');
-    alloc::borrow::Cow::Owned(out)
 }
