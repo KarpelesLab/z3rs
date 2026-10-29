@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/z3rs/compare/v0.0.10...v0.0.11) - 2026-10-29
+
+### Other
+
+- lex after an unbounded objective takes the limit; soft groups by :id
+- keep the quoting helpers above the test module (clippy)
+- Print symbols |quoted| where z3 does
+- box and pareto priorities, iterated across repeated check-sat
+- Retarget upstream parity to Z3 5.3.2 (latest stable)
+- Retarget upstream parity from Z3 4.17.0 to 5.0.0
+- replace Fourier-Motzkin with a bounded simplex as the LRA core
+- state congruence and read-over-write so they survive folding
+- VSIDS heap for SAT decisions; one traversal for multi-root e-graphs
+- don't report unbounded / strict bounds from an LP relaxation
+- classify 4008 as a known z3 bug; pin z3rs's correct unsat
+- Bump puremp to 0.3
+- Stop tracking Cargo.lock
+
 ## [0.0.10](https://github.com/KarpelesLab/z3rs/compare/v0.0.9...v0.0.10) - 2026-09-01
 
 ### Other
