@@ -158,6 +158,9 @@ pub fn remap_vars(constraints: &[(Polynomial, Rel)]) -> (Vec<(Polynomial, Rel)>,
 /// systems (`k ≤ 4`) with a bounded candidate product are attempted.
 pub fn sat_by_fixing(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
     let k = is_int.len();
+    if (5..=12).contains(&k) {
+        return sat_by_sampling(constraints, is_int);
+    }
     if !(2..=4).contains(&k) {
         return false;
     }
@@ -218,6 +221,67 @@ pub fn sat_by_fixing(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool
             i += 1;
         }
     }
+}
+
+/// [`sat_by_fixing`] for 5..=12 variables, where the full grid is too large:
+/// each variable in turn is left free while the others take small values —
+/// all zero first, then a deterministic pseudo-random sample over
+/// `{0, ±1, ±2, ±1/2}` (`±1/2` only for reals) — and the free variable is
+/// decided univariately. Sound for the same reason (a found point is a
+/// verified witness); a bounded number of attempts.
+fn sat_by_sampling(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
+    const SAMPLES: usize = 400;
+    let k = is_int.len();
+    let small = |int: bool| -> Vec<Rational> {
+        let mut v: Vec<Rational> = [0i64, 1, -1, 2, -2]
+            .iter()
+            .map(|&n| Rational::from_integer(n.into()))
+            .collect();
+        if !int {
+            v.push(Rational::new(1.into(), 2.into()));
+            v.push(Rational::new((-1).into(), 2.into()));
+        }
+        v
+    };
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = || {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    for free in 0..k as Var {
+        for sample in 0..SAMPLES {
+            let mut cons = constraints.to_vec();
+            for v in 0..k as Var {
+                if v == free {
+                    continue;
+                }
+                let cands = small(is_int[v as usize]);
+                let val = if sample == 0 {
+                    cands[0].clone()
+                } else {
+                    cands[next() % cands.len()].clone()
+                };
+                let pv = Polynomial::constant(val);
+                for (p, _) in cons.iter_mut() {
+                    if p.degree_of(v) > 0 {
+                        *p = subst_var(p, v, &pv);
+                    }
+                }
+            }
+            let (reduced, _) = remap_vars(&cons);
+            let dec = if is_int[free as usize] {
+                crate::nlsat::univariate::decide_int(&reduced, 0)
+            } else {
+                crate::nlsat::univariate::decide(&reduced, 0)
+            };
+            if dec == Some(true) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
