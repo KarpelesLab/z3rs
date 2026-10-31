@@ -19968,9 +19968,7 @@ impl Context {
                     .collect();
                 let inst = crate::rewriter::substitute(&mut self.m, body, &subst);
                 let mut memo = BTreeMap::new();
-                let Some(phi) = self.mbqi_modelize(inst, model, st, &symbolic, &mut memo) else {
-                    return None;
-                };
+                let phi = self.mbqi_modelize(inst, model, st, &symbolic, &mut memo)?;
                 let phi = crate::rewriter::simplify(&mut self.m, phi);
                 if self.m.is_true(phi) {
                     continue;
@@ -19985,9 +19983,7 @@ impl Context {
                     SmtResult::Unsat => {}
                     SmtResult::Sat => {
                         // The instance at the counterexample values.
-                        let Some(mut cm) = cex else {
-                            return None;
-                        };
+                        let mut cm = cex?;
                         let mut vals = subst.clone();
                         for &v in &symbolic {
                             let lit = match cm.eval(&self.m, v) {
