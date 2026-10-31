@@ -824,6 +824,33 @@ impl Model {
             let a = m.app_args(t).to_vec();
             return self.values_eq(m, a[0], a[1]);
         }
+        // An untracked uninterpreted predicate application takes the value of
+        // a tracked one on equal arguments (the predicate's interpretation is a
+        // function of its argument values), so `r = o` gives `p(x, r) = p(x, o)`.
+        if let Some(app) = m.app(t)
+            && !app.args.is_empty()
+            && m.func_decl(app.decl)
+                .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+        {
+            let (decl, args) = (app.decl, app.args.clone());
+            let candidates: Vec<(AstId, bool)> = self
+                .bools
+                .iter()
+                .filter(|&(&u, _)| u != t && m.app(u).is_some_and(|a| a.decl == decl))
+                .map(|(&u, &v)| (u, v))
+                .collect();
+            for (u, v) in candidates {
+                let uargs = m.app_args(u).to_vec();
+                if uargs.len() == args.len()
+                    && args
+                        .iter()
+                        .zip(&uargs)
+                        .all(|(&x, &y)| self.values_eq(m, x, y))
+                {
+                    return v;
+                }
+            }
+        }
         false // an untracked atom we cannot resolve; default to false
     }
 

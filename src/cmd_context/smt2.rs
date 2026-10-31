@@ -3961,6 +3961,13 @@ impl Context {
                 if let Some(b) = self.asserted_truth(id) {
                     return Ok(Some(if b { "true" } else { "false" }.to_string()));
                 }
+                // A Boolean over uninterpreted symbols that the assertions
+                // entail (or refute) has that value in every model — the
+                // recorded model may not have instantiated it (e.g. a
+                // universal applied through an equality of its argument).
+                if let Some(b) = self.entailed_truth(id) {
+                    return Ok(Some(if b { "true" } else { "false" }.to_string()));
+                }
                 // A ground algebraic real containing a nested `root-obj` evaluates
                 // to its exact value (model-independent) rather than the opaque node.
                 let pp_decimal = self.params.get_bool("pp.decimal", false);
@@ -22092,6 +22099,38 @@ impl Context {
             }
         }
         Some(lo)
+    }
+
+    /// `Some(b)` when the assertions entail `t = b` for a Boolean term over
+    /// uninterpreted function applications, decided by two solver calls
+    /// (`assertions ∧ ¬t` / `assertions ∧ t` unsat); `None` otherwise.
+    fn entailed_truth(&mut self, t: AstId) -> Option<bool> {
+        if !self.m.is_bool_sort(self.m.get_sort(t)) {
+            return None;
+        }
+        let has_uf = self.m.postorder(t).iter().any(|&u| {
+            self.m.app(u).is_some_and(|a| {
+                !a.args.is_empty()
+                    && self
+                        .m
+                        .func_decl(a.decl)
+                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+            })
+        });
+        if !has_uf {
+            return None;
+        }
+        let witness = core::mem::take(&mut self.str_witness);
+        let not_t = self.m.mk_not(t);
+        let r = if self.check_with(&[not_t]).0 == SmtResult::Unsat {
+            Some(true)
+        } else if self.check_with(&[t]).0 == SmtResult::Unsat {
+            Some(false)
+        } else {
+            None
+        };
+        self.str_witness = witness;
+        r
     }
 
     /// The `(objectives …)` response after an optimizing `check-sat`.
