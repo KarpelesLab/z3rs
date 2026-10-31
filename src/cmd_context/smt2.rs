@@ -132,6 +132,8 @@ struct MbqiState {
     tables: BTreeMap<AstId, Vec<(Vec<MbqiVal>, MbqiVal)>>,
     reps: BTreeMap<(AstId, usize), AstId>,
     universe: BTreeMap<AstId, Vec<usize>>,
+    /// The chosen default value per function (else the first entry's).
+    defaults: BTreeMap<AstId, MbqiVal>,
 }
 
 /// A proven bracket `[lo, hi]` on an objective value (`None` = infinite).
@@ -19795,8 +19797,11 @@ impl Context {
             tables: BTreeMap::new(),
             reps: BTreeMap::new(),
             universe: BTreeMap::new(),
+            defaults: BTreeMap::new(),
         };
         // Tables and element representatives from the ground goal.
+        let mut entry_terms: BTreeMap<(AstId, usize), AstId> = BTreeMap::new();
+        let mut congruence: Vec<AstId> = Vec::new();
         for t in self.m.postorder(goal) {
             let sort = self.m.get_sort(t);
             if self.is_uninterp_sort(sort) {
@@ -19821,11 +19826,35 @@ impl Context {
                 return Mbqi::Unknown;
             };
             let tab = st.tables.entry(decl).or_default();
-            match tab.iter().find(|(k, _)| *k == key) {
-                Some((_, v)) if *v != val => return Mbqi::Unknown, // inconsistent table
+            match tab.iter().position(|(k, _)| *k == key) {
+                Some(i) if tab[i].1 != val => {
+                    // Equal arguments, different results: the candidate breaks
+                    // congruence (the arithmetic model merged values the EUF
+                    // side keeps apart). The congruence axiom refines it.
+                    let u = entry_terms[&(decl, i)];
+                    let uargs = self.m.app_args(u).to_vec();
+                    let eqs: Vec<AstId> = args
+                        .iter()
+                        .zip(&uargs)
+                        .map(|(&x, &y)| self.m.mk_eq(x, y))
+                        .collect();
+                    let pre = if eqs.len() == 1 {
+                        eqs[0]
+                    } else {
+                        self.m.mk_and(&eqs)
+                    };
+                    let post = self.m.mk_eq(t, u);
+                    congruence.push(self.m.mk_implies(pre, post));
+                }
                 Some(_) => {}
-                None => tab.push((key, val)),
+                None => {
+                    entry_terms.insert((decl, tab.len()), t);
+                    tab.push((key, val));
+                }
             }
+        }
+        if !congruence.is_empty() {
+            return Mbqi::Refine(congruence);
         }
         // The interpretation must satisfy the ground goal itself.
         let mut memo = BTreeMap::new();
@@ -19834,6 +19863,74 @@ impl Context {
             Some(g) if self.m.is_true(g) => {}
             _ => return Mbqi::Unknown,
         }
+        // Each function's default ("else") value: the first entry's value is
+        // tried first, then the other table values and the sort's default —
+        // a combination under which every universal holds is a model.
+        let mut decls: Vec<AstId> = Vec::new();
+        for (_, body) in self.universals.clone() {
+            for t in self.m.postorder(body) {
+                if let Some(app) = self.m.app(t)
+                    && !app.args.is_empty()
+                    && user.contains(&app.decl)
+                    && !decls.contains(&app.decl)
+                {
+                    decls.push(app.decl);
+                }
+            }
+        }
+        let mut choices: Vec<(AstId, Vec<MbqiVal>)> = Vec::new();
+        for &d in &decls {
+            let range = self.m.func_decl(d).map(|f| f.range);
+            let mut vals: Vec<MbqiVal> = Vec::new();
+            for (_, v) in st.tables.get(&d).map(|t| t.as_slice()).unwrap_or(&[]) {
+                if !vals.contains(v) {
+                    vals.push(v.clone());
+                }
+            }
+            if let Some(dv) = range.and_then(|r| self.mbqi_default_value(r, &st))
+                && !vals.contains(&dv)
+            {
+                vals.push(dv);
+            }
+            choices.push((d, vals));
+        }
+        const MAX_DEFAULT_COMBOS: usize = 16;
+        let combos: usize = choices
+            .iter()
+            .map(|(_, v)| v.len().max(1))
+            .product::<usize>()
+            .min(MAX_DEFAULT_COMBOS);
+        let mut first_refine = None;
+        for idx in 0..combos {
+            let mut rem = idx;
+            st.defaults.clear();
+            for (d, vals) in &choices {
+                if !vals.is_empty() {
+                    st.defaults.insert(*d, vals[rem % vals.len()].clone());
+                    rem /= vals.len();
+                }
+            }
+            match self.mbqi_round(model, &st) {
+                None => return Mbqi::Unknown,
+                Some(inst) if inst.is_empty() => return Mbqi::Valid,
+                Some(inst) => {
+                    if first_refine.is_none() {
+                        first_refine = Some(inst);
+                    }
+                }
+            }
+        }
+        match first_refine {
+            Some(inst) => Mbqi::Refine(inst),
+            None => Mbqi::Unknown,
+        }
+    }
+
+    /// One MBQI pass under the current defaults: the counterexample instance
+    /// of each refuted universal (empty when all hold); `None` = outside the
+    /// fragment.
+    fn mbqi_round(&mut self, model: &mut Model, st: &MbqiState) -> Option<Vec<AstId>> {
+        const MAX_COMBOS: usize = 64;
         let universals = self.universals.clone();
         let mut instances = Vec::new();
         for (vars, body) in universals {
@@ -19845,16 +19942,16 @@ impl Context {
                     domains.push((v, alloc::vec![self.m.mk_true(), self.m.mk_false()]));
                 } else if self.is_uninterp_sort(sort) {
                     let Some(u) = st.universe.get(&sort) else {
-                        return Mbqi::Unknown;
+                        return None;
                     };
                     domains.push((v, u.iter().map(|&c| st.reps[&(sort, c)]).collect()));
                 } else if !self.m.is_arith_sort(sort) && self.m.bv_sort_width(sort).is_none() {
-                    return Mbqi::Unknown; // datatypes, arrays, strings, …
+                    return None; // datatypes, arrays, strings, …
                 }
             }
             let combos: usize = domains.iter().map(|(_, d)| d.len()).product();
             if combos > MAX_COMBOS {
-                return Mbqi::Unknown;
+                return None;
             }
             let symbolic: Vec<AstId> = vars
                 .iter()
@@ -19873,8 +19970,8 @@ impl Context {
                     .collect();
                 let inst = crate::rewriter::substitute(&mut self.m, body, &subst);
                 let mut memo = BTreeMap::new();
-                let Some(phi) = self.mbqi_modelize(inst, model, &st, &symbolic, &mut memo) else {
-                    return Mbqi::Unknown;
+                let Some(phi) = self.mbqi_modelize(inst, model, st, &symbolic, &mut memo) else {
+                    return None;
                 };
                 let phi = crate::rewriter::simplify(&mut self.m, phi);
                 if self.m.is_true(phi) {
@@ -19891,29 +19988,25 @@ impl Context {
                     SmtResult::Sat => {
                         // The instance at the counterexample values.
                         let Some(mut cm) = cex else {
-                            return Mbqi::Unknown;
+                            return None;
                         };
                         let mut vals = subst.clone();
                         for &v in &symbolic {
                             let lit = match cm.eval(&self.m, v) {
                                 Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
                                 Value::Bv(b, w) => self.m.mk_bv_numeral(b, w),
-                                _ => return Mbqi::Unknown,
+                                _ => return None,
                             };
                             vals.push((v, lit));
                         }
                         instances.push(crate::rewriter::substitute(&mut self.m, body, &vals));
                         break;
                     }
-                    SmtResult::Unknown => return Mbqi::Unknown,
+                    SmtResult::Unknown => return None,
                 }
             }
         }
-        if instances.is_empty() {
-            Mbqi::Valid
-        } else {
-            Mbqi::Refine(instances)
-        }
+        Some(instances)
     }
 
     /// Is `sort` a user-declared uninterpreted sort?
@@ -19994,8 +20087,12 @@ impl Context {
             }
             if user {
                 let tab = st.tables.get(&decl);
-                let default = match tab.and_then(|t| t.first()) {
-                    Some((_, v)) => self.mbqi_literal(v, st)?,
+                let default = match st
+                    .defaults
+                    .get(&decl)
+                    .or_else(|| tab.and_then(|t| t.first()).map(|(_, v)| v))
+                {
+                    Some(v) => self.mbqi_literal(v, st)?,
                     None => self.mbqi_default(sort, st)?,
                 };
                 let mut acc = default;
@@ -20081,6 +20178,22 @@ impl Context {
             MbqiVal::Bv(b, w) => self.m.mk_bv_numeral(b.clone(), *w),
             MbqiVal::Elem(s, c) => *st.reps.get(&(*s, *c))?,
         })
+    }
+
+    /// The default value of `sort` as a table value.
+    fn mbqi_default_value(&self, sort: AstId, st: &MbqiState) -> Option<MbqiVal> {
+        if self.m.is_bool_sort(sort) {
+            Some(MbqiVal::Bool(false))
+        } else if self.m.is_arith_sort(sort) {
+            Some(MbqiVal::Num(
+                Rational::from_integer(Int::from(0)),
+                self.m.is_int_sort(sort),
+            ))
+        } else if let Some(w) = self.m.bv_sort_width(sort) {
+            Some(MbqiVal::Bv(Int::from(0), w))
+        } else {
+            Some(MbqiVal::Elem(sort, *st.universe.get(&sort)?.first()?))
+        }
     }
 
     /// A default value of `sort` for a function with an empty table.
