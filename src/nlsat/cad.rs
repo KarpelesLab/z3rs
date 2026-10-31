@@ -33,9 +33,13 @@ const MAX_VARS: usize = 4;
 const MAX_DEG: u32 = 12;
 const MAX_PROJ: usize = 500;
 const MAX_CELLS: usize = 40_000;
+/// Cap on the product of a sample point's coordinate degrees when lifting.
+const MAX_POINT_DEGREE: usize = 36;
+/// Cap on the total lifting work (Σ point degree per lifted sample).
+const MAX_LIFT_WORK: usize = 2_000;
 
 /// Does sign `σ` satisfy `⋈ 0`?
-fn rel_holds(sigma: i32, rel: Rel) -> bool {
+pub fn rel_holds(sigma: i32, rel: Rel) -> bool {
     match rel {
         Rel::Lt => sigma < 0,
         Rel::Le => sigma <= 0,
@@ -69,23 +73,7 @@ pub fn cad_sat(constraints: &[(Polynomial, Rel)], num_vars: usize) -> Option<boo
         }
     }
 
-    // Projection: `levels[k]` is the polynomial set whose main variable is `k`.
-    let top: Vec<Polynomial> = clean(
-        constraints
-            .iter()
-            .map(|(p, _)| p.clone())
-            .filter(|p| !p.is_zero() && p.as_constant().is_none())
-            .collect(),
-    );
-    let mut levels: Vec<Vec<Polynomial>> = alloc::vec![Vec::new(); num_vars];
-    levels[num_vars - 1] = top;
-    for main in (1..num_vars).rev() {
-        let proj = project(&levels[main], main as Var)?;
-        if proj.len() > MAX_PROJ {
-            return None;
-        }
-        levels[main - 1] = proj;
-    }
+    let levels = project_levels(constraints, num_vars)?;
 
     // Base phase: 1-D CAD in variable 0.
     let base = base_samples(&levels[0]);
@@ -122,6 +110,153 @@ pub fn cad_sat(constraints: &[(Polynomial, Rel)], num_vars: usize) -> Option<boo
         }
     }
     Some(false)
+}
+
+/// The projection tower: `levels[k]` is the polynomial set whose main
+/// variable is `k` (the constraint polynomials at the top, Collins' projection
+/// below). `None` past the resource caps.
+fn project_levels(
+    constraints: &[(Polynomial, Rel)],
+    num_vars: usize,
+) -> Option<Vec<Vec<Polynomial>>> {
+    if num_vars > MAX_VARS {
+        return None;
+    }
+    for (p, _) in constraints {
+        if p.total_degree() > MAX_DEG {
+            return None;
+        }
+    }
+    let top: Vec<Polynomial> = clean(
+        constraints
+            .iter()
+            .map(|(p, _)| p.clone())
+            .filter(|p| !p.is_zero() && p.as_constant().is_none())
+            .collect(),
+    );
+    let mut levels: Vec<Vec<Polynomial>> = alloc::vec![Vec::new(); num_vars];
+    levels[num_vars - 1] = top;
+    for main in (1..num_vars).rev() {
+        let proj = project(&levels[main], main as Var)?;
+        if proj.len() > MAX_PROJ {
+            return None;
+        }
+        levels[main - 1] = proj;
+    }
+    Some(levels)
+}
+
+/// The extremum of variable 0 over `⋀ constraints` (see [`cad_optimize`]).
+#[derive(Clone, Debug)]
+pub enum CadOpt {
+    /// The constraints are unsatisfiable.
+    Infeasible,
+    /// Variable 0 is unbounded in the optimizing direction.
+    Unbounded,
+    /// The optimum is attained at this value, with a satisfying point.
+    Attained(Alg, Vec<Alg>),
+    /// The supremum (infimum) is this value, approached but not attained.
+    Limit(Alg),
+}
+
+/// Maximize (or minimize) variable 0 over `⋀ constraints` in variables
+/// `0..num_vars`, exactly. With variable 0 lowest in the projection order, its
+/// base cells (sections at the roots of the projected polynomials, sectors in
+/// between) are sign-invariant cylinders, so each is feasible iff some lifted
+/// sample above it satisfies every constraint. Scanning the base cells from the
+/// optimizing end: a feasible outer sector means unbounded; the first feasible
+/// section is the attained optimum; a first feasible sector `(r, r')` means the
+/// optimum is the limit `r'` (the section at `r'` is infeasible). `None` = a
+/// resource cap or undetermined sign (a sound "don't know").
+pub fn cad_optimize(
+    constraints: &[(Polynomial, Rel)],
+    num_vars: usize,
+    maximize: bool,
+) -> Option<CadOpt> {
+    if num_vars == 0 {
+        return None;
+    }
+    let levels = project_levels(constraints, num_vars)?;
+    let base = base_samples(&levels[0]);
+    // Each constraint is checked as soon as its highest variable is lifted
+    // (partial CAD): a falsified partial sample has no satisfying extension.
+    let top_var = |p: &Polynomial| p.vars().into_iter().max().map_or(0, |v| v as usize);
+    let mut by_level: Vec<Vec<&(Polynomial, Rel)>> = alloc::vec![Vec::new(); num_vars];
+    for c in constraints {
+        by_level[top_var(&c.0)].push(c);
+    }
+    let holds = |s: &[Alg], level: usize| -> Option<bool> {
+        for (p, rel) in &by_level[level] {
+            if !rel_holds(sign_at_point(p, s)?, *rel) {
+                return Some(false);
+            }
+        }
+        Some(true)
+    };
+    let mut cells = 0usize;
+    let mut work = 0usize;
+    // A satisfying point above base cell `i`, if any.
+    let mut feasible = |i: usize| -> Option<Option<Vec<Alg>>> {
+        let first = alloc::vec![base[i].clone()];
+        if !holds(&first, 0)? {
+            return Some(None);
+        }
+        let mut samples: Vec<Vec<Alg>> = alloc::vec![first];
+        #[allow(clippy::needless_range_loop)]
+        for k in 1..num_vars {
+            let mut next: Vec<Vec<Alg>> = Vec::new();
+            for s in &samples {
+                for c in lift(s, &levels[k], k as Var)? {
+                    // Exact signs at a point cost resultants whose degree is
+                    // the product of its coordinates' degrees: decline past a
+                    // cap rather than stall (a sound "don't know").
+                    let deg: usize = c
+                        .iter()
+                        .map(|a| match a {
+                            Alg::Rational(_) => 1,
+                            Alg::Irrational { poly, .. } => poly.degree(),
+                        })
+                        .product();
+                    work += deg;
+                    if deg > MAX_POINT_DEGREE || work > MAX_LIFT_WORK {
+                        return None;
+                    }
+                    if holds(&c, k)? {
+                        next.push(c);
+                    }
+                }
+            }
+            cells += next.len();
+            if cells > MAX_CELLS {
+                return None;
+            }
+            if next.is_empty() {
+                return Some(None);
+            }
+            samples = next;
+        }
+        Some(samples.into_iter().next())
+    };
+    // `base` alternates sector, section, sector, …, sector (odd = section).
+    // Scan from the optimizing end; the first feasible cell decides.
+    let n = base.len();
+    let order: Vec<usize> = if maximize {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    for (pos, &i) in order.iter().enumerate() {
+        let Some(w) = feasible(i)? else { continue };
+        if i % 2 == 1 {
+            return Some(CadOpt::Attained(base[i].clone(), w));
+        }
+        if pos == 0 {
+            return Some(CadOpt::Unbounded);
+        }
+        // A sector bounded on the optimizing side by the previous section.
+        return Some(CadOpt::Limit(base[order[pos - 1]].clone()));
+    }
+    Some(CadOpt::Infeasible)
 }
 
 /// Collins' **complete** projection eliminating `var` (the sound fallback that

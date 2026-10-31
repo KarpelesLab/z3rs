@@ -80,6 +80,31 @@ enum Objective {
     },
 }
 
+/// The exact optimum of a nonlinear real objective (see
+/// `Context::nra_optimize`).
+enum NraOpt {
+    Infeasible,
+    Unbounded,
+    /// Attained at `value`, by the algebraic point `point` with the Boolean
+    /// constants `bools`.
+    Attained {
+        value: crate::nlsat::realclosure::Alg,
+        point: Vec<(AstId, crate::nlsat::realclosure::Alg)>,
+        bools: Vec<(AstId, bool)>,
+    },
+    /// An open supremum (infimum), with z3's infinitesimal coefficient.
+    Limit(crate::nlsat::realclosure::Alg, Rational),
+}
+
+impl NraOpt {
+    fn value(&self) -> Option<&crate::nlsat::realclosure::Alg> {
+        match self {
+            NraOpt::Attained { value, .. } | NraOpt::Limit(value, _) => Some(value),
+            _ => None,
+        }
+    }
+}
+
 /// A proven bracket `[lo, hi]` on an objective value (`None` = infinite).
 type Bracket = (Option<Rational>, Option<Rational>);
 
@@ -87,12 +112,31 @@ type Bracket = (Option<Rational>, Option<Rational>);
 enum RealOpt {
     /// A proven-exact attained optimum.
     Attained(Rational),
-    /// A strict supremum/infimum (the bound value, not attained).
-    Supremum(Rational),
+    /// A strict supremum/infimum (the bound value, not attained) and the
+    /// coefficient of z3's infinitesimal in it (`r ∓ k·ε`).
+    Supremum(Rational, Rational),
     /// Unbounded in the optimizing direction.
     Unbounded,
     /// Not determined exactly (non-linear or verification failed).
     Unknown,
+}
+
+/// An open optimum as z3 prints it: `r − k·ε` (maximize) or `r + k·ε`
+/// (minimize), with `r` already rendered (`zero` drops it) and a unit `k`
+/// elided: `(+ 2.0 (* (- 1.0) epsilon))`, `(+ (- 8.0) (* 2.0 epsilon))`,
+/// `epsilon`.
+fn render_eps_bound(r: &str, zero: bool, k: &Rational, maximize: bool) -> String {
+    let unit = k.is_one();
+    let eps = match (maximize, unit) {
+        (true, _) => alloc::format!("(* (- {}) epsilon)", render_real(k)),
+        (false, true) => "epsilon".to_string(),
+        (false, false) => alloc::format!("(* {} epsilon)", render_real(k)),
+    };
+    if zero {
+        eps
+    } else {
+        alloc::format!("(+ {r} {eps})")
+    }
 }
 
 /// A non-integer rational as z3 prints it: `(/ p.0 q.0)`, negated outside
@@ -121,6 +165,50 @@ fn render_real(r: &Rational) -> String {
     } else {
         render_fraction(r)
     }
+}
+
+/// A model value that depends on an irrational algebraic leaf (see
+/// [`Model::alg_value`]), printed as z3 does: a real numeral, or `root-obj`.
+fn alg_model_value(m: &AstManager, model: &mut Model, id: AstId) -> Option<String> {
+    let a = model.alg_value(m, id)?;
+    if a.is_rational() {
+        return Some(render_real(a.interval().0));
+    }
+    super::algebraic_pp::root_obj_string(&a)
+}
+
+/// The nlsat [`Alg`](crate::nlsat::realclosure::Alg) as a puremp
+/// [`Algebraic`](puremp::Algebraic).
+fn alg_to_algebraic(v: &crate::nlsat::realclosure::Alg) -> puremp::Algebraic {
+    use crate::nlsat::realclosure::Alg;
+    match v {
+        Alg::Rational(r) => puremp::Algebraic::from_rational(r.clone()),
+        Alg::Irrational { poly, lo, hi } => puremp::Algebraic::new(
+            puremp::Poly::new(poly.coeffs().to_vec()),
+            lo.clone(),
+            hi.clone(),
+        ),
+    }
+}
+
+/// A real algebraic number as z3 prints an objective value: a rational via
+/// [`render_rational`], an irrational as its `(root-obj <minimal poly> <i>)`.
+fn render_alg(v: &crate::nlsat::realclosure::Alg) -> String {
+    let a = alg_to_algebraic(v);
+    if a.is_rational() {
+        return render_rational(a.interval().0);
+    }
+    super::algebraic_pp::root_obj_string(&a).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `v` as the real term of an `epsilon` bound: a rational keeps its `.0`
+/// (`(+ 2.0 (* (- 1.0) epsilon))`), an irrational is a `root-obj`.
+fn render_alg_real(v: &crate::nlsat::realclosure::Alg) -> String {
+    let a = alg_to_algebraic(v);
+    if a.is_rational() {
+        return render_real(a.interval().0);
+    }
+    render_alg(v)
 }
 
 /// Render a rational as z3 prints an objective value: an integer as `n` /
@@ -2178,6 +2266,12 @@ struct Context {
     objective_values: Vec<String>,
     /// `box`/`pareto` iteration state across repeated `check-sat`s.
     opt_iter: OptIter,
+    /// Set by [`Self::optimize_one`] when a nonlinear objective's optimum is
+    /// an open limit (no model attains it, so nothing can be committed).
+    opt_open_limit: bool,
+    /// Why the last `check-sat` answered `unknown`, when more specific than
+    /// z3's generic `incomplete`.
+    reason_unknown: Option<String>,
     /// The interned `String` sort, once used.
     string_sort: Option<AstId>,
     /// String literal text → its distinct constant of the `String` sort.
@@ -3232,6 +3326,8 @@ impl Context {
             objectives: Vec::new(),
             objective_values: Vec::new(),
             opt_iter: OptIter::Fresh,
+            opt_open_limit: false,
+            reason_unknown: None,
             string_sort: None,
             str_lits: BTreeMap::new(),
             str_len_decl: None,
@@ -3556,7 +3652,7 @@ impl Context {
                     // Why the most recent check returned `unknown` (empty if it
                     // was decided), mirroring z3's response shape.
                     let r = if self.last_verdict == Some(SmtResult::Unknown) {
-                        "incomplete"
+                        self.reason_unknown.as_deref().unwrap_or("incomplete")
                     } else {
                         ""
                     };
@@ -4137,6 +4233,7 @@ impl Context {
                 // full decision pipeline (and model recording) applies.
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
                 self.last_assumptions.clear();
+                self.reason_unknown = None;
                 // A `check-sat-using` tactic that names `nlsat` unlocks the trig
                 // range bounds (see `nlsat_requested`); reset for the next check.
                 self.nlsat_requested =
@@ -4149,11 +4246,15 @@ impl Context {
                         self.last_assumptions.push((render_sexpr(a), id));
                         assumptions.push(id);
                     }
-                    self.check_with(&assumptions)
+                    if self.objectives.is_empty() {
+                        self.check_with(&assumptions)
+                    } else {
+                        self.optimize(&assumptions)
+                    }
                 } else if self.objectives.is_empty() {
                     self.check_sat()
                 } else {
-                    self.optimize()
+                    self.optimize(&[])
                 };
                 // z3 completes division-by-zero to 0 in the model. On the plain
                 // (assumption-free, non-optimize) `sat` path, prefer that completion
@@ -4184,7 +4285,13 @@ impl Context {
                     self.last_assumptions.push((render_sexpr(a), id));
                     terms.push(id);
                 }
-                let (res, model) = self.check_with(&terms);
+                self.reason_unknown = None;
+                // With objectives, z3 optimizes under the assumptions.
+                let (res, model) = if self.objectives.is_empty() {
+                    self.check_with(&terms)
+                } else {
+                    self.optimize(&terms)
+                };
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -4989,6 +5096,9 @@ impl Context {
             return s;
         }
         if let Some(s) = self.fp_model_value(model, id) {
+            return s;
+        }
+        if let Some(s) = alg_model_value(&self.m, model, id) {
             return s;
         }
         model.value_string(&self.m, id)
@@ -20769,7 +20879,7 @@ impl Context {
     /// `sat` once per objective (each with that objective's model) and then
     /// `unsat`; `pareto` answers `sat` once per front point and then `unsat`
     /// (a single `pareto` objective: `sat`, then `unsat`). See [`OptIter`].
-    fn optimize(&mut self) -> (SmtResult, Option<Model>) {
+    fn optimize(&mut self, assumptions: &[AstId]) -> (SmtResult, Option<Model>) {
         match core::mem::take(&mut self.opt_iter) {
             OptIter::Fresh => {}
             OptIter::Box { mut models, next } => {
@@ -20794,6 +20904,7 @@ impl Context {
         // minimized penalty `pen = Σ(ite pᵢ wᵢ 0)` over a fresh variable whose
         // definition is threaded through via `fixed`.
         let (objs, mut fixed) = self.objective_terms();
+        fixed.extend_from_slice(assumptions);
         let n = objs.len();
         if pri == "pareto" && n >= 2 {
             let st = ParetoState {
@@ -20805,7 +20916,31 @@ impl Context {
         }
         let boxed = pri == "box" && n >= 2;
         let mut values = alloc::vec!["unknown".to_string(); n];
-        let (res, mut model) = self.check_with(&fixed);
+        let (mut res, mut model) = self.check_with(&fixed);
+        if res == SmtResult::Unknown {
+            // A nonlinear real problem the solver leaves open: the CAD
+            // optimizer decides it (optimizing a constant is a feasibility
+            // check, and an attained optimum carries a witness).
+            let zero = self
+                .m
+                .mk_numeral(Rational::from_integer(Int::from(0)), false);
+            match self.nra_optimize(zero, true, &fixed) {
+                Some(NraOpt::Infeasible) => res = SmtResult::Unsat,
+                Some(NraOpt::Attained { point, bools, .. }) => {
+                    let mut md = model
+                        .take()
+                        .unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                    for (v, a) in &point {
+                        md.set_alg(*v, alg_to_algebraic(a));
+                    }
+                    for &(b, val) in &bools {
+                        md.set_bool(b, val);
+                    }
+                    (res, model) = (SmtResult::Sat, Some(md));
+                }
+                _ => {}
+            }
+        }
         if res != SmtResult::Sat {
             self.set_objective_values(res);
             return (res, model);
@@ -20834,11 +20969,25 @@ impl Context {
         }
         for i in 0..n {
             let (obj, maximize) = objs[i];
+            self.opt_open_limit = false;
             let (v, unbounded) = self.optimize_one(obj, maximize, &mut fixed, &mut model);
             values[i] = v;
             if unbounded && i + 1 < n {
                 self.lex_after_unbounded(&objs, i, &mut fixed, &mut model, &mut values);
                 break;
+            }
+            if self.opt_open_limit && i + 1 < n {
+                // As z3: no model attains the limit, so the later objectives
+                // have nothing to be optimized under.
+                for (k, v) in values.iter_mut().enumerate().skip(i + 1) {
+                    *v = self.untouched_objective_value(k);
+                }
+                self.objective_values = values;
+                self.reason_unknown = Some(
+                    "later lexicographic objectives after an unattained nonlinear optimum are not supported"
+                        .to_string(),
+                );
+                return (SmtResult::Unknown, model);
             }
         }
         if pri == "pareto" {
@@ -21120,8 +21269,11 @@ impl Context {
         }
         match self.real_optimize(u, umax, fixed) {
             RealOpt::Unbounded => Some(true),
-            RealOpt::Attained(_) | RealOpt::Supremum(_) => Some(false),
-            RealOpt::Unknown => None,
+            RealOpt::Attained(_) | RealOpt::Supremum(..) => Some(false),
+            RealOpt::Unknown => match self.nra_optimize(u, umax, fixed)? {
+                NraOpt::Unbounded => Some(true),
+                _ => Some(false),
+            },
         }
     }
 
@@ -21166,20 +21318,45 @@ impl Context {
                     *model = self.check_with(fixed).1;
                     (render_rational(&r), false)
                 }
-                // z3 form: max → r - ε, min → r + ε (a zero r is dropped).
-                RealOpt::Supremum(r) => (
-                    match (maximize, r.numerator() == &Int::from(0)) {
-                        (true, true) => "(* (- 1.0) epsilon)".to_string(),
-                        (true, false) => {
-                            alloc::format!("(+ {} (* (- 1.0) epsilon))", render_real(&r))
-                        }
-                        (false, true) => "epsilon".to_string(),
-                        (false, false) => alloc::format!("(+ {} epsilon)", render_real(&r)),
-                    },
+                RealOpt::Supremum(r, k) => (
+                    render_eps_bound(&render_real(&r), r.is_zero(), &k, maximize),
                     false,
                 ),
                 RealOpt::Unbounded => infinite(),
-                RealOpt::Unknown => unknown(),
+                RealOpt::Unknown => match self.nra_optimize(obj, maximize, fixed) {
+                    Some(NraOpt::Unbounded) => infinite(),
+                    Some(NraOpt::Attained {
+                        value,
+                        point,
+                        bools,
+                    }) => {
+                        // Commit `obj = value` for later objectives.
+                        let pin = self.pin_to_alg(obj, &value);
+                        fixed.extend(pin);
+                        *model = self.check_with(fixed).1.or_else(|| model.take());
+                        // The CAD witness is the model at the optimum (its
+                        // coordinates may be irrational).
+                        if let Some(md) = model.as_mut() {
+                            for (v, a) in &point {
+                                md.set_alg(*v, alg_to_algebraic(a));
+                            }
+                            for &(b, val) in &bools {
+                                md.set_bool(b, val);
+                            }
+                        }
+                        (render_alg(&value), false)
+                    }
+                    Some(NraOpt::Limit(v, k)) => {
+                        self.opt_open_limit = true;
+                        let a = alg_to_algebraic(&v);
+                        let zero = a.is_rational() && a.interval().0.is_zero();
+                        (
+                            render_eps_bound(&render_alg_real(&v), zero, &k, maximize),
+                            false,
+                        )
+                    }
+                    _ => unknown(),
+                },
             };
         }
         if !self.m.is_int_sort(osort) {
@@ -21280,7 +21457,18 @@ impl Context {
     /// unrestricted interval `(interval (* (- 1) oo) oo)` once the hard
     /// constraints are `unsat`.
     fn set_objective_values(&mut self, res: SmtResult) {
-        let v = if res == SmtResult::Unsat {
+        // Assertions that simplify to `false` never reach z3's optimizer,
+        // whose objective values then stay 0.
+        let trivially_false = res == SmtResult::Unsat && {
+            let all = self.assertions.clone();
+            all.iter().any(|&a| {
+                let s = crate::rewriter::simplify(&mut self.m, a);
+                self.m.is_false(s)
+            })
+        };
+        let v = if trivially_false {
+            "0"
+        } else if res == SmtResult::Unsat {
             " (interval (* (- 1) oo) oo)"
         } else {
             "unknown"
@@ -21310,6 +21498,341 @@ impl Context {
                 }
             }
             _ => unreachable!(),
+        }
+    }
+
+    /// Constraints pinning the real term `t` to the algebraic value `v`:
+    /// `t = r` for a rational, else `p(t) = 0 ∧ lo < t < hi` with `p` the
+    /// defining polynomial and `(lo, hi)` the isolating interval.
+    fn pin_to_alg(&mut self, t: AstId, v: &crate::nlsat::realclosure::Alg) -> Vec<AstId> {
+        use crate::nlsat::realclosure::Alg;
+        match v {
+            Alg::Rational(r) => {
+                let rv = self.m.mk_numeral(r.clone(), false);
+                alloc::vec![self.m.mk_eq(t, rv)]
+            }
+            Alg::Irrational { poly, lo, hi } => {
+                let mut terms = Vec::new();
+                let mut pow = None;
+                for (k, c) in poly.coeffs().iter().enumerate() {
+                    if k > 0 {
+                        pow = Some(match pow {
+                            None => t,
+                            Some(p) => self.m.mk_mul(&[p, t]),
+                        });
+                    }
+                    if c.is_zero() {
+                        continue;
+                    }
+                    let cv = self.m.mk_numeral(c.clone(), false);
+                    terms.push(match pow {
+                        None => cv,
+                        Some(p) => self.m.mk_mul(&[cv, p]),
+                    });
+                }
+                let sum = if terms.len() == 1 {
+                    terms[0]
+                } else {
+                    self.m.mk_add(&terms)
+                };
+                let zero = self
+                    .m
+                    .mk_numeral(Rational::from_integer(Int::from(0)), false);
+                let (lv, hv) = (
+                    self.m.mk_numeral(lo.clone(), false),
+                    self.m.mk_numeral(hi.clone(), false),
+                );
+                alloc::vec![
+                    self.m.mk_eq(sum, zero),
+                    self.m.mk_gt(t, lv),
+                    self.m.mk_lt(t, hv)
+                ]
+            }
+        }
+    }
+
+    /// Optimize a nonlinear real objective exactly by CAD (z3 5.3's nlsat-backed
+    /// optimizer gives the same answers). The assertions plus `fixed` are
+    /// expanded into a small DNF of polynomial constraints over plain Real
+    /// constants and Boolean constants; in each cube a fresh variable
+    /// `t = obj`, placed lowest in the projection order, is maximized
+    /// (minimized) by [`cad_optimize`](crate::nlsat::cad::cad_optimize), and
+    /// the best cube wins. Returns the optimum with, for an attained one, the
+    /// AST variable of each witness coordinate and the cube's Boolean values.
+    /// `None` when the problem is outside that fragment or past the CAD caps.
+    fn nra_optimize(&mut self, obj: AstId, maximize: bool, fixed: &[AstId]) -> Option<NraOpt> {
+        use crate::math::polynomial::Polynomial;
+        // `opt.optsmt_nlsat false` turns z3's exact nonlinear optimizer off.
+        if matches!(
+            self.params.get("opt.optsmt_nlsat"),
+            Some(crate::util::ParamValue::Bool(false))
+        ) {
+            return None;
+        }
+        use crate::nlsat::Rel as NRel;
+        use crate::nlsat::cad::CadOpt;
+        const MAX_CUBES: usize = 64;
+        // Term-level `ite`s (e.g. a soft penalty) become guarded equalities.
+        let all: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
+        let conj = match all.len() {
+            0 => self.m.mk_true(),
+            1 => all[0],
+            _ => self.m.mk_and(&all),
+        };
+        let lifted = self.lift(conj);
+        let mut roots = Vec::new();
+        self.icp_flatten_and(lifted, &mut roots);
+        let mut cubes: Vec<Vec<(AstId, bool)>> = alloc::vec![Vec::new()];
+        for r in roots {
+            let d = self.opt_dnf(r, true, MAX_CUBES)?;
+            let mut next = Vec::new();
+            for c in &cubes {
+                for e in &d {
+                    let mut m = c.clone();
+                    m.extend_from_slice(e);
+                    next.push(m);
+                }
+            }
+            if next.len() > MAX_CUBES {
+                return None;
+            }
+            cubes = next;
+        }
+        let mut best: Option<NraOpt> = None;
+        let mut any_feasible = false;
+        for cube in cubes {
+            let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
+            let mut cons: Vec<(Polynomial, NRel)> = Vec::new();
+            let mut bools: BTreeMap<AstId, bool> = BTreeMap::new();
+            let mut consistent = true;
+            for &(atom, pos) in &cube {
+                if self.m.is_bool_sort(self.m.get_sort(atom)) && self.m.is_uninterp_const(atom) {
+                    if bools.insert(atom, pos).is_some_and(|old| old != pos) {
+                        consistent = false;
+                    }
+                    continue;
+                }
+                let c = self.icp_atom(atom, !pos, &mut var_map)?;
+                cons.push((c.poly, c.rel));
+            }
+            if !consistent {
+                continue;
+            }
+            let mut p_obj = self.icp_to_poly(obj, &mut var_map);
+            let ast_of: BTreeMap<u32, AstId> = var_map.iter().map(|(&a, &i)| (i, a)).collect();
+            // An Int variable pinned by `v = k` (k integral) is substituted out,
+            // so the rest can be decided over ℝ.
+            let mut pinned: Vec<(AstId, Rational)> = Vec::new();
+            while let Some((v, k)) = cons.iter().find_map(|(p, r)| {
+                let vs = p.vars();
+                if *r != NRel::Eq || vs.len() != 1 || p.degree_of(vs[0]) != 1 {
+                    return None;
+                }
+                let v = vs[0];
+                if !self.m.is_int_sort(self.m.get_sort(ast_of[&v])) {
+                    return None;
+                }
+                let a = p.coeff_of_var(v, 1).as_constant()?;
+                let b = p.coeff_of_var(v, 0).as_constant()?;
+                let k = b.neg().div(&a);
+                k.is_integer().then_some((v, k))
+            }) {
+                let kp = Polynomial::constant(k.clone());
+                for c in cons.iter_mut() {
+                    c.0 = crate::nlsat::elim::subst_var(&c.0, v, &kp);
+                }
+                p_obj = crate::nlsat::elim::subst_var(&p_obj, v, &kp);
+                pinned.push((ast_of[&v], k));
+            }
+            // A constraint left constant is decided outright.
+            let mut falsified = false;
+            cons.retain(|(p, r)| match p.as_constant() {
+                Some(c) => {
+                    falsified |= !crate::nlsat::cad::rel_holds(c.signum(), *r);
+                    false
+                }
+                None => true,
+            });
+            if falsified {
+                continue;
+            }
+            // The variables left must be plain Real constants (CAD decides ℝ
+            // only); renumber them 1..=n above t = obj (variable 0).
+            let mut used: BTreeSet<u32> = p_obj.vars().into_iter().collect();
+            for (p, _) in &cons {
+                used.extend(p.vars());
+            }
+            if used.iter().any(|v| {
+                !self.m.is_uninterp_const(ast_of[v])
+                    || self.m.is_int_sort(self.m.get_sort(ast_of[v]))
+            }) {
+                return None;
+            }
+            let order: Vec<u32> = used.into_iter().collect();
+            let n = order.len();
+            let renumber = |p: &Polynomial| {
+                // Two phases (via indices past every original one) so no
+                // renaming collides with a variable still to be renamed.
+                let off = (var_map.len() + n + 1) as u32;
+                let mut q = p.clone();
+                for (i, &v) in order.iter().enumerate() {
+                    q = crate::nlsat::elim::subst_var(&q, v, &Polynomial::var(off + i as u32));
+                }
+                for i in 0..n as u32 {
+                    q = crate::nlsat::elim::subst_var(&q, off + i, &Polynomial::var(i + 1));
+                }
+                q
+            };
+            let mut shifted: Vec<(Polynomial, NRel)> =
+                cons.iter().map(|(p, r)| (renumber(p), *r)).collect();
+            shifted.push((Polynomial::var(0).sub(&renumber(&p_obj)), NRel::Eq));
+            let r = crate::nlsat::cad::cad_optimize(&shifted, n + 1, maximize)?;
+            let vars: Vec<AstId> = order.iter().map(|v| ast_of[v]).collect();
+            // On a linear cube an open optimum carries z3's LP infinitesimal
+            // coefficient (see `real_optimize`); a nonlinear one prints 1.
+            let one = Rational::from_integer(Int::from(1));
+            let eps_coeff = |lim: &crate::nlsat::realclosure::Alg| -> Rational {
+                let crate::nlsat::realclosure::Alg::Rational(r) = lim else {
+                    return one.clone();
+                };
+                if shifted
+                    .iter()
+                    .any(|(p, rel)| p.total_degree() > 1 || *rel == NRel::Ne)
+                {
+                    return one.clone();
+                }
+                let slope = |delta: Rational| -> Option<Rational> {
+                    let tight: Vec<(Polynomial, NRel)> = shifted
+                        .iter()
+                        .map(|(p, rel)| {
+                            let vs = p.vars();
+                            let scale = if vs.len() == 1 {
+                                p.coeff_of_var(vs[0], 1)
+                                    .as_constant()
+                                    .map_or(one.clone(), |a| a.abs())
+                            } else {
+                                one.clone()
+                            };
+                            let d = Polynomial::constant(delta.mul(&scale));
+                            match rel {
+                                NRel::Lt => (p.add(&d), NRel::Le),
+                                NRel::Gt => (p.sub(&d), NRel::Ge),
+                                _ => (p.clone(), *rel),
+                            }
+                        })
+                        .collect();
+                    match crate::nlsat::cad::cad_optimize(&tight, n + 1, maximize)? {
+                        CadOpt::Attained(crate::nlsat::realclosure::Alg::Rational(rd), _) => {
+                            Some(if maximize { r.sub(&rd) } else { rd.sub(r) }.div(&delta))
+                        }
+                        _ => None,
+                    }
+                };
+                match (
+                    slope(Rational::power_of_two(-20)),
+                    slope(Rational::power_of_two(-21)),
+                ) {
+                    (Some(a), Some(b)) if a == b && a.is_positive() => a,
+                    _ => one.clone(),
+                }
+            };
+            let cand = match r {
+                CadOpt::Infeasible => continue,
+                CadOpt::Unbounded => return Some(NraOpt::Unbounded),
+                CadOpt::Limit(v) => {
+                    let k = eps_coeff(&v);
+                    NraOpt::Limit(v, k)
+                }
+                CadOpt::Attained(v, point) => NraOpt::Attained {
+                    value: v,
+                    point: vars
+                        .into_iter()
+                        .zip(point.into_iter().skip(1))
+                        .chain(
+                            pinned
+                                .into_iter()
+                                .map(|(a, k)| (a, crate::nlsat::realclosure::Alg::Rational(k))),
+                        )
+                        .collect(),
+                    bools: bools.into_iter().collect(),
+                },
+            };
+            any_feasible = true;
+            best = Some(match best {
+                None => cand,
+                Some(b) => {
+                    let (bv, cv) = (b.value()?, cand.value()?);
+                    let ord = cv.compare(bv);
+                    let better = if maximize { ord.is_gt() } else { ord.is_lt() };
+                    // Equal values: an attained optimum beats an open limit.
+                    if better || (ord.is_eq() && matches!(cand, NraOpt::Attained { .. })) {
+                        cand
+                    } else {
+                        b
+                    }
+                }
+            });
+        }
+        if !any_feasible {
+            return Some(NraOpt::Infeasible);
+        }
+        best
+    }
+
+    /// `f` (negated when `!pos`) as a DNF of `(atom, polarity)` literals over
+    /// `and`/`or`/`not`/`=>` and Boolean constants; `None` past `cap` cubes or
+    /// on a connective outside that set.
+    fn opt_dnf(&self, f: AstId, pos: bool, cap: usize) -> Option<Vec<Vec<(AstId, bool)>>> {
+        if self.m.is_true(f) || self.m.is_false(f) {
+            // A true literal is the one empty cube; a false one has no cubes.
+            let holds = self.m.is_true(f) == pos;
+            return Some(if holds {
+                alloc::vec![Vec::new()]
+            } else {
+                Vec::new()
+            });
+        }
+        if self.m.is_not(f) {
+            return self.opt_dnf(self.m.app_args(f)[0], !pos, cap);
+        }
+        let args = self.m.app_args(f).to_vec();
+        // Conjunctive (and / ¬or / ¬⇒) vs disjunctive (or / ¬and / ⇒) shape.
+        let (conj, parts): (bool, Vec<(AstId, bool)>) = if self.m.is_and(f) {
+            (pos, args.iter().map(|&a| (a, pos)).collect())
+        } else if self.m.is_or(f) {
+            (!pos, args.iter().map(|&a| (a, pos)).collect())
+        } else if self.m.is_implies(f) && args.len() == 2 {
+            (!pos, alloc::vec![(args[0], !pos), (args[1], pos)])
+        } else {
+            return Some(alloc::vec![alloc::vec![(f, pos)]]);
+        };
+        if conj {
+            let mut acc: Vec<Vec<(AstId, bool)>> = alloc::vec![Vec::new()];
+            for (a, p) in parts {
+                let d = self.opt_dnf(a, p, cap)?;
+                let mut next = Vec::new();
+                for c in &acc {
+                    for e in &d {
+                        let mut m = c.clone();
+                        m.extend_from_slice(e);
+                        next.push(m);
+                    }
+                }
+                if next.len() > cap {
+                    return None;
+                }
+                acc = next;
+            }
+            Some(acc)
+        } else {
+            let mut acc = Vec::new();
+            for (a, p) in parts {
+                acc.extend(self.opt_dnf(a, p, cap)?);
+                if acc.len() > cap {
+                    return None;
+                }
+            }
+            Some(acc)
         }
     }
 
@@ -21377,11 +21900,46 @@ impl Context {
                 };
                 let mut ex = fixed.to_vec();
                 ex.push(reach);
-                if self.check_with(&ex).0 == SmtResult::Unsat {
-                    RealOpt::Supremum(r)
-                } else {
-                    RealOpt::Unknown
+                if self.check_with(&ex).0 != SmtResult::Unsat {
+                    return RealOpt::Unknown;
                 }
+                // z3 reports the bound as `r ∓ k·ε`, the optimum with every
+                // strict `e < 0` read as `e ≤ −ε` — over a single variable `a·v`
+                // the bound is on `v` itself (`e ≤ −|a|ε`). The LP optimum is
+                // linear in a small enough shift δ, so k is the slope at two
+                // such δs (1 when they disagree: the shift crossed a breakpoint).
+                let mut slope = |delta: Rational| -> Option<Rational> {
+                    let shifted: Vec<_> =
+                        cons.iter()
+                            .map(|c| match c.rel {
+                                crate::smt::arith::Rel::Lt => {
+                                    let mut ts = c.expr.terms();
+                                    let scale = match (ts.next(), ts.next()) {
+                                        (Some((_, a)), None) => a.abs(),
+                                        _ => Rational::from_integer(Int::from(1)),
+                                    };
+                                    crate::smt::arith::Constraint::le(c.expr.add(
+                                        &crate::smt::arith::LinExpr::constant(delta.mul(&scale)),
+                                    ))
+                                }
+                                _ => c.clone(),
+                            })
+                            .collect();
+                    match arith_optimize(&shifted, &obj_lin, z, maximize, &mut budget) {
+                        OptOutcome::Attained(rd) => {
+                            Some(if maximize { r.sub(&rd) } else { rd.sub(&r) }.div(&delta))
+                        }
+                        _ => None,
+                    }
+                };
+                let one = Rational::from_integer(Int::from(1));
+                let k1 = slope(Rational::power_of_two(-20));
+                let k2 = slope(Rational::power_of_two(-21));
+                let k = match (k1, k2) {
+                    (Some(a), Some(b)) if a == b && a.is_positive() => a,
+                    _ => one,
+                };
+                RealOpt::Supremum(r, k)
             }
             OptOutcome::Exhausted => RealOpt::Unknown,
         }
@@ -26924,8 +27482,9 @@ impl Context {
         let mut model = self.last_model.take().unwrap();
         let mut out = String::from("(");
         for (i, (text, id)) in terms.iter().enumerate() {
+            // z3 puts each `(term value)` pair on its own line.
             if i > 0 {
-                out.push(' ');
+                out.push_str("\n ");
             }
             let v = match *id {
                 Ok(id) => self
@@ -26934,6 +27493,7 @@ impl Context {
                     .or_else(|| self.str_model_value(&mut model, id))
                     .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
+                    .or_else(|| alg_model_value(&self.m, &mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id)),
                 Err((d, dom, ran)) => {
                     let body = self
@@ -29474,7 +30034,7 @@ mod tests {
         ";
         assert_eq!(
             run(script).unwrap(),
-            alloc::vec!["sat", "((x 7) (p true) ((+ x 1) 8))"]
+            alloc::vec!["sat", "((x 7)\n (p true)\n ((+ x 1) 8))"]
         );
     }
 
@@ -31317,7 +31877,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out[0], "sat");
-        assert_eq!(out[1], "((a false) (b true))");
+        assert_eq!(out[1], "((a false)\n (b true))");
     }
 
     #[test]
@@ -31440,6 +32000,72 @@ mod tests {
                  (declare-const x Real)(declare-const y Real)\
                  (assert (<= y 10.0))(assert (>= x y))(maximize x)(maximize y)"),
             "(objectives\n (x oo)\n (y  (interval (* (- 1) oo) oo))\n)"
+        );
+    }
+
+    #[test]
+    fn nonlinear_optimization_is_exact() {
+        let obj = |script: &str| run(script).unwrap();
+        // Attained irrational optimum, with the algebraic model.
+        let out = obj(
+            "(declare-const x Real)(declare-const y Real)(assert (<= (* x x) 2.0))\
+             (assert (<= (* x y) 1.0))(assert (>= y 0.0))(maximize x)(maximize y)\
+             (check-sat)(get-objectives)(get-value (x y))",
+        );
+        assert_eq!(out[0], "sat");
+        assert_eq!(
+            out[1],
+            "(objectives\n (x (root-obj (+ (^ x 2) (- 2)) 2))\n (y (root-obj (+ (* 2 (^ x 2)) (- 1)) 2))\n)"
+        );
+        assert_eq!(
+            out[2],
+            "((x (root-obj (+ (^ x 2) (- 2)) 2))\n (y (root-obj (+ (* 2 (^ x 2)) (- 1)) 2)))"
+        );
+        // Open supremum, unboundedness, and a disjunction of regions.
+        let one = |s: &str| obj(&alloc::format!("{s}(check-sat)(get-objectives)"))[1].clone();
+        assert_eq!(
+            one("(declare-const x Real)(assert (< (* x x) 2.0))(maximize x)"),
+            "(objectives\n (x (+ (root-obj (+ (^ x 2) (- 2)) 2) (* (- 1.0) epsilon)))\n)"
+        );
+        assert_eq!(
+            one(
+                "(declare-const x Real)(declare-const y Real)(assert (= (* x y) 1.0))(assert (> y 0.0))(maximize x)"
+            ),
+            "(objectives\n (x oo)\n)"
+        );
+        assert_eq!(
+            one(
+                "(declare-const x Real)(declare-const b Bool)(assert (or (and b (<= (* x x) 2.0))\
+                 (and (not b) (<= (* x x x) 5.0) (>= x 0.0))))(maximize x)"
+            ),
+            "(objectives\n (x (root-obj (+ (^ x 3) (- 5)) 1))\n)"
+        );
+        // A later lex objective after an open nonlinear limit: z3 declines.
+        let out = obj(
+            "(declare-const x Real)(declare-const y Real)(assert (< (* x x) 2.0))\
+             (assert (<= y 3.0))(maximize x)(maximize y)(check-sat)",
+        );
+        assert_eq!(out[0], "unknown");
+    }
+
+    #[test]
+    fn strict_linear_bounds_carry_the_epsilon_coefficient() {
+        let one =
+            |s: &str| run(&alloc::format!("{s}(check-sat)(get-objectives)")).unwrap()[1].clone();
+        // x > -4: the bound is on x itself, so 2x has infimum -8 + 2ε.
+        assert_eq!(
+            one(
+                "(declare-const x Real)(assert (> x (- 4.0)))(assert (< x 0.0))(minimize (* 2.0 x))"
+            ),
+            "(objectives\n ((* 2.0 x) (+ (- 8.0) (* 2.0 epsilon)))\n)"
+        );
+        // A multi-variable strict row shifts as written: 2x + 4y ≤ 1 − ε.
+        assert_eq!(
+            one(
+                "(declare-const x Real)(declare-const y Real)(assert (< (+ (* 2.0 x) (* 4.0 y)) 1.0))\
+                 (assert (>= y 0.0))(maximize x)"
+            ),
+            "(objectives\n (x (+ (/ 1.0 2.0) (* (- (/ 1.0 2.0)) epsilon)))\n)"
         );
     }
 

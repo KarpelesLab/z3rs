@@ -1230,7 +1230,7 @@ fn render_real_rational(r: &Rational) -> String {
 /// 1-based index of this root among that polynomial's real roots in increasing
 /// order. Uses only root isolation, factoring and polynomial evaluation — never
 /// algebraic arithmetic (which puremp 0.2.0 mishandles on crowded polynomials).
-fn root_obj_string(a: &Algebraic) -> Option<String> {
+pub(crate) fn root_obj_string(a: &Algebraic) -> Option<String> {
     // Tighten the isolating interval so it excludes every other root of the
     // defining polynomial (adjacent factors, incl. a spurious `x`/root-0 factor);
     // otherwise an endpoint sitting on another root mis-selects the factor.

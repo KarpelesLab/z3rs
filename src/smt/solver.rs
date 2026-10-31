@@ -139,6 +139,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         arith: BTreeMap::new(),
                         euf: Egraph::new(m, &[]),
                         bv: BTreeMap::new(),
+                        alg: BTreeMap::new(),
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -166,6 +167,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                             arith,
                             euf,
                             bv: BTreeMap::new(),
+                            alg: BTreeMap::new(),
                         };
                         return (SmtResult::Sat, Some(model));
                     }
@@ -261,6 +263,9 @@ pub struct Model {
     euf: Egraph,
     /// Concrete `(value, width)` of blasted bit-vector terms (QF_BV models).
     bv: BTreeMap<AstId, (Int, u32)>,
+    /// Irrational real algebraic values of arithmetic leaf variables (e.g. an
+    /// optimum on a nonlinear objective), overriding `arith`.
+    alg: BTreeMap<AstId, puremp::Algebraic>,
 }
 
 /// A concrete value in a [`Model`].
@@ -284,7 +289,73 @@ impl Model {
             arith: BTreeMap::new(),
             euf: Egraph::new_empty(),
             bv,
+            alg: BTreeMap::new(),
         }
+    }
+
+    /// Pin a Boolean constant (or atom) to a truth value.
+    pub fn set_bool(&mut self, var: AstId, val: bool) {
+        self.bools.insert(var, val);
+    }
+
+    /// Pin an arithmetic leaf variable to a real algebraic value (a rational
+    /// one goes to the ordinary assignment).
+    pub fn set_alg(&mut self, var: AstId, val: puremp::Algebraic) {
+        if val.is_rational() {
+            let (lo, _) = val.interval();
+            self.arith.insert(var, lo.clone());
+            self.alg.remove(&var);
+        } else {
+            self.alg.insert(var, val);
+        }
+    }
+
+    /// The exact algebraic value of the arithmetic term `t` when it depends on
+    /// an irrational leaf (see [`Model::set_alg`]) through `+ - *` and numerals;
+    /// `None` otherwise (the caller evaluates it the ordinary way).
+    pub fn alg_value(&mut self, m: &AstManager, t: AstId) -> Option<puremp::Algebraic> {
+        use crate::ast::arith::ArithOp;
+        use puremp::Algebraic;
+        if self.alg.is_empty() || !m.postorder(t).iter().any(|v| self.alg.contains_key(v)) {
+            return None;
+        }
+        fn go(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
+            if let Some(a) = md.alg.get(&t) {
+                return Some(a.clone());
+            }
+            if let Some(r) = m.as_numeral(t) {
+                return Some(Algebraic::from_rational(r));
+            }
+            if m.is_uninterp_const(t) {
+                return match md.eval(m, t) {
+                    Value::Num(r, _) => Some(Algebraic::from_rational(r)),
+                    _ => None,
+                };
+            }
+            let args = m.app_args(t).to_vec();
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(go(md, m, a)?);
+            }
+            let mut it = vals.into_iter();
+            let first = it.next()?;
+            Some(match m.arith_op(t)? {
+                ArithOp::Add => it.fold(first, |acc, v| acc.add(&v)),
+                ArithOp::Mul => it.fold(first, |acc, v| acc.mul(&v)),
+                ArithOp::Sub => {
+                    let rest: Vec<Algebraic> = it.collect();
+                    if rest.is_empty() {
+                        first.neg()
+                    } else {
+                        rest.iter().fold(first, |acc, v| acc.sub(v))
+                    }
+                }
+                ArithOp::Uminus => first.neg(),
+                ArithOp::ToReal => first,
+                _ => return None,
+            })
+        }
+        go(self, m, t)
     }
 
     /// Pin an arithmetic leaf variable to a concrete value. Used when a witness

@@ -20,6 +20,7 @@ gap can be closed systematically:
   Z3-INDEFINITE   expected itself is unknown/empty       (skipped from the ratio)
 
 Usage: scripts/z3test_diff.py [subdir ...] [--timeout S] [--limit N] [--show K]
+                              [--list FILE]   (write "BUCKET path" per file)
 """
 import os, sys, subprocess, concurrent.futures
 
@@ -83,6 +84,7 @@ def main():
     timeout = 10.0
     limit = None
     show = 8
+    listing = None
     subdirs = []
     i = 0
     while i < len(args):
@@ -90,6 +92,8 @@ def main():
             timeout = float(args[i + 1]); i += 2
         elif args[i] == "--limit":
             limit = int(args[i + 1]); i += 2
+        elif args[i] == "--list":
+            listing = args[i + 1]; i += 2
         elif args[i] == "--show":
             show = int(args[i + 1]); i += 2
         else:
@@ -111,6 +115,11 @@ def main():
         for res in ex.map(lambda f: run_one(f, timeout), files):
             if res:
                 buckets[res[0]].append(res)
+    if listing:
+        with open(listing, "w") as out:
+            for k, rs in buckets.items():
+                for _, f, _, _ in sorted(rs, key=lambda r: r[1]):
+                    out.write(f"{k} {os.path.relpath(f, CORPUS)}\n")
     total = sum(len(v) for v in buckets.values())
     definite = total - len(buckets["Z3-INDEFINITE"]) - len(buckets["Z3-BUG"])
     print(f"corpus: {total} files ({definite} with a definite z3 verdict)\n")
