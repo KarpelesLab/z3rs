@@ -2286,6 +2286,8 @@ struct Context {
     /// string-witness search, so `get-value`/`get-model` report a concrete string
     /// (e.g. `"aaa"`) rather than an uninterpreted placeholder.
     str_witness: Vec<(AstId, AstId)>,
+    /// The `v = literal` bindings the last `inline_str_bindings` substituted.
+    str_inlined: Vec<(AstId, AstId)>,
     /// Length links for symbolic string predicates: `(pred_app, longer, shorter)`
     /// asserts `pred_app ⇒ str.len(longer) ≥ str.len(shorter)` — sound for
     /// `str.contains`/`str.prefixof`/`str.suffixof`, and enough to refute e.g.
@@ -3333,6 +3335,7 @@ impl Context {
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
             str_witness: Vec::new(),
+            str_inlined: Vec::new(),
             str_pred_len: Vec::new(),
             str_len_ub: Vec::new(),
             str_op_decls: BTreeMap::new(),
@@ -3967,11 +3970,24 @@ impl Context {
                 {
                     return Ok(Some(d));
                 }
+                // As `get-value`: a string term evaluates under the string
+                // witness to its concrete literal.
+                let mut id = id;
+                if !self.str_witness.is_empty() {
+                    let sub = self.str_witness.clone();
+                    id = crate::rewriter::substitute(&mut self.m, id, &sub);
+                    let mut memo = BTreeMap::new();
+                    id = self.refold_str_markers(id, &mut memo);
+                    id = crate::rewriter::simplify(&mut self.m, id);
+                }
                 let mut model = self.last_model.take().unwrap();
                 let v = self
                     .eval_array_value(id)
+                    .or_else(|| self.str_value(id).map(|cps| smt_string_literal(&cps)))
+                    .or_else(|| self.str_model_value(&mut model, id))
                     .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
+                    .or_else(|| alg_model_value(&self.m, &mut model, id))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
                 Ok(Some(v))
@@ -4234,6 +4250,7 @@ impl Context {
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
                 self.last_assumptions.clear();
                 self.reason_unknown = None;
+                self.str_witness.clear();
                 // A `check-sat-using` tactic that names `nlsat` unlocks the trig
                 // range bounds (see `nlsat_requested`); reset for the next check.
                 self.nlsat_requested =
@@ -25031,7 +25048,16 @@ impl Context {
         if res == SmtResult::Unknown {
             let inlined = self.inline_str_bindings(goal);
             if inlined != goal {
+                let bindings = core::mem::take(&mut self.str_inlined);
                 let (r2, m2) = self.decide_inner(inlined);
+                if r2 == SmtResult::Sat {
+                    // Record the inlined values for get-value / eval.
+                    for (v, l) in bindings {
+                        if !self.str_witness.iter().any(|(w, _)| *w == v) {
+                            self.str_witness.push((v, l));
+                        }
+                    }
+                }
                 if r2 != SmtResult::Unknown {
                     return (r2, m2);
                 }
@@ -25335,6 +25361,13 @@ impl Context {
         if subst.is_empty() {
             return goal;
         }
+        // The literal bindings are part of any model of the inlined goal (which
+        // no longer mentions those variables).
+        self.str_inlined = subst
+            .iter()
+            .filter(|(_, l)| lit_consts.contains(l))
+            .copied()
+            .collect();
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
         self.refold_str_markers(g, &mut memo)
