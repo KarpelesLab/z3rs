@@ -2179,6 +2179,9 @@ struct Context {
     /// The `:named` label of each assertion (parallel to `assertions`), if any —
     /// used to report an unsat core.
     assert_names: Vec<Option<String>>,
+    /// `:named` assertion labels as `(name, term, assertion index)`: a name
+    /// denotes its term (e.g. as a `check-sat-assuming` literal).
+    named_terms: Vec<(String, AstId, usize)>,
     /// The verdict of the most recent `check-sat`.
     last_verdict: Option<SmtResult>,
     /// Set by `(exit)`: subsequent commands in the script are ignored.
@@ -3297,6 +3300,7 @@ impl Context {
             funcs: BTreeMap::new(),
             assertions: Vec::new(),
             assert_names: Vec::new(),
+            named_terms: Vec::new(),
             last_verdict: None,
             exited: false,
             print_success: false,
@@ -3685,6 +3689,7 @@ impl Context {
                         .ok_or_else(|| "pop with no matching push".to_string())?;
                     self.assertions.truncate(mark.assertions); // discard scoped assertions
                     self.assert_names.truncate(mark.assertions);
+                    self.named_terms.retain(|&(_, _, i)| i < mark.assertions);
                     self.universals.truncate(mark.universals);
                     // Undeclare constants/functions and sorts made since the push.
                     for name in self.decl_order.drain(mark.decls..) {
@@ -3700,6 +3705,7 @@ impl Context {
             "reset" => {
                 self.assertions.clear();
                 self.assert_names.clear();
+                self.named_terms.clear();
                 self.universals.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
@@ -3713,6 +3719,7 @@ impl Context {
                 // and options (unlike `reset`).
                 self.assertions.clear();
                 self.assert_names.clear();
+                self.named_terms.clear();
                 self.universals.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
@@ -4188,6 +4195,10 @@ impl Context {
                 }
                 let t = self.term(&asserted)?;
                 let name = named_label(&list[1]);
+                if let Some(n) = &name {
+                    // `:named n` makes `n` denote the asserted term.
+                    self.named_terms.push((n.clone(), t, self.assertions.len()));
+                }
                 self.assertions.push(t);
                 self.assert_names.push(name);
                 self.last_model = None;
@@ -28100,6 +28111,12 @@ impl Context {
                     if self.macros.contains_key(name) {
                         return self.expand_macro(name, Vec::new());
                     }
+                    if !self.funcs.contains_key(name)
+                        && let Some(&(_, t, _)) =
+                            self.named_terms.iter().rev().find(|(n, _, _)| n == name)
+                    {
+                        return Ok(t);
+                    }
                     let d = *self
                         .funcs
                         .get(name)
@@ -28279,6 +28296,26 @@ impl Context {
                             "rotate_left" => Ok(self.bv_rotate(k, x, true)),
                             _ => Ok(self.bv_rotate(k, x, false)),
                         };
+                    }
+                    if qid.len() == 3
+                        && matches!(&qid[0], SExpr::Atom(a) if a == "_")
+                        && matches!(&qid[1], SExpr::Atom(a) if a == "re.loop")
+                    {
+                        // ((_ re.loop n) r): at least n repetitions, rⁿ·r*.
+                        let lo: usize = Self::sym(&qid[2])?
+                            .parse()
+                            .map_err(|_| "re.loop: bad lower bound".to_string())?;
+                        let rt = self.term(&l[1])?;
+                        let sort = self.reglan_sort();
+                        let t = self.fresh_const(sort);
+                        if let Some(r) = self.regex_of.get(&rt).cloned() {
+                            let mut acc = Regex::Star(Box::new(r.clone()));
+                            for _ in 0..lo {
+                                acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                            }
+                            self.regex_of.insert(t, acc);
+                        }
+                        return Ok(t);
                     }
                     if (qid.len() == 4
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
