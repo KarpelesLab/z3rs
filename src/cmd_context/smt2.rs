@@ -372,6 +372,18 @@ fn rm_canonical(name: &str) -> &str {
     }
 }
 
+/// The spelling z3 prints for a `RoundingMode` value.
+fn rm_long_name(name: &str) -> &str {
+    match name {
+        "RNE" => "roundNearestTiesToEven",
+        "RNA" => "roundNearestTiesToAway",
+        "RTP" => "roundTowardPositive",
+        "RTN" => "roundTowardNegative",
+        "RTZ" => "roundTowardZero",
+        other => other,
+    }
+}
+
 /// Whether `name` is a `RoundingMode` constant.
 fn is_rm_name(name: &str) -> bool {
     matches!(
@@ -2388,6 +2400,9 @@ struct Context {
     fp_from_bv: BTreeMap<AstId, (AstId, u32, u32)>,
     /// The `RoundingMode` sort, once used.
     rm_sort: Option<AstId>,
+    /// The five `RoundingMode` constants (RNE, RNA, RTP, RTN, RTZ), built with
+    /// the sort.
+    rm_modes: Vec<AstId>,
     /// Floating-point constants: term → `(raw bits, eb, sb)`. Only `Float64`
     /// `(eb, sb) = (11, 53)` constants are folded (via `f64`); other formats and
     /// symbolic values are gated to a sound `unknown`.
@@ -3389,6 +3404,7 @@ impl Context {
             fp_to_bv_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
+            rm_modes: Vec::new(),
             fp_of: BTreeMap::new(),
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
@@ -5173,6 +5189,15 @@ impl Context {
     /// If `id` has an enum sort, the name of the constructor it equals under
     /// `model` (so `get-value` prints `green`, not `Color!val!2`).
     fn enum_value_name(&self, model: &mut Model, id: AstId) -> Option<String> {
+        if self.rm_sort == Some(self.m.get_sort(id)) {
+            for &c in &self.rm_modes {
+                if model.terms_equal(&self.m, id, c) {
+                    let name = self.decl_name(self.m.app_decl(c))?;
+                    return Some(rm_long_name(&name).to_string());
+                }
+            }
+            return None;
+        }
         let ctors = self.enums.get(&self.m.get_sort(id))?;
         for &c in ctors {
             if model.terms_equal(&self.m, id, c) {
@@ -5855,6 +5880,14 @@ impl Context {
         }
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let g = crate::rewriter::simplify(&mut self.m, g);
+        // `check_model` sees only EUF + arithmetic: give it the enum axioms and
+        // keep every other theory out (an FP or BV atom would be opaque to it).
+        if !self.in_euf_arith_fragment_with(g, true) {
+            return None;
+        }
+        let mut parts = self.enum_axioms(g);
+        parts.push(g);
+        let g = self.m.mk_and(&parts);
         if check_model(&self.m, g).0 == SmtResult::Sat {
             return Some(Model::from_bv(BTreeMap::new()));
         }
@@ -15810,6 +15843,13 @@ impl Context {
         }
         let s = self.m.mk_uninterpreted_sort(Symbol::new("RoundingMode"));
         self.rm_sort = Some(s);
+        self.rm_modes = ["RNE", "RNA", "RTP", "RTN", "RTZ"]
+            .iter()
+            .map(|n| {
+                let d = self.m.mk_func_decl(Symbol::new(n), &[], s);
+                self.m.mk_const(d)
+            })
+            .collect();
         s
     }
 
@@ -20017,12 +20057,9 @@ impl Context {
 
     /// Is `sort` a user-declared uninterpreted sort?
     fn is_uninterp_sort(&self, sort: AstId) -> bool {
-        self.m
-            .sort(sort)
-            .is_some_and(|s| s.info.family_id == crate::ast::NULL_FAMILY_ID)
-            && !self.m.is_bool_sort(sort)
-            && !self.enums.contains_key(&sort)
-            && !self.datatypes.contains_key(&sort)
+        // Not a null-family test: FP, RoundingMode, strings, … are built that way
+        // too, and their values are not an arbitrary model universe.
+        self.declared_sorts.contains(&sort)
     }
 
     /// The model value of a ground term as an MBQI table key.
@@ -20268,8 +20305,7 @@ impl Context {
             if app.args.is_empty() {
                 return None;
             }
-            let fd = ctx.m.func_decl(app.decl)?;
-            (fd.info.family_id == crate::ast::NULL_FAMILY_ID).then_some(app.decl)
+            ctx.is_free_function(app.decl).then_some(app.decl)
         };
         let (head, rhs) = if self.m.is_eq(body) && self.m.app_args(body).len() == 2 {
             let a = self.m.app_args(body);
@@ -20426,6 +20462,30 @@ impl Context {
         true
     }
 
+    /// Is `decl` a function the user declared with no fixed meaning? Theory
+    /// operators z3rs builds on null-family decls (`str.len`, `fp.*`, …) and
+    /// datatype constructors, selectors and testers are interpreted, so a
+    /// universal over them is not a definition that always has a model.
+    fn is_free_function(&self, decl: AstId) -> bool {
+        let interp = |d: AstId| {
+            self.tester_of.values().any(|&t| t == d)
+                || self
+                    .records
+                    .values()
+                    .any(|(c, sels)| *c == d || sels.contains(&d))
+                || self
+                    .datatypes
+                    .values()
+                    .flatten()
+                    .any(|(c, sels, t)| *c == d || *t == d || sels.contains(&d))
+        };
+        self.m
+            .func_decl(decl)
+            .is_some_and(|fd| fd.info.family_id == crate::ast::NULL_FAMILY_ID)
+            && self.funcs.values().any(|&f| f == decl)
+            && !interp(decl)
+    }
+
     /// If `t` is an application of an uninterpreted, `Bool`-ranged function of
     /// arity ≥ 1 (a CHC *predicate*), return its declaration.
     fn predicate_of(&self, t: AstId) -> Option<AstId> {
@@ -20440,7 +20500,7 @@ impl Context {
         if self.tester_of.values().any(|&td| td == app.decl) {
             return None;
         }
-        if d.info.family_id == crate::ast::NULL_FAMILY_ID && self.m.is_bool_sort(d.range) {
+        if self.is_free_function(app.decl) && self.m.is_bool_sort(d.range) {
             Some(app.decl)
         } else {
             None
@@ -22685,7 +22745,42 @@ impl Context {
         if let Some(w) = self.m.bv_sort_width(sort) {
             return (w <= 8).then(|| (0..(1i64 << w)).map(|i| self.m.mk_bv(i, w)).collect());
         }
+        if self.rm_sort == Some(sort) {
+            return Some(self.rm_modes.clone());
+        }
         self.enums.get(&sort).cloned()
+    }
+
+    /// The `RoundingMode` axioms for a goal that mentions the sort: the five
+    /// modes are pairwise distinct and every RM-sorted term is one of them.
+    fn rm_axioms(&mut self, goal: AstId) -> Vec<AstId> {
+        let Some(s) = self.rm_sort else {
+            return Vec::new();
+        };
+        let terms: Vec<AstId> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter(|&t| self.m.get_sort(t) == s)
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let modes = self.rm_modes.clone();
+        let mut ax = Vec::new();
+        for i in 0..modes.len() {
+            for j in i + 1..modes.len() {
+                let eq = self.m.mk_eq(modes[i], modes[j]);
+                ax.push(self.m.mk_not(eq));
+            }
+        }
+        for t in terms {
+            if !modes.contains(&t) {
+                let eqs: Vec<AstId> = modes.iter().map(|&c| self.m.mk_eq(t, c)).collect();
+                ax.push(self.m.mk_or(&eqs));
+            }
+        }
+        ax
     }
 
     /// Eliminate a nested `(forall|exists xs. φ)` over linear arithmetic by
@@ -22791,6 +22886,12 @@ impl Context {
         if contains_partial_arith(&self.m, body, &mut seen2) {
             return None;
         }
+        // `check_model` only knows EUF and arithmetic: any other theory's atoms
+        // are opaque to it, so its `sat` would "refute" valid bit-vector or FP
+        // universals (`∀x:BV16. x ≤u #xffff`).
+        if !self.in_euf_arith_fragment(body) {
+            return None;
+        }
         let neg = self.m.mk_not(body);
         match check_model(&self.m, neg).0 {
             // `check_model` treats a nonlinear term (`a·a`) as a free variable, so
@@ -22801,6 +22902,38 @@ impl Context {
             SmtResult::Unsat => Some(true),
             _ => None,
         }
+    }
+
+    /// Is `t` built only from Booleans, arithmetic and user-declared functions
+    /// over Bool/Int/Real/`declare-sort` sorts — the fragment [`check_model`]
+    /// decides on its own?
+    fn in_euf_arith_fragment(&self, t: AstId) -> bool {
+        self.in_euf_arith_fragment_with(t, false)
+    }
+
+    /// [`Self::in_euf_arith_fragment`], also admitting enum sorts when the caller
+    /// adds the enum axioms itself.
+    fn in_euf_arith_fragment_with(&self, t: AstId, enums: bool) -> bool {
+        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        self.m.postorder(t).into_iter().all(|n| {
+            let sort = self.m.get_sort(n);
+            let sort_ok = self.m.is_bool_sort(sort)
+                || self.m.is_arith_sort(sort)
+                || self.declared_sorts.contains(&sort)
+                || (enums && self.enums.contains_key(&sort));
+            sort_ok
+                && match self.m.app(n) {
+                    None => true,
+                    Some(a) => {
+                        let fam = self.m.func_decl(a.decl).map(|d| d.info.family_id);
+                        fam == Some(crate::ast::BASIC_FAMILY_ID)
+                            || self.m.arith_op(n).is_some()
+                            || self.m.as_numeral(n).is_some()
+                            || user.contains(&a.decl)
+                            || self.m.is_uninterp_const(n)
+                    }
+                }
+        })
     }
 
     /// Expand `∀x₁:S₁ … xₙ:Sₙ. φ` to the ground conjunction over the domains when
@@ -23937,6 +24070,13 @@ impl Context {
                 break;
             }
         }
+        // Likewise for a binder over a sort with a fixed interpretation (BV, FP,
+        // strings, sequences, arrays, datatypes, RoundingMode): the ground terms
+        // present are not its whole domain, so instances over them only refute.
+        let theory_constrained = universals.iter().any(|(vars, body)| {
+            self.universal_theory_constrained(vars, *body)
+                && !self.universal_is_definition(vars, *body, &user_decls)
+        });
         let trigs: Vec<Vec<Vec<AstId>>> = universals
             .iter()
             .map(|(vars, body)| {
@@ -24191,7 +24331,8 @@ impl Context {
                         && !dt_enumerated
                         && !arith_enumerated
                         && !seed_enumerated
-                        && !arith_constrained,
+                        && !arith_constrained
+                        && !theory_constrained,
                 );
             }
         }
@@ -24335,6 +24476,35 @@ impl Context {
             }
         }
         false
+    }
+
+    /// Does a binder whose sort has a fixed interpretation (not Bool, Int/Real or
+    /// a `declare-sort`) occur other than as a direct argument of
+    /// a free user function? Then a model of the instances over the present
+    /// ground terms need not satisfy the universal (`∀x:BV12. x ≤u 4093` with a
+    /// ground `c`), so the enumeration cannot saturate.
+    fn universal_theory_constrained(&self, vars: &[AstId], body: AstId) -> bool {
+        let binders: BTreeSet<AstId> = vars
+            .iter()
+            .copied()
+            .filter(|&v| {
+                let s = self.m.get_sort(v);
+                !(self.m.is_bool_sort(s)
+                    || self.m.is_arith_sort(s)
+                    || self.declared_sorts.contains(&s))
+            })
+            .collect();
+        if binders.is_empty() {
+            return false;
+        }
+        if binders.contains(&body) {
+            return true;
+        }
+        self.m.postorder(body).into_iter().any(|t| {
+            self.m.app(t).is_some_and(|a| {
+                !self.is_free_function(a.decl) && a.args.iter().any(|x| binders.contains(x))
+            })
+        })
     }
 
     /// Instantiate the array + enum axioms for `lifted` and conjoin them.
@@ -25015,6 +25185,7 @@ impl Context {
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
+        axioms.extend(self.rm_axioms(lifted));
         axioms.extend(self.record_axioms(lifted));
         axioms.extend(self.datatype_axioms(lifted));
         axioms.extend(self.string_axioms(lifted));
@@ -33841,6 +34012,45 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn theory_sorted_universals_are_not_assumed() {
+        // Each universal is false; an instance over the ground terms present
+        // is no model of it, and an interpreted function is no macro.
+        for q in [
+            "(assert (forall ((x (_ BitVec 16))) (bvult x #xffff)))",
+            "(declare-const c (_ BitVec 12)) (assert (= (bvand c c) c))
+             (assert (forall ((x (_ BitVec 12))) (bvule x (_ bv4093 12))))",
+            "(assert (forall ((x String)) (= (str.len x) 0)))",
+            "(assert (forall ((x (Seq Int))) (= (seq.len x) 0)))",
+            "(assert (forall ((x RoundingMode)) (= x RNE)))",
+            "(declare-datatypes ((L 0)) (((nil) (cons (hd Int) (tl L)))))
+             (assert (forall ((x L)) ((_ is cons) x)))",
+        ] {
+            let out = run(&alloc::format!("{q} (check-sat)")).unwrap();
+            assert_ne!(out, alloc::vec!["sat"], "{q}");
+        }
+        // A valid bit-vector universal is not refuted.
+        let out =
+            run("(assert (forall ((x (_ BitVec 16))) (bvule x #xffff))) (check-sat)").unwrap();
+        assert_ne!(out, alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn rounding_modes_are_distinct_and_exhaustive() {
+        let script = "
+            (assert (= RNE RTZ))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        let script = "
+            (declare-const r RoundingMode)
+            (assert (not (= r RNE))) (assert (not (= r RNA))) (assert (not (= r RTP)))
+            (assert (not (= r RTN))) (assert (not (= r RTZ)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
