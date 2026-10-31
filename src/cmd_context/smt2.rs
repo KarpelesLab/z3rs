@@ -109,6 +109,9 @@ impl NraOpt {
 enum Mbqi {
     /// Every universal holds in the candidate model.
     Valid,
+    /// A universal is refuted, but no instance could be built (its free
+    /// functions have no fixed interpretation).
+    Refuted,
     /// Counterexample instances to add to the ground goal.
     Refine(Vec<AstId>),
     /// Outside the checkable fragment.
@@ -19793,9 +19796,13 @@ impl Context {
             const MBQI_ROUNDS: usize = 8;
             for _ in 0..MBQI_ROUNDS {
                 let Some(md) = model.as_mut() else { break };
-                match self.mbqi_check(goal, md) {
+                let verdict = match self.mbqi_check(goal, md) {
+                    Mbqi::Unknown => self.mbqi_theory(goal, md),
+                    v => v,
+                };
+                match verdict {
                     Mbqi::Valid => return (SmtResult::Sat, model),
-                    Mbqi::Unknown => break,
+                    Mbqi::Unknown | Mbqi::Refuted => break,
                     Mbqi::Refine(instances) => {
                         let mut conj = alloc::vec![combined];
                         conj.extend(instances);
@@ -20053,6 +20060,281 @@ impl Context {
             }
         }
         Some(instances)
+    }
+
+    /// MBQI for universals over theory sorts (Bool, arithmetic, bit-vectors,
+    /// FP), where the table-based [`Self::mbqi_check`] does not apply: each
+    /// binder becomes a fresh constant, every other constant is fixed to its
+    /// model value and the negated instance is decided by the ground solver.
+    /// Skolem functions (which no ground term mentions, so any interpretation
+    /// extends the model) are tried as constant or projection functions.
+    fn mbqi_theory(&mut self, goal: AstId, model: &mut Model) -> Mbqi {
+        const MAX_COMBOS: usize = 16;
+        let goal_terms: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        // The candidate must be a model of the ground goal itself.
+        let Some(fix) = self.mbqi_fix_constants(goal, model, &BTreeSet::new(), &goal_terms) else {
+            return Mbqi::Unknown;
+        };
+        let g = crate::rewriter::substitute(&mut self.m, goal, &fix);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        if !self.m.is_true(g) {
+            return Mbqi::Unknown;
+        }
+        let mut fdecls: Vec<AstId> = Vec::new();
+        for (_, body) in self.universals.clone() {
+            for t in self.m.postorder(body) {
+                if let Some(app) = self.m.app(t)
+                    && !app.args.is_empty()
+                    && user.contains(&app.decl)
+                    && !fdecls.contains(&app.decl)
+                {
+                    let skolem = self
+                        .decl_name(app.decl)
+                        .is_some_and(|n| n.starts_with("!sk!"));
+                    let in_goal = goal_terms
+                        .iter()
+                        .any(|&g| self.m.app(g).is_some_and(|a| a.decl == app.decl));
+                    if !skolem || in_goal {
+                        return Mbqi::Unknown;
+                    }
+                    fdecls.push(app.decl);
+                }
+            }
+        }
+        // Candidate interpretations: `Ok(k)` constant, `Err(i)` the i-th argument.
+        let mut cands: Vec<Vec<Result<AstId, usize>>> = Vec::new();
+        for &f in &fdecls {
+            let Some(fd) = self.m.func_decl(f) else {
+                return Mbqi::Unknown;
+            };
+            let (range, domain) = (fd.range, fd.domain.clone());
+            let mut c: Vec<Result<AstId, usize>> =
+                self.mbqi_sample_values(range).into_iter().map(Ok).collect();
+            c.extend((0..domain.len()).filter(|&i| domain[i] == range).map(Err));
+            if c.is_empty() {
+                return Mbqi::Unknown;
+            }
+            cands.push(c);
+        }
+        let combos: usize = cands.iter().map(Vec::len).product::<usize>();
+        if combos > MAX_COMBOS {
+            return Mbqi::Unknown;
+        }
+        let mut refuted = false;
+        for idx in 0..combos {
+            let mut rem = idx;
+            let interp: BTreeMap<AstId, Result<AstId, usize>> = fdecls
+                .iter()
+                .zip(&cands)
+                .map(|(&f, c)| {
+                    let v = c[rem % c.len()];
+                    rem /= c.len();
+                    (f, v)
+                })
+                .collect();
+            match self.mbqi_theory_round(model, &goal_terms, &interp) {
+                Mbqi::Valid => return Mbqi::Valid,
+                Mbqi::Refine(inst) => return Mbqi::Refine(inst),
+                Mbqi::Refuted => refuted = true,
+                Mbqi::Unknown => return Mbqi::Unknown,
+            }
+        }
+        if refuted {
+            Mbqi::Refuted
+        } else {
+            Mbqi::Unknown
+        }
+    }
+
+    /// One [`Self::mbqi_theory`] pass under the function interpretation
+    /// `interp`.
+    fn mbqi_theory_round(
+        &mut self,
+        model: &mut Model,
+        goal_terms: &BTreeSet<AstId>,
+        interp: &BTreeMap<AstId, Result<AstId, usize>>,
+    ) -> Mbqi {
+        let mut instances = Vec::new();
+        let mut refuted = false;
+        for (vars, body) in self.universals.clone() {
+            let mut pairs: Vec<(AstId, AstId)> = Vec::new();
+            let mut fresh: Vec<AstId> = Vec::new();
+            for &v in &vars {
+                let s = self.m.get_sort(v);
+                if !(self.m.is_bool_sort(s)
+                    || self.m.is_arith_sort(s)
+                    || self.m.bv_sort_width(s).is_some()
+                    || self.fp_format_of(s).is_some())
+                {
+                    return Mbqi::Unknown;
+                }
+                let x0 = self.fresh_const(s);
+                fresh.push(x0);
+                pairs.push((v, x0));
+            }
+            let mut pairs = self.with_fp_bits(pairs);
+            for t in self.m.postorder(body) {
+                let Some(app) = self.m.app(t) else { continue };
+                let Some(&how) = interp.get(&app.decl) else {
+                    continue;
+                };
+                let args: Vec<AstId> = app.args.clone();
+                let val = match how {
+                    Ok(k) => k,
+                    Err(i) => crate::rewriter::substitute(&mut self.m, args[i], &pairs),
+                };
+                pairs.push((t, val));
+                if let Some(&bv) = self.fp_bv.get(&t) {
+                    let Some(bits) = self.fp_to_bv(val) else {
+                        return Mbqi::Unknown;
+                    };
+                    pairs.push((bv, bits));
+                }
+            }
+            let mut raw = crate::rewriter::substitute(&mut self.m, body, &pairs);
+            if !self.fp_deferred_decls.is_empty() {
+                raw = self.fpa_blast(raw);
+                raw = crate::rewriter::substitute(&mut self.m, raw, &pairs);
+            }
+            let mut symbolic: BTreeSet<AstId> = fresh.iter().copied().collect();
+            for &x0 in &fresh {
+                if let Some(bv) = self.fp_to_bv(x0) {
+                    symbolic.insert(bv);
+                }
+            }
+            let Some(fix) = self.mbqi_fix_constants(raw, model, &symbolic, goal_terms) else {
+                return Mbqi::Unknown;
+            };
+            let phi = crate::rewriter::substitute(&mut self.m, raw, &fix);
+            let phi = crate::rewriter::simplify(&mut self.m, phi);
+            if self.m.is_true(phi) {
+                continue;
+            }
+            let neg = self.m.mk_not(phi);
+            let saved_u = core::mem::take(&mut self.universals);
+            let saved_a = core::mem::replace(&mut self.assertions, alloc::vec![neg]);
+            let (r, cex) = self.check_sat();
+            self.assertions = saved_a;
+            self.universals = saved_u;
+            match r {
+                SmtResult::Unsat => {}
+                SmtResult::Unknown => return Mbqi::Unknown,
+                SmtResult::Sat if !interp.is_empty() => refuted = true,
+                SmtResult::Sat => {
+                    let Some(mut cm) = cex else {
+                        return Mbqi::Unknown;
+                    };
+                    let mut vals = Vec::new();
+                    for (&v, &x0) in vars.iter().zip(&fresh) {
+                        let s = self.m.get_sort(v);
+                        let lit = if let Some((eb, sb)) = self.fp_format_of(s) {
+                            let Some(bv) = self.fp_to_bv(x0) else {
+                                return Mbqi::Unknown;
+                            };
+                            match cm.eval(&self.m, bv) {
+                                Value::Bv(b, _) => match b.to_u64() {
+                                    Some(bits) => self.mk_fp(bits, eb, sb),
+                                    None => return Mbqi::Unknown,
+                                },
+                                _ => return Mbqi::Unknown,
+                            }
+                        } else {
+                            match cm.eval(&self.m, x0) {
+                                Value::Bool(b) => self.mk_bool(b),
+                                Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+                                Value::Bv(b, w) => self.m.mk_bv_numeral(b, w),
+                                Value::Uninterp(..) => return Mbqi::Unknown,
+                            }
+                        };
+                        vals.push((v, lit));
+                    }
+                    let vals = self.with_fp_bits(vals);
+                    let mut inst = crate::rewriter::substitute(&mut self.m, body, &vals);
+                    if !self.fp_deferred_decls.is_empty() {
+                        inst = self.fpa_blast(inst);
+                        inst = crate::rewriter::substitute(&mut self.m, inst, &vals);
+                    }
+                    instances.push(inst);
+                }
+            }
+        }
+        if !instances.is_empty() {
+            Mbqi::Refine(instances)
+        } else if refuted {
+            Mbqi::Refuted
+        } else {
+            Mbqi::Valid
+        }
+    }
+
+    /// The model value of every free constant of `t` outside `symbolic`, as
+    /// substitution pairs. `None` when one is not a Bool/arithmetic/BV
+    /// constant of the decided goal (its value would not be the model's).
+    fn mbqi_fix_constants(
+        &mut self,
+        t: AstId,
+        model: &mut Model,
+        symbolic: &BTreeSet<AstId>,
+        goal_terms: &BTreeSet<AstId>,
+    ) -> Option<Vec<(AstId, AstId)>> {
+        let mut fix = Vec::new();
+        for n in self.m.postorder(t) {
+            if symbolic.contains(&n) || !self.m.is_uninterp_const(n) {
+                continue;
+            }
+            let s = self.m.get_sort(n);
+            if self.fp_format_of(s).is_some() && self.fp_bv.contains_key(&n) {
+                // An FP constant stands for its bits, fixed separately.
+                continue;
+            }
+            // Outside the goal, only a user constant (or a user FP constant's
+            // bits) is free: an internal one may be defined by axioms the
+            // decided goal did not carry.
+            if !goal_terms.contains(&n) && !self.is_user_constant_or_bits(n) {
+                return None;
+            }
+            let lit = match model.eval(&self.m, n) {
+                Value::Bool(b) if self.m.is_bool_sort(s) => self.mk_bool(b),
+                Value::Num(r, is_int) if self.m.is_arith_sort(s) => self.m.mk_numeral(r, is_int),
+                Value::Bv(b, w) if self.m.bv_sort_width(s).is_some() => self.m.mk_bv_numeral(b, w),
+                _ => return None,
+            };
+            fix.push((n, lit));
+        }
+        Some(fix)
+    }
+
+    /// Is `n` a user-declared constant, or the bit-vector image of a
+    /// user-declared FP constant?
+    fn is_user_constant_or_bits(&self, n: AstId) -> bool {
+        let user = |t: AstId| {
+            self.m
+                .app(t)
+                .is_some_and(|a| a.args.is_empty() && self.funcs.values().any(|&d| d == a.decl))
+        };
+        user(n) || self.fp_bv.iter().any(|(&c, &bv)| bv == n && user(c))
+    }
+
+    /// A few values of `sort` to try as a constant function's result.
+    fn mbqi_sample_values(&mut self, sort: AstId) -> Vec<AstId> {
+        if self.m.is_bool_sort(sort) {
+            alloc::vec![self.m.mk_false(), self.m.mk_true()]
+        } else if self.m.is_arith_sort(sort) {
+            let int = self.m.is_int_sort(sort);
+            [0i64, 1]
+                .iter()
+                .map(|&v| self.m.mk_numeral(Rational::from(v), int))
+                .collect()
+        } else if let Some(w) = self.m.bv_sort_width(sort) {
+            alloc::vec![self.m.mk_bv(0, w), self.m.mk_bv(1, w)]
+        } else if let Some((eb, sb)) = self.fp_format_of(sort) {
+            // +0 and 1.0.
+            let one = ((1u64 << (eb - 1)) - 1) << (sb - 1);
+            alloc::vec![self.mk_fp(0, eb, sb), self.mk_fp(one, eb, sb)]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Is `sort` a user-declared uninterpreted sort?
@@ -34067,6 +34349,23 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn mbqi_decides_theory_sorted_universals() {
+        let script = "
+            (declare-const c (_ BitVec 12))
+            (assert (forall ((x (_ BitVec 12))) (bvule x (bvor c x))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+        // fp-quantifiers-2: the skolem function is interpreted as 1.0.
+        let script = "
+            (assert (forall ((x (_ FloatingPoint 5 11)))
+              (exists ((y (_ FloatingPoint 5 11))) (=> (fp.eq x y) (= x y)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
