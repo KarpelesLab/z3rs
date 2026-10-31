@@ -105,6 +105,35 @@ impl NraOpt {
     }
 }
 
+/// The outcome of [`Context::mbqi_check`].
+enum Mbqi {
+    /// Every universal holds in the candidate model.
+    Valid,
+    /// Counterexample instances to add to the ground goal.
+    Refine(Vec<AstId>),
+    /// Outside the checkable fragment.
+    Unknown,
+}
+
+/// A ground value in an MBQI function table.
+#[derive(Clone, PartialEq, Eq)]
+enum MbqiVal {
+    Bool(bool),
+    Num(Rational, bool),
+    Bv(Int, u32),
+    /// An element of an uninterpreted sort: `(sort, class)`.
+    Elem(AstId, usize),
+}
+
+/// The model interpretation used by [`Context::mbqi_check`]: function tables
+/// `decl → [(argument values, result)]`, a representative ground term per
+/// element, and each uninterpreted sort's elements.
+struct MbqiState {
+    tables: BTreeMap<AstId, Vec<(Vec<MbqiVal>, MbqiVal)>>,
+    reps: BTreeMap<(AstId, usize), AstId>,
+    universe: BTreeMap<AstId, Vec<usize>>,
+}
+
 /// A proven bracket `[lo, hi]` on an objective value (`None` = infinite).
 type Bracket = (Option<Rational>, Option<Rational>);
 
@@ -19687,6 +19716,392 @@ impl Context {
         if let Some(r) = self.try_modular_sat_witness(combined) {
             return r;
         }
+        let (mut res, mut model, mut goal) = self.decide_combined(combined);
+        // Model-based quantifier instantiation (z3's `smt::model_checker`): a
+        // `sat` over un-saturated universals is confirmed when every universal
+        // holds in the candidate model; a counterexample instance refines it.
+        // z3 runs MBQI unless both `smt.mbqi` and `auto-config` are off
+        // (auto-configuration turns it back on).
+        let off = |k: &str| {
+            matches!(
+                self.params.get(k),
+                Some(crate::util::ParamValue::Bool(false))
+            )
+        };
+        let mbqi = !(off("smt.mbqi") && off("auto-config"));
+        if mbqi
+            && res == SmtResult::Sat
+            && !self.universals.is_empty()
+            && !saturated
+            && !self.all_universals_free_macros()
+            && model.is_some()
+        {
+            const MBQI_ROUNDS: usize = 8;
+            for _ in 0..MBQI_ROUNDS {
+                let Some(md) = model.as_mut() else { break };
+                match self.mbqi_check(goal, md) {
+                    Mbqi::Valid => return (SmtResult::Sat, model),
+                    Mbqi::Unknown => break,
+                    Mbqi::Refine(instances) => {
+                        let mut conj = alloc::vec![combined];
+                        conj.extend(instances);
+                        combined = self.m.mk_and(&conj);
+                        (res, model, goal) = self.decide_combined(combined);
+                        if res != SmtResult::Sat {
+                            // Instances are consequences: `unsat` is a refutation.
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // A `sat` result is complete only if instantiation reached a fixpoint
+        // (every ground instance is present — e.g. a finite Datalog domain);
+        // otherwise the un-instantiated cases keep it a sound `unknown`.
+        let gated_sat = res == SmtResult::Sat
+            && !self.universals.is_empty()
+            && !saturated
+            && !self.all_universals_free_macros();
+        // The instantiation engine cannot confirm a `sat` over un-saturated
+        // universals, and may not decide the goal at all. Finite model finding can
+        // still *exhibit* a model when every bound variable ranges over an
+        // uninterpreted sort — and exhibiting one settles `sat` outright.
+        if (gated_sat || res == SmtResult::Unknown)
+            && !self.universals.is_empty()
+            && let Some(m) = self.try_finite_model_find()
+        {
+            return (SmtResult::Sat, Some(m));
+        }
+        if gated_sat {
+            (SmtResult::Unknown, None)
+        } else {
+            (res, model)
+        }
+    }
+
+    /// Model-based check of every universal against the candidate `model` of
+    /// the ground `goal` (z3's `smt::model_checker`). Each user function is
+    /// interpreted by its table of ground applications in `goal` (evaluated in
+    /// `model`) with the first entry's value as the default; uninterpreted-sort
+    /// binders range over the model's elements (the classes of the ground
+    /// terms), Booleans over both values, and arithmetic / bit-vector binders
+    /// stay symbolic. A universal holds iff the negation of its body under that
+    /// interpretation is unsatisfiable; a satisfiable one yields the instance
+    /// at the counterexample, to be added to the ground goal.
+    fn mbqi_check(&mut self, goal: AstId, model: &mut Model) -> Mbqi {
+        const MAX_COMBOS: usize = 64;
+        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        let mut st = MbqiState {
+            tables: BTreeMap::new(),
+            reps: BTreeMap::new(),
+            universe: BTreeMap::new(),
+        };
+        // Tables and element representatives from the ground goal.
+        for t in self.m.postorder(goal) {
+            let sort = self.m.get_sort(t);
+            if self.is_uninterp_sort(sort) {
+                if let Value::Uninterp(_, c) = model.eval(&self.m, t) {
+                    st.reps.entry((sort, c)).or_insert(t);
+                    let u = st.universe.entry(sort).or_default();
+                    if !u.contains(&c) {
+                        u.push(c);
+                    }
+                } else {
+                    return Mbqi::Unknown;
+                }
+            }
+            let Some(app) = self.m.app(t) else { continue };
+            if app.args.is_empty() || !user.contains(&app.decl) {
+                continue;
+            }
+            let (decl, args) = (app.decl, app.args.clone());
+            let key: Option<Vec<MbqiVal>> =
+                args.iter().map(|&a| self.mbqi_value(model, a)).collect();
+            let (Some(key), Some(val)) = (key, self.mbqi_value(model, t)) else {
+                return Mbqi::Unknown;
+            };
+            let tab = st.tables.entry(decl).or_default();
+            match tab.iter().find(|(k, _)| *k == key) {
+                Some((_, v)) if *v != val => return Mbqi::Unknown, // inconsistent table
+                Some(_) => {}
+                None => tab.push((key, val)),
+            }
+        }
+        // The interpretation must satisfy the ground goal itself.
+        let mut memo = BTreeMap::new();
+        let g = self.mbqi_modelize(goal, model, &st, &[], &mut memo);
+        match g.map(|g| crate::rewriter::simplify(&mut self.m, g)) {
+            Some(g) if self.m.is_true(g) => {}
+            _ => return Mbqi::Unknown,
+        }
+        let universals = self.universals.clone();
+        let mut instances = Vec::new();
+        for (vars, body) in universals {
+            // Enumerated binders (uninterpreted / Bool) and symbolic ones.
+            let mut domains: Vec<(AstId, Vec<AstId>)> = Vec::new();
+            for &v in &vars {
+                let sort = self.m.get_sort(v);
+                if self.m.is_bool_sort(sort) {
+                    domains.push((v, alloc::vec![self.m.mk_true(), self.m.mk_false()]));
+                } else if self.is_uninterp_sort(sort) {
+                    let Some(u) = st.universe.get(&sort) else {
+                        return Mbqi::Unknown;
+                    };
+                    domains.push((v, u.iter().map(|&c| st.reps[&(sort, c)]).collect()));
+                } else if !self.m.is_arith_sort(sort) && self.m.bv_sort_width(sort).is_none() {
+                    return Mbqi::Unknown; // datatypes, arrays, strings, …
+                }
+            }
+            let combos: usize = domains.iter().map(|(_, d)| d.len()).product();
+            if combos > MAX_COMBOS {
+                return Mbqi::Unknown;
+            }
+            let symbolic: Vec<AstId> = vars
+                .iter()
+                .copied()
+                .filter(|v| !domains.iter().any(|(d, _)| d == v))
+                .collect();
+            for idx in 0..combos {
+                let mut rem = idx;
+                let subst: Vec<(AstId, AstId)> = domains
+                    .iter()
+                    .map(|(v, d)| {
+                        let e = d[rem % d.len()];
+                        rem /= d.len();
+                        (*v, e)
+                    })
+                    .collect();
+                let inst = crate::rewriter::substitute(&mut self.m, body, &subst);
+                let mut memo = BTreeMap::new();
+                let Some(phi) = self.mbqi_modelize(inst, model, &st, &symbolic, &mut memo) else {
+                    return Mbqi::Unknown;
+                };
+                let phi = crate::rewriter::simplify(&mut self.m, phi);
+                if self.m.is_true(phi) {
+                    continue;
+                }
+                let neg = self.m.mk_not(phi);
+                let saved_u = core::mem::take(&mut self.universals);
+                let saved_a = core::mem::replace(&mut self.assertions, alloc::vec![neg]);
+                let (r, cex) = self.check_sat();
+                self.assertions = saved_a;
+                self.universals = saved_u;
+                match r {
+                    SmtResult::Unsat => {}
+                    SmtResult::Sat => {
+                        // The instance at the counterexample values.
+                        let Some(mut cm) = cex else {
+                            return Mbqi::Unknown;
+                        };
+                        let mut vals = subst.clone();
+                        for &v in &symbolic {
+                            let lit = match cm.eval(&self.m, v) {
+                                Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+                                Value::Bv(b, w) => self.m.mk_bv_numeral(b, w),
+                                _ => return Mbqi::Unknown,
+                            };
+                            vals.push((v, lit));
+                        }
+                        instances.push(crate::rewriter::substitute(&mut self.m, body, &vals));
+                        break;
+                    }
+                    SmtResult::Unknown => return Mbqi::Unknown,
+                }
+            }
+        }
+        if instances.is_empty() {
+            Mbqi::Valid
+        } else {
+            Mbqi::Refine(instances)
+        }
+    }
+
+    /// Is `sort` a user-declared uninterpreted sort?
+    fn is_uninterp_sort(&self, sort: AstId) -> bool {
+        self.m
+            .sort(sort)
+            .is_some_and(|s| s.info.family_id == crate::ast::NULL_FAMILY_ID)
+            && !self.m.is_bool_sort(sort)
+            && !self.enums.contains_key(&sort)
+            && !self.datatypes.contains_key(&sort)
+    }
+
+    /// The model value of a ground term as an MBQI table key.
+    fn mbqi_value(&self, model: &mut Model, t: AstId) -> Option<MbqiVal> {
+        Some(match model.eval(&self.m, t) {
+            Value::Bool(b) => MbqiVal::Bool(b),
+            Value::Num(r, i) => MbqiVal::Num(r, i),
+            Value::Bv(b, w) => MbqiVal::Bv(b, w),
+            Value::Uninterp(s, c) => MbqiVal::Elem(s, c),
+        })
+    }
+
+    /// `t` (ground except for the `symbolic` binders) under the model: user
+    /// constants become their values, user function applications their table
+    /// (an `ite` over the entries when an argument is symbolic), and terms of
+    /// an uninterpreted sort are resolved to their element (only `=` /
+    /// `distinct` / function arguments may consume them). `None` outside
+    /// that fragment.
+    fn mbqi_modelize(
+        &mut self,
+        t: AstId,
+        model: &mut Model,
+        st: &MbqiState,
+        symbolic: &[AstId],
+        memo: &mut BTreeMap<AstId, AstId>,
+    ) -> Option<AstId> {
+        if let Some(&r) = memo.get(&t) {
+            return Some(r);
+        }
+        let sort = self.m.get_sort(t);
+        let uninterp = self.is_uninterp_sort(sort);
+        let is_ground =
+            |m: &AstManager, t: AstId| !m.postorder(t).iter().any(|v| symbolic.contains(v));
+        let out = if symbolic.contains(&t)
+            || self.m.as_numeral(t).is_some()
+            || self.m.bv_numeral_value(t).is_some()
+        {
+            t
+        } else if uninterp {
+            // An element: must be ground; represented by its class representative.
+            if !is_ground(&self.m, t) {
+                return None;
+            }
+            let MbqiVal::Elem(s, c) = self.mbqi_value(model, t)? else {
+                return None;
+            };
+            *st.reps.get(&(s, c))?
+        } else {
+            // Anything but an application (a nested quantifier / variable) is
+            // outside the fragment.
+            let app = self.m.app(t)?;
+            let (decl, args) = (app.decl, app.args.clone());
+            let user = self.funcs.values().any(|&d| d == decl);
+            let null_family = self
+                .m
+                .func_decl(decl)
+                .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID);
+            if args.is_empty() && null_family {
+                // A constant (user-declared or internal): its model value.
+                let v = self.mbqi_value(model, t)?;
+                let lit = self.mbqi_literal(&v, st)?;
+                memo.insert(t, lit);
+                return Some(lit);
+            }
+            let mut nargs = Vec::with_capacity(args.len());
+            for &a in &args {
+                nargs.push(self.mbqi_modelize(a, model, st, symbolic, memo)?);
+            }
+            if user {
+                let tab = st.tables.get(&decl);
+                let default = match tab.and_then(|t| t.first()) {
+                    Some((_, v)) => self.mbqi_literal(v, st)?,
+                    None => self.mbqi_default(sort, st)?,
+                };
+                let mut acc = default;
+                for (key, val) in tab.map(|t| t.as_slice()).unwrap_or(&[]).iter().rev() {
+                    let mut conds = Vec::with_capacity(key.len());
+                    let mut possible = true;
+                    for (&a, k) in nargs.iter().zip(key) {
+                        match k {
+                            MbqiVal::Elem(..) => {
+                                // `a` is a representative: compare statically.
+                                let ka = self.mbqi_value(model, a)?;
+                                if ka != *k {
+                                    possible = false;
+                                }
+                            }
+                            _ => {
+                                let lit = self.mbqi_literal(k, st)?;
+                                conds.push(self.m.mk_eq(a, lit));
+                            }
+                        }
+                    }
+                    if !possible {
+                        continue;
+                    }
+                    let v = self.mbqi_literal(val, st)?;
+                    acc = if conds.is_empty() {
+                        v
+                    } else {
+                        let c = if conds.len() == 1 {
+                            conds[0]
+                        } else {
+                            self.m.mk_and(&conds)
+                        };
+                        self.m.mk_ite(c, v, acc)
+                    };
+                }
+                acc
+            } else if null_family {
+                return None; // an internal uninterpreted function
+            } else if (self.m.is_eq(t) || self.m.is_distinct(t))
+                && args
+                    .first()
+                    .is_some_and(|&a| self.is_uninterp_sort(self.m.get_sort(a)))
+            {
+                // Element (dis)equality is decided by the classes.
+                let mut vals = Vec::with_capacity(nargs.len());
+                for &a in &nargs {
+                    vals.push(self.mbqi_value(model, a)?);
+                }
+                let all_eq = vals.windows(2).all(|w| w[0] == w[1]);
+                let pairwise_distinct =
+                    (0..vals.len()).all(|i| (i + 1..vals.len()).all(|j| vals[i] != vals[j]));
+                if if self.m.is_eq(t) {
+                    all_eq
+                } else {
+                    pairwise_distinct
+                } {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                }
+            } else if nargs == args {
+                t
+            } else {
+                self.m.mk_app(decl, &nargs)
+            }
+        };
+        memo.insert(t, out);
+        Some(out)
+    }
+
+    /// The AST literal of a table value (an element as its representative).
+    fn mbqi_literal(&mut self, v: &MbqiVal, st: &MbqiState) -> Option<AstId> {
+        Some(match v {
+            MbqiVal::Bool(b) => {
+                if *b {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                }
+            }
+            MbqiVal::Num(r, i) => self.m.mk_numeral(r.clone(), *i),
+            MbqiVal::Bv(b, w) => self.m.mk_bv_numeral(b.clone(), *w),
+            MbqiVal::Elem(s, c) => *st.reps.get(&(*s, *c))?,
+        })
+    }
+
+    /// A default value of `sort` for a function with an empty table.
+    fn mbqi_default(&mut self, sort: AstId, st: &MbqiState) -> Option<AstId> {
+        if self.m.is_bool_sort(sort) {
+            Some(self.m.mk_false())
+        } else if self.m.is_arith_sort(sort) {
+            let int = self.m.is_int_sort(sort);
+            Some(self.m.mk_numeral(Rational::from_integer(Int::from(0)), int))
+        } else if let Some(w) = self.m.bv_sort_width(sort) {
+            Some(self.m.mk_bv_numeral(Int::from(0), w))
+        } else {
+            let c = *st.universe.get(&sort)?.first()?;
+            st.reps.get(&(sort, c)).copied()
+        }
+    }
+
+    /// Decide a combined ground goal (assertions plus universal instances):
+    /// lift, add the theory axioms and run [`Self::decide`]. Returns the
+    /// verdict, the model and the axiom-laden goal that was decided.
+    fn decide_combined(&mut self, combined: AstId) -> (SmtResult, Option<Model>, AstId) {
         let lifted = self.lift(combined);
         // For a divisor the goal proves nonzero, add the Euclidean identity
         // `a = d·q + r` UNCONDITIONALLY: the lifted form only guards it by `d ≠ 0`
@@ -19719,28 +20134,7 @@ impl Context {
         self.witness_base = Some(lifted);
         let (res, model) = self.decide(goal);
         self.witness_base = None;
-        // A `sat` result is complete only if instantiation reached a fixpoint
-        // (every ground instance is present — e.g. a finite Datalog domain);
-        // otherwise the un-instantiated cases keep it a sound `unknown`.
-        let gated_sat = res == SmtResult::Sat
-            && !self.universals.is_empty()
-            && !saturated
-            && !self.all_universals_free_macros();
-        // The instantiation engine cannot confirm a `sat` over un-saturated
-        // universals, and may not decide the goal at all. Finite model finding can
-        // still *exhibit* a model when every bound variable ranges over an
-        // uninterpreted sort — and exhibiting one settles `sat` outright.
-        if (gated_sat || res == SmtResult::Unknown)
-            && !self.universals.is_empty()
-            && let Some(m) = self.try_finite_model_find()
-        {
-            return (SmtResult::Sat, Some(m));
-        }
-        if gated_sat {
-            (SmtResult::Unknown, None)
-        } else {
-            (res, model)
-        }
+        (res, model, goal)
     }
 
     /// The defining head function of a *free macro* universal `∀x̄. body`:
@@ -32113,6 +32507,32 @@ mod tests {
     }
 
     #[test]
+    fn mbqi_confirms_models_of_universals() {
+        // ∀x y. p(x+y+2) with p(a+b+2): the model p ≡ true satisfies it.
+        let script = "(declare-fun p (Int) Bool)(declare-const a Int)(declare-const b Int)\
+             (assert (forall ((x Int) (y Int)) (p (+ x y 2))))(assert (p (+ a b 2)))(check-sat)";
+        assert_eq!(run(script).unwrap(), ["sat"]);
+        // A counterexample refines the candidate: ∀x. f(x) > x with f(c) = c.
+        assert_eq!(
+            run("(declare-fun f (Int) Int)(declare-const c Int)\
+                 (assert (forall ((x Int)) (> (f x) x)))(assert (= (f c) c))(check-sat)")
+            .unwrap(),
+            ["unsat"]
+        );
+        // Over an uninterpreted sort the binder ranges over the model's elements.
+        assert_eq!(
+            run("(declare-sort U 0)(declare-fun g (U) U)(declare-const u U)\
+                 (assert (forall ((y U)) (= (g y) y)))(assert (= (g u) u))(check-sat)")
+            .unwrap(),
+            ["sat"]
+        );
+        // With smt.mbqi and auto-config both off, z3 leaves it unknown.
+        let off =
+            alloc::format!("(set-option :auto-config false)(set-option :smt.mbqi false){script}");
+        assert_eq!(run(&off).unwrap(), ["unknown"]);
+    }
+
+    #[test]
     fn nonlinear_optimization_is_exact() {
         let obj = |script: &str| run(script).unwrap();
         // Attained irrational optimum, with the algebraic model.
@@ -32484,12 +32904,12 @@ mod tests {
             .unwrap(),
             alloc::vec!["unsat"]
         );
-        // Non-unit coefficient falls back (sound unknown, not a wrong verdict).
+        // Non-unit coefficient: no QE, but MBQI confirms a model (a = 0).
         assert_eq!(
             run("(declare-const a Int)\
                  (assert (forall ((x Int)) (=> (<= (* 2 x) a) (<= x 3))))(check-sat)")
             .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["sat"]
         );
     }
 
@@ -32635,12 +33055,12 @@ mod tests {
 
     #[test]
     fn quantifiers_accepted_soundly() {
-        // A non-linear quantified body is accepted (not a parse error) and
-        // answered with a sound `unknown` (no QE, no saturation).
+        // A non-linear quantified body is accepted (not a parse error); MBQI
+        // confirms the model x = -1 (y² > -1 for every y, by the CAD).
         assert_eq!(
             run("(declare-const x Int)(assert (forall ((y Int)) (> (* y y) x)))(check-sat)")
                 .unwrap(),
-            alloc::vec!["unknown"]
+            alloc::vec!["sat"]
         );
         // A ground goal alongside a quantifier still decides.
         assert_eq!(
