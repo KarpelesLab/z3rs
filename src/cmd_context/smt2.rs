@@ -17420,8 +17420,8 @@ impl Context {
     /// z3's `mk_fma`. `None` for unsupported format/rm or unavailable bits.
     fn fp_fma_bv(&mut self, rm: AstId, x: AstId, y: AstId, z: AstId) -> Option<AstId> {
         let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
-        if eb < 2 || sb < 5 || eb > sb {
-            return None; // sb ≥ 5 ⇒ z3's `too_short` padding is 0
+        if eb < 2 || sb < 2 || eb > sb {
+            return None;
         }
         let rm_c = self.rm_code(rm)?;
         let rm_is_to_neg = rm_c == 3;
@@ -17606,18 +17606,30 @@ impl Context {
         let res_exp = self.m.mk_bvsub(res_exp, renorm);
         let renorm_ext = self.m.mk_bv_zero_extend(2 * sb + 3 - eb, renorm); // 2sb+5
         let sig_abs = self.m.mk_bvshl(sig_abs, renorm_ext); // 2sb+5
-        // Round-significand assembly (too_short = 0).
-        let sticky_h1 = self.m.mk_bv_extract(sb - 2, 0, sig_abs); // sb-1
-        let sig_abs_h1 = self.m.mk_bv_extract(2 * sb + 4, sb - 1, sig_abs); // sb+6
-        let sh1z = self.m.mk_bv(0, sb - 1);
+        // Round-significand assembly; short significands are zero-padded.
+        let ts = if sb < 5 { 6 - sb + 1 } else { 0 };
+        let sig_abs = if ts > 0 {
+            let pad = self.m.mk_bv(0, ts);
+            self.m.mk_bv_concat(sig_abs, pad)
+        } else {
+            sig_abs
+        };
+        let sticky_h1 = self.m.mk_bv_extract(sb + ts - 2, 0, sig_abs); // sb+ts-1
+        let sig_abs_h1 = self.m.mk_bv_extract(2 * sb + ts + 4, sb + ts - 1, sig_abs); // sb+6
+        let sh1z = self.m.mk_bv(0, sb + ts - 1);
         let sh1_eq = self.m.mk_eq(sticky_h1, sh1z);
         let sh1_nz = self.m.mk_not(sh1_eq);
         let sh1_bit = self.m.mk_ite(sh1_nz, one1, zero1);
         let sh1_red = self.m.mk_bv_zero_extend(sb + 5, sh1_bit); // sb+6
         let h1_f = self.m.mk_bvor(sig_abs_h1, sh1_red); // sb+6
         let res_sig_1 = self.m.mk_bv_extract(sb + 3, 0, h1_f); // sb+4
-        let sig_abs_h2 = self.m.mk_bv_extract(2 * sb + 4, sb, sig_abs); // sb+5
-        let sh2_red = self.m.mk_bv_zero_extend(sb + 4, sh1_bit); // sb+5 (z3 uses sticky_h1)
+        let sticky_h2 = self.m.mk_bv_extract(sb + ts - 1, 0, sig_abs); // sb+ts
+        let sig_abs_h2 = self.m.mk_bv_extract(2 * sb + ts + 4, sb + ts, sig_abs); // sb+5
+        let sh2z = self.m.mk_bv(0, sb + ts);
+        let sh2_eq = self.m.mk_eq(sticky_h2, sh2z);
+        let sh2_nz = self.m.mk_not(sh2_eq);
+        let sh2_bit = self.m.mk_ite(sh2_nz, one1, zero1);
+        let sh2_red = self.m.mk_bv_zero_extend(sb + 4, sh2_bit); // sb+5
         let h2_or = self.m.mk_bvor(sig_abs_h2, sh2_red); // sb+5
         let h2_f = self.m.mk_bv_zero_extend(1, h2_or); // sb+6
         let res_sig_2 = self.m.mk_bv_extract(sb + 3, 0, h2_f); // sb+4
