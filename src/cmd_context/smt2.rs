@@ -22676,6 +22676,27 @@ impl Context {
         self.enums.get(&sort).cloned()
     }
 
+    /// Eliminate a nested `(forall|exists xs. φ)` over linear arithmetic by
+    /// [`Self::qe_forall`] / [`Self::qe_exists`]; `None` when the body is
+    /// outside that fragment (it still mentions an undecided quantifier, a
+    /// binder under a function, …).
+    fn try_nested_qe(&mut self, is_forall: bool, binders: &SExpr, body: &SExpr) -> Option<AstId> {
+        let (vars, bodyt) = self.parse_quantifier(binders, body).ok()?;
+        if self
+            .m
+            .postorder(bodyt)
+            .iter()
+            .any(|t| self.quant_atoms.contains(t))
+        {
+            return None;
+        }
+        if is_forall {
+            self.qe_forall(&vars, bodyt)
+        } else {
+            self.qe_exists(&vars, bodyt)
+        }
+    }
+
     /// Try to reduce a nested `(forall|exists xs. φ)` to a ground term without the
     /// opaque `unknown` sentinel: drop bound vars absent from `φ` (sorts are
     /// non-empty, so `Qx:S. φ ≡ φ` when `x ∉ φ`), and if the survivors range over
@@ -29236,6 +29257,14 @@ impl Context {
                     {
                         return Ok(t);
                     }
+                    // A nested quantifier over linear arithmetic is eliminated
+                    // exactly (inner quantifiers first: parsing the body already
+                    // reduced them), leaving a quantifier-free formula.
+                    if l.len() == 3
+                        && let Some(t) = self.try_nested_qe(head == "forall", &l[1], &l[2])
+                    {
+                        return Ok(t);
+                    }
                     // Quantifiers are not decided yet. Sound over-approximation:
                     // replace the quantified formula by a fresh, unconstrained
                     // Boolean sentinel; any goal that mentions one forces a sound
@@ -33780,6 +33809,26 @@ mod tests {
               :status unsat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn nested_linear_quantifiers_are_eliminated() {
+        // z3 regression 2557: exists/forall/exists over linear reals.
+        let script = "
+            (assert (exists ((a Real)) (forall ((b Real)) (exists ((c Real))
+              (and (< (+ a (* 2 c)) 0) (or (not (= a 0)) (< b 0))
+                   (not (= (+ b c) 0)) (> c 0))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+        let script = "
+            (declare-const x Real)
+            (assert (forall ((y Real)) (exists ((z Real)) (and (> z y) (< z (+ y x))))))
+            (check-sat)
+            (assert (<= x 0))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
