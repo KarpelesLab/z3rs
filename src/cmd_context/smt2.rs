@@ -24166,11 +24166,13 @@ impl Context {
                     for binding in self.ematch_set(set, &vs, &by_decl) {
                         let subst: Vec<(AstId, AstId)> =
                             vars.iter().map(|&v| (v, binding[&v])).collect();
+                        let subst = self.with_fp_bits(subst);
                         let mut raw = substitute(&mut self.m, *body, &subst);
                         // Lower any deferred FP nodes now that the binder is a
                         // concrete FP term (z3's fpa2bv, applied per instance).
                         if !self.fp_deferred_decls.is_empty() {
                             raw = self.fpa_blast(raw);
+                            raw = substitute(&mut self.m, raw, &subst);
                         }
                         // Alternate arithmetic/Boolean simplification with
                         // datatype folding so selector/tester chains collapse.
@@ -24285,11 +24287,13 @@ impl Context {
                 }
                 for combo in combos {
                     let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(combo).collect();
+                    let subst = self.with_fp_bits(subst);
                     let mut raw = substitute(&mut self.m, *body, &subst);
                     // Lower any deferred FP nodes now that the binder is a concrete
                     // FP term (z3's fpa2bv, applied per instance).
                     if !self.fp_deferred_decls.is_empty() {
                         raw = self.fpa_blast(raw);
+                        raw = substitute(&mut self.m, raw, &subst);
                     }
                     // Simplify the instance: constant `ite` conditions and ground
                     // arithmetic fold away, so recursive definitions bottom out
@@ -24337,6 +24341,23 @@ impl Context {
             }
         }
         (instances, false) // ran out of rounds: not saturated
+    }
+
+    /// Extend a binder substitution with each FP binder's bit-vector image:
+    /// FP operations over a binder were bit-blasted at parse time against
+    /// `fp_to_bv(binder)`, which plain substitution leaves untouched (and which
+    /// only enters the instance once `fpa_blast` lowers a deferred predicate,
+    /// so the substitution is applied again after it).
+    fn with_fp_bits(&mut self, mut subst: Vec<(AstId, AstId)>) -> Vec<(AstId, AstId)> {
+        for i in 0..subst.len() {
+            let (v, val) = subst[i];
+            if let Some(&bv) = self.fp_bv.get(&v)
+                && let Some(bits) = self.fp_to_bv(val)
+            {
+                subst.push((bv, bits));
+            }
+        }
+        subst
     }
 
     /// Does `body` have an infinite arithmetic (Int/Real) binder occurring inside
@@ -34035,6 +34056,17 @@ mod tests {
         let out =
             run("(assert (forall ((x (_ BitVec 16))) (bvule x #xffff))) (check-sat)").unwrap();
         assert_ne!(out, alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn fp_universal_instances_reach_blasted_operations() {
+        // `fp.max a b` is bit-blasted over b's bits; the +oo instance refutes it.
+        let script = "
+            (declare-fun a () Float32)
+            (assert (forall ((b Float32)) (not (fp.isPositive (fp.max a b)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
