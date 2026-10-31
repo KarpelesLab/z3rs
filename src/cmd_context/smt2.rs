@@ -19941,9 +19941,7 @@ impl Context {
                 if self.m.is_bool_sort(sort) {
                     domains.push((v, alloc::vec![self.m.mk_true(), self.m.mk_false()]));
                 } else if self.is_uninterp_sort(sort) {
-                    let Some(u) = st.universe.get(&sort) else {
-                        return None;
-                    };
+                    let u = st.universe.get(&sort)?;
                     domains.push((v, u.iter().map(|&c| st.reps[&(sort, c)]).collect()));
                 } else if !self.m.is_arith_sort(sort) && self.m.bv_sort_width(sort).is_none() {
                     return None; // datatypes, arrays, strings, …
