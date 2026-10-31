@@ -2406,6 +2406,10 @@ struct Context {
     /// The five `RoundingMode` constants (RNE, RNA, RTP, RTN, RTZ), built with
     /// the sort.
     rm_modes: Vec<AstId>,
+    /// Axioms valid in every model of their theory (the product sign and square
+    /// rules): a decision procedure that cannot read one may ignore it without
+    /// putting a `sat` at risk.
+    valid_axioms: BTreeSet<AstId>,
     /// Floating-point constants: term → `(raw bits, eb, sb)`. Only `Float64`
     /// `(eb, sb) = (11, 53)` constants are folded (via `f64`); other formats and
     /// symbolic values are gated to a sound `unknown`.
@@ -3408,6 +3412,7 @@ impl Context {
             fp_from_bv: BTreeMap::new(),
             rm_sort: None,
             rm_modes: Vec::new(),
+            valid_axioms: BTreeSet::new(),
             fp_of: BTreeMap::new(),
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
@@ -25492,7 +25497,9 @@ impl Context {
         axioms.extend(self.record_axioms(lifted));
         axioms.extend(self.datatype_axioms(lifted));
         axioms.extend(self.string_axioms(lifted));
-        axioms.extend(self.square_axioms(lifted));
+        let squares = self.square_axioms(lifted);
+        self.valid_axioms.extend(squares.iter().copied());
+        axioms.extend(squares);
         axioms.extend(self.product_cancel_axioms(lifted));
         axioms.extend(self.power_zero_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
@@ -27680,18 +27687,18 @@ impl Context {
     }
 
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
-        use crate::nlsat::{Constraint, Rel};
         let mut conjuncts = Vec::new();
         self.icp_flatten_and(goal, &mut conjuncts);
         let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
-        let mut constraints: Vec<(crate::math::polynomial::Polynomial, Rel)> = Vec::new();
+        let mut constraints: Vec<(crate::math::polynomial::Polynomial, crate::nlsat::Rel)> =
+            Vec::new();
         // Track whether any conjunct failed to become a polynomial constraint. A
         // dropped atom can only *further* restrict the system, so deciding over the
         // retained subset is sound for `unsat` (a subset unsat refutes the whole)
         // but NOT for `sat` (the dropped atom might contradict the witness) —
         // `f2`: `1−c−b+a = 4c(a−b) ∧ a = b+9` reduces to `37c = 10` (unsat), but if
         // the nonlinear equality is dropped only `a = b+9` remains ⇒ spurious sat.
-        let mut dropped = false;
+        let mut dropped: Vec<AstId> = Vec::new();
         for atom in conjuncts {
             let (negated, a) = if self.m.is_not(atom) {
                 (true, self.m.app_args(atom)[0])
@@ -27700,6 +27707,8 @@ impl Context {
             };
             if let Some(c) = self.icp_atom(a, negated, &mut var_map) {
                 constraints.push((c.poly, c.rel));
+            } else if self.valid_axioms.contains(&atom) {
+                // A valid fact holds at any witness.
             } else if self
                 .m
                 .postorder(a)
@@ -27709,24 +27718,109 @@ impl Context {
                 // Only a dropped atom that mentions an arith variable can constrain
                 // the system and thus invalidate a `sat`; a pure-boolean (or other
                 // arith-free) conjunct does not, so it is safe to ignore.
-                dropped = true;
+                dropped.push(atom);
             }
         }
         if var_map.is_empty() || constraints.is_empty() {
             return None;
         }
-        // `int_of[idx]` = is this variable integer-sorted? Each must be a free
-        // uninterpreted constant, or a *free read* `(select a i)` whose array is a
-        // free constant read exactly once (so the read is unconstrained — sound to
-        // treat as an independent variable in both directions).
         let free_reads = self.free_array_reads(goal);
+        let int_of = self.nl_int_of(&var_map, &free_reads)?;
+        if let Some(b) = self.nl_decide(constraints.clone(), &int_of, dropped.is_empty(), 400) {
+            return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
+        }
+        // Prove `sat` of a strengthening instead: each dropped implication is
+        // replaced by constraints that imply it, so a witness of the stronger
+        // system satisfies the goal.
+        if dropped.is_empty() {
+            return None;
+        }
+        for atom in dropped {
+            for (p, r) in self.nl_strengthen(atom, &mut var_map)? {
+                constraints.push((p, r));
+            }
+        }
+        let int_of = self.nl_int_of(&var_map, &free_reads)?;
+        // Sampling only (the complete procedures already ran above), on a
+        // small budget: the strengthened system has more variables.
+        match self.nl_decide(constraints, &int_of, true, 0) {
+            Some(true) => Some(SmtResult::Sat),
+            _ => None,
+        }
+    }
+
+    /// Whether each polynomial variable is integer-sorted. Each must be a free
+    /// uninterpreted constant, or a *free read* `(select a i)` whose array is a
+    /// free constant read exactly once (so the read is unconstrained — sound to
+    /// treat as an independent variable in both directions).
+    fn nl_int_of(
+        &self,
+        var_map: &BTreeMap<AstId, u32>,
+        free_reads: &BTreeSet<AstId>,
+    ) -> Option<BTreeMap<u32, bool>> {
         let mut int_of: BTreeMap<u32, bool> = BTreeMap::new();
-        for (&ast, &idx) in &var_map {
+        for (&ast, &idx) in var_map {
             if !self.m.is_uninterp_const(ast) && !free_reads.contains(&ast) {
                 return None;
             }
             int_of.insert(idx, self.m.is_int_sort(self.m.get_sort(ast)));
         }
+        Some(int_of)
+    }
+
+    /// Polynomial constraints implying the implication `atom` (`H ⇒ C` over
+    /// arithmetic atoms): the negation of an equality in `H` when there is one
+    /// (a congruence axiom's premise), else `H ∧ C` (a guarded definition
+    /// such as `d ≠ 0 ⇒ q·d = n`). `None` for any other shape.
+    fn nl_strengthen(
+        &self,
+        atom: AstId,
+        var_map: &mut BTreeMap<AstId, u32>,
+    ) -> Option<Vec<(crate::math::polynomial::Polynomial, crate::nlsat::Rel)>> {
+        if !self.m.is_implies(atom) {
+            return None;
+        }
+        let args = self.m.app_args(atom);
+        let (hyp, concl) = (args[0], args[1]);
+        let hyps: Vec<AstId> = if self.m.is_and(hyp) {
+            self.m.app_args(hyp).to_vec()
+        } else {
+            alloc::vec![hyp]
+        };
+        let lit = |ctx: &Self, t: AstId, neg: bool, vm: &mut BTreeMap<AstId, u32>| {
+            let (n, a) = if ctx.m.is_not(t) {
+                (!neg, ctx.m.app_args(t)[0])
+            } else {
+                (neg, t)
+            };
+            ctx.icp_atom(a, n, vm).map(|c| (c.poly, c.rel))
+        };
+        if let Some(&eq) = hyps.iter().find(|&&h| self.m.is_eq(h)) {
+            return Some(alloc::vec![lit(self, eq, true, var_map)?]);
+        }
+        let mut out = Vec::new();
+        for h in hyps {
+            out.push(lit(self, h, false, var_map)?);
+        }
+        out.push(lit(self, concl, false, var_map)?);
+        Some(out)
+    }
+
+    /// Decide a polynomial system: linear elimination, then the univariate,
+    /// bounded-integer, CAD and nlsat procedures, then sampling for `sat`.
+    /// `Some(true)` only when `sat_ok`. `samples` is the sampling budget per
+    /// free variable; 0 = a small budget: CAD/nlsat only up to 3 variables and
+    /// no candidate grid.
+    fn nl_decide(
+        &self,
+        constraints: Vec<(crate::math::polynomial::Polynomial, crate::nlsat::Rel)>,
+        int_of: &BTreeMap<u32, bool>,
+        sat_ok: bool,
+        samples: usize,
+    ) -> Option<bool> {
+        let budgeted = samples == 0;
+        let samples = if budgeted { 24 } else { samples };
+        use crate::nlsat::Constraint;
         let all_int = int_of.values().all(|&b| b);
 
         // Eliminate linearly-determined variables. Integer variables are only
@@ -27745,6 +27839,8 @@ impl Context {
             .iter()
             .map(|v| *int_of.get(v).unwrap_or(&false))
             .collect();
+        // On a budget, the complete procedures still run on up to 3 variables.
+        let complete = !budgeted || k <= 3;
 
         let verdict = if k <= 1 {
             let is_int = remaining_int.first().copied().unwrap_or(true);
@@ -27765,18 +27861,15 @@ impl Context {
         // A dropped conjunct invalidates every `sat` conclusion below (the retained
         // subset is weaker), while `unsat` of the subset still refutes the whole.
         if let Some(b) = verdict {
-            if b && dropped {
-                return None;
-            }
-            return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
+            return (!b || sat_ok).then_some(b);
         }
         // Multivariate residual not otherwise decided. If it is over the reals
         // (no integer variables — CAD decides ℝ, not ℤ), invoke the complete CAD
         // decision procedure; it returns a definite verdict or declines soundly.
-        if k >= 2 && remaining_int.iter().all(|&b| !b) {
+        if complete && k >= 2 && remaining_int.iter().all(|&b| !b) {
             match crate::nlsat::cad::cad_sat(&reduced, k) {
-                Some(true) if !dropped => return Some(SmtResult::Sat),
-                Some(false) => return Some(SmtResult::Unsat),
+                Some(true) if sat_ok => return Some(true),
+                Some(false) => return Some(false),
                 _ => {}
             }
             // Model-constructing nlsat search decides cases upfront CAD declines
@@ -27784,8 +27877,8 @@ impl Context {
             // witness re-verified exactly against every atom, `Unsat` is a complete
             // cover, and it declines (no verdict) on any inexactness or cap.
             match crate::nlsat::nlsat_decide(k, &reduced) {
-                crate::nlsat::NlResult::Sat(_) if !dropped => return Some(SmtResult::Sat),
-                crate::nlsat::NlResult::Unsat => return Some(SmtResult::Unsat),
+                crate::nlsat::NlResult::Sat(_) if sat_ok => return Some(true),
+                crate::nlsat::NlResult::Unsat => return Some(false),
                 _ => {}
             }
         }
@@ -27793,8 +27886,12 @@ impl Context {
         // candidate values and deciding the last univariately (a verified
         // witness — sound). Skipped when a conjunct was dropped (the witness would
         // not be checked against it).
-        if !dropped && k >= 2 && crate::nlsat::elim::sat_by_fixing(&reduced, &remaining_int) {
-            return Some(SmtResult::Sat);
+        if sat_ok
+            && k >= 2
+            && (!budgeted || (k >= 5 && reduced.len() <= 16))
+            && crate::nlsat::elim::sat_by_fixing(&reduced, &remaining_int, samples)
+        {
+            return Some(true);
         }
         None
     }
@@ -34363,6 +34460,19 @@ mod tests {
         let script = "
             (assert (forall ((x (_ FloatingPoint 5 11)))
               (exists ((y (_ FloatingPoint 5 11))) (=> (fp.eq x y) (= x y)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nonlinear_division_sat_by_strengthening() {
+        // z3 regression 3319: the guarded quotient definitions are dropped by
+        // the polynomial view; a strengthened system yields the witness.
+        let script = "
+            (declare-const r0 Real) (declare-const r2 Real)
+            (declare-const r4 Real) (declare-const r5 Real)
+            (assert (< 0.0 r0 (/ r2 (* (/ r4 (/ 0.9 r5)) r0 7.0 r0))))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);

@@ -155,11 +155,12 @@ pub fn remap_vars(constraints: &[(Polynomial, Rel)]) -> (Vec<(Polynomial, Rel)>,
 /// `false` means "not proven sat here", never "unsat".
 ///
 /// `is_int[i]` gives the sort of variable `i` (indices `0..k`). Only small
-/// systems (`k ≤ 4`) with a bounded candidate product are attempted.
-pub fn sat_by_fixing(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
+/// systems (`k ≤ 4`) with a bounded candidate product are attempted; larger
+/// ones are sampled, `samples` attempts per free variable.
+pub fn sat_by_fixing(constraints: &[(Polynomial, Rel)], is_int: &[bool], samples: usize) -> bool {
     let k = is_int.len();
     if (5..=12).contains(&k) {
-        return sat_by_sampling(constraints, is_int);
+        return sat_by_sampling(constraints, is_int, samples);
     }
     if !(2..=4).contains(&k) {
         return false;
@@ -229,8 +230,7 @@ pub fn sat_by_fixing(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool
 /// `{0, ±1, ±2, ±1/2}` (`±1/2` only for reals) — and the free variable is
 /// decided univariately. Sound for the same reason (a found point is a
 /// verified witness); a bounded number of attempts.
-fn sat_by_sampling(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
-    const SAMPLES: usize = 400;
+fn sat_by_sampling(constraints: &[(Polynomial, Rel)], is_int: &[bool], samples: usize) -> bool {
     let k = is_int.len();
     let small = |int: bool| -> Vec<Rational> {
         let mut v: Vec<Rational> = [0i64, 1, -1, 2, -2]
@@ -251,12 +251,29 @@ fn sat_by_sampling(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
         (seed >> 33) as usize
     };
     for free in 0..k as Var {
-        for sample in 0..SAMPLES {
+        'sample: for sample in 0..samples {
             let mut cons = constraints.to_vec();
+            let mut fixed = alloc::vec![false; k];
+            fixed[free as usize] = true;
             for v in 0..k as Var {
-                if v == free {
+                // Solve each equality that is linear in its one remaining
+                // variable instead of guessing that variable.
+                while let Some((u, val)) = solvable_equality(&cons, &fixed, free) {
+                    if is_int[u as usize] && !val.is_integer() {
+                        continue 'sample;
+                    }
+                    fixed[u as usize] = true;
+                    let pv = Polynomial::constant(val);
+                    for (p, _) in cons.iter_mut() {
+                        if p.degree_of(u) > 0 {
+                            *p = subst_var(p, u, &pv);
+                        }
+                    }
+                }
+                if fixed[v as usize] {
                     continue;
                 }
+                fixed[v as usize] = true;
                 let cands = small(is_int[v as usize]);
                 let val = if sample == 0 {
                     cands[0].clone()
@@ -282,6 +299,39 @@ fn sat_by_sampling(constraints: &[(Polynomial, Rel)], is_int: &[bool]) -> bool {
         }
     }
     false
+}
+
+/// An equality of `cons` whose only unfixed variable `u` (not `free`) occurs
+/// linearly, `a·u + b = 0` with `a ≠ 0`, and its solution `u = −b/a`.
+fn solvable_equality(
+    cons: &[(Polynomial, Rel)],
+    fixed: &[bool],
+    free: Var,
+) -> Option<(Var, Rational)> {
+    for (p, rel) in cons {
+        if *rel != Rel::Eq {
+            continue;
+        }
+        let vars = p.vars();
+        let [u] = vars.as_slice() else { continue };
+        let u = *u;
+        if u == free || fixed[u as usize] || p.degree_of(u) != 1 {
+            continue;
+        }
+        let mut a = Rational::from_integer(0.into());
+        let mut b = Rational::from_integer(0.into());
+        for (c, m) in p.terms() {
+            if m.degree_of(u) == 1 {
+                a += c.clone();
+            } else {
+                b += c.clone();
+            }
+        }
+        if !a.is_zero() {
+            return Some((u, -b / a));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
