@@ -14287,6 +14287,7 @@ impl Context {
                 // element equalities left by `refold` collapse (simplify_eq now
                 // handles bit-vector numerals) rather than leaking to the EUF core.
                 let g3 = crate::rewriter::simplify(&mut self.m, g3);
+                let g3 = self.lift_arith_ites(g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
                     // `check_model` may report `sat` without a model when the goal
@@ -14360,6 +14361,7 @@ impl Context {
             conj.push(g2);
             self.m.mk_and(&conj)
         };
+        let g3 = self.lift_arith_ites(g3);
         let (res, m) = check_model(&self.m, g3);
         if res == SmtResult::Sat {
             self.str_witness = subst;
@@ -15020,6 +15022,7 @@ impl Context {
                     conj.push(g2);
                     self.m.mk_and(&conj)
                 };
+                let g3 = self.lift_arith_ites(g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
                     self.str_witness = subst.clone(); // record for get-value/get-model
@@ -15762,9 +15765,134 @@ impl Context {
         }
     }
 
+    /// The number of non-`ite` leaves of an `ite` tree.
+    fn ite_leaves(&self, t: AstId) -> usize {
+        if self.m.is_ite(t) {
+            let a = self.m.app_args(t);
+            self.ite_leaves(a[1]) + self.ite_leaves(a[2])
+        } else {
+            1
+        }
+    }
+
+    /// Case splits for string ops over a short literal with symbolic
+    /// positions or a string-variable pattern, each case folding to a
+    /// literal: `substr L i n`, `replace L a r`, `indexof L s k` (symbolic
+    /// `k`).
+    fn split_literal_op(&mut self, op: &str, raw: &[AstId]) -> Option<AstId> {
+        const MAX: usize = 8;
+        let l = self.str_value(*raw.first()?)?;
+        if l.len() > MAX {
+            return None;
+        }
+        let lit = |ctx: &mut Self, cs: &[u32]| ctx.mk_str_lit(&code_points_to_string(cs));
+        match op {
+            "str.substr"
+                if raw.len() == 3
+                    && (self.int_arg(raw[1]).is_none() || self.int_arg(raw[2]).is_none()) =>
+            {
+                let n = l.len();
+                let mut out = lit(self, &[]);
+                // A constant offset has the one case.
+                let offsets: Vec<usize> = match self.int_arg(raw[1]) {
+                    Some(k) if (0..n as i64).contains(&k) => alloc::vec![k as usize],
+                    Some(_) => Vec::new(),
+                    None => (0..n).collect(),
+                };
+                for &i in offsets.iter().rev() {
+                    for len in (1..=n - i).rev() {
+                        let iv = self.m.mk_int(i as i64);
+                        let at_i = if self.int_arg(raw[1]).is_some() {
+                            self.m.mk_true()
+                        } else {
+                            self.m.mk_eq(raw[1], iv)
+                        };
+                        let lv = self.m.mk_int(len as i64);
+                        let len_ok = if len == n - i {
+                            self.m.mk_ge(raw[2], lv)
+                        } else {
+                            self.m.mk_eq(raw[2], lv)
+                        };
+                        let cond = self.m.mk_and(&[at_i, len_ok]);
+                        let piece = lit(self, &l[i..i + len]);
+                        out = self.m.mk_ite(cond, piece, out);
+                    }
+                }
+                Some(out)
+            }
+            "str.replace"
+                if raw.len() == 3 && self.m.is_uninterp_const(raw[1]) && raw[1] != raw[2] =>
+            {
+                let n = l.len();
+                let whole = lit(self, &l);
+                let mut out = whole;
+                for p in (0..n).rev() {
+                    for len in (1..=n - p).rev() {
+                        let pat = lit(self, &l[p..p + len]);
+                        let hit = self.m.mk_eq(raw[1], pat);
+                        let before = lit(self, &l[..p]);
+                        let after = lit(self, &l[p + len..]);
+                        let rep = self.string_op("str.++", &[before, raw[2], after]).ok()?;
+                        out = self.m.mk_ite(hit, rep, out);
+                    }
+                }
+                let empty = lit(self, &[]);
+                let is_empty = self.m.mk_eq(raw[1], empty);
+                let front = self.string_op("str.++", &[raw[2], whole]).ok()?;
+                Some(self.m.mk_ite(is_empty, front, out))
+            }
+            "str.indexof"
+                if raw.len() == 3
+                    && self.int_arg(raw[2]).is_none()
+                    && self.m.is_uninterp_const(raw[1]) =>
+            {
+                let mut out = self.m.mk_int(-1);
+                for k in (0..=l.len()).rev() {
+                    let kv = self.m.mk_int(k as i64);
+                    let at_k = self.m.mk_eq(raw[2], kv);
+                    let case = self.string_op("str.indexof", &[raw[0], raw[1], kv]).ok()?;
+                    out = self.m.mk_ite(at_k, case, out);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
     fn string_op(&mut self, op: &str, raw: &[AstId]) -> Result<AstId, String> {
+        // A string operand that is an `ite` (of a few leaves) distributes:
+        // `op(ite(c, x, y), …) = ite(c, op(x, …), op(y, …))`, so each branch
+        // can fold.
+        if matches!(
+            op,
+            "str.at"
+                | "str.substr"
+                | "str.replace"
+                | "str.indexof"
+                | "str.contains"
+                | "str.prefixof"
+                | "str.suffixof"
+        ) && let Some(k) = raw.iter().position(|&a| {
+            self.m.is_ite(a)
+                && self.string_sort == Some(self.m.get_sort(a))
+                && self.ite_leaves(a) <= 16
+        }) {
+            let ite = self.m.app_args(raw[k]).to_vec();
+            let mut then_args = raw.to_vec();
+            then_args[k] = ite[1];
+            let mut else_args = raw.to_vec();
+            else_args[k] = ite[2];
+            let t = self.string_op(op, &then_args)?;
+            let e = self.string_op(op, &else_args)?;
+            return Ok(self.m.mk_ite(ite[0], t, e));
+        }
         // Concrete code points of each argument, if all are string literals.
         let strs: Option<Vec<Vec<u32>>> = raw.iter().map(|&a| self.str_value(a)).collect();
+        if strs.is_none()
+            && let Some(t) = self.split_literal_op(op, raw)
+        {
+            return Ok(t);
+        }
         match op {
             "str.len" => {
                 if let Some(v) = self.str_value(raw[0]) {
@@ -27754,8 +27882,21 @@ impl Context {
         (res, model.map(|m| self.complete_substituted(m, &pins)))
     }
 
+    /// `goal` with its arithmetic term-level `ite`s lifted (see [`Self::lift`]):
+    /// a fallback that substitutes and refolds can rebuild one (`indexof` of a
+    /// position split), which `check_model` would read as a free term.
+    fn lift_arith_ites(&mut self, goal: AstId) -> AstId {
+        let has = self
+            .m
+            .postorder(goal)
+            .iter()
+            .any(|&t| self.m.is_ite(t) && self.m.is_arith_sort(self.m.get_sort(t)));
+        if has { self.lift(goal) } else { goal }
+    }
+
     fn decide_inner_core(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
+        let goal = self.lift_arith_ites(goal);
         // Fold ground algebraic (in)equalities — e.g. `(0.375^¼)² = (0.375²)^¼`
         // (both √0.375, so `true`) — to `true`/`false` via exact algebraic
         // arithmetic, so an assertion like `(not (= …))` collapses to `false`
@@ -36435,6 +36576,29 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn literal_ops_with_symbolic_arguments_case_split() {
+        // z3 regression 4018: `substr (replace "B" a "A") b b` against
+        // `substr "B" 0 (indexof "A" a b)` agree for every `a`, `b`.
+        let script = "
+            (declare-fun a () String)
+            (declare-fun b () Int)
+            (assert (distinct (str.substr (str.replace \"B\" a \"A\") b b)
+                              (str.substr \"B\" 0 (str.indexof \"A\" a b))))
+            (check-sat)
+            (reset)
+            (declare-fun a () String)
+            (declare-fun i () Int)
+            (assert (= (str.indexof (str.at (str.++ \"ab\" a) i) \"a\" 2) (str.len a)))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        // Fuzz-found: the split `indexof` folded to an arithmetic `ite` that a
+        // witness check read as a free term (wrong sat).
+        assert_ne!(out[1], "sat");
     }
 
     #[test]
