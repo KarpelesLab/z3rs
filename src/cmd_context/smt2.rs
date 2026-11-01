@@ -15927,6 +15927,20 @@ impl Context {
                 // `str.at x i`: reuse one congruent marker per `(x, i)` so repeated
                 // reads at the same position are the same term.
                 if op == "str.at" && raw.len() == 2 {
+                    // A literal read at a symbolic index is a finite case split:
+                    // `ite(i = 0, L[0], ite(i = 1, L[1], …, ""))`.
+                    if let Some(l) = self.str_value(raw[0])
+                        && l.len() <= 16
+                    {
+                        let mut out = self.mk_str_lit("");
+                        for (k, &c) in l.iter().enumerate().rev() {
+                            let kv = self.m.mk_int(k as i64);
+                            let at_k = self.m.mk_eq(raw[1], kv);
+                            let ch = self.mk_str_lit(&code_points_to_string(&[c]));
+                            out = self.m.mk_ite(at_k, ch, out);
+                        }
+                        return Ok(out);
+                    }
                     if let Some(&c) = self.str_at_sym.get(&(raw[0], raw[1])) {
                         return Ok(c);
                     }
@@ -16040,6 +16054,47 @@ impl Context {
                         let nonneg = self.m.mk_ge(t, zero);
                         return Ok(self.m.mk_ite(nonneg, t, neg1));
                     }
+                }
+                // `indexof L s k` over a literal `L`, a string variable `s` and a
+                // constant start: the first position of each substring of `L`, as
+                // a case split on `s`.
+                if op == "str.indexof"
+                    && (raw.len() == 2 || raw.len() == 3)
+                    && self.m.is_uninterp_const(raw[1])
+                    && let Some(l) = self.str_value(raw[0])
+                    && l.len() <= 8
+                    && let Some(k) = if raw.len() == 3 {
+                        self.int_arg(raw[2])
+                    } else {
+                        Some(0)
+                    }
+                {
+                    let n = l.len() as i64;
+                    if k < 0 || k > n {
+                        return Ok(self.m.mk_int(-1));
+                    }
+                    let mut out = self.m.mk_int(-1);
+                    for p in (k..n).rev() {
+                        let p_us = p as usize;
+                        let eqs: Vec<AstId> = (1..=l.len() - p_us)
+                            .map(|len| {
+                                let sub =
+                                    self.mk_str_lit(&code_points_to_string(&l[p_us..p_us + len]));
+                                self.m.mk_eq(raw[1], sub)
+                            })
+                            .collect();
+                        let hit = if eqs.len() == 1 {
+                            eqs[0]
+                        } else {
+                            self.m.mk_or(&eqs)
+                        };
+                        let pv = self.m.mk_int(p);
+                        out = self.m.mk_ite(hit, pv, out);
+                    }
+                    let empty = self.mk_str_lit("");
+                    let is_empty = self.m.mk_eq(raw[1], empty);
+                    let kv = self.m.mk_int(k);
+                    return Ok(self.m.mk_ite(is_empty, kv, out));
                 }
                 self.symbolic_string(op, raw)
             }
@@ -36350,6 +36405,23 @@ mod tests {
         assert_eq!(out[0], "unsat");
         assert_eq!(out[1], "sat");
         assert!(!out[2].contains("    0)"), "{}", out[2]);
+    }
+
+    #[test]
+    fn literal_reads_at_symbolic_positions_case_split() {
+        // z3 regression string6: `str.at "A" i` is "A" or "", and
+        // `indexof "a" s` over a one-character `s` is 0 or -1.
+        let script = "
+            (declare-const s String)
+            (declare-const s2 String)
+            (declare-const i Int)
+            (assert (= (str.len s) 1))
+            (assert (= (str.indexof \"a\" s) i))
+            (assert (or (and (= s s2) (< i 0)) (and (= (str.at \"A\" i) s2) (>= i 0))))
+            (assert (= s2 \"a\"))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
