@@ -2435,6 +2435,9 @@ struct Context {
     /// as an FP bit pattern: FP term → `(bv x, eb, sb)`. Lets `to_fp(x) = c` (c a
     /// concrete non-NaN FP) invert to `x = bits(c)`.
     fp_from_bv: BTreeMap<AstId, (AstId, u32, u32)>,
+    /// Arithmetic pins `v = k` that `fold_fp_conversions` substituted away; the
+    /// innermost `decide_inner` re-attaches the ones made during its run.
+    fp_fold_pins: Vec<(AstId, AstId)>,
     /// The `RoundingMode` sort, once used.
     rm_sort: Option<AstId>,
     /// The five `RoundingMode` constants (RNE, RNA, RTP, RTN, RTZ), built with
@@ -3443,6 +3446,7 @@ impl Context {
             fp_minmax_zero_sign: BTreeMap::new(),
             fp_to_bv_markers: BTreeMap::new(),
             fp_from_bv: BTreeMap::new(),
+            fp_fold_pins: Vec::new(),
             rm_sort: None,
             rm_modes: Vec::new(),
             valid_axioms: BTreeSet::new(),
@@ -5467,6 +5471,7 @@ impl Context {
         }
         // Eliminate the pinned constant variables from the goal (so no leftover
         // integer binding makes it a mixed query) and fold the conversion markers.
+        self.fp_fold_pins.extend(subst.iter().copied());
         subst.extend(fold_subst);
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
@@ -5746,8 +5751,123 @@ impl Context {
             let notnan = self.m.mk_not(isnan);
             let g2 = self.m.mk_and(&[g1, notnan]);
             let (res, model) = self.decide_inner(g2);
-            if res == SmtResult::Sat {
-                return Some((SmtResult::Sat, model));
+            if res != SmtResult::Sat {
+                continue;
+            }
+            // Realize the value: pin `x` (and `rm`) to a preimage of it.
+            let Some(mut model) = model else { continue };
+            let Some(bits) = self.fp_bits_in(&mut model, fresh, eb + sb) else {
+                continue;
+            };
+            let fixed = self.rm_code(rm);
+            let Some((val, code)) = Self::to_fp_preimage(bits, eb, sb, fixed) else {
+                continue;
+            };
+            let c = self.mk_fp(bits, eb, sb);
+            let g3 = crate::rewriter::substitute(&mut self.m, goal, &[(t, c)]);
+            let xv = self.m.mk_numeral(val, false);
+            let mut parts = alloc::vec![g3, self.m.mk_eq(x, xv)];
+            if fixed.is_none() {
+                self.rm_sort();
+                let mode = self.rm_modes[code as usize];
+                parts.push(self.m.mk_eq(rm, mode));
+            }
+            let g3 = self.m.mk_and(&parts);
+            let (r3, m3) = self.decide_inner(g3);
+            if r3 == SmtResult::Sat {
+                return Some((SmtResult::Sat, m3));
+            }
+        }
+        None
+    }
+
+    /// A real `r` and, when it matters, a rounding-mode code under which
+    /// `to_fp(r)` yields the FP value `bits`: its exact value for finite
+    /// values, a tiny negative under RTZ for −0, a huge magnitude under RNE for
+    /// ±∞; restricted to `rm` when given. Each candidate is checked against
+    /// [`Self::real_to_fp_bits`]. `None` for NaN or no preimage.
+    fn to_fp_preimage(bits: u64, eb: u32, sb: u32, rm: Option<u32>) -> Option<(Rational, u32)> {
+        let w = eb + sb;
+        let neg = bits >> (w - 1) == 1;
+        let candidates: Vec<(Rational, u32)> = match Self::fp_real_value(bits, eb, sb) {
+            Some(v) if v.is_zero() && neg => {
+                let tiny = Rational::power_of_two(-(1i32 << (eb - 1)) - sb as i32 - 2);
+                alloc::vec![(tiny.neg(), 4), (tiny.neg(), 0)]
+            }
+            Some(v) => (0..5).map(|c| (v.clone(), c)).collect(),
+            None => {
+                let mant_mask = (1u64 << (sb - 1)) - 1;
+                if bits & mant_mask != 0 {
+                    return None; // NaN
+                }
+                let huge = Rational::power_of_two((1i32 << (eb - 1)) + 2);
+                let huge = if neg { huge.neg() } else { huge };
+                alloc::vec![(huge.clone(), 0), (huge, 1)]
+            }
+        };
+        candidates
+            .into_iter()
+            .filter(|&(_, c)| rm.is_none_or(|m| m == c))
+            .find(|(r, c)| Self::real_to_fp_bits(r, eb, sb, *c) == Some(bits))
+    }
+
+    /// The bits of the FP term `t`'s value under `model`, read from its
+    /// bit-blasted image.
+    fn fp_bits_in(&self, model: &mut Model, t: AstId, w: u32) -> Option<u64> {
+        let &bv = self.fp_bv.get(&t)?;
+        let Value::Bv(v, _) = model.eval(&self.m, bv) else {
+            return None;
+        };
+        let mut bits = 0u64;
+        for i in 0..w {
+            if v.bit(u64::from(i)) {
+                bits |= 1u64 << i;
+            }
+        }
+        Some(bits)
+    }
+
+    /// `to_fp rm x` of a real `x` constrained elsewhere: decide with the marker
+    /// as a free non-NaN FP (a relaxation — its `unsat` is the goal's), read the
+    /// value `c` it takes, then pin `x` to a preimage of `c` under `rm` with the
+    /// marker fixed to `c`, and re-decide.
+    fn try_to_fp_pinned_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+        for (&t, &(rm, x, eb, sb, _uns)) in &self.fp_conv.clone() {
+            let xs = self.m.get_sort(x);
+            if !present.contains(&t) || !self.m.is_arith_sort(xs) || self.rm_code(rm).is_none() {
+                continue;
+            }
+            let fps = self.fp_sort(eb, sb);
+            let fresh = self.fresh_const(fps);
+            let g1 = crate::rewriter::substitute(&mut self.m, goal, &[(t, fresh)]);
+            let Ok(isnan) = self.fp_op("fp.isNaN", &[fresh]) else {
+                continue;
+            };
+            let notnan = self.m.mk_not(isnan);
+            let g1 = self.m.mk_and(&[g1, notnan]);
+            let (res, model) = self.decide_inner(g1);
+            if res == SmtResult::Unsat {
+                return Some((SmtResult::Unsat, None));
+            }
+            let Some(mut model) = model else { continue };
+            let Some(bits) = self.fp_bits_in(&mut model, fresh, eb + sb) else {
+                continue;
+            };
+            let Some((val, _)) = Self::to_fp_preimage(bits, eb, sb, self.rm_code(rm)) else {
+                continue;
+            };
+            if self.m.is_int_sort(xs) && !val.is_integer() {
+                continue;
+            }
+            let c = self.mk_fp(bits, eb, sb);
+            let g3 = crate::rewriter::substitute(&mut self.m, goal, &[(t, c)]);
+            let xv = self.m.mk_numeral(val, self.m.is_int_sort(xs));
+            let pin = self.m.mk_eq(x, xv);
+            let g3 = self.m.mk_and(&[g3, pin]);
+            let (r3, m3) = self.decide_inner(g3);
+            if r3 == SmtResult::Sat {
+                return Some((SmtResult::Sat, m3));
             }
         }
         None
@@ -26556,13 +26676,15 @@ impl Context {
         }
         // Fallback: re-fold `to_fp(to_real n)` conversions once `n` is pinned by a
         // `v = k` binding, re-blasting the FP equality so it reduces to a pure query.
+        let mark = self.fp_fold_pins.len();
         if res == SmtResult::Unknown
             && !self.fp_conv.is_empty()
             && let Some(g) = self.fold_fp_conversions(goal)
         {
             let (r2, m2) = self.decide_inner(g);
+            let pins = self.fp_fold_pins.split_off(mark);
             if r2 != SmtResult::Unknown {
-                return (r2, m2);
+                return (r2, m2.map(|m| self.complete_substituted(m, &pins)));
             }
         }
         // Fallback: re-fold `fp.rem(x, y)` once both operands are pinned to
@@ -26589,6 +26711,12 @@ impl Context {
         // so replace such a marker by a free non-NaN FP and re-decide.
         if res == SmtResult::Unknown
             && let Some(r) = self.try_to_fp_free_witness(goal)
+        {
+            return r;
+        }
+        if res == SmtResult::Unknown
+            && !self.fp_conv.is_empty()
+            && let Some(r) = self.try_to_fp_pinned_witness(goal)
         {
             return r;
         }
@@ -27479,6 +27607,13 @@ impl Context {
     }
 
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        let mark = self.fp_fold_pins.len();
+        let (res, model) = self.decide_inner_core(goal);
+        let pins = self.fp_fold_pins.split_off(mark);
+        (res, model.map(|m| self.complete_substituted(m, &pins)))
+    }
+
+    fn decide_inner_core(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
         // Fold ground algebraic (in)equalities — e.g. `(0.375^¼)² = (0.375²)^¼`
         // (both √0.375, so `true`) — to `true`/`false` via exact algebraic
@@ -29337,10 +29472,31 @@ impl Context {
         if groups.len() < 2 {
             return None;
         }
+        // The groups that are not pure bit-vector are decided together (one
+        // model), each pure one by the bit-blaster.
+        let mut parts: Vec<Vec<AstId>> = Vec::new();
+        let mut rest: Vec<AstId> = Vec::new();
+        for (_, cs) in groups {
+            let g = match cs.len() {
+                1 => cs[0],
+                _ => self.m.mk_and(&cs),
+            };
+            if self.bv_goal_is_pure(g) {
+                parts.push(cs);
+            } else {
+                rest.extend(cs);
+            }
+        }
+        if !rest.is_empty() {
+            parts.push(rest);
+        }
+        if parts.len() < 2 {
+            return None;
+        }
         let mut model: Option<Model> = None;
         let mut bv_models: Vec<Model> = Vec::new();
         let mut unknown = false;
-        for (_, cs) in groups {
+        for cs in parts {
             let g = match cs.len() {
                 1 => cs[0],
                 _ => self.m.mk_and(&cs),
@@ -35899,6 +36055,47 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn to_fp_of_constrained_real_is_witnessed() {
+        // z3 regression fpa_to_fp_from_real_interval: `x = to_fp RTZ r` with
+        // `r` in an interval holding x's exact value.
+        let script = "
+            (declare-const x Float32)
+            (assert (= x (fp #b1 #b01111100 #b11110111110011001010011)))
+            (declare-const r Real)
+            (assert (and (> r (- (/ 4127125.0 16777216.0))) (<= r (- (/ 16508499.0 67108864.0)))))
+            (assert (= x ((_ to_fp 8 24) RTZ r)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn to_fp_witness_models_assign_the_source() {
+        // Fuzz-found: the free-source witness left `q` at 0 and the pinned
+        // conversion fold dropped `q = -15/16` from the model.
+        let script = "
+            (declare-const q Real)
+            (declare-const f (_ FloatingPoint 3 5))
+            (assert (= f ((_ to_fp 3 5) RTZ q)))
+            (assert (fp.lt f ((_ to_fp 3 5) RNE (- 1.0))))
+            (check-sat)
+            (get-value (q))
+            (reset)
+            (declare-const q Real)
+            (declare-const f (_ FloatingPoint 3 5))
+            (assert (not (= ((_ to_fp 3 5) RNE q) f)))
+            (assert (= q (- (/ 15.0 16.0))))
+            (check-sat)
+            (get-value (q))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_ne!(out[1], "((q 0.0))");
+        assert_eq!(out[2], "sat");
+        assert_eq!(out[3], "((q (- (/ 15.0 16.0))))");
     }
 
     #[test]
