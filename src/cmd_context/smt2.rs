@@ -1746,6 +1746,32 @@ fn z3_command_error(msg: &str, toks: &[String], positions: &[(u32, u32)]) -> Opt
         let (l, c) = positions.last().copied().unwrap_or((0, 0));
         return Some(alloc::format!("(error \"line {l} column {c}: {what}\")"));
     }
+    // An ill-sorted `((as const S) v)`: reported at the application's closing
+    // paren; `#k` says which `(as const` of the command (in token order).
+    if let Some(ord) = msg
+        .strip_prefix(
+            "invalid const array definition, sort mismatch between array range and argument#",
+        )
+        .and_then(|k| k.parse::<usize>().ok())
+    {
+        let start = (1..toks.len().saturating_sub(1))
+            .filter(|&i| toks[i] == "as" && toks[i + 1] == "const")
+            .nth(ord)?
+            .checked_sub(2)?;
+        let mut depth = 0i32;
+        let close = (start..toks.len()).find(|&i| {
+            match toks[i].as_str() {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
+            }
+            depth == 0
+        })?;
+        let (l, c) = positions[close];
+        return Some(alloc::format!(
+            "(error \"line {l} column {c}: invalid const array definition, sort mismatch between array range and argument\")"
+        ));
+    }
     // Ill-sorted recursive definition. z3 reports it once the whole command is
     // parsed: for `define-fun-rec` at the command's closing paren (the last
     // token), for `define-funs-rec` at the bodies-list closing paren (the
@@ -2474,6 +2500,8 @@ struct Context {
     disj_witness_depth: u32,
     /// Set while `decide_independent_components` decides one component.
     in_components: bool,
+    /// `(as const …)` applications built so far in the current command.
+    as_const_seen: u32,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -3459,6 +3487,7 @@ impl Context {
             fp_defer_depth: 0,
             disj_witness_depth: 0,
             in_components: false,
+            as_const_seen: 0,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -3639,6 +3668,7 @@ impl Context {
 
     /// Interpret a top-level command, returning any textual response.
     fn command(&mut self, form: &SExpr) -> Result<Option<String>, String> {
+        self.as_const_seen = 0;
         let list = match form {
             SExpr::List(l) if !l.is_empty() => l,
             _ => return Err("expected a command list".to_string()),
@@ -30959,8 +30989,24 @@ impl Context {
                         && matches!(&qid[0], SExpr::Atom(a) if a == "as")
                         && matches!(&qid[1], SExpr::Atom(a) if a == "const")
                     {
+                        let ord = self.as_const_seen;
+                        self.as_const_seen += 1;
                         let array_sort = self.resolve_sort(&qid[2])?;
-                        let value = self.term(&l[1])?;
+                        let mut value = self.term(&l[1])?;
+                        if let Some((_, range)) = self.m.array_sort_params(array_sort) {
+                            let vs = self.m.get_sort(value);
+                            if vs != range {
+                                if self.m.is_int_sort(vs) && self.m.is_arith_sort(range) {
+                                    value = self.m.mk_to_real(value);
+                                } else {
+                                    // `#ord`: which `(as const …)` of the command, for
+                                    // the error position.
+                                    return Err(alloc::format!(
+                                        "invalid const array definition, sort mismatch between array range and argument#{ord}"
+                                    ));
+                                }
+                            }
+                        }
                         return Ok(self.m.mk_const_array(array_sort, value));
                     }
                     if qid.len() == 4
@@ -36599,6 +36645,21 @@ mod tests {
         // Fuzz-found: the split `indexof` folded to an arithmetic `ite` that a
         // witness check read as a free term (wrong sat).
         assert_ne!(out[1], "sat");
+    }
+
+    #[test]
+    fn ill_sorted_const_array_is_a_recoverable_error() {
+        // z3 regression const_array_bug.
+        let out = run_partial(
+            "(declare-fun d () (_ BitVec 4))\n(assert (= ((as const (Array Int (_ BitVec 1))) d) ((as const (Array Int (_ BitVec 1))) #b0)))\n(check-sat)",
+        );
+        assert_eq!(
+            out.0,
+            alloc::vec![
+                "(error \"line 2 column 49: invalid const array definition, sort mismatch between array range and argument\")",
+                "sat"
+            ]
+        );
     }
 
     #[test]
