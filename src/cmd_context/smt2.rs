@@ -2511,6 +2511,8 @@ struct Context {
     /// decides a divisor-concretised residual, so nested `decide_inner` calls do
     /// not re-enter the witness search (which would risk unbounded recursion).
     in_divmod_witness: bool,
+    /// Re-entrancy guard for the opaque-atom strengthening in `decide`.
+    in_opaque_strengthen: bool,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -3462,6 +3464,7 @@ impl Context {
             int_div0_decl: None,
             int_mod0_decl: None,
             in_divmod_witness: false,
+            in_opaque_strengthen: false,
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
@@ -27519,6 +27522,19 @@ impl Context {
             if let Some(m) = self.try_seq_witness(wg) {
                 return (SmtResult::Sat, Some(m));
             }
+            // A model of a strengthening is a model of the goal: an atom over an
+            // opaque term that occurs only positively may become `false` (only
+            // negatively: `true`). `fp.rem` in one disjunct leaves the others.
+            if !self.in_opaque_strengthen
+                && let Some(g2) = self.strengthen_opaque_atoms(goal)
+            {
+                self.in_opaque_strengthen = true;
+                let (r, m) = self.decide_inner(g2);
+                self.in_opaque_strengthen = false;
+                if r == SmtResult::Sat {
+                    return (SmtResult::Sat, m);
+                }
+            }
             return (SmtResult::Unknown, None);
         }
         // Bit-vector formulas are decided by bit-blasting (no model produced yet).
@@ -28822,6 +28838,58 @@ impl Context {
         };
         memo.insert(t, out);
         out
+    }
+
+    /// `goal` with each Boolean atom over an opaque term (`str_symbolic`, FP
+    /// markers) replaced by `false` where it occurs only positively and by
+    /// `true` where only negatively: a stronger formula without them. `None`
+    /// if an opaque atom occurs in both polarities (or under `=`/`xor`/an `ite`
+    /// condition) or nothing changes.
+    fn strengthen_opaque_atoms(&mut self, goal: AstId) -> Option<AstId> {
+        let opaque = |ctx: &Self, t: AstId| {
+            ctx.m
+                .postorder(t)
+                .iter()
+                .any(|&u| ctx.str_symbolic.contains(&u) || ctx.is_opaque_fp_marker(u))
+        };
+        // Polarity of each opaque atom: bit 1 positive, bit 2 negative.
+        let mut pol: BTreeMap<AstId, u8> = BTreeMap::new();
+        let mut stack: Vec<(AstId, u8)> = alloc::vec![(goal, 1)];
+        let mut seen: BTreeSet<(AstId, u8)> = BTreeSet::new();
+        while let Some((t, p)) = stack.pop() {
+            if !seen.insert((t, p)) || !opaque(self, t) {
+                continue;
+            }
+            let args = self.m.app_args(t).to_vec();
+            let flip = |p: u8| ((p & 1) << 1) | ((p & 2) >> 1);
+            if self.m.is_and(t) || self.m.is_or(t) {
+                stack.extend(args.iter().map(|&a| (a, p)));
+            } else if self.m.is_not(t) {
+                stack.push((args[0], flip(p)));
+            } else if self.m.is_implies(t) {
+                stack.push((args[0], flip(p)));
+                stack.push((args[1], p));
+            } else if self.is_bool_connective(t) {
+                // `=`/`xor` over Booleans, a Boolean `ite`: both polarities.
+                stack.extend(args.iter().map(|&a| (a, 3)));
+            } else {
+                *pol.entry(t).or_insert(0) |= p;
+            }
+        }
+        if pol.is_empty() {
+            return None;
+        }
+        let mut pairs = Vec::new();
+        for (&t, &p) in &pol {
+            match p {
+                1 => pairs.push((t, self.m.mk_false())),
+                2 => pairs.push((t, self.m.mk_true())),
+                _ => return None,
+            }
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &pairs);
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        (!opaque(self, g)).then_some(g)
     }
 
     /// For a bit-vector-indexed array equality `t` over `args` (already
@@ -35308,6 +35376,19 @@ mod tests {
             (assert (and
               (forall ((e Real)) (or (= (* b d) 0.0) (and (< 0.0 (/ 2.0 e c)) (< (* e c) g))))
               (forall ((f Real)) (< 0.0 (* a c)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn opaque_disjuncts_are_dropped_for_sat() {
+        // z3 regression fp-operations: the `fp.rem` disjunct stays opaque, but
+        // a model of the other disjuncts is a model of the disjunction.
+        let script = "
+            (declare-fun X () (_ FloatingPoint 2 6)) (declare-fun Y () (_ FloatingPoint 2 6))
+            (declare-fun Z () (_ FloatingPoint 2 6))
+            (assert (or (= X (fp.rem X Y)) (= X (fp.add RTZ Y Z))))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
