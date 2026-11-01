@@ -120,6 +120,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
     // the whole call terminates in bounded time even when many blocking-clause
     // rounds each face an expensive (blow-up-prone) theory check.
     let mut budget = BB_WORK_BUDGET;
+    let mut euf_bases: Option<(ProofEgraph, Egraph)> = None;
     loop {
         rounds += 1;
         if rounds > DPLL_ROUND_LIMIT {
@@ -143,6 +144,11 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     };
                     return (SmtResult::Sat, Some(model));
                 }
+                // The interned e-graphs are rebuilt by cloning, not re-interning
+                // every subterm each round.
+                let bases = euf_bases.get_or_insert_with(|| {
+                    (ProofEgraph::new(m, &euf_roots), Egraph::new(m, &euf_roots))
+                });
                 match theory_check(
                     m,
                     &euf_eq,
@@ -151,6 +157,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     &pred_atoms,
                     &sat,
                     &mut budget,
+                    bases,
                 ) {
                     // Both theories consistent under this assignment → SAT.
                     TheoryOutcome::Sat(arith, euf) => {
@@ -2044,6 +2051,7 @@ enum TheoryOutcome {
 /// congruence puts in one class have their equality added to the arithmetic
 /// constraints. Each direction only adds genuinely new equalities, so the loop
 /// converges.
+#[allow(clippy::too_many_arguments)]
 fn theory_check(
     m: &AstManager,
     euf_eq: &[(Lit, AstId, AstId)],
@@ -2052,6 +2060,7 @@ fn theory_check(
     pred_atoms: &[(Lit, AstId)],
     sat: &Solver,
     budget: &mut u64,
+    bases: &(ProofEgraph, Egraph),
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
     let mut eqs = Vec::new();
@@ -2078,7 +2087,7 @@ fn theory_check(
             .filter(|&(_, &(lit, _, _))| sat.model_holds(lit))
             .map(|(id, &(_, a, b))| (id, a, b))
             .collect();
-        let mut pg = ProofEgraph::new(m, euf_roots);
+        let mut pg = bases.0.clone();
         pg.assert_eqs(m, &id_eqs);
         for &(lit, a, b) in euf_eq {
             if !sat.model_holds(lit) && pg.class_of(m, a) == pg.class_of(m, b) {
@@ -2158,7 +2167,7 @@ fn theory_check(
         // Congruence closure augmented with the arithmetic-implied equalities.
         let mut all_eqs = eqs.clone();
         all_eqs.extend(euf_extra.iter().cloned());
-        let mut g = Egraph::new(m, euf_roots);
+        let mut g = bases.1.clone();
         if !g.is_consistent(m, &all_eqs, &diseqs) {
             return TheoryOutcome::Unsat;
         }

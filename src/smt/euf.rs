@@ -14,6 +14,7 @@ use crate::ast::manager::AstManager;
 use crate::ast::node::AstNode;
 
 /// A congruence-closure structure over the subterms of some formula.
+#[derive(Clone)]
 pub struct Egraph {
     /// Dense id per term (index into the union-find).
     ids: BTreeMap<AstId, usize>,
@@ -189,6 +190,7 @@ enum Cause {
 /// * a **fast find** (`parent`, path-halved) that answers `class_of` cheaply, and
 /// * a **proof forest** (`pparent`/`pedge`, never compressed) recording the exact
 ///   causal edge of every merge, so paths reconstruct the justification.
+#[derive(Clone)]
 pub struct ProofEgraph {
     ids: BTreeMap<AstId, usize>,
     terms: Vec<AstId>,
