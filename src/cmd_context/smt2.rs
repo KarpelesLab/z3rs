@@ -30269,15 +30269,56 @@ impl Context {
             fp_link.insert(f, b);
             fp_link.insert(b, f);
         }
+        // Opaque marker constants whose meaning (their operands) lives in a
+        // side table, not in the term: `to_fp rm x` is a fresh constant
+        // standing for a function of `x`.
+        let mut side: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for (&t, &(rm, x, ..)) in &self.fp_conv {
+            side.insert(t, alloc::vec![rm, x]);
+        }
+        for (&t, &(x, ..)) in &self.fp_from_bv {
+            side.insert(t, alloc::vec![x]);
+        }
+        for (&t, &(x, y, ..)) in &self.fp_rem_markers {
+            side.insert(t, alloc::vec![x, y]);
+        }
+        for (&t, &(_, _, _, x, y)) in &self.fp_to_bv_markers {
+            side.insert(t, alloc::vec![x, y]);
+        }
+        for (&t, (_, x)) in &self.fp_class_markers {
+            side.insert(t, alloc::vec![*x]);
+        }
+        for (&t, (_, x, y)) in &self.fp_cmp_markers {
+            side.insert(t, alloc::vec![*x, *y]);
+        }
+        for &(q, b, a) in &self.symbolic_realdiv {
+            side.entry(q).or_default().extend([b, a]);
+        }
+        for (&t, (_, arrays)) in &self.maps {
+            side.insert(t, arrays.clone());
+        }
+        for (&t, (_, body)) in &self.lambdas {
+            side.insert(t, alloc::vec![*body]);
+        }
         let symbols = |ctx: &Self, c: AstId| -> BTreeSet<AstId> {
             let mut out = BTreeSet::new();
-            for t in ctx.m.postorder(c) {
-                for u in [Some(t), fp_link.get(&t).copied()].into_iter().flatten() {
-                    if let Some(a) = ctx.m.app(u)
-                        && let Some(fd) = ctx.m.func_decl(a.decl)
-                        && fd.info.family_id == crate::ast::NULL_FAMILY_ID
-                    {
-                        out.insert(a.decl);
+            let mut seen = BTreeSet::new();
+            let mut stack = alloc::vec![c];
+            while let Some(r) = stack.pop() {
+                for t in ctx.m.postorder(r) {
+                    if !seen.insert(t) {
+                        continue;
+                    }
+                    if let Some(extra) = side.get(&t) {
+                        stack.extend(extra.iter().copied());
+                    }
+                    for u in [Some(t), fp_link.get(&t).copied()].into_iter().flatten() {
+                        if let Some(a) = ctx.m.app(u)
+                            && let Some(fd) = ctx.m.func_decl(a.decl)
+                            && fd.info.family_id == crate::ast::NULL_FAMILY_ID
+                        {
+                            out.insert(a.decl);
+                        }
                     }
                 }
             }
@@ -37361,6 +37402,25 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat", "unsat"]);
+    }
+
+    #[test]
+    fn components_follow_side_table_operands() {
+        // Fuzz-found wrong model: `to_fp RNA r` is a marker constant whose
+        // operand `r` lives in a side table, so `r ≥ 5/2` was split off.
+        let script = "
+            (declare-const q Real)
+            (declare-const r Real)
+            (assert (> q (- 12.0)))
+            (assert (>= r (/ 20.0 8.0)))
+            (assert (not (= ((_ to_fp 3 5) RNE (/ 14.0 4.0)) ((_ to_fp 3 5) RNA r))))
+            (check-sat)
+            (get-value (r))
+        ";
+        let out = run_partial(script).0;
+        if out[0] == "sat" {
+            assert!(!out[1].contains("(- "), "{}", out[1]);
+        }
     }
 
     #[test]
