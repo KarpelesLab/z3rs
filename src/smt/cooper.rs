@@ -280,7 +280,162 @@ pub fn exists(dnf: &Dnf, x: AstId, budget: &mut u64) -> Option<Dnf> {
     for cube in dnf {
         out.extend(cube_exists(cube, x, budget)?);
     }
-    Some(out)
+    Some(simplify(out))
+}
+
+/// A normalized atom, or its constant truth value.
+enum Norm {
+    True,
+    False,
+    Atom(Atom),
+}
+
+/// Comparable identity of a (normalized) atom: kind, modulus, terms, constant.
+type AtomKey = (u8, Int, Vec<(AstId, Rational)>, Rational);
+
+fn key(a: &Atom) -> AtomKey {
+    let (k, m) = match a {
+        Atom::Lt(_) => (0, int(0)),
+        Atom::Le(_) => (1, int(0)),
+        Atom::Eq(_) => (2, int(0)),
+        Atom::Ne(_) => (3, int(0)),
+        Atom::Div(m, _) => (4, m.clone()),
+        Atom::Ndiv(m, _) => (5, m.clone()),
+    };
+    let e = expr_of(a);
+    (
+        k,
+        m,
+        e.terms().map(|(v, c)| (v, c.clone())).collect(),
+        e.const_term().clone(),
+    )
+}
+
+/// Rebuild `Σ cᵢ·vᵢ + k` from terms.
+fn build(terms: &[(AstId, Int)], k: &Int) -> LinExpr {
+    let mut e = LinExpr::constant(rat_int(k));
+    for (v, c) in terms {
+        e = e.add(&LinExpr::var(*v).scale(&rat_int(c)));
+    }
+    e
+}
+
+/// Integer normal form: `<` as `≤ −1`, coefficients divided by their gcd
+/// (rounding the constant of a bound, deciding an equality's divisibility),
+/// equalities sign-normalized, divisibility reduced modulo `m`.
+fn normalize(a: &Atom) -> Norm {
+    if let Some(b) = eval_ground(a) {
+        return if b { Norm::True } else { Norm::False };
+    }
+    let e = expr_of(a);
+    let Some(terms) = e
+        .terms()
+        .map(|(v, c)| c.to_integer().map(|i| (v, i)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Norm::Atom(a.clone());
+    };
+    let Some(k) = e.const_term().to_integer() else {
+        return Norm::Atom(a.clone());
+    };
+    let g = terms.iter().fold(int(0), |g, (_, c)| g.gcd(&c.abs()));
+    let div = |ts: &[(AstId, Int)], d: &Int| -> Vec<(AstId, Int)> {
+        ts.iter().map(|(v, c)| (*v, c / d)).collect()
+    };
+    match a {
+        Atom::Lt(_) | Atom::Le(_) => {
+            // e ≤ 0 (or e + 1 ≤ 0 for a strict bound) ⇔ Σ (cᵢ/g)·vᵢ + ⌈k/g⌉ ≤ 0.
+            let k = if matches!(a, Atom::Lt(_)) {
+                &k + &int(1)
+            } else {
+                k
+            };
+            let kc = -(&(-&k).div_floor(&g));
+            Norm::Atom(Atom::Le(build(&div(&terms, &g), &kc)))
+        }
+        Atom::Eq(_) | Atom::Ne(_) => {
+            let eq = matches!(a, Atom::Eq(_));
+            if !k.rem_euclid(&g).is_zero() {
+                return if eq { Norm::False } else { Norm::True };
+            }
+            let mut ts = div(&terms, &g);
+            let mut kk = &k / &g;
+            if ts.first().is_some_and(|(_, c)| c.is_negative()) {
+                ts = ts.into_iter().map(|(v, c)| (v, -c)).collect();
+                kk = -kk;
+            }
+            let e = build(&ts, &kk);
+            Norm::Atom(if eq { Atom::Eq(e) } else { Atom::Ne(e) })
+        }
+        Atom::Div(m, _) | Atom::Ndiv(m, _) => {
+            let ts: Vec<(AstId, Int)> = terms
+                .iter()
+                .map(|(v, c)| (*v, c.rem_euclid(m)))
+                .filter(|(_, c)| !c.is_zero())
+                .collect();
+            let e = build(&ts, &k.rem_euclid(m));
+            let r = if matches!(a, Atom::Div(..)) {
+                Atom::Div(m.clone(), e)
+            } else {
+                Atom::Ndiv(m.clone(), e)
+            };
+            match eval_ground(&r) {
+                Some(true) => Norm::True,
+                Some(false) => Norm::False,
+                None => Norm::Atom(r),
+            }
+        }
+    }
+}
+
+/// Normalize every cube, dropping true atoms, false cubes (a false atom,
+/// `e = 0 ∧ e ≠ 0`, or bounds `e ≤ 0 ∧ f ≤ 0` with `e + f` a positive
+/// constant), duplicates, and cubes subsumed by a smaller one.
+fn simplify(dnf: Dnf) -> Dnf {
+    let mut cubes: Vec<(alloc::collections::BTreeSet<AtomKey>, Vec<Atom>)> = Vec::new();
+    'cube: for cube in dnf {
+        let mut keys = alloc::collections::BTreeSet::new();
+        let mut atoms: Vec<Atom> = Vec::new();
+        for a in &cube {
+            match normalize(a) {
+                Norm::True => {}
+                Norm::False => continue 'cube,
+                Norm::Atom(n) => {
+                    if keys.insert(key(&n)) {
+                        atoms.push(n);
+                    }
+                }
+            }
+        }
+        for (i, a) in atoms.iter().enumerate() {
+            for b in &atoms[i + 1..] {
+                let clash = match (a, b) {
+                    (Atom::Le(e), Atom::Le(f)) => {
+                        let s = e.add(f);
+                        s.is_constant() && s.const_term().is_positive()
+                    }
+                    (Atom::Eq(e), Atom::Ne(f)) | (Atom::Ne(f), Atom::Eq(e)) => {
+                        let d = e.sub(f);
+                        d.is_constant() && d.const_term().is_zero()
+                    }
+                    _ => false,
+                };
+                if clash {
+                    continue 'cube;
+                }
+            }
+        }
+        cubes.push((keys, atoms));
+    }
+    cubes.sort_by_key(|(k, _)| k.len());
+    let mut kept: Vec<(alloc::collections::BTreeSet<AtomKey>, Vec<Atom>)> = Vec::new();
+    for (k, atoms) in cubes {
+        if kept.iter().any(|(s, _)| s.is_subset(&k)) {
+            continue;
+        }
+        kept.push((k, atoms));
+    }
+    kept.into_iter().map(|(_, a)| a).collect()
 }
 
 /// Negate a DNF into a DNF (`¬⋁cube = ⋀¬cube`, distributed). Bounded.
@@ -302,7 +457,7 @@ fn negate(dnf: &Dnf, budget: &mut u64) -> Option<Dnf> {
                 }
             }
         }
-        acc = next;
+        acc = simplify(next);
         if acc.is_empty() {
             return Some(Vec::new()); // ¬(true) contribution
         }
@@ -433,6 +588,59 @@ mod tests {
             for yv in -8..=8 {
                 let want = (-20..=20).any(|xv| eval(&cube, xv, yv));
                 let got = ex.iter().any(|cb| {
+                    cb.iter()
+                        .all(|a| eval_ground(&subst(a, y, &c(yv))) == Some(true))
+                });
+                assert_eq!(got, want, "y = {yv}");
+            }
+        }
+    }
+
+    // `∀x` of random two-cube DNFs (x boxed by `x < −20 ∨ x > 20 ∨ φ`) against
+    // brute force; exercises `negate` and the cube simplifier.
+    #[test]
+    fn forall_matches_brute_force() {
+        let (x, y) = (AstId(1000), AstId(1001));
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = |n: i64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % n as u64) as i64
+        };
+        let holds = |a: &Atom, xv: i64, yv: i64| {
+            eval_ground(&subst(&subst(a, x, &c(xv)), y, &c(yv))) == Some(true)
+        };
+        for _ in 0..300 {
+            let mut dnf: Dnf = vec![
+                vec![Atom::Lt(lin(1, x, 20))],
+                vec![Atom::Lt(lin(-1, x, 20))],
+            ];
+            for _ in 0..2 {
+                let mut cube = Vec::new();
+                for _ in 0..1 + rnd(2) {
+                    let cx = [-3, -2, -1, 1, 2, 3][rnd(6) as usize];
+                    let e = lin(cx, x, rnd(11) - 5)
+                        .add(&LinExpr::var(y).scale(&Rational::from_integer(int(rnd(5) - 2))));
+                    cube.push(match rnd(6) {
+                        0 => Atom::Lt(e),
+                        1 => Atom::Le(e),
+                        2 => Atom::Eq(e),
+                        3 => Atom::Ne(e),
+                        4 => Atom::Div(int(2 + rnd(2)), e),
+                        _ => Atom::Ndiv(int(2 + rnd(2)), e),
+                    });
+                }
+                dnf.push(cube);
+            }
+            let mut b = 1_000_000u64;
+            let Some(fx) = forall(&dnf, x, &mut b) else {
+                continue;
+            };
+            for yv in -8..=8 {
+                let want =
+                    (-25..=25).all(|xv| dnf.iter().any(|cb| cb.iter().all(|a| holds(a, xv, yv))));
+                let got = fx.iter().any(|cb| {
                     cb.iter()
                         .all(|a| eval_ground(&subst(a, y, &c(yv))) == Some(true))
                 });
