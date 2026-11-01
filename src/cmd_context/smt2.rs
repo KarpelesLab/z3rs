@@ -12988,14 +12988,19 @@ impl Context {
         let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
         let divs: Vec<AstId> = {
             let mut s: BTreeSet<AstId> = BTreeSet::new();
+            // The constants of every divisor (`a / (b / h)` pins `b` and `h`).
             for &(_, b, _) in &self.symbolic_realdiv {
-                if present.contains(&b) && self.m.is_uninterp_const(b) {
-                    s.insert(b);
+                if present.contains(&b) {
+                    for u in self.m.postorder(b) {
+                        if self.m.is_uninterp_const(u) && self.m.is_arith_sort(self.m.get_sort(u)) {
+                            s.insert(u);
+                        }
+                    }
                 }
             }
             s.into_iter().collect()
         };
-        if divs.is_empty() || divs.len() > 3 {
+        if divs.is_empty() || divs.len() > 4 {
             return None;
         }
         // Candidate nonzero values, plus the goal's nonzero integer constants.
@@ -13039,7 +13044,17 @@ impl Context {
                 .collect();
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let g = crate::rewriter::simplify(&mut self.m, g);
-            if !self.arith_nonlinear(g)
+            // Every divisor must evaluate to a nonzero constant.
+            let nonzero = self.symbolic_realdiv.clone().iter().all(|&(_, b, _)| {
+                if !present.contains(&b) {
+                    return true;
+                }
+                let bb = crate::rewriter::substitute(&mut self.m, b, &subst);
+                let bb = crate::rewriter::simplify(&mut self.m, bb);
+                self.m.as_numeral(bb).is_some_and(|v| !v.is_zero())
+            });
+            if nonzero
+                && !self.arith_nonlinear(g)
                 && let (SmtResult::Sat, _) = check_model(&self.m, g)
             {
                 // The model must also fix the substituted divisors.
@@ -35776,6 +35791,20 @@ mod tests {
             (assert (forall ((m Int) (n Int)) (=> (and (E m) (= n (+ m 1))) (E n))))
             (assert (forall ((m Int)) (=> (E m) (W m))))
             (assert (forall ((m Int)) (=> (and (W m) (< m 0)) false)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn realdiv_witness_pins_nested_divisor_constants() {
+        // z3 regression 3625: `a / (b / h)` needs `b` pinned as well as `h`.
+        let script = "
+            (declare-fun a () Int) (declare-fun b () Int) (declare-fun c () Int)
+            (declare-fun d () Int) (declare-fun f () Int) (declare-fun g () Int)
+            (declare-fun h () Int) (declare-fun i () Int)
+            (assert (= (/ c g) 1))
+            (assert (= (not (<= (/ a (/ b h)) 6)) (= (+ f (/ d i)) 0)))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
