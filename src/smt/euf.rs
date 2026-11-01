@@ -124,6 +124,18 @@ impl Egraph {
         }
     }
 
+    /// Take over the classes of `other`, an e-graph over terms sharing no
+    /// uninterpreted symbol with this one (interpreted terms common to both
+    /// denote the same value, so merging through them is sound).
+    pub fn absorb(&mut self, m: &AstManager, mut other: Egraph) {
+        for i in 0..other.terms.len() {
+            let r = other.find(i);
+            let (t, rt) = (other.terms[i], other.terms[r]);
+            self.merge_terms(m, t, rt);
+        }
+        self.close();
+    }
+
     /// The canonical class index of `t` in the current union-find (terms that
     /// are equal share it). Interns `t` if unseen. Meaningful after a call to
     /// `is_consistent` has applied the equalities.

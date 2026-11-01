@@ -2472,6 +2472,8 @@ struct Context {
     /// Nesting depth of `try_disjunction_sat_witness`: a disjunct is itself a
     /// conjunction that may contain a disjunction, so re-entry is bounded.
     disj_witness_depth: u32,
+    /// Set while `decide_independent_components` decides one component.
+    in_components: bool,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -3456,6 +3458,7 @@ impl Context {
             rm_bv: BTreeMap::new(),
             fp_defer_depth: 0,
             disj_witness_depth: 0,
+            in_components: false,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -5071,6 +5074,9 @@ impl Context {
         let (eb, sb) = self.fp_format_of(self.m.get_sort(id))?;
         let bits: u64 = if let Some(&(b, _, _)) = self.fp_of.get(&id) {
             b
+        } else if !self.fp_bv.contains_key(&id) && self.m.is_uninterp_const(id) {
+            // An FP constant no assertion constrains: z3's completion is NaN.
+            (((1u64 << eb) - 1) << (sb - 1)) | (1u64 << (sb - 2))
         } else {
             let bv = self.fp_bv.get(&id).copied()?;
             let v = match model.eval(&self.m, bv) {
@@ -26345,10 +26351,19 @@ impl Context {
         // store(B,2,3) = store(A,5,3)` lost both `A[2] = 1` and the stores'
         // agreement at 2, and came back `sat` (2549). Stated directly, each
         // instance survives folding as a real constraint (`A = const 1 ⇒ A[2] = 1`).
+        // Only indices of an array's own index sort.
+        let fits = |ctx: &Self, arr: AstId, j: AstId| {
+            ctx.m
+                .array_sort_params(ctx.m.get_sort(arr))
+                .is_none_or(|(idx, _)| idx == ctx.m.get_sort(j))
+        };
         for &(a, b) in &array_eqs {
             let eq_ab = self.m.mk_eq(a, b);
             let ne_ab = self.m.mk_not(eq_ab);
             for &j in &indices {
+                if !fits(self, a, j) {
+                    continue;
+                }
                 let sel_a = self.select_expand_map(a, j);
                 let sel_b = self.select_expand_map(b, j);
                 let eq_reads = self.m.mk_eq(sel_a, sel_b);
@@ -26360,6 +26375,9 @@ impl Context {
         for &ca in &const_arrays {
             let v = self.m.app_args(ca)[0];
             for &j in &indices {
+                if !fits(self, ca, j) {
+                    continue;
+                }
                 let sel = self.m.mk_select(ca, j);
                 let ax = self.m.mk_eq(sel, v);
                 axioms.push(ax);
@@ -26372,7 +26390,7 @@ impl Context {
             let row1 = self.m.mk_eq(sel_i, v);
             axioms.push(row1);
             for &j in &indices {
-                if j == i {
+                if j == i || !fits(self, st, j) {
                     continue;
                 }
                 let eq_ij = self.m.mk_eq(i, j);
@@ -26890,6 +26908,12 @@ impl Context {
                     return (r2, m2);
                 }
             }
+        }
+        // Fallback: decide independent components separately.
+        if res == SmtResult::Unknown
+            && let Some(r) = self.decide_independent_components(goal)
+        {
+            return r;
         }
         (res, model)
     }
@@ -29426,11 +29450,9 @@ impl Context {
         Some((0..1i64 << w).map(|v| self.m.mk_bv(v, w)).collect())
     }
 
-    /// Decide a mixed goal whose top-level conjuncts split into groups sharing
-    /// no constant or function symbol: pure bit-vector groups by bit-blasting,
-    /// bit-vector-free groups by the general procedure. The goal is sat iff
-    /// every group is. `None` if a group mixes bit-vectors with other theories.
-    fn decide_bv_components(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+    /// The conjuncts of `goal` grouped into components that share no
+    /// uninterpreted symbol (an FP term and its bit-vector image count as one).
+    fn component_groups(&self, goal: AstId) -> Vec<Vec<AstId>> {
         let mut conjuncts = Vec::new();
         self.icp_flatten_and(goal, &mut conjuncts);
         // An FP term and its bit-vector image are one symbol (linked through
@@ -29471,6 +29493,57 @@ impl Context {
             rest.push(merged);
             groups = rest;
         }
+        groups.into_iter().map(|(_, cs)| cs).collect()
+    }
+
+    /// A goal whose conjuncts split into independent components is decided
+    /// component by component (any `unsat` is the goal's; all `sat` merge
+    /// into one model). Not re-entered from inside a component.
+    fn decide_independent_components(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        if self.in_components || !self.universals.is_empty() {
+            return None;
+        }
+        let groups = self.component_groups(goal);
+        if groups.len() < 2 {
+            return None;
+        }
+        self.in_components = true;
+        let mut model: Option<Model> = Some(Model::from_bv(BTreeMap::new()));
+        let mut result = Some(SmtResult::Sat);
+        for cs in groups {
+            let g = match cs.len() {
+                1 => cs[0],
+                _ => self.m.mk_and(&cs),
+            };
+            let (r, m) = self.decide(g);
+            match r {
+                SmtResult::Unsat => {
+                    result = Some(SmtResult::Unsat);
+                    model = None;
+                    break;
+                }
+                SmtResult::Unknown => result = None,
+                SmtResult::Sat => {
+                    model = match (model, m) {
+                        (Some(mut a), Some(b)) => {
+                            a.absorb(&self.m, b);
+                            Some(a)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        }
+        self.in_components = false;
+        result.map(|r| (r, model))
+    }
+
+    /// Decide a mixed goal whose top-level conjuncts split into groups sharing
+    /// no constant or function symbol: pure bit-vector groups by bit-blasting,
+    /// bit-vector-free groups by the general procedure. The goal is sat iff
+    /// every group is. `None` if a group mixes bit-vectors with other theories.
+    fn decide_bv_components(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let groups = self.component_groups(goal);
         if groups.len() < 2 {
             return None;
         }
@@ -29478,7 +29551,7 @@ impl Context {
         // model), each pure one by the bit-blaster.
         let mut parts: Vec<Vec<AstId>> = Vec::new();
         let mut rest: Vec<AstId> = Vec::new();
-        for (_, cs) in groups {
+        for cs in groups {
             let g = match cs.len() {
                 1 => cs[0],
                 _ => self.m.mk_and(&cs),
@@ -29527,7 +29600,7 @@ impl Context {
         }
         let mut model = model.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
         for m in bv_models {
-            model.absorb(m);
+            model.absorb(&self.m, m);
         }
         Some((SmtResult::Sat, Some(model)))
     }
@@ -36117,6 +36190,45 @@ mod tests {
         assert_eq!(
             run(script).unwrap(),
             alloc::vec!["sat", "((s #b0000000000010))"]
+        );
+    }
+
+    #[test]
+    fn independent_components_are_decided_separately() {
+        // z3 regression fp-array-5: arrays over FP indices next to unrelated
+        // Int/FP arrays; extensionality used to pair arrays with indices of
+        // another sort, gluing the components together.
+        let script = "
+            (declare-fun A () (Array (_ FloatingPoint 8 24) (_ FloatingPoint 11 53)))
+            (declare-fun A2 () (Array (_ FloatingPoint 8 24) (_ FloatingPoint 11 53)))
+            (declare-fun C () (Array (_ FloatingPoint 11 53) Int))
+            (assert (not (= A A2)))
+            (assert (= (select A (_ +oo 8 24)) (select A (_ -oo 8 24))))
+            (assert (not (= (select C (_ -oo 11 53)) 2)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn congruence_separates_model_arguments() {
+        // Fuzz-found: `f(0) ≠ f(k)` (and `a[j] ≠ a[0]`) got the model `k = 0`.
+        let script = "
+            (declare-fun f (Int) Int)
+            (declare-fun k () Int)
+            (declare-fun a () (Array Int Int))
+            (declare-fun j () Int)
+            (assert (distinct (f 0) (f k)))
+            (assert (distinct (select a j) (select a 0)))
+            (check-sat)
+            (get-value (k j))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(
+            !out[1].contains("(k 0)") && !out[1].contains("(j 0)"),
+            "{}",
+            out[1]
         );
     }
 

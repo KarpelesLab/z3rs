@@ -293,11 +293,14 @@ impl Model {
         }
     }
 
-    /// Take over the bit-vector and Boolean assignments of `other`, a model
-    /// of a component sharing no symbols with this one.
-    pub fn absorb(&mut self, other: Model) {
+    /// Take over the assignments of `other`, a model of a component sharing no
+    /// symbols with this one.
+    pub fn absorb(&mut self, m: &AstManager, other: Model) {
         self.bv.extend(other.bv);
         self.bools.extend(other.bools);
+        self.arith.extend(other.arith);
+        self.alg.extend(other.alg);
+        self.euf.absorb(m, other.euf);
     }
 
     /// Pin a Boolean constant (or atom) to a truth value.
@@ -2212,13 +2215,102 @@ fn theory_check(
         }
         if !changed {
             return match arith {
-                Feas::Sat(assign) => TheoryOutcome::Sat(assign, g),
+                Feas::Sat(assign) => {
+                    match separate_classes(m, &sys, euf_roots, &mut g, assign, budget) {
+                        Some(assign) => TheoryOutcome::Sat(assign, g),
+                        None => TheoryOutcome::Unknown,
+                    }
+                }
                 Feas::Unknown => TheoryOutcome::Unknown,
                 Feas::Unsat => unreachable!(),
             };
         }
     }
     TheoryOutcome::Unknown // did not converge within the round budget
+}
+
+/// The arithmetic model must respect congruence: two applications of one
+/// function whose arguments get equal values must get equal values too (else
+/// `f(0) ≠ f(k)` gets `k = 0`). Each violation is repaired by re-solving with
+/// a differing argument pair as a disequality. `None` when a violation has no
+/// arithmetic argument to separate, they cannot all be separated (a
+/// non-convex integer case), or the budget runs out.
+fn separate_classes(
+    m: &AstManager,
+    sys: &ArithSystem,
+    euf_roots: &[AstId],
+    g: &mut Egraph,
+    mut assign: Assignment,
+    budget: &mut u64,
+) -> Option<Assignment> {
+    let mut apps: Vec<AstId> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for &r in euf_roots {
+        for t in m.postorder(r) {
+            if let Some(a) = m.app(t)
+                && !a.args.is_empty()
+                && (m.is_select(t)
+                    || m.func_decl(a.decl)
+                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID))
+                && seen.insert(t)
+            {
+                apps.push(t);
+            }
+        }
+    }
+    if apps.len() < 2 {
+        return Some(assign);
+    }
+    let mut sys = ArithSystem {
+        cons: sys.cons.clone(),
+        diseqs: sys.diseqs.clone(),
+        int_set: sys.int_set.clone(),
+        con_lits: sys.con_lits.clone(),
+    };
+    let arith = |t: AstId| m.is_arith_sort(m.get_sort(t));
+    for _ in 0..8 {
+        let mut clash = Vec::new();
+        for i in 0..apps.len() {
+            for j in (i + 1)..apps.len() {
+                let (p, q) = (apps[i], apps[j]);
+                if m.app_decl(p) != m.app_decl(q) {
+                    continue;
+                }
+                let (pa, qa) = (m.app_args(p), m.app_args(q));
+                let same = |g: &mut Egraph, a: AstId, b: AstId| {
+                    if arith(a) {
+                        ast_to_lin(m, a).eval(&assign) == ast_to_lin(m, b).eval(&assign)
+                    } else {
+                        g.class_of(m, a) == g.class_of(m, b)
+                    }
+                };
+                if !pa.iter().zip(qa).all(|(&a, &b)| same(g, a, b)) || same(g, p, q) {
+                    continue;
+                }
+                let sep = pa
+                    .iter()
+                    .zip(qa)
+                    .find(|&(&a, &b)| arith(a) && g.class_of(m, a) != g.class_of(m, b))?;
+                clash.push(ast_to_lin(m, *sep.0).sub(&ast_to_lin(m, *sep.1)));
+            }
+        }
+        if clash.is_empty() {
+            return Some(assign);
+        }
+        for d in &clash {
+            for v in d.vars() {
+                if m.is_int_sort(m.get_sort(v)) {
+                    sys.int_set.insert(v);
+                }
+            }
+        }
+        sys.diseqs.extend(clash);
+        match arith_feasible(&sys, budget) {
+            Feas::Sat(a) => assign = a,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Record the integer-sorted variables of `e` into `set`.
