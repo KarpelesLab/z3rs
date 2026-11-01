@@ -30,9 +30,22 @@ pub fn check_bv(m: &AstManager, formula: AstId) -> SmtResult {
 /// A concrete bit-vector value per blasted term: `(value, width)`.
 pub type BvValuation = BTreeMap<AstId, (puremp::Int, u32)>;
 
+/// A bit-vector model together with its uninterpreted Boolean constants.
+pub type BvBoolModel = (BvValuation, BTreeMap<AstId, bool>);
+
 /// Like [`check_bv`], but on `Sat` also returns the concrete value of every
 /// blasted bit-vector term (read off the satisfying SAT assignment), for models.
 pub fn check_bv_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<BvValuation>) {
+    let (r, v) = check_bv_model_with_bools(m, formula);
+    (r, v.map(|(bv, _)| bv))
+}
+
+/// [`check_bv_model`], also returning the value of each uninterpreted Boolean
+/// constant of the formula.
+pub fn check_bv_model_with_bools(
+    m: &AstManager,
+    formula: AstId,
+) -> (SmtResult, Option<BvBoolModel>) {
     let mut bb = BitBlaster::new(m);
     let top = bb.blast_bool(formula);
     bb.sat.add_clause(&[top]);
@@ -59,7 +72,13 @@ pub fn check_bv_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<BvVa
                 }
                 val.insert(t, (v, width));
             }
-            (SmtResult::Sat, Some(val))
+            let bools: BTreeMap<AstId, bool> = bb
+                .bools
+                .iter()
+                .filter(|&(&t, _)| m.is_uninterp_const(t))
+                .map(|(&t, &lit)| (t, bb.sat.model_holds(lit)))
+                .collect();
+            (SmtResult::Sat, Some((val, bools)))
         }
     }
 }

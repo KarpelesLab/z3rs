@@ -31,7 +31,8 @@ use crate::ast::manager::AstManager;
 use crate::rewriter::substitute;
 use crate::smt::{
     Constraint, LinExpr, Model, OptOutcome, Rel, SmtResult, Value, arith_optimize, ast_to_lin,
-    check_bv_model, check_model, feasible, linear_constraints, project, substitute_lin,
+    check_bv_model, check_bv_model_with_bools, check_model, feasible, linear_constraints, project,
+    substitute_lin,
 };
 
 /// Optimization state carried between repeated `check-sat`s (z3's
@@ -20553,6 +20554,9 @@ impl Context {
                 .chain(self.m.postorder(*b))
                 .all(|t| !self.declared_sorts.contains(&self.m.get_sort(t)))
         });
+        if let Some(r) = self.solve_bv_universals() {
+            return r;
+        }
         if ground_trivial
             && sentinel_free
             && interpreted_only
@@ -20704,6 +20708,207 @@ impl Context {
         } else {
             (res, model)
         }
+    }
+
+    /// Universals over Bool/bit-vector binders with pure bit-vector bodies
+    /// and a pure bit-vector ground goal, decided by counterexample-guided
+    /// instantiation: bit-blast the ground goal with the instances so far,
+    /// look for binder values falsifying a universal under that model, and
+    /// add the instance; no counterexample left is `sat`, an unsat ground goal
+    /// `unsat`. Complete on these finite domains (bounded rounds).
+    fn solve_bv_universals(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        let finite = |m: &AstManager, v: AstId| {
+            let s = m.get_sort(v);
+            m.is_bool_sort(s) || m.bv_sort_width(s).is_some()
+        };
+        if self.universals.is_empty() {
+            return None;
+        }
+        // Each universal as (∀ binders, ∃ binders, body): a skolem application
+        // `!sk!k(x…)` of the body is an inner existential (fresh per universal).
+        let mut univ: Vec<(Vec<AstId>, Vec<AstId>, AstId)> = Vec::new();
+        for (vars, body) in self.universals.clone() {
+            if !vars.iter().all(|&v| finite(&self.m, v)) {
+                return None;
+            }
+            let mut sk: Vec<(AstId, AstId)> = Vec::new();
+            for t in self.m.postorder(body) {
+                if let Some(a) = self.m.app(t)
+                    && !a.args.is_empty()
+                    && self
+                        .decl_name(a.decl)
+                        .is_some_and(|n| n.starts_with("!sk!"))
+                    && !sk.iter().any(|&(u, _)| u == t)
+                {
+                    if !finite(&self.m, t) || a.args.iter().any(|x| !vars.contains(x)) {
+                        return None;
+                    }
+                    let y = self.fresh_const(self.m.get_sort(t));
+                    sk.push((t, y));
+                }
+            }
+            let mut body = crate::rewriter::substitute(&mut self.m, body, &sk);
+            if !self.bv_goal_is_pure(body) {
+                return None;
+            }
+            // One-point rule: an existential defined by a top-level conjunct
+            // `y = t` (t free of the existentials) is replaced by `t`.
+            let mut ys: Vec<AstId> = sk.into_iter().map(|(_, y)| y).collect();
+            loop {
+                let mut conj = Vec::new();
+                self.icp_flatten_and(body, &mut conj);
+                let def = conj.iter().find_map(|&c| {
+                    if !self.m.is_eq(c) {
+                        return None;
+                    }
+                    let a = self.m.app_args(c);
+                    [(a[0], a[1]), (a[1], a[0])].into_iter().find(|&(y, t)| {
+                        ys.contains(&y) && !ys.iter().any(|&z| self.term_contains(t, z))
+                    })
+                });
+                let Some((y, t)) = def else { break };
+                body = crate::rewriter::substitute(&mut self.m, body, &[(y, t)]);
+                body = crate::rewriter::simplify(&mut self.m, body);
+                ys.retain(|&z| z != y);
+            }
+            univ.push((vars, ys, body));
+        }
+        let mut roots: Vec<AstId> = univ.iter().map(|u| u.2).collect();
+        roots.extend(self.assertions.iter().copied());
+        if self
+            .m
+            .postorder_many(&roots)
+            .iter()
+            .any(|t| self.quant_atoms.contains(t))
+        {
+            return None;
+        }
+        let ground = self.conjunction();
+        if !self.bv_goal_is_pure(ground) {
+            return None;
+        }
+        let mut parts = alloc::vec![ground];
+        for _ in 0..256 {
+            let g = if parts.len() == 1 {
+                parts[0]
+            } else {
+                self.m.mk_and(&parts)
+            };
+            let (r, val) = check_bv_model_with_bools(&self.m, g);
+            let (bv, bools) = match r {
+                SmtResult::Unsat => return Some((SmtResult::Unsat, None)),
+                SmtResult::Unknown => return None,
+                SmtResult::Sat => val?,
+            };
+            let mut refined = false;
+            for (xs, ys, body) in &univ {
+                let bound: BTreeSet<AstId> = xs.iter().chain(ys).copied().collect();
+                let free: Vec<AstId> = self
+                    .m
+                    .postorder(*body)
+                    .into_iter()
+                    .filter(|&t| self.m.is_uninterp_const(t) && !bound.contains(&t))
+                    .collect();
+                let fix: Vec<(AstId, AstId)> = free
+                    .iter()
+                    .map(|&c| (c, self.bv_value_of(c, &bv, &bools)))
+                    .collect();
+                let fixed = crate::rewriter::substitute(&mut self.m, *body, &fix);
+                if let Some(cex) = self.bv_forall_exists_cex(xs, ys, fixed)? {
+                    // `∃y. φ(x*, y)` as a ground instance with fresh `y`.
+                    let mut inst = cex;
+                    for &y in ys {
+                        let fy = self.fresh_const(self.m.get_sort(y));
+                        inst.push((y, fy));
+                    }
+                    parts.push(crate::rewriter::substitute(&mut self.m, *body, &inst));
+                    refined = true;
+                }
+            }
+            if !refined {
+                let mut model = Model::from_bv(bv);
+                for (t, b) in bools {
+                    model.set_bool(t, b);
+                }
+                return Some((SmtResult::Sat, Some(model)));
+            }
+        }
+        None
+    }
+
+    /// The value of `t` under a bit-blasted model (unassigned: 0 / false).
+    fn bv_value_of(
+        &mut self,
+        t: AstId,
+        bv: &crate::smt::bv::BvValuation,
+        bools: &BTreeMap<AstId, bool>,
+    ) -> AstId {
+        if self.m.is_bool_sort(self.m.get_sort(t)) {
+            self.mk_bool(bools.get(&t).copied().unwrap_or(false))
+        } else {
+            let w = self.m.bv_sort_width(self.m.get_sort(t)).unwrap_or(1);
+            let v = bv
+                .get(&t)
+                .map(|(v, _)| v.clone())
+                .unwrap_or_else(|| Int::from(0));
+            self.m.mk_bv_numeral(v, w)
+        }
+    }
+
+    /// For the closed `∀xs ∃ys. φ`: `Some(Some(x*))` binder values with no
+    /// `ys` satisfying `φ`, `Some(None)` when it is valid, `None` when
+    /// undecided. Counterexample-guided (2QBF): candidates `x` falsify `φ`
+    /// at every `y` found so far, and each is answered by a new `y` or is
+    /// the counterexample.
+    fn bv_forall_exists_cex(
+        &mut self,
+        xs: &[AstId],
+        ys: &[AstId],
+        phi: AstId,
+    ) -> Option<Option<Vec<(AstId, AstId)>>> {
+        let mut answers: Vec<AstId> = Vec::new(); // φ[y := y*] for each y* found
+        for _ in 0..64 {
+            let negs: Vec<AstId> = if ys.is_empty() {
+                alloc::vec![self.m.mk_not(phi)]
+            } else {
+                answers.iter().map(|&a| self.m.mk_not(a)).collect()
+            };
+            let q = match negs.len() {
+                0 => self.m.mk_true(),
+                1 => negs[0],
+                _ => self.m.mk_and(&negs),
+            };
+            let q = crate::rewriter::simplify(&mut self.m, q);
+            let (r, val) = check_bv_model_with_bools(&self.m, q);
+            let (bv, bools) = match r {
+                SmtResult::Unsat => return Some(None),
+                SmtResult::Unknown => return None,
+                SmtResult::Sat => val?,
+            };
+            let xstar: Vec<(AstId, AstId)> = xs
+                .iter()
+                .map(|&x| (x, self.bv_value_of(x, &bv, &bools)))
+                .collect();
+            if ys.is_empty() {
+                return Some(Some(xstar));
+            }
+            let at_x = crate::rewriter::substitute(&mut self.m, phi, &xstar);
+            let at_x = crate::rewriter::simplify(&mut self.m, at_x);
+            let (r2, val2) = check_bv_model_with_bools(&self.m, at_x);
+            match r2 {
+                SmtResult::Unsat => return Some(Some(xstar)),
+                SmtResult::Unknown => return None,
+                SmtResult::Sat => {
+                    let (bv2, bools2) = val2?;
+                    let ystar: Vec<(AstId, AstId)> = ys
+                        .iter()
+                        .map(|&y| (y, self.bv_value_of(y, &bv2, &bools2)))
+                        .collect();
+                    answers.push(crate::rewriter::substitute(&mut self.m, phi, &ystar));
+                }
+            }
+        }
+        None
     }
 
     /// Model-based check of every universal against the candidate `model` of
@@ -37138,6 +37343,24 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn bitvector_universals_by_counterexample_instantiation() {
+        // z3 regressions 3752 (∀q. x·x ≥s q over 19 bits) and 3735 (∀∃).
+        let script = "
+            (declare-const x (_ BitVec 19))
+            (assert (not (exists ((q (_ BitVec 19))) (not (bvsge (bvmul x x) q)))))
+            (check-sat)
+            (reset)
+            (assert (forall ((a (_ BitVec 16)) (b Bool))
+              (exists ((c (_ BitVec 16)) (d Bool)) (and (= c (bvadd a #x0001)) (= d (not b))))))
+            (check-sat)
+            (reset)
+            (assert (forall ((a (_ BitVec 8))) (exists ((c (_ BitVec 8))) (bvult a c))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "sat", "unsat"]);
     }
 
     #[test]
