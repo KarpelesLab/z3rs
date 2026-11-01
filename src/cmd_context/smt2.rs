@@ -20856,16 +20856,18 @@ impl Context {
         }
     }
 
-    /// Universals over Bool/bit-vector binders with pure bit-vector bodies
-    /// and a pure bit-vector ground goal, decided by counterexample-guided
-    /// instantiation: bit-blast the ground goal with the instances so far,
-    /// look for binder values falsifying a universal under that model, and
-    /// add the instance; no counterexample left is `sat`, an unsat ground goal
-    /// `unsat`. Complete on these finite domains (bounded rounds).
+    /// Universals over Bool/bit-vector/arithmetic binders with interpreted
+    /// bodies (no uninterpreted functions) and such a ground goal, decided by
+    /// counterexample-guided instantiation: solve the ground goal with the
+    /// instances so far, look for binder values falsifying a universal under
+    /// that model, and add the instance; no counterexample left is `sat`, an
+    /// unsat ground goal `unsat`. Pure bit-vector parts are bit-blasted (a
+    /// complete procedure on these finite domains, bounded rounds), the rest
+    /// go through the full decision procedure and need rational model values.
     fn solve_bv_universals(&mut self) -> Option<(SmtResult, Option<Model>)> {
-        let finite = |m: &AstManager, v: AstId| {
+        let binder = |m: &AstManager, v: AstId| {
             let s = m.get_sort(v);
-            m.is_bool_sort(s) || m.bv_sort_width(s).is_some()
+            m.is_bool_sort(s) || m.bv_sort_width(s).is_some() || m.is_arith_sort(s)
         };
         if self.universals.is_empty() {
             return None;
@@ -20873,8 +20875,9 @@ impl Context {
         // Each universal as (∀ binders, ∃ binders, body): a skolem application
         // `!sk!k(x…)` of the body is an inner existential (fresh per universal).
         let mut univ: Vec<(Vec<AstId>, Vec<AstId>, AstId)> = Vec::new();
+        let mut all_bv = true;
         for (vars, body) in self.universals.clone() {
-            if !vars.iter().all(|&v| finite(&self.m, v)) {
+            if !vars.iter().all(|&v| binder(&self.m, v)) {
                 return None;
             }
             let mut sk: Vec<(AstId, AstId)> = Vec::new();
@@ -20886,7 +20889,7 @@ impl Context {
                         .is_some_and(|n| n.starts_with("!sk!"))
                     && !sk.iter().any(|&(u, _)| u == t)
                 {
-                    if !finite(&self.m, t) || a.args.iter().any(|x| !vars.contains(x)) {
+                    if !binder(&self.m, t) || a.args.iter().any(|x| !vars.contains(x)) {
                         return None;
                     }
                     let y = self.fresh_const(self.m.get_sort(t));
@@ -20894,9 +20897,10 @@ impl Context {
                 }
             }
             let mut body = crate::rewriter::substitute(&mut self.m, body, &sk);
-            if !self.bv_goal_is_pure(body) {
+            if !self.cegar_interpreted(body) {
                 return None;
             }
+            all_bv &= self.bv_goal_is_pure(body);
             // One-point rule: an existential defined by a top-level conjunct
             // `y = t` (t free of the existentials) is replaced by `t`.
             let mut ys: Vec<AstId> = sk.into_iter().map(|(_, y)| y).collect();
@@ -20930,21 +20934,22 @@ impl Context {
             return None;
         }
         let ground = self.conjunction();
-        if !self.bv_goal_is_pure(ground) {
+        if !self.cegar_interpreted(ground) {
             return None;
         }
+        all_bv &= self.bv_goal_is_pure(ground);
+        let rounds = if all_bv { 256 } else { 32 };
         let mut parts = alloc::vec![ground];
-        for _ in 0..256 {
+        for _ in 0..rounds {
             let g = if parts.len() == 1 {
                 parts[0]
             } else {
                 self.m.mk_and(&parts)
             };
-            let (r, val) = check_bv_model_with_bools(&self.m, g);
-            let (bv, bools) = match r {
-                SmtResult::Unsat => return Some((SmtResult::Unsat, None)),
-                SmtResult::Unknown => return None,
-                SmtResult::Sat => val?,
+            let mut model = match self.cegar_solve(g) {
+                (SmtResult::Unsat, _) => return Some((SmtResult::Unsat, None)),
+                (SmtResult::Sat, Some(m)) => m,
+                _ => return None,
             };
             let mut refined = false;
             for (xs, ys, body) in &univ {
@@ -20955,12 +20960,12 @@ impl Context {
                     .into_iter()
                     .filter(|&t| self.m.is_uninterp_const(t) && !bound.contains(&t))
                     .collect();
-                let fix: Vec<(AstId, AstId)> = free
-                    .iter()
-                    .map(|&c| (c, self.bv_value_of(c, &bv, &bools)))
-                    .collect();
+                let mut fix: Vec<(AstId, AstId)> = Vec::new();
+                for &c in &free {
+                    fix.push((c, self.cegar_value(&mut model, c)?));
+                }
                 let fixed = crate::rewriter::substitute(&mut self.m, *body, &fix);
-                if let Some(cex) = self.bv_forall_exists_cex(xs, ys, fixed)? {
+                if let Some(cex) = self.forall_exists_cex(xs, ys, fixed)? {
                     // `∃y. φ(x*, y)` as a ground instance with fresh `y`.
                     let mut inst = cex;
                     for &y in ys {
@@ -20972,33 +20977,106 @@ impl Context {
                 }
             }
             if !refined {
-                let mut model = Model::from_bv(bv);
-                for (t, b) in bools {
-                    model.set_bool(t, b);
-                }
                 return Some((SmtResult::Sat, Some(model)));
             }
         }
         None
     }
 
-    /// The value of `t` under a bit-blasted model (unassigned: 0 / false).
-    fn bv_value_of(
-        &mut self,
-        t: AstId,
-        bv: &crate::smt::bv::BvValuation,
-        bools: &BTreeMap<AstId, bool>,
-    ) -> AstId {
-        if self.m.is_bool_sort(self.m.get_sort(t)) {
-            self.mk_bool(bools.get(&t).copied().unwrap_or(false))
-        } else {
-            let w = self.m.bv_sort_width(self.m.get_sort(t)).unwrap_or(1);
-            let v = bv
-                .get(&t)
-                .map(|(v, _)| v.clone())
-                .unwrap_or_else(|| Int::from(0));
-            self.m.mk_bv_numeral(v, w)
+    /// Built only from Booleans, bit-vectors and arithmetic, with no
+    /// uninterpreted function or opaque marker.
+    fn cegar_interpreted(&self, t: AstId) -> bool {
+        self.m.postorder(t).into_iter().all(|u| {
+            let s = self.m.get_sort(u);
+            let sort_ok = self.m.is_bool_sort(s)
+                || self.m.bv_sort_width(s).is_some()
+                || self.m.is_arith_sort(s);
+            let uf = self.m.app(u).is_some_and(|a| {
+                !a.args.is_empty()
+                    && self
+                        .m
+                        .func_decl(a.decl)
+                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+            });
+            sort_ok
+                && !uf
+                && !self.str_symbolic.contains(&u)
+                && !self.is_opaque_fp_marker(u)
+                && !self.quant_atoms.contains(&u)
+        })
+    }
+
+    /// Decide `g` for the CEGAR loop: bit-blasted when pure bit-vector,
+    /// otherwise by the full decision procedure.
+    fn cegar_solve(&mut self, g: AstId) -> (SmtResult, Option<Model>) {
+        if self.bv_goal_is_pure(g) {
+            let (r, val) = check_bv_model_with_bools(&self.m, g);
+            return match val {
+                Some((bv, bools)) => {
+                    let mut model = Model::from_bv(bv);
+                    for (t, b) in bools {
+                        model.set_bool(t, b);
+                    }
+                    (r, Some(model))
+                }
+                None => (r, None),
+            };
         }
+        // Negated disjunctions become conjunctions of literals, the shape the
+        // nonlinear refuters read.
+        let g = self.push_not_top(g);
+        let l = self.lift(g);
+        self.decide(l)
+    }
+
+    /// `g` with negations pushed through the top-level Boolean structure:
+    /// `¬(a ∨ b)` → `¬a ∧ ¬b`, `¬(a ⇒ b)` → `a ∧ ¬b`, `¬¬a` → `a`, under `∧`.
+    fn push_not_top(&mut self, g: AstId) -> AstId {
+        if self.m.is_and(g) {
+            let args: Vec<AstId> = self.m.app_args(g).to_vec();
+            let parts: Vec<AstId> = args.into_iter().map(|a| self.push_not_top(a)).collect();
+            return self.m.mk_and(&parts);
+        }
+        if !self.m.is_not(g) {
+            return g;
+        }
+        let inner = self.m.app_args(g)[0];
+        let args = self.m.app_args(inner).to_vec();
+        if self.m.is_not(inner) {
+            self.push_not_top(args[0])
+        } else if self.m.is_or(inner) && args.len() >= 2 {
+            let parts: Vec<AstId> = args
+                .into_iter()
+                .map(|a| {
+                    let n = self.m.mk_not(a);
+                    self.push_not_top(n)
+                })
+                .collect();
+            self.m.mk_and(&parts)
+        } else if self.m.is_implies(inner) && args.len() == 2 {
+            let n = self.m.mk_not(args[1]);
+            let nb = self.push_not_top(n);
+            let a = self.push_not_top(args[0]);
+            self.m.mk_and(&[a, nb])
+        } else {
+            g
+        }
+    }
+
+    /// The model value of the constant `t` as a literal (`None` for an
+    /// irrational one).
+    fn cegar_value(&mut self, model: &mut Model, t: AstId) -> Option<AstId> {
+        if let Some(a) = model.alg_value(&self.m, t)
+            && !a.is_rational()
+        {
+            return None;
+        }
+        Some(match model.eval_value(&self.m, t) {
+            Value::Bool(b) => self.mk_bool(b),
+            Value::Bv(v, w) => self.m.mk_bv_numeral(v, w),
+            Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+            Value::Uninterp(..) => return None,
+        })
     }
 
     /// For the closed `∀xs ∃ys. φ`: `Some(Some(x*))` binder values with no
@@ -21006,7 +21084,7 @@ impl Context {
     /// undecided. Counterexample-guided (2QBF): candidates `x` falsify `φ`
     /// at every `y` found so far, and each is answered by a new `y` or is
     /// the counterexample.
-    fn bv_forall_exists_cex(
+    fn forall_exists_cex(
         &mut self,
         xs: &[AstId],
         ys: &[AstId],
@@ -21025,33 +21103,30 @@ impl Context {
                 _ => self.m.mk_and(&negs),
             };
             let q = crate::rewriter::simplify(&mut self.m, q);
-            let (r, val) = check_bv_model_with_bools(&self.m, q);
-            let (bv, bools) = match r {
-                SmtResult::Unsat => return Some(None),
-                SmtResult::Unknown => return None,
-                SmtResult::Sat => val?,
+            let mut model = match self.cegar_solve(q) {
+                (SmtResult::Unsat, _) => return Some(None),
+                (SmtResult::Sat, Some(m)) => m,
+                _ => return None,
             };
-            let xstar: Vec<(AstId, AstId)> = xs
-                .iter()
-                .map(|&x| (x, self.bv_value_of(x, &bv, &bools)))
-                .collect();
+            let mut xstar = Vec::new();
+            for &x in xs {
+                xstar.push((x, self.cegar_value(&mut model, x)?));
+            }
             if ys.is_empty() {
                 return Some(Some(xstar));
             }
             let at_x = crate::rewriter::substitute(&mut self.m, phi, &xstar);
             let at_x = crate::rewriter::simplify(&mut self.m, at_x);
-            let (r2, val2) = check_bv_model_with_bools(&self.m, at_x);
-            match r2 {
-                SmtResult::Unsat => return Some(Some(xstar)),
-                SmtResult::Unknown => return None,
-                SmtResult::Sat => {
-                    let (bv2, bools2) = val2?;
-                    let ystar: Vec<(AstId, AstId)> = ys
-                        .iter()
-                        .map(|&y| (y, self.bv_value_of(y, &bv2, &bools2)))
-                        .collect();
+            match self.cegar_solve(at_x) {
+                (SmtResult::Unsat, _) => return Some(Some(xstar)),
+                (SmtResult::Sat, Some(mut m2)) => {
+                    let mut ystar = Vec::new();
+                    for &y in ys {
+                        ystar.push((y, self.cegar_value(&mut m2, y)?));
+                    }
                     answers.push(crate::rewriter::substitute(&mut self.m, phi, &ystar));
                 }
+                _ => return None,
             }
         }
         None
@@ -37589,6 +37664,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat", "unsat"]);
+    }
+
+    #[test]
+    fn arithmetic_universals_by_counterexample_instantiation() {
+        // z3 regressions issue-1694 (x < 1 ∧ ∀y∈[0,0.1]. x > y²) and
+        // issue-1658 (∀x ∃y∈[0,1]. x ≤ y², false at x = 2).
+        let script = "
+            (declare-const x Real)
+            (assert (< x 1.0))
+            (assert (forall ((y Real)) (or (< y 0.0) (> y 0.1) (> x (* y y)))))
+            (check-sat)
+            (reset)
+            (assert (forall ((x Real)) (exists ((y Real)) (and (<= 0.0 y) (<= y 1.0) (<= x (* y y))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
