@@ -28070,13 +28070,15 @@ impl Context {
                 dropped.push(atom);
             }
         }
-        if var_map.is_empty() || constraints.is_empty() {
+        if constraints.is_empty() && dropped.is_empty() {
             return None;
         }
         let free_reads = self.free_array_reads(goal);
-        let int_of = self.nl_int_of(&var_map, &free_reads)?;
-        if let Some(b) = self.nl_decide(constraints.clone(), &int_of, dropped.is_empty(), 400) {
-            return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
+        if !var_map.is_empty() && !constraints.is_empty() {
+            let int_of = self.nl_int_of(&var_map, &free_reads)?;
+            if let Some(b) = self.nl_decide(constraints.clone(), &int_of, dropped.is_empty(), 400) {
+                return Some(if b { SmtResult::Sat } else { SmtResult::Unsat });
+            }
         }
         // Prove `sat` of a strengthening instead: each dropped implication is
         // replaced by constraints that imply it, so a witness of the stronger
@@ -28088,6 +28090,9 @@ impl Context {
             for (p, r) in self.nl_strengthen(atom, &mut var_map)? {
                 constraints.push((p, r));
             }
+        }
+        if var_map.is_empty() || constraints.is_empty() {
+            return None;
         }
         let int_of = self.nl_int_of(&var_map, &free_reads)?;
         // Sampling only (the complete procedures already ran above), on a
@@ -34929,6 +34934,18 @@ mod tests {
             (assert (and
               (forall ((e Real)) (or (= (* b d) 0.0) (and (< 0.0 (/ 2.0 e c)) (< (* e c) g))))
               (forall ((f Real)) (< 0.0 (* a c)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nonlinear_sat_from_implications_only() {
+        // z3 regression 2891: after lifting, every conjunct is a guarded
+        // definition; the strengthened system still yields x = 2/3.
+        let script = "
+            (declare-fun x () Real)
+            (assert (= (^ (- 1.0 x) (- 1.0)) (* 2.0 (^ x (- 1.0)))))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
