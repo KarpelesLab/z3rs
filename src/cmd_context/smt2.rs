@@ -27375,6 +27375,17 @@ impl Context {
             if res0 == SmtResult::Unsat {
                 return (SmtResult::Unsat, None);
             }
+            // Opaque arithmetic markers (transcendentals) are free variables to
+            // the nonlinear refuters, which is sound for `unsat`.
+            let arith_marker = self.m.postorder(goal).iter().any(|&t| {
+                self.str_symbolic.contains(&t) && self.m.is_arith_sort(self.m.get_sort(t))
+            });
+            if arith_marker
+                && self.arith_nonlinear(goal)
+                && (self.ideal_refutes(goal) || self.nonlinear_icp_refutes(goal))
+            {
+                return (SmtResult::Unsat, None);
+            }
             let wg = self.witness_base.unwrap_or(goal);
             // The abstract model may already pin every string variable to a
             // literal (e.g. a concat-vs-literal split forces `x="ab", y="cd"`);
@@ -27625,7 +27636,10 @@ impl Context {
             // Otherwise, interval constraint propagation over the *actual*
             // polynomials may still prove the (multivariate) system
             // unsatisfiable; that refutation is sound.
-            if self.nonlinear_icp_refutes(lin) || self.nla_saturate_refutes(lin) {
+            if self.nonlinear_icp_refutes(lin)
+                || self.nla_saturate_refutes(lin)
+                || self.ideal_refutes(lin)
+            {
                 (SmtResult::Unsat, None)
             } else if let Some(m) = self.try_int_box_witness(lin)
                 && !untrustworthy_sat
@@ -28377,6 +28391,44 @@ impl Context {
             return false;
         }
         crate::nlsat::refute(&constraints, var_map.len())
+    }
+
+    /// Refute by ideal membership: after substituting linearly defined
+    /// variables, a disequality `p ≠ 0` whose `p` reduces to 0 modulo the
+    /// equalities contradicts them (trig-spherical: `x² + y² + z² ≠ r²` under
+    /// `sin² + cos² = 1`). Opaque terms are free variables, sound here.
+    fn ideal_refutes(&self, goal: AstId) -> bool {
+        use crate::nlsat::Rel as NRel;
+        let mut conjuncts = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        let mut var_map: BTreeMap<AstId, u32> = BTreeMap::new();
+        let mut cons: Vec<(crate::math::polynomial::Polynomial, NRel)> = Vec::new();
+        for atom in conjuncts {
+            let (negated, a) = if self.m.is_not(atom) {
+                (true, self.m.app_args(atom)[0])
+            } else {
+                (false, atom)
+            };
+            if let Some(c) = self.icp_atom(a, negated, &mut var_map)
+                && matches!(c.rel, NRel::Eq | NRel::Ne)
+            {
+                cons.push((c.poly, c.rel));
+            }
+        }
+        if !cons.iter().any(|(_, r)| *r == NRel::Ne) || !cons.iter().any(|(_, r)| *r == NRel::Eq) {
+            return false;
+        }
+        // Any equation may be solved for a linear variable: it holds in every
+        // model, so the substitution preserves unsatisfiability.
+        let reduced = crate::nlsat::elim::eliminate_linear(cons, |_, _| true);
+        let eqs: Vec<_> = reduced
+            .iter()
+            .filter(|(_, r)| *r == NRel::Eq)
+            .map(|(p, _)| p.clone())
+            .collect();
+        reduced.iter().any(|(p, r)| {
+            *r == NRel::Ne && p.reduce_by(&eqs, 10_000).is_some_and(|rem| rem.is_zero())
+        })
     }
 
     /// Flatten a nest of top-level `(and …)` into its conjuncts.
@@ -30516,6 +30568,24 @@ impl Context {
             let hi = self.m.mk_le(t, one);
             out.push(lo);
             out.push(hi);
+            // `sin² + cos² = 1` for a `sin`/`cos` pair on one argument (z3's
+            // nlsat transcendentals add the same identity).
+            if self.decl_name(self.m.app_decl(t)).as_deref() == Some("sin") {
+                let arg = self.m.app_args(t)[0];
+                let partner = self.m.postorder(goal).into_iter().find(|&u| {
+                    self.m.app(u).is_some_and(|b| {
+                        b.args.len() == 1
+                            && b.args[0] == arg
+                            && self.decl_name(b.decl).as_deref() == Some("cos")
+                    })
+                });
+                if let Some(c) = partner {
+                    let ss = self.m.mk_mul(&[t, t]);
+                    let cc = self.m.mk_mul(&[c, c]);
+                    let sum = self.m.mk_add(&[ss, cc]);
+                    out.push(self.m.mk_eq(sum, one));
+                }
+            }
         }
         out
     }
@@ -34921,6 +34991,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn spherical_coordinates_refute_by_ideal_membership() {
+        // z3 regression trig-spherical: x²+y²+z² = r² follows from
+        // sin²+cos² = 1 on both angles.
+        let script = "
+            (declare-fun x () Real) (declare-fun y () Real) (declare-fun z () Real)
+            (declare-fun r () Real) (declare-fun theta () Real) (declare-fun phi () Real)
+            (assert (= x (* r (* (sin theta) (cos phi)))))
+            (assert (= y (* r (* (sin theta) (sin phi)))))
+            (assert (= z (* r (cos theta))))
+            (assert (distinct (* r r) (+ (* x x) (+ (* y y) (* z z)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]

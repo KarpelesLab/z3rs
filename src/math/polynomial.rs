@@ -361,6 +361,41 @@ impl Polynomial {
         Some(quot)
     }
 
+    /// Remainder of multivariate division by `divisors` (graded-lex leading
+    /// terms): a zero remainder proves `self` is in their ideal, so it vanishes
+    /// wherever they all do. `None` past `max_steps` reduction steps.
+    pub fn reduce_by(&self, divisors: &[Polynomial], max_steps: usize) -> Option<Polynomial> {
+        let mut p = self.clone();
+        let mut rem = Polynomial::zero();
+        let mut steps = 0;
+        while let Some((pc, pm)) = p.terms.first().cloned() {
+            steps += 1;
+            if steps > max_steps {
+                return None;
+            }
+            let hit = divisors.iter().filter(|g| !g.is_zero()).find_map(|g| {
+                let (gc, gm) = &g.terms[0];
+                pm.checked_div(gm).map(|q| (g, pc.div(gc), q))
+            });
+            let lead = Polynomial {
+                terms: vec![(pc, pm)],
+            };
+            match hit {
+                Some((g, qc, qm)) => {
+                    let q = Polynomial {
+                        terms: vec![(qc, qm)],
+                    };
+                    p = p.sub(&g.mul(&q));
+                }
+                None => {
+                    rem = rem.add(&lead);
+                    p = p.sub(&lead);
+                }
+            }
+        }
+        Some(rem)
+    }
+
     /// Multiply by a scalar rational.
     pub fn scale(&self, c: &Rational) -> Polynomial {
         if c.is_zero() {

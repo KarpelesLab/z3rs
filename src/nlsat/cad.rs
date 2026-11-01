@@ -298,6 +298,21 @@ pub(crate) fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>>
         .filter(|p| p.degree_of(var) >= 1)
         .map(|f| reducta(f, var))
         .collect();
+    // A chain that ends in a nonzero `var`-free reductum: where every leading
+    // coefficient above it vanishes, `f` *is* that reductum, so its sign must
+    // be invariant too (Collins takes the leading coefficient of every nonzero
+    // reductum, degree 0 included). `x·y·z + y` at `x = 0` is `y`.
+    for rl in &reducta_lists {
+        if let Some(last) = rl.last() {
+            let d = last.degree_of(var);
+            if last.coeff_of_var(var, d).as_constant().is_none() {
+                let rest = last.sub(&last.coeff_of_var(var, d).mul(&Polynomial::var(var).pow(d)));
+                if !rest.is_zero() && rest.degree_of(var) == 0 {
+                    proj.push(rest);
+                }
+            }
+        }
+    }
 
     // PROJ1: per-reductum leading coefficient + sub-discriminant chain.
     for rl in &reducta_lists {
@@ -687,5 +702,19 @@ mod tests {
     fn empty_variety_unsat() {
         let c = alloc::vec![(poly(&[(1, &[(0, 2)]), (1, &[(1, 2)]), (1, &[])]), Rel::Eq,)];
         assert_eq!(cad_sat(&c, 2), Some(false));
+    }
+
+    // x·y = 0 ∧ x²·y·z + y ≠ 0 : SAT (x=0, y=1). At x = 0 the second
+    // polynomial degenerates to its reductum `y`, which must be projected.
+    #[test]
+    fn degenerate_reductum_is_projected() {
+        let c = alloc::vec![
+            (poly(&[(1, &[(0, 1), (1, 1)])]), Rel::Eq),
+            (
+                poly(&[(1, &[(0, 2), (1, 1), (2, 1)]), (1, &[(1, 1)])]),
+                Rel::Ne
+            ),
+        ];
+        assert_eq!(cad_sat(&c, 3), Some(true));
     }
 }
