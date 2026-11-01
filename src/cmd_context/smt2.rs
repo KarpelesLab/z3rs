@@ -2502,6 +2502,10 @@ struct Context {
     in_components: bool,
     /// `(as const …)` applications built so far in the current command.
     as_const_seen: u32,
+    /// Datalog relations (`declare-rel`) with their argument sorts.
+    dl_rels: BTreeMap<String, Vec<SExpr>>,
+    /// Datalog rule variables (`declare-var`).
+    dl_vars: Vec<(String, SExpr)>,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -3488,6 +3492,8 @@ impl Context {
             disj_witness_depth: 0,
             in_components: false,
             as_const_seen: 0,
+            dl_rels: BTreeMap::new(),
+            dl_vars: Vec::new(),
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -4131,6 +4137,108 @@ impl Context {
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
                 Ok(Some(v))
+            }
+            // Datalog front end (z3's `fp` commands), as Horn clauses:
+            // `(declare-rel r (S…))` a Boolean function, `(declare-var v S)` a
+            // rule variable, `(rule body)` the universal closure of `body` over
+            // its rule variables, and `(query r)` the CHC check of
+            // `∀x. r(x) ⇒ false` — derivable (`sat`) iff that is `unsat`.
+            "declare-rel" if list.len() >= 3 => {
+                let name = Self::sym(&list[1])?.to_string();
+                let SExpr::List(sorts) = &list[2] else {
+                    return Err("declare-rel: expected a sort list".to_string());
+                };
+                self.dl_rels.insert(name.clone(), sorts.clone());
+                let decl = SExpr::List(alloc::vec![
+                    SExpr::Atom("declare-fun".to_string()),
+                    list[1].clone(),
+                    list[2].clone(),
+                    SExpr::Atom("Bool".to_string()),
+                ]);
+                self.command(&decl)
+            }
+            "declare-var" if list.len() == 3 => {
+                let name = Self::sym(&list[1])?.to_string();
+                self.dl_vars.push((name, list[2].clone()));
+                Ok(None)
+            }
+            "rule" if list.len() >= 2 => {
+                let mut atoms = BTreeSet::new();
+                let mut stack = alloc::vec![&list[1]];
+                while let Some(e) = stack.pop() {
+                    match e {
+                        SExpr::Atom(a) => {
+                            atoms.insert(a.clone());
+                        }
+                        SExpr::List(l) => stack.extend(l.iter()),
+                    }
+                }
+                let binders: Vec<SExpr> = self
+                    .dl_vars
+                    .iter()
+                    .filter(|(n, _)| atoms.contains(n))
+                    .map(|(n, sort)| SExpr::List(alloc::vec![SExpr::Atom(n.clone()), sort.clone()]))
+                    .collect();
+                let body = if binders.is_empty() {
+                    list[1].clone()
+                } else {
+                    SExpr::List(alloc::vec![
+                        SExpr::Atom("forall".to_string()),
+                        SExpr::List(binders),
+                        list[1].clone(),
+                    ])
+                };
+                self.command(&SExpr::List(alloc::vec![
+                    SExpr::Atom("assert".to_string()),
+                    body
+                ]))
+            }
+            "query" if list.len() >= 2 => {
+                let name = Self::sym(&list[1])?.to_string();
+                let sorts = self
+                    .dl_rels
+                    .get(&name)
+                    .cloned()
+                    .ok_or_else(|| alloc::format!("query: unknown relation {name}"))?;
+                let vars: Vec<SExpr> = (0..sorts.len())
+                    .map(|i| SExpr::Atom(alloc::format!("!q{i}")))
+                    .collect();
+                let mut app = alloc::vec![list[1].clone()];
+                app.extend(vars.iter().cloned());
+                let app = if vars.is_empty() {
+                    list[1].clone()
+                } else {
+                    SExpr::List(app)
+                };
+                let neg = SExpr::List(alloc::vec![
+                    SExpr::Atom("=>".to_string()),
+                    app,
+                    SExpr::Atom("false".to_string()),
+                ]);
+                let goal = if vars.is_empty() {
+                    neg
+                } else {
+                    let binders = vars
+                        .iter()
+                        .zip(&sorts)
+                        .map(|(v, s)| SExpr::List(alloc::vec![v.clone(), s.clone()]))
+                        .collect();
+                    SExpr::List(alloc::vec![
+                        SExpr::Atom("forall".to_string()),
+                        SExpr::List(binders),
+                        neg,
+                    ])
+                };
+                let atom = |a: &str| SExpr::Atom(a.to_string());
+                self.command(&SExpr::List(alloc::vec![atom("push")]))?;
+                self.command(&SExpr::List(alloc::vec![atom("assert"), goal]))?;
+                let r = self.command(&SExpr::List(alloc::vec![atom("check-sat")]))?;
+                self.command(&SExpr::List(alloc::vec![atom("pop")]))?;
+                Ok(r.map(|r| match r.as_str() {
+                    "sat" => "unsat".to_string(),
+                    "unsat" => "sat".to_string(),
+                    other => other.to_string(),
+                }))
             }
             "declare-const" => {
                 // (declare-const c S)
@@ -36660,6 +36768,26 @@ mod tests {
                 "sat"
             ]
         );
+    }
+
+    #[test]
+    fn datalog_rules_and_queries() {
+        // z3 regression 3113 and a counter: `query` is `sat` when derivable.
+        let script = "
+            (declare-rel f ((Array Int Int)))
+            (declare-var a (Array Int Int))
+            (rule (f a))
+            (query f)
+            (reset)
+            (declare-rel inv (Int))
+            (declare-rel err ())
+            (declare-var x Int)
+            (rule (=> (= x 0) (inv x)))
+            (rule (=> (and (inv x) (< x 10)) (inv (+ x 1))))
+            (rule (=> (and (inv x) (> x 10)) err))
+            (query err)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
