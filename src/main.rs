@@ -10,7 +10,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 
-use z3rs::cmd_context::run_smt2;
+use z3rs::cmd_context::run_smt2_partial;
 use z3rs::sat::{SatResult, check_drat_text, parse_dimacs};
 use z3rs::util::lbool::LBool;
 use z3rs::util::memory;
@@ -231,14 +231,14 @@ fn run_smt2_file(path: &str) -> ExitCode {
         Ok(t) => t,
         Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
     };
-    match run_smt2(&text) {
-        Ok(responses) => {
-            for r in responses {
-                println!("{r}");
-            }
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
+    // Responses before a fatal error are still printed, as z3 does.
+    let (responses, err) = run_smt2_partial(&text);
+    for r in responses {
+        println!("{r}");
+    }
+    match err {
+        None => ExitCode::SUCCESS,
+        Some(e) => {
             eprintln!("z3rs: {e}");
             ExitCode::from(1)
         }

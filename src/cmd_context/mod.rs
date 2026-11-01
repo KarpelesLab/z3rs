@@ -13,4 +13,4 @@
 mod algebraic_pp;
 pub mod smt2;
 
-pub use smt2::{Session, run as run_smt2};
+pub use smt2::{Session, run as run_smt2, run_partial as run_smt2_partial};

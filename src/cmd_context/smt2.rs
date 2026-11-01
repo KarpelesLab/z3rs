@@ -1196,6 +1196,23 @@ enum SExpr {
 /// (`"sat"`, `"unsat"`, or `"unknown"`). Accepts both SMT-LIB 2 command scripts
 /// and the older SMT-LIB 1.2 `(benchmark …)` format.
 pub fn run(script: &str) -> Result<Vec<String>, String> {
+    match run_partial(script) {
+        (out, None) => Ok(out),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// [`run`], keeping the responses printed before a fatal error: the
+/// responses so far, and the error that stopped the script (if any).
+pub fn run_partial(script: &str) -> (Vec<String>, Option<String>) {
+    let mut out = Vec::new();
+    match run_into(script, &mut out) {
+        Ok(()) => (out, None),
+        Err(e) => (out, Some(e)),
+    }
+}
+
+fn run_into(script: &str, out: &mut Vec<String>) -> Result<(), String> {
     let (toks, positions) = tokenize(script);
     // SMT-LIB 1.2: a single top-level (benchmark …) form.
     if toks.first().map(String::as_str) == Some("(")
@@ -1203,11 +1220,11 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
     {
         let forms = parse(script)?;
         if let [SExpr::List(l)] = forms.as_slice() {
-            return run_v1(l);
+            out.extend(run_v1(l)?);
+            return Ok(());
         }
     }
     let mut ctx = Context::new();
-    let mut out = Vec::new();
     let mut p = 0usize;
     while p < toks.len() {
         // Every top-level command starts with `(`; anything else is a syntax
@@ -1286,7 +1303,7 @@ pub fn run(script: &str) -> Result<Vec<String>, String> {
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Whether `s` is a logic z3 recognises (port of `smt_logics::supported_logic`,
@@ -1711,6 +1728,23 @@ fn z3_command_error(msg: &str, toks: &[String], positions: &[(u32, u32)]) -> Opt
         return Some(alloc::format!(
             "(error \"line {l} column {c}: unknown sort '{name}'\")"
         ));
+    }
+    // A model/proof/core query without one: reported at the command's closing
+    // paren, and the script continues.
+    let unavailable = match msg {
+        "get-model requires a preceding satisfiable check-sat"
+        | "get-value requires a preceding satisfiable check-sat"
+        | "eval requires a preceding satisfiable check-sat" => Some("model is not available"),
+        "get-proof requires a preceding unsatisfiable check-sat" => Some("proof is not available"),
+        "get-unsat-core requires a preceding unsatisfiable check-sat" => {
+            Some("unsat core is not available")
+        }
+        m if m.contains("construction is not enabled") => Some(m),
+        _ => None,
+    };
+    if let Some(what) = unavailable {
+        let (l, c) = positions.last().copied().unwrap_or((0, 0));
+        return Some(alloc::format!("(error \"line {l} column {c}: {what}\")"));
     }
     // Ill-sorted recursive definition. z3 reports it once the whole command is
     // parsed: for `define-fun-rec` at the command's closing paren (the last
@@ -2421,6 +2455,9 @@ struct Context {
     /// Bit-vector representation of a symbolic FP term (`fp_to_bv`), so equality
     /// and the classification predicates bit-blast through the QF_BV engine.
     fp_bv: BTreeMap<AstId, AstId>,
+    /// Raw 3-bit image of each symbolic RoundingMode constant (z3's fpa2bv
+    /// encoding: 0 RNE, 1 RNA, 2 RTP, 3 RTN, 4 RTZ; see [`Self::rm_bits`]).
+    rm_bv: BTreeMap<AstId, AstId>,
     /// While `> 0` (parsing inside a quantifier body), FP operations are kept as
     /// opaque *deferred* symbolic nodes rather than bit-blasted eagerly. Mirrors
     /// z3's architecture: parsing keeps FP as symbolic theory terms and the
@@ -3410,6 +3447,7 @@ impl Context {
             fp_of: BTreeMap::new(),
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
+            rm_bv: BTreeMap::new(),
             fp_defer_depth: 0,
             disj_witness_active: false,
             fp_symbolic_cache: BTreeMap::new(),
@@ -5202,13 +5240,24 @@ impl Context {
     /// `model` (so `get-value` prints `green`, not `Color!val!2`).
     fn enum_value_name(&self, model: &mut Model, id: AstId) -> Option<String> {
         if self.rm_sort == Some(self.m.get_sort(id)) {
+            if let Some(&raw) = self.rm_bv.get(&id) {
+                // The clamped encoding of `rm_bits`.
+                let code = match model.eval(&self.m, raw) {
+                    Value::Bv(b, _) => b.to_u64().filter(|&c| c <= 4).unwrap_or(0),
+                    _ => 0,
+                };
+                let c = *self.rm_modes.get(code as usize)?;
+                let name = self.decl_name(self.m.app_decl(c))?;
+                return Some(rm_long_name(&name).to_string());
+            }
             for &c in &self.rm_modes {
                 if model.terms_equal(&self.m, id, c) {
                     let name = self.decl_name(self.m.app_decl(c))?;
                     return Some(rm_long_name(&name).to_string());
                 }
             }
-            return None;
+            // An unconstrained mode: z3's model completion picks RTZ.
+            return Some("roundTowardZero".to_string());
         }
         let ctors = self.enums.get(&self.m.get_sort(id))?;
         for &c in ctors {
@@ -5255,6 +5304,14 @@ impl Context {
                 } else {
                     self.m.mk_app(decl, &args)
                 }
+            } else if self.m.is_eq(t)
+                && args.len() == 2
+                && self.rm_sort == Some(self.m.get_sort(args[0]))
+                && let (Some(a), Some(b)) = (self.rm_bits(args[0]), self.rm_bits(args[1]))
+            {
+                // Rounding modes by their 3-bit encodings, so a mode equality
+                // constrains the same bits the FP circuits read.
+                self.m.mk_eq(a, b)
             } else {
                 self.m.mk_app(decl, &args)
             }
@@ -16358,6 +16415,62 @@ impl Context {
         })
     }
 
+    /// The 3-bit encoding of a rounding-mode term: a numeral for a constant
+    /// mode, a bit-vector `ite` for an `ite`, and for a symbolic constant its
+    /// image clamped to a valid code (`ite(b ≤ 4, b, RNE)`), so every value of
+    /// the image denotes one of the five modes.
+    fn rm_bits(&mut self, rm: AstId) -> Option<AstId> {
+        if let Some(c) = self.rm_code(rm) {
+            return Some(self.m.mk_bv(c as i64, 3));
+        }
+        if self.m.is_ite(rm) {
+            let a = self.m.app_args(rm).to_vec();
+            let t = self.rm_bits(a[1])?;
+            let e = self.rm_bits(a[2])?;
+            return Some(self.m.mk_ite(a[0], t, e));
+        }
+        if self.rm_sort != Some(self.m.get_sort(rm)) || !self.m.is_uninterp_const(rm) {
+            return None;
+        }
+        let raw = match self.rm_bv.get(&rm) {
+            Some(&b) => b,
+            None => {
+                let b = self
+                    .m
+                    .mk_bv_const(&alloc::format!("!rmbv!{}", self.fresh_counter), 3);
+                self.fresh_counter += 1;
+                self.rm_bv.insert(rm, b);
+                b
+            }
+        };
+        let four = self.m.mk_bv(4, 3);
+        let ok = self.m.mk_bvule(raw, four);
+        let rne = self.m.mk_bv(0, 3);
+        Some(self.m.mk_ite(ok, raw, rne))
+    }
+
+    /// `op(rm, …)` for a symbolic `rm`: the `ite` over the five constant-mode
+    /// circuits `build(mode)`, selected by `rm`'s 3-bit encoding.
+    fn fp_rm_cases(
+        &mut self,
+        rm: AstId,
+        mut build: impl FnMut(&mut Self, AstId) -> Option<AstId>,
+    ) -> Option<AstId> {
+        let bits = self.rm_bits(rm)?;
+        let modes = self.rm_modes.clone();
+        if modes.len() != 5 {
+            return None;
+        }
+        let mut acc = build(self, modes[4])?;
+        for code in (0..4).rev() {
+            let r = build(self, modes[code])?;
+            let k = self.m.mk_bv(code as i64, 3);
+            let is = self.m.mk_eq(bits, k);
+            acc = self.m.mk_ite(is, r, acc);
+        }
+        Some(acc)
+    }
+
     /// A `w`-bit numeral from a raw `u64` bit pattern (reduced mod 2^w).
     fn fp_lit(&mut self, bits: u64, w: u32) -> AstId {
         self.m.mk_bv_numeral(Int::from(bits as i64), w)
@@ -17015,8 +17128,7 @@ impl Context {
         if eb < 2 || sb < 2 || eb > sb {
             return None;
         }
-        let rm_c = self.rm_code(rm)?; // constant rounding mode only
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
         let bvy0 = self.fp_to_bv(y)?;
@@ -17136,8 +17248,7 @@ impl Context {
         if eb < 2 || sb < 4 || eb > sb {
             return None; // sb ≥ 4 for the 4-bit round tail; eb ≤ sb for the shift
         }
-        let rm_c = self.rm_code(rm)?;
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
         let bvy = self.fp_to_bv(y)?;
@@ -17250,8 +17361,7 @@ impl Context {
         if eb < 2 || sb < 4 || eb > sb {
             return None;
         }
-        let rm_c = self.rm_code(rm)?;
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
         let bvy = self.fp_to_bv(y)?;
@@ -17386,8 +17496,7 @@ impl Context {
         if eb < 2 || sb < 4 || eb > sb || sb + 3 >= 63 {
             return None;
         }
-        let rm_c = self.rm_code(rm)?;
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
         let mant = sb - 1;
@@ -17487,7 +17596,9 @@ impl Context {
         if eb < 2 || sb < 2 || eb > sb {
             return None;
         }
-        let rm_c = self.rm_code(rm)?;
+        let Some(rm_c) = self.rm_code(rm) else {
+            return self.fp_rm_cases(rm, |ctx, mode| ctx.fp_fma_bv(mode, x, y, z));
+        };
         let rm_is_to_neg = rm_c == 3;
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
@@ -17743,8 +17854,7 @@ impl Context {
         {
             return None;
         }
-        let rm_c = self.rm_code(rm)?;
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let fw = fe + fs;
         let tw = to_eb + to_sb;
         let bvx = self.fp_to_bv(x)?;
@@ -17858,7 +17968,9 @@ impl Context {
         if eb < 2 || sb < 3 || eb > sb {
             return None;
         }
-        let rm_c = self.rm_code(rm)?;
+        let Some(rm_c) = self.rm_code(rm) else {
+            return self.fp_rm_cases(rm, |ctx, mode| ctx.fp_r2i_bv(mode, x));
+        };
         let (rte, rta, rtp, rtn, rtz) = (rm_c == 0, rm_c == 1, rm_c == 2, rm_c == 3, rm_c == 4);
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
@@ -18056,8 +18168,7 @@ impl Context {
         if eb < 2 || sb < 2 || eb > sb || eb + sb > 64 || !(1..=63).contains(&m) {
             return None;
         }
-        let rm_c = self.rm_code(rm)?; // constant rounding mode only
-        let rm3 = self.m.mk_bv(rm_c as i64, 3);
+        let rm3 = self.rm_bits(rm)?;
         let bvx = self.fp_to_bv(x)?;
         let w = eb + sb;
 
@@ -28934,6 +29045,14 @@ impl Context {
         self.decide(goal).0
     }
 
+    /// Is the Boolean option `name` (with or without its leading `:`) set?
+    fn option_on(&self, name: &str) -> bool {
+        use crate::util::ParamValue;
+        [name.to_string(), alloc::format!(":{name}")]
+            .iter()
+            .any(|k| matches!(self.params.get(k), Some(ParamValue::Bool(true))))
+    }
+
     /// `(get-unsat-core)` — the `:named` assertions in a minimal unsatisfiable
     /// core of the last (unsatisfiable) check. Computed by deletion-based
     /// minimization: drop each named assertion; keep it only if the remainder is
@@ -28943,11 +29062,17 @@ impl Context {
     /// proof-term (a follow-on). The core is checkable: asserting exactly it is
     /// still `unsat`.
     fn get_proof(&mut self) -> Result<String, String> {
+        if !self.option_on("produce-proofs") {
+            return Err(
+                "proof construction is not enabled, use command (set-option :produce-proofs true)"
+                    .to_string(),
+            );
+        }
         if self.last_verdict != Some(SmtResult::Unsat) {
             return Err("get-proof requires a preceding unsatisfiable check-sat".to_string());
         }
         if self.assert_names.iter().any(|n| n.is_some()) {
-            let core = self.get_unsat_core()?;
+            let core = self.unsat_core()?;
             Ok(alloc::format!("(proof (unsat-core {core}))"))
         } else {
             // No named assertions to reference; certify unsatisfiability directly.
@@ -28956,6 +29081,16 @@ impl Context {
     }
 
     fn get_unsat_core(&mut self) -> Result<String, String> {
+        if !self.option_on("produce-unsat-cores") {
+            return Err("unsat core construction is not enabled, use command \
+                 (set-option :produce-unsat-cores true)"
+                .to_string());
+        }
+        self.unsat_core()
+    }
+
+    /// The minimal core behind [`Self::get_unsat_core`] (and `get-proof`).
+    fn unsat_core(&mut self) -> Result<String, String> {
         if self.last_verdict != Some(SmtResult::Unsat) {
             return Err("get-unsat-core requires a preceding unsatisfiable check-sat".to_string());
         }
@@ -31887,12 +32022,16 @@ mod tests {
 
     #[test]
     fn get_value_without_sat_is_error() {
-        // No check-sat before get-value.
+        // No check-sat before get-value: z3's recoverable error, at the
+        // command's closing paren.
         let script = "
             (declare-const x Int)
             (get-value (x))
         ";
-        assert!(run(script).is_err());
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["(error \"line 3 column 26: model is not available\")"]
+        );
     }
 
     #[test]
@@ -35172,6 +35311,25 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn symbolic_rounding_modes_are_bit_encoded() {
+        // 1 + 1/8 is a tie at 3 significand bits: only RNA and RTP round it up.
+        let script = "
+            (declare-const rm RoundingMode)
+            (assert (fp.gt (fp.add rm ((_ to_fp 3 3) RNE 1.0) ((_ to_fp 3 3) RNE 0.125))
+                           ((_ to_fp 3 3) RNE 1.0)))
+            (assert (not (= rm RTP)))
+            (check-sat)
+            (get-value (rm))
+            (assert (not (= rm RNA)))
+            (check-sat)
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "((rm roundNearestTiesToAway))", "unsat"]
+        );
     }
 
     #[test]
