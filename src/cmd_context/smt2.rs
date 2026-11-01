@@ -17232,7 +17232,12 @@ impl Context {
         let norm_or_zero = self.m.mk_or(&[is_norm, is_sig_zero]);
         let lz = self.m.mk_ite(norm_or_zero, zero_e, lz_d);
         let shift = self.m.mk_ite(is_sig_zero, zero_e, lz);
-        let q = self.m.mk_bv_zero_extend(sb - eb, shift); // sb bits (eb ≤ sb)
+        // To sb bits (the shift is below sb, so truncating a wider one is exact).
+        let q = if sb >= eb {
+            self.m.mk_bv_zero_extend(sb - eb, shift)
+        } else {
+            self.m.mk_bv_extract(sb - 1, 0, shift)
+        };
         denormal_sig = self.m.mk_bvshl(denormal_sig, q);
         let sig = self.m.mk_ite(is_norm, normal_sig, denormal_sig);
         let exp = self.m.mk_ite(is_norm, normal_exp, denormal_exp);
@@ -17779,7 +17784,7 @@ impl Context {
     /// z3's `mk_fma`. `None` for unsupported format/rm or unavailable bits.
     fn fp_fma_bv(&mut self, rm: AstId, x: AstId, y: AstId, z: AstId) -> Option<AstId> {
         let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
-        if eb < 2 || sb < 2 || eb > sb {
+        if eb < 2 || sb < 2 || eb > 2 * sb + 3 {
             return None;
         }
         let Some(rm_c) = self.rm_code(rm) else {
@@ -36229,6 +36234,29 @@ mod tests {
             !out[1].contains("(k 0)") && !out[1].contains("(j 0)"),
             "{}",
             out[1]
+        );
+    }
+
+    #[test]
+    fn fma_circuit_for_wide_exponent_formats() {
+        // z3 regression 6674-simp: Float(3,2) has eb > sb.
+        let script = "
+            (declare-fun x () (_ FloatingPoint 3 2))
+            (declare-fun r () (_ FloatingPoint 3 2))
+            (assert (fp.eq x (fp #b0 #b000 #b1)))
+            (assert (fp.eq r (fp.fma RTN x x (_ +zero 3 2))))
+            (assert (= (_ +zero 3 2) r))
+            (check-sat)
+            (reset)
+            (declare-const r (_ FloatingPoint 4 2))
+            (assert (= r (fp.fma RNE (fp #b1 #b0111 #b0) (fp #b1 #b0101 #b1) (fp #b1 #b0000 #b0))))
+            (check-sat)
+            (get-value (r))
+        ";
+        // 1·0.375 + (−0) = 0.375 exactly (z3 5.3.2 folds it to 0.75).
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "sat", "((r (fp #b0 #x5 #b1)))"]
         );
     }
 
