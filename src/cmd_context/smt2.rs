@@ -28669,6 +28669,24 @@ impl Context {
                 self.m.mk_ite(cond, v, sel)
             } else if self.m.is_select(t) && self.m.is_const_array(args[0]) {
                 self.m.app_args(args[0])[0]
+            } else if let Some((points, base_eq)) = self.store_chain_eq(args[..].to_vec(), t) {
+                // `A = B` over store chains: agreement at every stored index,
+                // and of the bases everywhere else.
+                let mut eqs: Vec<AstId> = points
+                    .into_iter()
+                    .map(|k| {
+                        let a = self.m.mk_select(args[0], k);
+                        let b = self.m.mk_select(args[1], k);
+                        let e = self.m.mk_eq(a, b);
+                        self.expand_select_store(e, memo)
+                    })
+                    .collect();
+                eqs.extend(base_eq);
+                match eqs.len() {
+                    0 => self.m.mk_true(),
+                    1 => eqs[0],
+                    _ => self.m.mk_and(&eqs),
+                }
             } else if let Some(points) = self.small_array_eq_indices(t) {
                 // Extensionality over a small finite index sort: equal arrays
                 // agree at every index, and only there.
@@ -28690,6 +28708,50 @@ impl Context {
         };
         memo.insert(t, out);
         out
+    }
+
+    /// For a bit-vector-indexed array equality `t` over `args` (already
+    /// expanded) whose sides are store chains: the stored indices, and the
+    /// condition on the bases outside them — none for a shared base, `v₁ = v₂`
+    /// for constant bases when the index sort has more values than stored
+    /// indices. `None` for any other shape (or a small domain, expanded
+    /// pointwise instead).
+    fn store_chain_eq(
+        &mut self,
+        args: Vec<AstId>,
+        t: AstId,
+    ) -> Option<(Vec<AstId>, Option<AstId>)> {
+        if !self.m.is_eq(t) || args.len() != 2 {
+            return None;
+        }
+        let (idx, _) = self.m.array_sort_params(self.m.get_sort(args[0]))?;
+        let w = self.m.bv_sort_width(idx).filter(|&w| w > 4)?;
+        let mut points: Vec<AstId> = Vec::new();
+        let mut bases = Vec::new();
+        for &side in &args {
+            let mut a = side;
+            while self.m.is_store(a) {
+                let sa = self.m.app_args(a).to_vec();
+                if !points.contains(&sa[1]) {
+                    points.push(sa[1]);
+                }
+                a = sa[0];
+            }
+            bases.push(a);
+        }
+        let base_eq = if bases[0] == bases[1] {
+            None
+        } else if self.m.is_const_array(bases[0]) && self.m.is_const_array(bases[1]) {
+            if w < 64 && (points.len() as u64) >= 1u64 << w {
+                return None;
+            }
+            let v0 = self.m.app_args(bases[0])[0];
+            let v1 = self.m.app_args(bases[1])[0];
+            Some(self.m.mk_eq(v0, v1))
+        } else {
+            return None;
+        };
+        Some((points, base_eq))
     }
 
     /// The index values of an array equality `t` whose index sort is `Bool`
@@ -35035,6 +35097,14 @@ mod tests {
             (assert (distinct x y))
             (assert (= (store ((as const (Array (_ BitVec 2) (_ BitVec 8))) x) i0 e0)
                        (store ((as const (Array (_ BitVec 2) (_ BitVec 8))) y) i1 e1)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        // Wide indices: constant bases must agree off the stored indices.
+        let script = "
+            (declare-const i (_ BitVec 8)) (declare-const x (_ BitVec 4))
+            (assert (= (store ((as const (Array (_ BitVec 8) (_ BitVec 4))) #x1) i x)
+                       ((as const (Array (_ BitVec 8) (_ BitVec 4))) #x2)))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);

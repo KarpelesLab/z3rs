@@ -4,7 +4,8 @@
 Random conjunctions over free and constant arrays (Array (_ BitVec w) (_ BitVec 3)),
 store chains, selects, and array/element (dis)equalities. Index widths 1-3 hit
 the finite-domain extensionality expansion, width 5 the general path. Only
-definite answers are compared: a DISAGREE is a soundness bug.
+definite answers are compared: a DISAGREE is a soundness bug (a z3 `sat`
+whose model z3's own model_validate rejects is reported separately).
 
 Usage: scripts/fuzz_bv_array.py <z3rs> <z3> <n> <outdir>
 """
@@ -40,7 +41,12 @@ def run(c,p):
 def one(i):
     p=f"{OUT}/ba_{i}.smt2"; open(p,"w").write(gen(random.Random(i)))
     a,b=run(RS,p),run(Z3,p)
-    if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
+    if a in("sat","unsat") and b in("sat","unsat"):
+        if a==b: return "agree",p
+        # z3 occasionally returns a model it cannot validate itself.
+        if b=="sat" and "invalid model" in subprocess.run([Z3,"model_validate=true",p],capture_output=True,text=True,timeout=20).stdout:
+            return "z3-invalid-model",p
+        return "DISAGREE",p
     return f"{a}/{b}",p
 res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
 print(Counter(k for k,_ in res))
