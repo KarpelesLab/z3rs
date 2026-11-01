@@ -9667,6 +9667,10 @@ impl Context {
             let ge = self.m.mk_ge(ll, ls);
             let imp = self.m.mk_implies(app, ge);
             ax.push(imp);
+            // The empty word is a prefix, suffix and substring of every word.
+            let zero = self.m.mk_int(0);
+            let empty = self.m.mk_eq(ls, zero);
+            ax.push(self.m.mk_implies(empty, app));
         }
         // Substring/prefix/suffix monotonicity. Each `contains(x,s)`,
         // `prefixof(s,x)`, `suffixof(s,x)` (literal `s`) implies `x ⊇ s`, hence
@@ -13025,6 +13029,28 @@ impl Context {
                 }
             }
         }
+        // String lengths the axioms above introduced (`prefixof a t ⇒ len t ≥
+        // len a` with no `len a` in the goal) get the same `≥ 0` and emptiness
+        // axioms as the goal's own.
+        if let Some(lenf) = self.str_len_decl {
+            let zero = self.m.mk_int(0);
+            let empty = self.mk_str_lit("");
+            let fresh: BTreeSet<AstId> = self
+                .m
+                .postorder_many(&ax)
+                .into_iter()
+                .filter(|&t| {
+                    !present_set.contains(&t) && self.m.is_app(t) && self.m.app_decl(t) == lenf
+                })
+                .collect();
+            for t in fresh {
+                let s0 = self.m.app_args(t)[0];
+                ax.push(self.m.mk_ge(t, zero));
+                let len_zero = self.m.mk_eq(t, zero);
+                let is_empty = self.m.mk_eq(s0, empty);
+                ax.push(self.m.mk_eq(len_zero, is_empty));
+            }
+        }
         ax
     }
 
@@ -15001,7 +15027,14 @@ impl Context {
                     // `check_model` may report `sat` without a model when the goal
                     // folded to a ground truth; a concrete assignment still exists,
                     // so return an (empty) model rather than a spurious `None`.
-                    return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+                    let m = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                    // The enumerated index integers were substituted away.
+                    let ints: Vec<(AstId, AstId)> = subst
+                        .iter()
+                        .copied()
+                        .filter(|&(v, _)| self.m.is_int_sort(self.m.get_sort(v)))
+                        .collect();
+                    return Some(self.complete_substituted(m, &ints));
                 }
             }
             // Advance the mixed-radix counter over candidate indices.
@@ -15158,8 +15191,9 @@ impl Context {
         if tval.is_empty() {
             return s.clone();
         }
-        let Some(p) = (0..=sval.len().saturating_sub(tval.len()))
-            .find(|&p| sval[p..p + tval.len()] == tval[..])
+        let Some(p) = (tval.len() <= sval.len())
+            .then(|| (0..=sval.len() - tval.len()).find(|&p| sval[p..p + tval.len()] == tval[..]))
+            .flatten()
         else {
             // `T` absent: `str.replace` returns `S` unchanged.
             return SExpr::Atom(smt_string_literal(&sval));
@@ -15832,8 +15866,9 @@ impl Context {
                     && self.str_value(raw[2]).is_none()
                     && !t.is_empty()
                 {
-                    let pos =
-                        (0..=s.len().saturating_sub(t.len())).find(|&p| s[p..p + t.len()] == t[..]);
+                    let pos = (t.len() <= s.len())
+                        .then(|| (0..=s.len() - t.len()).find(|&p| s[p..p + t.len()] == t[..]))
+                        .flatten();
                     if let Some(p) = pos {
                         let before = self.mk_str_lit(&code_points_to_string(&s[..p]));
                         let after = self.mk_str_lit(&code_points_to_string(&s[p + t.len()..]));
@@ -26845,12 +26880,16 @@ impl Context {
         // an equality-pinned auxiliary variable (a lifted `mod` remainder = 0)
         // reduces to one the linear engine decides.
         if res == SmtResult::Unknown {
+            let mark = self.fp_fold_pins.len();
             let inlined = self.inline_int_const_bindings(goal);
             if inlined != goal {
                 let (r2, m2) = self.decide_inner(inlined);
+                let pins = self.fp_fold_pins.split_off(mark);
                 if r2 != SmtResult::Unknown {
-                    return (r2, m2);
+                    return (r2, m2.map(|m| self.complete_substituted(m, &pins)));
                 }
+            } else {
+                self.fp_fold_pins.truncate(mark);
             }
         }
         // Fallback: split `s ++ u = <concrete seq>` at a pinned `len s`.
@@ -27506,7 +27545,24 @@ impl Context {
         if subst.is_empty() {
             return goal;
         }
+        self.fp_fold_pins.extend(subst.iter().copied());
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        // A string marker over a now-constant index (`str.at "aab" i`, i = 0)
+        // is a fresh term the opaque gate no longer knows: fold it.
+        let mut memo = BTreeMap::new();
+        let folded = self.refold_str_markers(g, &mut memo);
+        let g = if folded == g {
+            g
+        } else {
+            // The folded literals need their own length/distinctness axioms.
+            let mut conj = self.string_axioms(folded);
+            if conj.is_empty() {
+                folded
+            } else {
+                conj.push(folded);
+                self.m.mk_and(&conj)
+            }
+        };
         crate::rewriter::simplify(&mut self.m, g)
     }
 
@@ -27821,11 +27877,11 @@ impl Context {
         // any (even a fold-substituted) opaque FP marker to be present — keep it as
         // a cheap short-circuit before the structural postorder scan.
         let has_symbolic_str = !self.str_symbolic.is_empty()
-            && self
-                .m
-                .postorder(goal)
-                .iter()
-                .any(|t| self.str_symbolic.contains(t) || self.is_opaque_fp_marker(*t));
+            && self.m.postorder(goal).iter().any(|t| {
+                self.str_symbolic.contains(t)
+                    || self.is_opaque_fp_marker(*t)
+                    || self.str_op_marker(*t)
+            });
         if has_symbolic_str {
             // Comparisons over ground transcendentals are decided outright: an
             // equivalent goal with fewer opaque terms.
@@ -36258,6 +36314,42 @@ mod tests {
             run(script).unwrap(),
             alloc::vec!["sat", "sat", "((r (fp #b0 #x5 #b1)))"]
         );
+    }
+
+    #[test]
+    fn string_predicate_length_and_emptiness_links() {
+        // z3 regression 2852: `prefixof a (substr a 1 2)` needs `a = ""`, and
+        // `a = str.at a 2` forces it; the empty word is a prefix of anything.
+        let script = "
+            (declare-fun a () String)
+            (assert (distinct (str.prefixof a (str.substr a 1 2)) (= a (str.at a 2))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn string_index_witnesses_are_folded_and_modelled() {
+        // Fuzz-found: `str.at "aab" i` with `i = 0` inlined became a fresh
+        // marker the opaque gate missed (wrong sat), and the witness search
+        // left the enumerated `i` out of the model.
+        let script = "
+            (declare-const i Int)
+            (declare-const s String)
+            (assert (= s (str.at \"aab\" i)))
+            (assert (<= (str.len s) i))
+            (assert (= i 0))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (assert (<= (str.len (str.at \"aab\" i)) i))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_eq!(out[1], "sat");
+        assert!(!out[2].contains("    0)"), "{}", out[2]);
     }
 
     #[test]
