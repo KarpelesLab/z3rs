@@ -2592,6 +2592,8 @@ struct Context {
     in_components: bool,
     /// `(as const …)` applications built so far in the current command.
     as_const_seen: u32,
+    /// Set while `decide_by_guard_split` decides one case.
+    in_guard_split: bool,
     /// `:named` quantified assertions: (index into `universals`, name,
     /// `assertions.len()` when asserted).
     universal_names: Vec<(usize, String, usize)>,
@@ -3587,6 +3589,7 @@ impl Context {
             disj_witness_depth: 0,
             in_components: false,
             as_const_seen: 0,
+            in_guard_split: false,
             universal_names: Vec::new(),
             last_tactic_macro_finder: false,
             dl_rels: BTreeMap::new(),
@@ -10598,13 +10601,11 @@ impl Context {
                     let Some(plen) = plen_of(self, p) else { break };
                     let cov = (off + plen).min(pv.len());
                     for (local, &pe) in pv[off..cov].iter().enumerate() {
-                        match self.seq_of.get(&p) {
+                        match self.seq_of.get(&p).cloned() {
                             Some(v) => {
-                                if v[local] != pe
-                                    && self.seq_of.get(&v[local]) != self.seq_of.get(&pe)
-                                {
-                                    let f = self.m.mk_false();
-                                    ax.push(self.m.mk_implies(t, f));
+                                if v[local] != pe {
+                                    let same = self.seq_content_eq(&[v[local]], &[pe]);
+                                    ax.push(self.m.mk_implies(t, same));
                                 }
                             }
                             None => {
@@ -10645,13 +10646,11 @@ impl Context {
                     for e in eoff..cov_end {
                         let local = plen - 1 - (e - eoff);
                         let pe = pv[pv.len() - 1 - e];
-                        match self.seq_of.get(&p) {
+                        match self.seq_of.get(&p).cloned() {
                             Some(v) => {
-                                if v[local] != pe
-                                    && self.seq_of.get(&v[local]) != self.seq_of.get(&pe)
-                                {
-                                    let f = self.m.mk_false();
-                                    ax.push(self.m.mk_implies(t, f));
+                                if v[local] != pe {
+                                    let same = self.seq_content_eq(&[v[local]], &[pe]);
+                                    ax.push(self.m.mk_implies(t, same));
                                 }
                             }
                             None => {
@@ -12721,11 +12720,16 @@ impl Context {
                         }
                     }
                 }
-                if complete
-                    && (forbidden.get(&s).is_some_and(|set| set.contains(&lit))
-                        || bound.get(&s).is_some_and(|b| *b != lit))
-                {
+                if complete && forbidden.get(&s).is_some_and(|set| set.contains(&lit)) {
                     ax.push(self.m.mk_false());
+                }
+                // The bound value and the pinned elements must agree (elements
+                // may be symbolic: `[i]` against `[2]` is `i = 2`).
+                if complete
+                    && let Some(b) = bound.get(&s).cloned()
+                    && b != lit
+                {
+                    ax.push(self.seq_content_eq(&b, &lit));
                 }
             }
         }
@@ -13372,12 +13376,13 @@ impl Context {
                 // content: `substitute` rebuilt this node without re-folding, and
                 // the general solver treats distinct concrete `seq_of` constants as
                 // free — a spurious `sat`. Deciding it here keeps the fold sound.
-                if let (Some(a), Some(b)) = (self.seq_of.get(&args[0]), self.seq_of.get(&args[1])) {
-                    if a == b {
-                        self.m.mk_true()
-                    } else {
-                        self.m.mk_false()
-                    }
+                // Elements may be symbolic (`[0] = [i]` is `0 = i`), so compare
+                // element-wise.
+                if let (Some(a), Some(b)) = (
+                    self.seq_of.get(&args[0]).cloned(),
+                    self.seq_of.get(&args[1]).cloned(),
+                ) {
+                    self.seq_content_eq(&a, &b)
                 } else if let (Some(a), Some(b)) =
                     (self.str_value(args[0]), self.str_value(args[1]))
                 {
@@ -14545,9 +14550,10 @@ impl Context {
                 let mut conj: Vec<AstId> = Vec::new();
                 for i in 0..seqs.len() {
                     for j in i + 1..seqs.len() {
-                        let same = self.seq_of[&seqs[i]] == self.seq_of[&seqs[j]];
+                        let (a, b) = (self.seq_of[&seqs[i]].clone(), self.seq_of[&seqs[j]].clone());
+                        let same = self.seq_content_eq(&a, &b);
                         let eq = self.m.mk_eq(seqs[i], seqs[j]);
-                        conj.push(if same { eq } else { self.m.mk_not(eq) });
+                        conj.push(self.m.mk_eq(eq, same));
                     }
                 }
                 let g3 = if conj.is_empty() {
@@ -19839,7 +19845,22 @@ impl Context {
                 {
                     let start = i as usize;
                     let end = (start + n as usize).min(l.len());
+                    if start >= end {
+                        let s = self.m.get_sort(args[0]);
+                        return Ok(self.seq_empty_of(s));
+                    }
                     return Ok(self.mk_seq(l[start..end].to_vec()));
+                }
+                // Out of range (negative offset or length, offset past the end):
+                // the empty sequence.
+                if let (Some(l), Some(i), Some(n)) = (
+                    self.seq_of.get(&args[0]).cloned(),
+                    self.int_arg(args[1]),
+                    self.int_arg(args[2]),
+                ) && (i < 0 || n < 0 || i as usize > l.len())
+                {
+                    let s = self.m.get_sort(args[0]);
+                    return Ok(self.seq_empty_of(s));
                 }
                 self.symbolic_seq(op, args)
             }
@@ -19921,6 +19942,34 @@ impl Context {
         }
     }
 
+    /// `a = b` for two concrete sequences by content: false on a length
+    /// mismatch, otherwise the (simplified) element-wise equalities — the
+    /// elements may be symbolic (`[0] = [i]` is `0 = i`).
+    fn seq_content_eq(&mut self, a: &[AstId], b: &[AstId]) -> AstId {
+        if a == b {
+            return self.m.mk_true();
+        }
+        if a.len() != b.len() {
+            return self.m.mk_false();
+        }
+        let eqs: Vec<AstId> = a
+            .iter()
+            .zip(b)
+            .map(
+                |(&x, &y)| match (self.seq_of.get(&x).cloned(), self.seq_of.get(&y).cloned()) {
+                    (Some(xs), Some(ys)) => self.seq_content_eq(&xs, &ys),
+                    _ => self.m.mk_eq(x, y),
+                },
+            )
+            .collect();
+        let e = if eqs.len() == 1 {
+            eqs[0]
+        } else {
+            self.m.mk_and(&eqs)
+        };
+        crate::rewriter::simplify(&mut self.m, e)
+    }
+
     /// The element sort of a `(Seq E)` sort, if known.
     fn seq_elem_sort(&self, seq_sort: AstId) -> Option<AstId> {
         self.seq_sorts
@@ -19941,6 +19990,11 @@ impl Context {
             // seq.++/at/extract and the rest return a sequence like args[0].
             _ => self.m.get_sort(args[0]),
         };
+        // One marker per `(op, args)`, so equal applications are congruent.
+        let key = (alloc::format!("!seqop!{op}"), args.to_vec());
+        if let Some(&cached) = self.str_marker_cache.get(&key) {
+            return Ok(cached);
+        }
         let domain: Vec<AstId> = args.iter().map(|&a| self.m.get_sort(a)).collect();
         let name = alloc::format!("!seqop!{}!{}", op, self.fresh_counter);
         self.fresh_counter += 1;
@@ -19951,6 +20005,7 @@ impl Context {
             self.seq_concat.push((app, args.to_vec()));
         }
         self.seqop_ops.insert(d, op.to_string());
+        self.str_marker_cache.insert(key, app);
         Ok(app)
     }
 
@@ -27637,6 +27692,84 @@ impl Context {
     /// len x = 2` → unsat). Sound: `(⋁ b) ∧ R` is sat iff some `b ∧ R` is. Bounded
     /// to ≤ 12 branches and one level (branches go through `decide_inner`, which
     /// never re-enters this).
+    /// Case split on the guards of lifted sequence/string `ite`s (the
+    /// top-level `c ⇒ k = a`, `¬c ⇒ k = b` definitions): with every guard
+    /// fixed the definitions are plain bindings the sequence reasoning
+    /// follows. `unsat` when every case is, `sat` with the first satisfiable
+    /// case (its guards asserted). At most 4 guards.
+    fn decide_by_guard_split(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        if self.in_guard_split {
+            return None;
+        }
+        let mut conj = Vec::new();
+        self.icp_flatten_and(goal, &mut conj);
+        let mut guards: Vec<AstId> = Vec::new();
+        for &c in &conj {
+            if !self.m.is_implies(c) {
+                continue;
+            }
+            let a = self.m.app_args(c).to_vec();
+            let seqish = |ctx: &Self, e: AstId| {
+                ctx.m.is_eq(e) && {
+                    let s = ctx.m.get_sort(ctx.m.app_args(e)[0]);
+                    ctx.string_sort == Some(s) || ctx.seq_elem_sort(s).is_some()
+                }
+            };
+            if !seqish(self, a[1]) {
+                continue;
+            }
+            let g = if self.m.is_not(a[0]) {
+                self.m.app_args(a[0])[0]
+            } else {
+                a[0]
+            };
+            // A constant guard is no case (and substituting `true` everywhere
+            // would rewrite the whole goal).
+            let constant = !self
+                .m
+                .postorder(g)
+                .iter()
+                .any(|&u| self.m.is_uninterp_const(u));
+            if !constant && !guards.contains(&g) {
+                guards.push(g);
+            }
+        }
+        if guards.is_empty() || guards.len() > 4 {
+            return None;
+        }
+        self.in_guard_split = true;
+        let mut all_unsat = true;
+        let mut found = None;
+        for mask in 0..(1u32 << guards.len()) {
+            let mut sub = Vec::new();
+            let mut lits = Vec::new();
+            for (k, &g) in guards.iter().enumerate() {
+                let v = mask & (1 << k) != 0;
+                let b = self.mk_bool(v);
+                sub.push((g, b));
+                lits.push(if v { g } else { self.m.mk_not(g) });
+            }
+            let g2 = crate::rewriter::substitute(&mut self.m, goal, &sub);
+            lits.push(g2);
+            let g3 = self.m.mk_and(&lits);
+            let g3 = crate::rewriter::simplify(&mut self.m, g3);
+            match self.decide(g3) {
+                (SmtResult::Unsat, _) => {}
+                (SmtResult::Sat, m) => {
+                    found = Some((SmtResult::Sat, m));
+                    all_unsat = false;
+                    break;
+                }
+                _ => all_unsat = false,
+            }
+        }
+        self.in_guard_split = false;
+        if found.is_some() {
+            return found;
+        }
+        all_unsat.then_some((SmtResult::Unsat, None))
+    }
+
     fn decide_via_case_split(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
         let mut conj: Vec<AstId> = Vec::new();
         let mut stack = alloc::vec![goal];
@@ -27913,6 +28046,12 @@ impl Context {
         {
             return r;
         }
+        // Fallback: case split on the guards of lifted sequence `ite`s.
+        if res == SmtResult::Unknown
+            && let Some(r) = self.decide_by_guard_split(goal)
+        {
+            return r;
+        }
         (res, model)
     }
 
@@ -28093,44 +28232,51 @@ impl Context {
     /// substituting the sequence and re-folding seq markers, so `nth`/`len` over
     /// `s` reduce to concrete values.
     fn inline_seq_bindings(&mut self, goal: AstId) -> AstId {
-        let mut conj: Vec<AstId> = Vec::new();
-        let mut stack = alloc::vec![goal];
-        while let Some(t) = stack.pop() {
-            if self.m.is_and(t) {
-                for &a in self.m.app_args(t) {
-                    stack.push(a);
+        // To a fixpoint: a refolded concatenation can bind the next variable
+        // (`k = a ++ b` once `a`, `b` are concrete).
+        let mut g = goal;
+        for _ in 0..8 {
+            let mut conj: Vec<AstId> = Vec::new();
+            self.icp_flatten_and(g, &mut conj);
+            let mut subst: Vec<(AstId, AstId)> = Vec::new();
+            let mut bound: BTreeSet<AstId> = BTreeSet::new();
+            for &c in &conj {
+                if !self.m.is_eq(c) {
+                    continue;
                 }
-            } else {
-                conj.push(t);
-            }
-        }
-        let mut subst: Vec<(AstId, AstId)> = Vec::new();
-        let mut bound: BTreeSet<AstId> = BTreeSet::new();
-        for &c in &conj {
-            if !self.m.is_eq(c) {
-                continue;
-            }
-            let a = self.m.app_args(c);
-            if a.len() != 2 {
-                continue;
-            }
-            for (v, sq) in [(a[0], a[1]), (a[1], a[0])] {
-                if self.m.is_uninterp_const(v)
-                    && !self.seq_of.contains_key(&v)
-                    && self.seq_of.contains_key(&sq)
-                    && !bound.contains(&v)
-                {
-                    subst.push((v, sq));
-                    bound.insert(v);
+                let a = self.m.app_args(c);
+                if a.len() != 2 {
+                    continue;
+                }
+                for (v, sq) in [(a[0], a[1]), (a[1], a[0])] {
+                    if self.m.is_uninterp_const(v)
+                        && !self.seq_of.contains_key(&v)
+                        && self.seq_of.contains_key(&sq)
+                        && !bound.contains(&v)
+                    {
+                        subst.push((v, sq));
+                        bound.insert(v);
+                    }
                 }
             }
+            if subst.is_empty() {
+                break;
+            }
+            let g2 = crate::rewriter::substitute(&mut self.m, g, &subst);
+            let mut memo = BTreeMap::new();
+            g = self.refold_str_markers(g2, &mut memo);
         }
-        if subst.is_empty() {
-            return goal;
+        if g == goal {
+            return g;
         }
-        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
-        let mut memo = BTreeMap::new();
-        self.refold_str_markers(g, &mut memo)
+        // The folded sequences' lengths were folded to numerals: restate the
+        // literal axioms so a variable equal to one keeps its length.
+        let mut conj = self.string_axioms(g);
+        if conj.is_empty() {
+            return g;
+        }
+        conj.push(g);
+        self.m.mk_and(&conj)
     }
 
     /// Inline `v = <string literal>` bindings and re-fold, so a predicate over a
@@ -28219,6 +28365,7 @@ impl Context {
         }
         let mut subst: Vec<(AstId, AstId)> = Vec::new();
         let mut bound: BTreeSet<AstId> = BTreeSet::new();
+        let mut extra: Vec<AstId> = Vec::new();
         for (app, parts) in self.seq_concat.clone() {
             if parts.len() < 2 {
                 continue;
@@ -28273,10 +28420,15 @@ impl Context {
             let mut unsplittable = false;
             for (i, &p) in parts.iter().enumerate() {
                 let (lo, hi) = ranges[i];
-                if let Some(pv) = self.seq_of.get(&p) {
-                    if pv[..] != cv[lo..hi] {
+                if let Some(pv) = self.seq_of.get(&p).cloned() {
+                    // Elements may be symbolic: equal content, not equal terms.
+                    let same = self.seq_content_eq(&pv, &cv[lo..hi]);
+                    if self.m.is_false(same) {
                         infeasible = true;
                         break;
+                    }
+                    if !self.m.is_true(same) {
+                        extra.push(same);
                     }
                 } else if !self.m.is_uninterp_const(p) {
                     unsplittable = true;
@@ -28298,12 +28450,17 @@ impl Context {
                 }
             }
         }
-        if subst.is_empty() {
+        if subst.is_empty() && extra.is_empty() {
             return goal;
         }
         let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
         let mut memo = BTreeMap::new();
-        self.refold_str_markers(g, &mut memo)
+        let g = self.refold_str_markers(g, &mut memo);
+        if extra.is_empty() {
+            return g;
+        }
+        extra.push(g);
+        self.m.mk_and(&extra)
     }
 
     /// String analog of `inline_seq_concat_split`: `x1·…·xn = L` (L a literal) with
@@ -28848,6 +29005,7 @@ impl Context {
                 self.str_symbolic.contains(t)
                     || self.is_opaque_fp_marker(*t)
                     || self.str_op_marker(*t)
+                    || (self.m.is_app(*t) && self.seqop_ops.contains_key(&self.m.app_decl(*t)))
             });
         if has_symbolic_str {
             // Comparisons over ground transcendentals are decided outright: an
@@ -37680,6 +37838,41 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn sequences_with_symbolic_elements_and_guards() {
+        // z3 regression 2956 (case split on lifted sequence-ite guards), and
+        // fuzz-found wrong unsats: `[0] = [i]`-style comparisons were decided
+        // syntactically.
+        let script = "
+            (declare-datatypes ((a 0)) (((b))))
+            (declare-fun e () (Seq a))
+            (define-fun x () (Seq a) (seq.extract e 1 (- (seq.len e) 1)))
+            (define-fun i () (Seq a) (seq.extract x 1 (- (seq.len x) 1)))
+            (define-fun y () (Seq Bool) (ite (= 0 (seq.len i)) (as seq.empty (Seq Bool)) (seq.unit true)))
+            (define-fun n () (Seq Bool) (ite (= 0 (seq.len x)) (as seq.empty (Seq Bool)) (seq.++ (seq.unit false) y)))
+            (define-fun o () (Seq Bool) (seq.++ (seq.unit false) n))
+            (assert (>= (seq.len o) 3))
+            (assert (not (seq.nth o 2)))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (declare-const s (Seq Int))
+            (assert (seq.prefixof (seq.unit 0) s))
+            (assert (= s (seq.unit i)))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (declare-const b (Seq Int))
+            (assert (= (seq.nth (seq.++ (seq.unit i) b) i) 1))
+            (assert (= (seq.unit i) (seq.++ (seq.unit 2) b)))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_ne!(out[1], "unsat");
+        assert_ne!(out[2], "unsat");
     }
 
     #[test]
