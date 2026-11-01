@@ -20516,6 +20516,152 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        // z3's macro finder: a universal `∀x̄. f(x̄) = t` (f not in t) defines
+        // `f`; with `f` used elsewhere, inline it everywhere and drop the
+        // universal (for this check only).
+        let saved = (self.assertions.clone(), self.universals.clone());
+        if !self.eliminate_macros() {
+            return self.check_sat_core();
+        }
+        let r = self.check_sat_core();
+        (self.assertions, self.universals) = saved;
+        r
+    }
+
+    /// The macro definition a universal states, if any: `(f, params, rhs)`
+    /// with `params` exactly the bound variables (distinct) as `f`'s
+    /// arguments. Boolean heads also match `xor(φ, f x̄)`, `f x̄ = φ` and
+    /// `¬(f x̄ = φ)`.
+    fn macro_definition(
+        &mut self,
+        vars: &[AstId],
+        body: AstId,
+    ) -> Option<(AstId, Vec<AstId>, AstId)> {
+        let is_head = |ctx: &Self, t: AstId| {
+            let app = ctx.m.app(t)?;
+            let distinct: BTreeSet<AstId> = app.args.iter().copied().collect();
+            (app.args.len() == vars.len()
+                && distinct.len() == vars.len()
+                && vars.iter().all(|v| distinct.contains(v))
+                && ctx.is_free_function(app.decl))
+            .then_some(app.decl)
+        };
+        let (head, rhs) = if self.m.is_eq(body) || self.m.is_xor(body) {
+            let a = self.m.app_args(body).to_vec();
+            if a.len() != 2 {
+                return None;
+            }
+            let (h, r) = if is_head(self, a[0]).is_some() {
+                (a[0], a[1])
+            } else {
+                (a[1], a[0])
+            };
+            let r = if self.m.is_xor(body) {
+                self.m.mk_not(r)
+            } else {
+                r
+            };
+            (h, r)
+        } else if self.m.is_not(body) {
+            let inner = self.m.app_args(body)[0];
+            if !self.m.is_eq(inner)
+                || !self
+                    .m
+                    .is_bool_sort(self.m.get_sort(self.m.app_args(inner)[0]))
+            {
+                return None;
+            }
+            let a = self.m.app_args(inner).to_vec();
+            let (h, r) = if is_head(self, a[0]).is_some() {
+                (a[0], a[1])
+            } else {
+                (a[1], a[0])
+            };
+            (h, self.m.mk_not(r))
+        } else {
+            return None;
+        };
+        let f = is_head(self, head)?;
+        if self
+            .m
+            .postorder(rhs)
+            .iter()
+            .any(|&t| self.m.app(t).is_some_and(|a| a.decl == f))
+        {
+            return None;
+        }
+        Some((f, self.m.app_args(head).to_vec(), rhs))
+    }
+
+    /// Inline the macro definitions among the universals whose function is
+    /// used elsewhere (ground assertions or other universals), dropping their
+    /// universals. Whether anything changed.
+    fn eliminate_macros(&mut self) -> bool {
+        let mut defs: BTreeMap<AstId, (Vec<AstId>, AstId)> = BTreeMap::new();
+        let mut drop: BTreeSet<usize> = BTreeSet::new();
+        for (i, (vars, body)) in self.universals.clone().into_iter().enumerate() {
+            if let Some((f, params, rhs)) = self.macro_definition(&vars, body)
+                && !defs.contains_key(&f)
+                // A function used as an array (`as-array`, `map`) is not only
+                // applied: inlining would leave those uses undefined.
+                && !self.as_arrays.values().any(|&d| d == f)
+                && !self
+                    .maps
+                    .values()
+                    .any(|(n, _)| self.decl_name(f).is_some_and(|fname| n.contains(fname.as_str())))
+                // Another definition must not mention `f` (no cycles).
+                && !defs.values().any(|(_, r)| self.term_mentions_decl(*r, f))
+                && !defs.keys().any(|&g| self.term_mentions_decl(rhs, g))
+            {
+                defs.insert(f, (params, rhs));
+                drop.insert(i);
+            }
+        }
+        if defs.is_empty() {
+            return false;
+        }
+        // Only worth it (and only changes anything) when a defined function is
+        // used outside its own definition.
+        let mut used = false;
+        for (i, (_, body)) in self.universals.iter().enumerate() {
+            if !drop.contains(&i) && defs.keys().any(|&f| self.term_mentions_decl(*body, f)) {
+                used = true;
+            }
+        }
+        if self
+            .assertions
+            .iter()
+            .any(|&a| defs.keys().any(|&f| self.term_mentions_decl(a, f)))
+        {
+            used = true;
+        }
+        if !used {
+            return false;
+        }
+        let mut memo = BTreeMap::new();
+        let assertions = self.assertions.clone();
+        self.assertions = assertions
+            .into_iter()
+            .map(|a| self.inline_macros_rec(a, &defs, &mut memo, 0))
+            .collect();
+        let universals = core::mem::take(&mut self.universals);
+        for (i, (vars, body)) in universals.into_iter().enumerate() {
+            if !drop.contains(&i) {
+                let b = self.inline_macros_rec(body, &defs, &mut memo, 0);
+                self.universals.push((vars, b));
+            }
+        }
+        true
+    }
+
+    fn term_mentions_decl(&self, t: AstId, f: AstId) -> bool {
+        self.m
+            .postorder(t)
+            .iter()
+            .any(|&u| self.m.app(u).is_some_and(|a| a.decl == f))
+    }
+
+    fn check_sat_core(&mut self) -> (SmtResult, Option<Model>) {
         // A single-predicate Constrained Horn Clause system (a transition system
         // `Init/τ/Bad`) is decided by bounded model checking (for `unsat`, a
         // counterexample trace) and k-induction (for `sat`, an inductive
@@ -37421,6 +37567,28 @@ mod tests {
         if out[0] == "sat" {
             assert!(!out[1].contains("(- "), "{}", out[1]);
         }
+    }
+
+    #[test]
+    fn macros_are_inlined_where_used() {
+        // z3 regression 3523: `∀b c. xor(c ≥ 7/b, a(b, c))` defines `a`.
+        let script = "
+            (declare-fun a (Int Int) Bool)
+            (assert (forall ((b Int) (c Int)) (xor (>= c (/ 7 b)) (a b c))))
+            (assert (a 4 1))
+            (check-sat)
+            (reset)
+            (declare-fun f (Int) Int)
+            (assert (forall ((x Int)) (= (f x) (* 2 x))))
+            (assert (= (f 3) 7))
+            (check-sat)
+            (reset)
+            (declare-fun g (Int) Bool)
+            (assert (forall ((x Int)) (not (= (g x) (> x 0)))))
+            (assert (g 5))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat", "unsat"]);
     }
 
     #[test]
