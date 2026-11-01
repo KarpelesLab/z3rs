@@ -4153,6 +4153,21 @@ impl Context {
                 // Normalize a negated top-level quantifier (`¬∃`/`¬∀`) into the dual
                 // so it gets sound handling rather than becoming an opaque `unknown`.
                 let asserted = push_not_quantifier(&list[1]);
+                // A conjunction with quantified conjuncts is asserted conjunct by
+                // conjunct, so each quantifier is top-level (the sentinel would
+                // otherwise hide it).
+                if let SExpr::List(cs) = &asserted
+                    && matches!(cs.first(), Some(SExpr::Atom(a)) if a == "and")
+                    && cs[1..]
+                        .iter()
+                        .any(|c| top_level_quantifier(&push_not_quantifier(c)).is_some())
+                {
+                    for c in &cs[1..] {
+                        let one = SExpr::List(alloc::vec![list[0].clone(), c.clone()]);
+                        self.command(&one)?;
+                    }
+                    return Ok(None);
+                }
                 if let Some(kind) = top_level_quantifier(&asserted) {
                     let ql = as_list(&asserted)?;
                     // Flatten `∀x.∀y.φ` into a single `∀x,y.φ` so E-matching /
@@ -12976,9 +12991,11 @@ impl Context {
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let g = crate::rewriter::simplify(&mut self.m, g);
             if !self.arith_nonlinear(g)
-                && let (SmtResult::Sat, m) = check_model(&self.m, g)
+                && let (SmtResult::Sat, _) = check_model(&self.m, g)
             {
-                return m;
+                // The model must also fix the substituted divisors.
+                let pinned = self.with_pins(g, &subst);
+                return check_model(&self.m, pinned).1;
             }
             let mut k = 0;
             loop {
@@ -12993,6 +13010,13 @@ impl Context {
                 k += 1;
             }
         }
+    }
+
+    /// `g` together with the equalities `x = v` of `pins`.
+    fn with_pins(&mut self, g: AstId, pins: &[(AstId, AstId)]) -> AstId {
+        let mut parts: Vec<AstId> = pins.iter().map(|&(x, v)| self.m.mk_eq(x, v)).collect();
+        parts.push(g);
+        self.m.mk_and(&parts)
     }
 
     fn try_divmod_witness(&mut self, goal: AstId) -> Option<Model> {
@@ -13080,12 +13104,15 @@ impl Context {
             // Only trust the verdict once the concretised goal is linear (the
             // nonlinear `b·q` is now `value·q`); then a `sat` is a genuine model.
             if !self.arith_nonlinear(g) {
-                if let (SmtResult::Sat, m) = check_model(&self.m, g) {
-                    return m;
+                if let (SmtResult::Sat, _) = check_model(&self.m, g) {
+                    // The model must also fix the substituted divisors.
+                    let pinned = self.with_pins(g, &subst);
+                    return check_model(&self.m, pinned).1;
                 }
             } else if nl_budget > 0 {
                 nl_budget -= 1;
                 self.in_divmod_witness = true;
+                let g = self.with_pins(g, &subst);
                 let r = self.decide_inner(g);
                 self.in_divmod_witness = false;
                 if let (SmtResult::Sat, Some(m)) = r {
@@ -19741,6 +19768,7 @@ impl Context {
         }
         let (instances, saturated) = self.universal_instances();
         let base = self.conjunction();
+        let no_instances = instances.is_empty();
         let mut combined = if instances.is_empty() {
             base
         } else {
@@ -19791,6 +19819,36 @@ impl Context {
             )
         };
         let mbqi = !(off("smt.mbqi") && off("auto-config"));
+        // The instance set can itself defeat the ground decision (instances over
+        // division witnesses breed further divisions). MBQI then restarts from
+        // the instance-free goal: its model is checked against every universal
+        // and counterexamples refine it, so a `sat` stays sound.
+        if mbqi
+            && res == SmtResult::Unknown
+            && !no_instances
+            && !self.universals.is_empty()
+            && !saturated
+            && !self.all_universals_free_macros()
+        {
+            let lean = self.realdiv_product_cancel(base);
+            let mut cong = self.divmod_congruence_axioms(lean);
+            cong.extend(self.realdiv_congruence_axioms(lean));
+            cong.extend(self.mod_multiple_axioms(lean));
+            cong.extend(self.trig_bound_axioms(lean));
+            let lean = if cong.is_empty() {
+                lean
+            } else {
+                cong.push(lean);
+                self.m.mk_and(&cong)
+            };
+            let (r, m, g) = self.decide_combined(lean);
+            match r {
+                // The instance-free goal is weaker: its `unsat` is a refutation.
+                SmtResult::Unsat => return (SmtResult::Unsat, None),
+                SmtResult::Sat => (res, model, goal, combined) = (r, m, g, lean),
+                SmtResult::Unknown => {}
+            }
+        }
         if mbqi
             && res == SmtResult::Sat
             && !self.universals.is_empty()
@@ -27240,9 +27298,12 @@ impl Context {
             // turns a nonlinear product like `x*y` into the linear `c*y`. If the
             // residual is fully linear the ordinary engine decides it soundly,
             // producing a real verdict (and model) instead of `unknown`.
-            let lin = self.linearize_fixed_vars(goal);
+            let (lin, pinned) = self.linearize_fixed_vars(goal);
+            // Every model of `lin` must also carry the substituted variables.
+            let full = |ctx: &Self, m: Model| ctx.complete_substituted(m, &pinned);
             if lin != goal && !self.arith_nonlinear(lin) {
-                return check_model(&self.m, lin);
+                let (r, m) = check_model(&self.m, lin);
+                return (r, m.map(|m| full(self, m)));
             }
             // An opaque exponentiation `(^ b e)` (symbolic exponent, or a constant
             // exponent too large to expand into a product) is a fresh, wholly
@@ -27289,10 +27350,10 @@ impl Context {
                 // proven independently. Falls back to a model-less `sat`.
                 if r == SmtResult::Sat {
                     if let Some(m) = self.try_int_box_witness(lin) {
-                        return (SmtResult::Sat, Some(m));
+                        return (SmtResult::Sat, Some(full(self, m)));
                     }
                     if let Some(m) = self.try_nonlinear_witness(lin) {
-                        return (SmtResult::Sat, Some(m));
+                        return (SmtResult::Sat, Some(full(self, m)));
                     }
                 }
                 return (r, None);
@@ -27305,11 +27366,11 @@ impl Context {
             } else if let Some(m) = self.try_int_box_witness(lin)
                 && !untrustworthy_sat
             {
-                (SmtResult::Sat, Some(m))
+                (SmtResult::Sat, Some(full(self, m)))
             } else if let Some(m) = self.try_nonlinear_witness(lin)
                 && !untrustworthy_sat
             {
-                (SmtResult::Sat, Some(m))
+                (SmtResult::Sat, Some(full(self, m)))
             } else {
                 (SmtResult::Unknown, None)
             }
@@ -27323,8 +27384,9 @@ impl Context {
     /// linearizes nonlinear terms whose non-constant factors become constant
     /// (e.g. `x*y` with `x = 2` → `2*y`). Sound: each substitution is entailed
     /// by the goal, so the result is equisatisfiable.
-    fn linearize_fixed_vars(&mut self, goal: AstId) -> AstId {
+    fn linearize_fixed_vars(&mut self, goal: AstId) -> (AstId, Vec<(AstId, AstId)>) {
         let mut g = goal;
+        let mut done: Vec<(AstId, AstId)> = Vec::new();
         for _ in 0..16 {
             let mut conjuncts = Vec::new();
             self.icp_flatten_and(g, &mut conjuncts);
@@ -27369,9 +27431,21 @@ impl Context {
             if ng == g {
                 break;
             }
+            done.push((from, to));
             g = ng;
         }
-        g
+        (g, done)
+    }
+
+    /// Re-attach the variables [`Self::linearize_fixed_vars`] substituted away:
+    /// latest first, each from its defining term under the model.
+    fn complete_substituted(&self, mut model: Model, subst: &[(AstId, AstId)]) -> Model {
+        for &(x, b) in subst.iter().rev() {
+            if let Value::Num(r, _) = model.eval_value(&self.m, b) {
+                model.set_arith(x, r);
+            }
+        }
+        model
     }
 
     /// Does `sub` occur anywhere within `term`?
@@ -34473,6 +34547,48 @@ mod tests {
             (declare-const r0 Real) (declare-const r2 Real)
             (declare-const r4 Real) (declare-const r5 Real)
             (assert (< 0.0 r0 (/ r2 (* (/ r4 (/ 0.9 r5)) r0 7.0 r0))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn realdiv_witness_model_fixes_the_divisor() {
+        // The witness pins the divisor `a` to a nonzero value; the model must
+        // report that value, not a default 0 that breaks `x/a = 3`.
+        let script = "
+            (declare-const a Real) (declare-const c Real) (declare-const x Real)
+            (assert (= (/ x a) 3.0)) (assert (< 0.0 (* a c))) (assert (> x 5.0))
+            (check-sat)
+            (eval (= (/ x a) 3.0))
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "true"]);
+    }
+
+    #[test]
+    fn linearized_models_keep_substituted_variables() {
+        // `r1 = 13` is substituted away to linearize the products; the model
+        // must still report r1.
+        let script = "
+            (declare-const r0 Real) (declare-const r1 Real) (declare-const r2 Real)
+            (assert (= 13.0 r1))
+            (assert (> (* (+ 1.0 (- r0 r2)) (- (/ r2 r1) (- r0 r1))) (* (* r0 r2) (- r0 r2))))
+            (check-sat)
+            (eval r1)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "13.0"]);
+    }
+
+    #[test]
+    fn quantified_conjuncts_are_top_level_universals() {
+        // z3 regression 3123: the universals sit inside an `and`; asserted
+        // conjunct by conjunct, MBQI confirms the model with `b·d = 0`.
+        let script = "
+            (declare-fun a () Real) (declare-fun b () Real) (declare-fun c () Real)
+            (declare-fun d () Real) (declare-fun g () Real)
+            (assert (and
+              (forall ((e Real)) (or (= (* b d) 0.0) (and (< 0.0 (/ 2.0 e c)) (< (* e c) g))))
+              (forall ((f Real)) (< 0.0 (* a c)))))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
