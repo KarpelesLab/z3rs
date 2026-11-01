@@ -27519,6 +27519,9 @@ impl Context {
                 let (res, bv) = check_bv_model(&self.m, g);
                 return (res, bv.map(Model::from_bv));
             }
+            if let Some(r) = self.decide_bv_components(goal) {
+                return r;
+            }
             return (SmtResult::Unknown, None);
         }
         // Arrays indexed by a *symbolic* Bool need the index's 2-valuedness: decide
@@ -28768,6 +28771,91 @@ impl Context {
         }
         let w = self.m.bv_sort_width(idx).filter(|&w| w <= 4)?;
         Some((0..1i64 << w).map(|v| self.m.mk_bv(v, w)).collect())
+    }
+
+    /// Decide a mixed goal whose top-level conjuncts split into groups sharing
+    /// no constant or function symbol: pure bit-vector groups by bit-blasting,
+    /// bit-vector-free groups by the general procedure. The goal is sat iff
+    /// every group is. `None` if a group mixes bit-vectors with other theories.
+    fn decide_bv_components(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let mut conjuncts = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        // An FP term and its bit-vector image are one symbol (linked through
+        // `fp_bv`, not syntactically).
+        let mut fp_link: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for (&f, &b) in &self.fp_bv {
+            fp_link.insert(f, b);
+            fp_link.insert(b, f);
+        }
+        let symbols = |ctx: &Self, c: AstId| -> BTreeSet<AstId> {
+            let mut out = BTreeSet::new();
+            for t in ctx.m.postorder(c) {
+                for u in [Some(t), fp_link.get(&t).copied()].into_iter().flatten() {
+                    if let Some(a) = ctx.m.app(u)
+                        && let Some(fd) = ctx.m.func_decl(a.decl)
+                        && fd.info.family_id == crate::ast::NULL_FAMILY_ID
+                    {
+                        out.insert(a.decl);
+                    }
+                }
+            }
+            out
+        };
+        // Union conjuncts that share a symbol.
+        let mut groups: Vec<(BTreeSet<AstId>, Vec<AstId>)> = Vec::new();
+        for c in conjuncts {
+            let syms = symbols(self, c);
+            let mut merged = (syms, alloc::vec![c]);
+            let mut rest = Vec::new();
+            for g in groups {
+                if g.0.is_disjoint(&merged.0) {
+                    rest.push(g);
+                } else {
+                    merged.0.extend(g.0);
+                    merged.1.extend(g.1);
+                }
+            }
+            rest.push(merged);
+            groups = rest;
+        }
+        if groups.len() < 2 {
+            return None;
+        }
+        let mut model: Option<Model> = None;
+        let mut bv_models: Vec<Model> = Vec::new();
+        let mut unknown = false;
+        for (_, cs) in groups {
+            let g = match cs.len() {
+                1 => cs[0],
+                _ => self.m.mk_and(&cs),
+            };
+            let (r, m) = if self.bv_goal_is_pure(g) {
+                let (r, bv) = check_bv_model(&self.m, g);
+                (r, bv.map(Model::from_bv))
+            } else if self.is_bv_goal(g) {
+                return None;
+            } else {
+                self.decide_inner(g)
+            };
+            match r {
+                SmtResult::Unsat => return Some((SmtResult::Unsat, None)),
+                SmtResult::Unknown => unknown = true,
+                SmtResult::Sat => match m {
+                    Some(m) if self.bv_goal_is_pure(g) => bv_models.push(m),
+                    Some(m) if model.is_none() => model = Some(m),
+                    // Two non-bit-vector models cannot be merged here.
+                    _ => unknown = true,
+                },
+            }
+        }
+        if unknown {
+            return Some((SmtResult::Unknown, None));
+        }
+        let mut model = model.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+        for m in bv_models {
+            model.absorb(m);
+        }
+        Some((SmtResult::Sat, Some(model)))
     }
 
     fn is_bv_goal(&self, goal: AstId) -> bool {
@@ -35084,6 +35172,25 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn mixed_goals_split_into_independent_components() {
+        // z3 regression fp-conversions-30: the bit-vector and the real part
+        // share no symbol, so each is decided by its own engine.
+        let script = "
+            (declare-fun rm () RoundingMode) (declare-fun x () (_ BitVec 64))
+            (declare-fun y () Real)
+            (assert (and (= x ((_ fp.to_ubv 64) rm (fp #b0 #b10000000100 #x5000000000000)))
+                         (= y (fp.to_real (fp #b0 #b10000000100 #x5000000000000)))))
+            (check-sat)
+            (eval x)
+            (eval y)
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "#x000000000000002a", "42.0"]
+        );
     }
 
     #[test]

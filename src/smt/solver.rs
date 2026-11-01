@@ -293,6 +293,13 @@ impl Model {
         }
     }
 
+    /// Take over the bit-vector and Boolean assignments of `other`, a model
+    /// of a component sharing no symbols with this one.
+    pub fn absorb(&mut self, other: Model) {
+        self.bv.extend(other.bv);
+        self.bools.extend(other.bools);
+    }
+
     /// Pin a Boolean constant (or atom) to a truth value.
     pub fn set_bool(&mut self, var: AstId, val: bool) {
         self.bools.insert(var, val);
