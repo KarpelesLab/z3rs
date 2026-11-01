@@ -27485,6 +27485,11 @@ impl Context {
                 .iter()
                 .any(|t| self.str_symbolic.contains(t) || self.is_opaque_fp_marker(*t));
         if has_symbolic_str {
+            // Comparisons over ground transcendentals are decided outright: an
+            // equivalent goal with fewer opaque terms.
+            if let Some(g2) = self.fold_ground_transcendentals(goal) {
+                return self.decide_inner(g2);
+            }
             let (res0, model0) = check_model(&self.m, goal);
             if res0 == SmtResult::Unsat {
                 return (SmtResult::Unsat, None);
@@ -28838,6 +28843,140 @@ impl Context {
         };
         memo.insert(t, out);
         out
+    }
+
+    /// A rigorous enclosure of the ground arithmetic term `t`: numerals, `pi`,
+    /// `+ − × /` and transcendentals (`sin`, `exp`, …) of exact rational
+    /// arguments. `None` for anything with a free symbol.
+    fn ground_enclosure(&self, t: AstId) -> Option<crate::math::transcendental::Enc> {
+        use crate::ast::arith::ArithOp;
+        use crate::math::transcendental as tr;
+        if let Some(v) = self.m.as_numeral(t) {
+            return Some((v.clone(), v));
+        }
+        let args = self.m.app_args(t).to_vec();
+        let mul = |a: &tr::Enc, b: &tr::Enc| {
+            let c = [a.0.mul(&b.0), a.0.mul(&b.1), a.1.mul(&b.0), a.1.mul(&b.1)];
+            (
+                c.iter().min().unwrap().clone(),
+                c.iter().max().unwrap().clone(),
+            )
+        };
+        match self.m.arith_op(t) {
+            Some(ArithOp::Add) | Some(ArithOp::Sub) => {
+                let mut acc = self.ground_enclosure(args[0])?;
+                for &a in &args[1..] {
+                    let e = self.ground_enclosure(a)?;
+                    acc = if self.m.arith_op(t) == Some(ArithOp::Add) {
+                        (acc.0.add(&e.0), acc.1.add(&e.1))
+                    } else {
+                        (acc.0.sub(&e.1), acc.1.sub(&e.0))
+                    };
+                }
+                return Some(acc);
+            }
+            Some(ArithOp::Uminus) => {
+                let e = self.ground_enclosure(args[0])?;
+                return Some((e.1.neg(), e.0.neg()));
+            }
+            Some(ArithOp::Mul) => {
+                let mut acc = self.ground_enclosure(args[0])?;
+                for &a in &args[1..] {
+                    acc = mul(&acc, &self.ground_enclosure(a)?);
+                }
+                return Some(acc);
+            }
+            Some(ArithOp::Div) if args.len() == 2 => {
+                let a = self.ground_enclosure(args[0])?;
+                let b = self.ground_enclosure(args[1])?;
+                if b.0.signum() * b.1.signum() <= 0 {
+                    return None;
+                }
+                return Some(mul(&a, &(b.1.recip(), b.0.recip())));
+            }
+            Some(ArithOp::ToReal) => return self.ground_enclosure(args[0]),
+            Some(_) => return None,
+            None => {}
+        }
+        let name = self.decl_name(self.m.app(t)?.decl)?;
+        if args.is_empty() && name == "pi" && !self.funcs.contains_key("pi") {
+            return Some(tr::pi());
+        }
+        if args.len() != 1 || !self.str_symbolic.contains(&t) {
+            return None;
+        }
+        let (lo, hi) = self.ground_enclosure(args[0])?;
+        if lo != hi {
+            return None;
+        }
+        tr::eval(&name, &lo)
+    }
+
+    /// `goal` with every arithmetic comparison over ground transcendental
+    /// terms (`tanh 0.5 < 97`) decided by interval evaluation, as z3's nlsat
+    /// does by evaluating transcendentals at rational points. `None` when no
+    /// atom is decided.
+    fn fold_ground_transcendentals(&mut self, goal: AstId) -> Option<AstId> {
+        use crate::ast::arith::ArithOp;
+        let mut pairs = Vec::new();
+        for t in self.m.postorder(goal) {
+            let args = self.m.app_args(t).to_vec();
+            if args.len() != 2 || !self.m.is_arith_sort(self.m.get_sort(args[0])) {
+                continue;
+            }
+            let op = self.m.arith_op(t);
+            let is_cmp = self.m.is_eq(t)
+                || matches!(
+                    op,
+                    Some(ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
+                );
+            if !is_cmp
+                || !self
+                    .m
+                    .postorder(t)
+                    .iter()
+                    .any(|u| self.str_symbolic.contains(u))
+            {
+                continue;
+            }
+            let (Some(a), Some(b)) = (
+                self.ground_enclosure(args[0]),
+                self.ground_enclosure(args[1]),
+            ) else {
+                continue;
+            };
+            // d = a − b ∈ [lo, hi]
+            let (lo, hi) = (a.0.sub(&b.1), a.1.sub(&b.0));
+            let decided = match op {
+                _ if self.m.is_eq(t) => (lo.is_positive() || hi.is_negative()).then_some(false),
+                Some(ArithOp::Le) => (!hi.is_positive())
+                    .then_some(true)
+                    .or((lo.is_positive()).then_some(false)),
+                Some(ArithOp::Lt) => (hi.is_negative())
+                    .then_some(true)
+                    .or((!lo.is_negative()).then_some(false)),
+                Some(ArithOp::Ge) => (!lo.is_negative())
+                    .then_some(true)
+                    .or((hi.is_negative()).then_some(false)),
+                Some(ArithOp::Gt) => (lo.is_positive())
+                    .then_some(true)
+                    .or((!hi.is_positive()).then_some(false)),
+                _ => None,
+            };
+            if let Some(v) = decided {
+                let c = if v {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                };
+                pairs.push((t, c));
+            }
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &pairs);
+        Some(crate::rewriter::simplify(&mut self.m, g))
     }
 
     /// `goal` with each Boolean atom over an opaque term (`str_symbolic`, FP
@@ -35482,6 +35621,25 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn ground_transcendental_atoms_by_interval() {
+        // z3 regression 3473: `tanh 0.51661` compared with constants is decided
+        // by evaluating it, leaving a propositional goal.
+        let script = "
+            (declare-const v Bool)
+            (assert (xor v (<= 0.51661 6.0 (tanh 0.51661)) (< (tanh 0.5) 0.47)))
+            (check-sat)
+            (reset)
+            (assert (< (exp 1.0) 2.718))
+            (check-sat)
+            (reset)
+            (assert (> (* 4.0 (atan 1.0)) 3.1415926))
+            (assert (< (log 2.0) 0.6931472))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat", "sat"]);
     }
 
     #[test]

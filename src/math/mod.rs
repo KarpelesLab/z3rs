@@ -19,6 +19,7 @@ pub mod interval;
 pub mod polynomial;
 pub mod resultant;
 pub mod simplex;
+pub mod transcendental;
 pub mod upoly;
 
 pub use interval::{Bound, Interval};
