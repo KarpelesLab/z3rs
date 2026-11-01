@@ -2429,12 +2429,6 @@ struct Context {
     /// parse-time blasting ties an FP op to a fresh bit-vector disconnected from
     /// the binder, so `substitute` cannot reach it (see the deferral in `fp_op`).
     fp_defer_depth: u32,
-    /// Set for a `(check-sat-using …)` whose tactic requests `nlsat` (e.g.
-    /// `qfnra-nlsat`). z3's *plain* `check-sat` leaves a transcendental goal like
-    /// `sin x < −1` `unknown`, but `qfnra-nlsat` decides it; gating the trig
-    /// range bounds on this flag mirrors that tactic-dependent completeness (so
-    /// trig-bounds → unsat while plain sine9 stays unknown, byte-matching z3).
-    nlsat_requested: bool,
     /// Guards `try_disjunction_sat_witness` against unbounded re-entry when a
     /// disjunct is itself a conjunction containing a disjunction.
     disj_witness_active: bool,
@@ -3417,7 +3411,6 @@ impl Context {
             fp_const_cache: BTreeMap::new(),
             fp_bv: BTreeMap::new(),
             fp_defer_depth: 0,
-            nlsat_requested: false,
             disj_witness_active: false,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
@@ -4339,10 +4332,6 @@ impl Context {
                 self.last_assumptions.clear();
                 self.reason_unknown = None;
                 self.str_witness.clear();
-                // A `check-sat-using` tactic that names `nlsat` unlocks the trig
-                // range bounds (see `nlsat_requested`); reset for the next check.
-                self.nlsat_requested =
-                    is_using && list.get(1).is_some_and(|t| sexpr_mentions(t, "nlsat"));
                 let plain = is_using || list.len() <= 1;
                 let (res, mut model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
@@ -30503,15 +30492,10 @@ impl Context {
     /// `sin`/`cos` ∈ [−1, 1] and `tanh` ∈ (−1, 1) (emitted as the sound weak
     /// bounds [−1, 1]). z3rs leaves these opaque, so without the bound a goal like
     /// `sin θ < −1` stays `unknown`; with it the opaque real is contradicted and
-    /// the goal refutes (trig-bounds, issue #680). Sound: every real argument maps
-    /// into the stated range.
+    /// the goal refutes (trig-bounds, issue #680, sine9). Sound: every real
+    /// argument maps into the stated range. z3 5.3's `nla_transcendentals`
+    /// asserts the same range axioms on every application.
     fn trig_bound_axioms(&mut self, goal: AstId) -> Vec<AstId> {
-        // Only under an `nlsat` tactic — z3's plain `check-sat` leaves these
-        // `unknown`, so emitting the bound there would over-decide and lose
-        // byte-parity (sine9).
-        if !self.nlsat_requested {
-            return Vec::new();
-        }
         let mut out = Vec::new();
         let mut seen = BTreeSet::new();
         for t in self.m.postorder(goal) {
@@ -34937,6 +34921,18 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn transcendental_ranges_on_plain_check_sat() {
+        // z3 regression sine9: z3 5.3 asserts `−1 ≤ sin t ≤ 1` on every
+        // application, with or without an nlsat tactic.
+        let script = "
+            (declare-fun x () Real)
+            (assert (< (sin x) -1.0))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
