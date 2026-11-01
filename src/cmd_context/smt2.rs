@@ -2469,9 +2469,9 @@ struct Context {
     /// parse-time blasting ties an FP op to a fresh bit-vector disconnected from
     /// the binder, so `substitute` cannot reach it (see the deferral in `fp_op`).
     fp_defer_depth: u32,
-    /// Guards `try_disjunction_sat_witness` against unbounded re-entry when a
-    /// disjunct is itself a conjunction containing a disjunction.
-    disj_witness_active: bool,
+    /// Nesting depth of `try_disjunction_sat_witness`: a disjunct is itself a
+    /// conjunction that may contain a disjunction, so re-entry is bounded.
+    disj_witness_depth: u32,
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
@@ -3455,7 +3455,7 @@ impl Context {
             fp_bv: BTreeMap::new(),
             rm_bv: BTreeMap::new(),
             fp_defer_depth: 0,
-            disj_witness_active: false,
+            disj_witness_depth: 0,
             fp_symbolic_cache: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
@@ -5880,7 +5880,7 @@ impl Context {
     /// (fp-operations). Sound: `dᵢ ⇒ (or …)`, and the sub-goal keeps every other
     /// conjunct, so its model satisfies the full goal.
     fn try_disjunction_sat_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
-        if self.disj_witness_active {
+        if self.disj_witness_depth >= 2 {
             return None;
         }
         let mut conj: Vec<AstId> = Vec::new();
@@ -5907,7 +5907,9 @@ impl Context {
                 disj.push(t);
             }
         }
-        if !(2..=16).contains(&disj.len()) {
+        // Nested splits stay small (they multiply).
+        let max = if self.disj_witness_depth == 0 { 16 } else { 4 };
+        if !(2..=max).contains(&disj.len()) {
             return None;
         }
         let others: Vec<AstId> = conj
@@ -5916,7 +5918,7 @@ impl Context {
             .filter(|(j, _)| *j != or_idx)
             .map(|(_, &c)| c)
             .collect();
-        self.disj_witness_active = true;
+        self.disj_witness_depth += 1;
         let mut result = None;
         for &d in &disj {
             let mut parts = others.clone();
@@ -5932,7 +5934,7 @@ impl Context {
                 break;
             }
         }
-        self.disj_witness_active = false;
+        self.disj_witness_depth -= 1;
         result
     }
 
@@ -36096,6 +36098,26 @@ mod tests {
         assert_ne!(out[1], "((q 0.0))");
         assert_eq!(out[2], "sat");
         assert_eq!(out[3], "((q (- (/ 15.0 16.0))))");
+    }
+
+    #[test]
+    fn nested_disjunction_witness() {
+        // z3 regression fpa_to_fp_unsigned_exponent_width_boundary: two
+        // disjunctive pins, each needed to fold its conversion.
+        let script = "
+            (declare-const h (_ BitVec 13))
+            (declare-const s (_ BitVec 13))
+            (assert (or (= h #b1111111111110) (= h #b1111111111111)))
+            (assert (= ((_ to_fp_unsigned 2 11) RTN h) (fp #b0 #b10 #b1111111111)))
+            (assert (or (= s #b0000000000001) (= s #b0000000000010)))
+            (assert (= ((_ to_fp_unsigned 2 11) RTN s) (fp #b0 #b10 #b0000000000)))
+            (check-sat)
+            (get-value (s))
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "((s #b0000000000010))"]
+        );
     }
 
     #[test]
