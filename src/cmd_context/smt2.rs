@@ -16169,6 +16169,11 @@ impl Context {
         if let Some(&bv) = self.fp_bv.get(&t) {
             return Some(bv);
         }
+        // `((_ to_fp eb sb) x)` of a symbolic bit-vector *is* the pattern `x`
+        // (every NaN pattern is the one NaN, as the blasted predicates treat it).
+        if let Some(&(x, _, _)) = self.fp_from_bv.get(&t) {
+            return Some(x);
+        }
         // An opaque symbolic FP operation (e.g. fp.fma/fp.sqrt we cannot fold)
         // has a *determined* value we don't know; representing it as a free
         // bit-vector would be unsound (it would satisfy any equality). Refuse it
@@ -35878,6 +35883,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn bitvector_reinterpreted_as_float_is_blasted() {
+        // z3 regressions 6983-*: `((_ to_fp 8 24) bv)` of a symbolic bit-vector
+        // is that bit pattern, so FP predicates over it bit-blast.
+        let script = "
+            (declare-const a (_ BitVec 1))
+            (declare-const c (_ BitVec 4))
+            (assert (not (fp.eq (fp (_ bv0 1) (_ bv0 8) (_ bv0 23))
+                                ((_ to_fp 8 24) (bvnand (_ bv1 32) ((_ zero_extend 31) a))))))
+            (check-sat)
+            (assert (fp.isNaN ((_ to_fp 8 24) ((_ zero_extend 31) a))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
