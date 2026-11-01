@@ -1948,6 +1948,95 @@ fn flatten_foralls(body: &SExpr) -> (Vec<SExpr>, SExpr) {
     (extra, cur)
 }
 
+/// Rename every free occurrence of the atom `from` in `e` to `to` (inner
+/// binders of the same name shadow it).
+fn rename_free(e: &SExpr, from: &str, to: &str) -> SExpr {
+    match e {
+        SExpr::Atom(a) if a == from => SExpr::Atom(to.to_string()),
+        SExpr::Atom(_) => e.clone(),
+        SExpr::List(l) => {
+            let binds = |b: &SExpr| match b {
+                SExpr::List(bs) => bs.iter().any(|p| match p {
+                    SExpr::List(pv) => matches!(pv.first(), Some(SExpr::Atom(n)) if n == from),
+                    _ => false,
+                }),
+                _ => false,
+            };
+            if l.len() == 3
+                && matches!(&l[0], SExpr::Atom(h) if h == "forall" || h == "exists" || h == "let")
+                && binds(&l[1])
+            {
+                return e.clone();
+            }
+            SExpr::List(l.iter().map(|x| rename_free(x, from, to)).collect())
+        }
+    }
+}
+
+/// Pull non-arithmetic universals out of a quantifier body where that is
+/// equivalent: a
+/// `forall` in positive position (under `and`/`or`, the consequent of `=>`,
+/// an `ite` branch, double negation) or an `exists` in negative position,
+/// its binders renamed fresh and appended to `extra`. `∀x. ite(c, ∀y. φ, ψ)`
+/// is `∀x y. ite(c, φ, ψ)`, which instantiation handles instead of an opaque
+/// nested quantifier.
+fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u32) -> SExpr {
+    let SExpr::List(l) = e else { return e.clone() };
+    let Some(SExpr::Atom(h)) = l.first() else {
+        return e.clone();
+    };
+    match h.as_str() {
+        "and" | "or" => SExpr::List(
+            core::iter::once(l[0].clone())
+                .chain(
+                    l[1..]
+                        .iter()
+                        .map(|x| prenex_positive(x, pos, extra, counter)),
+                )
+                .collect(),
+        ),
+        "not" if l.len() == 2 => SExpr::List(alloc::vec![
+            l[0].clone(),
+            prenex_positive(&l[1], !pos, extra, counter)
+        ]),
+        "=>" if l.len() == 3 => SExpr::List(alloc::vec![
+            l[0].clone(),
+            prenex_positive(&l[1], !pos, extra, counter),
+            prenex_positive(&l[2], pos, extra, counter),
+        ]),
+        "ite" if l.len() == 4 => SExpr::List(alloc::vec![
+            l[0].clone(),
+            l[1].clone(),
+            prenex_positive(&l[2], pos, extra, counter),
+            prenex_positive(&l[3], pos, extra, counter),
+        ]),
+        "forall" | "exists" if l.len() == 3 && (h == "forall") == pos => {
+            let SExpr::List(bs) = &l[1] else {
+                return e.clone();
+            };
+            // Arithmetic binders stay nested: quantifier elimination decides
+            // those exactly (inner block first).
+            let arith = |b: &SExpr| matches!(b, SExpr::List(pv) if matches!(pv.get(1), Some(SExpr::Atom(s)) if s == "Int" || s == "Real"));
+            if bs.iter().any(arith) {
+                return e.clone();
+            }
+            let mut body = l[2].clone();
+            for b in bs {
+                let SExpr::List(pv) = b else { return e.clone() };
+                let (Some(SExpr::Atom(n)), Some(sort)) = (pv.first(), pv.get(1)) else {
+                    return e.clone();
+                };
+                let fresh = alloc::format!("!pnx{}", *counter);
+                *counter += 1;
+                body = rename_free(&body, n, &fresh);
+                extra.push(SExpr::List(alloc::vec![SExpr::Atom(fresh), sort.clone()]));
+            }
+            prenex_positive(&body, pos, extra, counter)
+        }
+        _ => e.clone(),
+    }
+}
+
 /// Push a leading `not` through a top-level quantifier so negated quantifiers
 /// get sound handling instead of falling back to `unknown`:
 /// `¬∃x.φ ⇒ ∀x.¬φ`, `¬∀x.φ ⇒ ∃x.¬φ`, and `¬¬φ ⇒ φ`. Applied repeatedly.
@@ -2502,6 +2591,11 @@ struct Context {
     in_components: bool,
     /// `(as const …)` applications built so far in the current command.
     as_const_seen: u32,
+    /// `:named` quantified assertions: (index into `universals`, name,
+    /// `assertions.len()` when asserted).
+    universal_names: Vec<(usize, String, usize)>,
+    /// Whether the last check was `check-sat-using` with a macro-finder tactic.
+    last_tactic_macro_finder: bool,
     /// Datalog relations (`declare-rel`) with their argument sorts.
     dl_rels: BTreeMap<String, Vec<SExpr>>,
     /// Datalog rule variables (`declare-var`).
@@ -3492,6 +3586,8 @@ impl Context {
             disj_witness_depth: 0,
             in_components: false,
             as_const_seen: 0,
+            universal_names: Vec::new(),
+            last_tactic_macro_finder: false,
             dl_rels: BTreeMap::new(),
             dl_vars: Vec::new(),
             fp_symbolic_cache: BTreeMap::new(),
@@ -3823,6 +3919,8 @@ impl Context {
                     self.assert_names.truncate(mark.assertions);
                     self.named_terms.retain(|&(_, _, i)| i < mark.assertions);
                     self.universals.truncate(mark.universals);
+                    self.universal_names
+                        .retain(|&(u, _, _)| u < mark.universals);
                     // Undeclare constants/functions and sorts made since the push.
                     for name in self.decl_order.drain(mark.decls..) {
                         self.funcs.remove(&name);
@@ -3839,6 +3937,7 @@ impl Context {
                 self.assert_names.clear();
                 self.named_terms.clear();
                 self.universals.clear();
+                self.universal_names.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -3853,6 +3952,7 @@ impl Context {
                 self.assert_names.clear();
                 self.named_terms.clear();
                 self.universals.clear();
+                self.universal_names.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -4331,6 +4431,23 @@ impl Context {
                 // nested inside a formula fall back to the `unknown` sentinel.
                 // Normalize a negated top-level quantifier (`¬∃`/`¬∀`) into the dual
                 // so it gets sound handling rather than becoming an opaque `unknown`.
+                // A named quantifier `(! (forall …) :named n)` is asserted as the
+                // bare quantifier (handled below), remembering `n` for cores.
+                if let Some(n) = named_label(&list[1])
+                    && let SExpr::List(parts) = &list[1]
+                    && parts.len() >= 2
+                    && top_level_quantifier(&push_not_quantifier(&parts[1])).is_some()
+                {
+                    let (u0, a0) = (self.universals.len(), self.assertions.len());
+                    let one = SExpr::List(alloc::vec![list[0].clone(), parts[1].clone()]);
+                    self.command(&one)?;
+                    if self.universals.len() > u0 {
+                        self.universal_names.push((u0, n, a0));
+                    } else if self.assertions.len() > a0 {
+                        self.assert_names[a0] = Some(n);
+                    }
+                    return Ok(None);
+                }
                 let asserted = push_not_quantifier(&list[1]);
                 // A conjunction with quantified conjuncts is asserted conjunct by
                 // conjunct, so each quantifier is top-level (the sentinel would
@@ -4366,7 +4483,9 @@ impl Context {
                         self.scopes.push(scope);
                         let (fbinders, inner) = flatten_foralls(&ql[2]);
                         if fbinders.is_empty() {
-                            let body = self.term(&inner);
+                            let body = self
+                                .skolemize_nonarith(&inner, true)
+                                .and_then(|inner| self.term(&inner));
                             self.scopes.pop();
                             self.assertions.push(body?);
                             self.assert_names.push(None);
@@ -4388,9 +4507,16 @@ impl Context {
                     }
                     // forall: flatten nested universals, then eliminate/instantiate.
                     let (binders, inner) = {
-                        let (extra, inner) = flatten_foralls(&ql[2]);
+                        let (mut extra, inner) = flatten_foralls(&ql[2]);
+                        let inner = if extra.is_empty() {
+                            ql[2].clone()
+                        } else {
+                            inner
+                        };
+                        let inner =
+                            prenex_positive(&inner, true, &mut extra, &mut self.fresh_counter);
                         if extra.is_empty() {
-                            (ql[1].clone(), ql[2].clone())
+                            (ql[1].clone(), inner)
                         } else {
                             let mut bs = as_list(&ql[1])?.to_vec();
                             bs.extend(extra);
@@ -4442,6 +4568,10 @@ impl Context {
                     self.last_verdict = None;
                     return Ok(None);
                 }
+                // Positive existentials over non-arithmetic sorts nested in a
+                // ground assertion are skolemized rather than left as opaque
+                // sentinels (arithmetic ones are eliminated exactly instead).
+                let asserted = self.skolemize_nonarith(&asserted, true)?;
                 let t = self.term(&asserted)?;
                 let name = named_label(&list[1]);
                 if let Some(n) = &name {
@@ -4515,6 +4645,10 @@ impl Context {
                 // the same verdict. Route assumptions through `check_with` so the
                 // full decision pipeline (and model recording) applies.
                 let is_using = matches!(&list[0], SExpr::Atom(a) if a == "check-sat-using");
+                self.last_tactic_macro_finder = is_using
+                    && list
+                        .get(1)
+                        .is_some_and(|t| render_sexpr(t).contains("macro-finder"));
                 self.last_assumptions.clear();
                 self.reason_unknown = None;
                 self.str_witness.clear();
@@ -20410,8 +20544,18 @@ impl Context {
                 .iter()
                 .any(|t| self.quant_atoms.contains(t))
         });
+        // CHC answers range over fixed domains: over an uninterpreted sort the
+        // domain is part of the model (a guard `b ≠ x` is vacuous when the sort
+        // has one element), so a "reachable" query proves nothing there.
+        let interpreted_only = self.universals.iter().all(|(vs, b)| {
+            vs.iter()
+                .copied()
+                .chain(self.m.postorder(*b))
+                .all(|t| !self.declared_sorts.contains(&self.m.get_sort(t)))
+        });
         if ground_trivial
             && sentinel_free
+            && interpreted_only
             && self.fp_deferred_decls.is_empty()
             && !self.universals.is_empty()
             && let Some(r) = self
@@ -24191,7 +24335,19 @@ impl Context {
             // its `sat` on a nonlinear `¬body` (`a·a < 0`) is spurious — it would
             // "refute" the *valid* `∀a. a·a ≥ 0`. Only trust a `sat` (a refutation)
             // when `¬body` is linear; an `unsat` (validity) is always sound.
-            SmtResult::Sat if !self.arith_nonlinear(neg) => Some(false),
+            // Over an uninterpreted sort a counterexample needs enough domain
+            // elements, which a model need not have (`∀x y:U. x = y` holds in
+            // every one-element model): only validity is decided there.
+            SmtResult::Sat
+                if !self.arith_nonlinear(neg)
+                    && !self
+                        .m
+                        .postorder(body)
+                        .iter()
+                        .any(|&t| self.declared_sorts.contains(&self.m.get_sort(t))) =>
+            {
+                Some(false)
+            }
             SmtResult::Unsat => Some(true),
             _ => None,
         }
@@ -25089,6 +25245,44 @@ impl Context {
     /// Skolem function `f : (sorts of xs) → S`. Descends through `not` (flipping
     /// polarity), `=>`/`and`/`or`/`ite`; positive nested `∀` extend the scope.
     /// Existentials in negative position are left for the sound `unknown` path.
+    /// [`Self::skolemize_body`] applied to each outermost positive `exists`
+    /// whose binders are all non-arithmetic, through `and`/`or`/`not`/`=>`.
+    fn skolemize_nonarith(&mut self, e: &SExpr, pos: bool) -> Result<SExpr, String> {
+        let SExpr::List(l) = e else {
+            return Ok(e.clone());
+        };
+        let Some(SExpr::Atom(h)) = l.first() else {
+            return Ok(e.clone());
+        };
+        let arith = |b: &SExpr| matches!(b, SExpr::List(pv) if matches!(pv.get(1), Some(SExpr::Atom(s)) if s == "Int" || s == "Real"));
+        match h.as_str() {
+            "and" | "or" => {
+                let mut out = alloc::vec![l[0].clone()];
+                for x in &l[1..] {
+                    out.push(self.skolemize_nonarith(x, pos)?);
+                }
+                Ok(SExpr::List(out))
+            }
+            "not" if l.len() == 2 => Ok(SExpr::List(alloc::vec![
+                l[0].clone(),
+                self.skolemize_nonarith(&l[1], !pos)?
+            ])),
+            "=>" if l.len() == 3 => Ok(SExpr::List(alloc::vec![
+                l[0].clone(),
+                self.skolemize_nonarith(&l[1], !pos)?,
+                self.skolemize_nonarith(&l[2], pos)?,
+            ])),
+            "exists"
+                if l.len() == 3
+                    && pos
+                    && matches!(&l[1], SExpr::List(bs) if !bs.iter().any(arith)) =>
+            {
+                self.skolemize_body(e, &[], true)
+            }
+            _ => Ok(e.clone()),
+        }
+    }
+
     fn skolemize_body(
         &mut self,
         body: &SExpr,
@@ -26807,6 +27001,20 @@ impl Context {
     /// universal was checked at every one of them — so `sat` here exhibits a real
     /// model. Failing to find one for any `k ≤ 4` just declines to `unknown`.
     fn try_finite_model_find(&mut self) -> Option<Model> {
+        // A nested-quantifier sentinel is an opaque formula, not a Boolean the
+        // finite model may choose (`∀f g. (∀x. f x = g x) ⇒ C f = C g` became
+        // vacuous with it false — issue-628 answered `sat`).
+        let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
+        roots.extend(self.assertions.iter().copied());
+        if !self.quant_atoms.is_empty()
+            && self
+                .m
+                .postorder_many(&roots)
+                .iter()
+                .any(|t| self.quant_atoms.contains(t))
+        {
+            return None;
+        }
         let mut usorts: Vec<AstId> = Vec::new();
         for (vars, _) in &self.universals {
             for &v in vars {
@@ -30075,6 +30283,39 @@ impl Context {
         self.decide(goal).0
     }
 
+    /// The full check of the kept assertions and universals (the state is
+    /// restored afterwards).
+    fn check_with_universals(&mut self, keep: &[bool], keep_u: &[bool]) -> SmtResult {
+        let saved_a = self.assertions.clone();
+        let saved_n = self.assert_names.clone();
+        let saved_u = self.universals.clone();
+        let saved_model = self.last_model.take();
+        let saved_verdict = self.last_verdict;
+        let mut a = Vec::new();
+        let mut names = Vec::new();
+        for (i, &k) in keep.iter().enumerate() {
+            if k {
+                a.push(saved_a[i]);
+                names.push(saved_n[i].clone());
+            }
+        }
+        self.assertions = a;
+        self.assert_names = names;
+        self.universals = saved_u
+            .iter()
+            .zip(keep_u)
+            .filter(|&(_, &k)| k)
+            .map(|(q, _)| q.clone())
+            .collect();
+        let r = self.check_sat().0;
+        self.assertions = saved_a;
+        self.assert_names = saved_n;
+        self.universals = saved_u;
+        self.last_model = saved_model;
+        self.last_verdict = saved_verdict;
+        r
+    }
+
     /// Is the Boolean option `name` (with or without its leading `:`) set?
     fn option_on(&self, name: &str) -> bool {
         use crate::util::ParamValue;
@@ -30157,22 +30398,53 @@ impl Context {
         }
         let n = self.assertions.len();
         let mut keep = alloc::vec![true; n];
+        // Named universals first: drop each one the rest refutes without.
+        let mut keep_u = alloc::vec![true; self.universals.len()];
+        let named_u: Vec<usize> = self
+            .universal_names
+            .iter()
+            .map(|&(u, _, _)| u)
+            .filter(|&u| u < keep_u.len())
+            .collect();
+        for u in named_u {
+            keep_u[u] = false;
+            if self.check_with_universals(&keep, &keep_u) != SmtResult::Unsat {
+                keep_u[u] = true;
+            }
+        }
         for i in 0..n {
             if self.assert_names[i].is_none() {
                 continue; // unnamed assertions are not core candidates
             }
             keep[i] = false;
             // Keep the assertion unless the remainder is *still* unsatisfiable.
-            if self.check_subset(&keep) != SmtResult::Unsat {
+            let r = if self.universals.is_empty() {
+                self.check_subset(&keep)
+            } else {
+                self.check_with_universals(&keep, &keep_u)
+            };
+            if r != SmtResult::Unsat {
                 keep[i] = true;
             }
         }
-        let mut names = Vec::new();
-        for (k, label) in keep.iter().zip(&self.assert_names) {
+        // Named universals (live ones) join in assertion order; after a
+        // macro-finder tactic z3 lists them after the rest (their macros'
+        // dependencies are appended).
+        let macros_last = self.last_tactic_macro_finder;
+        let mut ordered: Vec<(usize, u8, String)> = Vec::new();
+        for (i, (k, label)) in keep.iter().zip(&self.assert_names).enumerate() {
             if *k && let Some(name) = label {
-                names.push(name.clone());
+                ordered.push((i, 1, name.clone()));
             }
         }
+        for (u, name, pos) in &self.universal_names {
+            if *u < self.universals.len() && keep_u[*u] {
+                let pos = if macros_last { usize::MAX } else { *pos };
+                ordered.push((pos, 0, name.clone()));
+            }
+        }
+        ordered.sort_by_key(|(p, kind, _)| (*p, *kind));
+        let names: Vec<String> = ordered.into_iter().map(|(_, _, n)| n).collect();
         Ok(alloc::format!("({})", names.join(" ")))
     }
 
@@ -36788,6 +37060,84 @@ mod tests {
             (query err)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn named_quantified_assertions_in_cores() {
+        // z3 regression macro-finder-cores.
+        let script = "
+            (set-option :produce-unsat-cores true)
+            (declare-fun f (Int) Int)
+            (declare-fun g (Int) Int)
+            (assert (! (forall ((x Int)) (= (f x) (+ x 1))) :named A))
+            (assert (! (forall ((x Int)) (= (g x) (- x 1))) :named B))
+            (declare-fun x () Int)
+            (assert (! (= (f x) (g x)) :named C))
+            (check-sat)
+            (get-unsat-core)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "(A B C)"]);
+    }
+
+    #[test]
+    fn finite_models_never_choose_quantifier_sentinels() {
+        // z3 regression issue-628: the antecedent `∀x. f x = g x` is an opaque
+        // sentinel; a finite model made it false and answered `sat`.
+        let script = "
+            (declare-sort S 0)
+            (declare-sort F 0)
+            (declare-sort C 0)
+            (declare-fun app (F S) Bool)
+            (declare-fun collect (F) C)
+            (declare-fun p (C) Bool)
+            (declare-fun f () F)
+            (declare-fun g () F)
+            (assert (forall ((a F) (b F)) (=> (forall ((x S)) (= (app a x) (app b x))) (= (collect a) (collect b)))))
+            (assert (forall ((x S)) (= (app f x) (app g x))))
+            (assert (p (collect f)))
+            (assert (not (p (collect g))))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn uninterpreted_universes_may_have_one_element() {
+        // Fuzz-found wrong unsats: `∀x y:U. x = y` holds in one-element models,
+        // and a CHC guard `b ≠ x` over U is vacuous there.
+        let script = "
+            (declare-sort U 0)
+            (assert (forall ((x U) (y U)) (= x y)))
+            (check-sat)
+            (reset)
+            (declare-sort U 0)
+            (declare-fun p (U) Bool)
+            (declare-const a U)
+            (declare-const b U)
+            (assert (forall ((v U)) (= b v)))
+            (assert (forall ((v U)) (p a)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
+    }
+
+    #[test]
+    fn nested_uninterpreted_quantifiers_are_prenexed() {
+        // z3 regression 3970: the positive inner `∀ag` joins the outer block,
+        // and the nested `∃ag` of a ground assertion is skolemized.
+        let script = "
+            (declare-datatypes ((a 0)) (((b (c a)) d)))
+            (declare-sort e)
+            (declare-fun k (e) a)
+            (declare-fun l (e) a)
+            (declare-fun j (a a) a)
+            (assert (forall ((ai e)) (ite ((_ is d) (k ai)) true
+              (ite ((_ is b) (k ai)) (forall ((ag e)) (= (k ag) (c (k ai)))) true))))
+            (assert (exists ((ah a)) (or (distinct (j (j ah d) d) ah)
+              (exists ((ag e)) (and (= (k ag) ah) (= (l ag) d))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
