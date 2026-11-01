@@ -19875,6 +19875,7 @@ impl Context {
                 .solve_chc()
                 .or_else(|| self.solve_chc_acyclic())
                 .or_else(|| self.solve_chc_invariant())
+                .or_else(|| self.solve_chc_houdini())
                 .or_else(|| self.solve_chc_bmc_paths())
                 .or_else(|| self.solve_chc_multi())
         {
@@ -21634,6 +21635,126 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Multi-predicate CHC **safety** by Houdini: start every predicate at the
+    /// conjunction of candidate bounds `sᵢ ⋈ c` (constants of the system and
+    /// 0) and orderings `sᵢ ≤ sⱼ`, drop each candidate some rule fails to
+    /// preserve, and repeat to a fixpoint. The surviving conjunctions are an
+    /// inductive invariant; if it blocks every query the system is safe
+    /// (`sat`). This converges where forward reachability does not (a counter
+    /// `m ↦ m+1` from `m = 0` with the query `m < 0`).
+    fn solve_chc_houdini(&mut self) -> Option<SmtResult> {
+        let (preds, state, rules) = self.chc_parse_multi()?;
+        if state
+            .values()
+            .flatten()
+            .any(|&v| !self.m.is_arith_sort(self.m.get_sort(v)))
+        {
+            return None;
+        }
+        let mut consts: BTreeSet<Rational> = BTreeSet::new();
+        consts.insert(Rational::from(0));
+        for (_, _, guards, _) in &rules {
+            for &g in guards {
+                for t in self.m.postorder(g) {
+                    if let Some(v) = self.m.as_numeral(t) {
+                        consts.insert(v);
+                    }
+                }
+            }
+        }
+        if consts.len() > 8 {
+            return None;
+        }
+        let mut inv: BTreeMap<AstId, Vec<Vec<Constraint>>> = BTreeMap::new();
+        for &p in &preds {
+            let sv = &state[&p];
+            let mut cands = Vec::new();
+            for &v in sv {
+                for c in &consts {
+                    let e = LinExpr::var(v).sub(&LinExpr::constant(c.clone()));
+                    cands.push(Constraint::le(e.clone()));
+                    cands.push(Constraint::le(e.neg()));
+                }
+            }
+            for &a in sv {
+                for &b in sv {
+                    if a != b {
+                        cands.push(Constraint::le(LinExpr::var(a).sub(&LinExpr::var(b))));
+                    }
+                }
+            }
+            inv.insert(p, alloc::vec![cands]);
+        }
+        let mut budget = 2_000usize;
+        loop {
+            let mut changed = false;
+            for (_bs, body_app, guards, head_app) in &rules.clone() {
+                let Some(happ) = *head_app else { continue };
+                let hp = self.predicate_of(happ)?;
+                let hstate = state.get(&hp)?.clone();
+                let hargs: Vec<AstId> = self.m.app_args(happ).to_vec();
+                if hargs.len() != hstate.len() {
+                    return None;
+                }
+                // The head's candidates over its arguments.
+                let hargs_lin: Vec<LinExpr> =
+                    hargs.iter().map(|&a| ast_to_lin(&self.m, a)).collect();
+                let guard_cubes = self.chc_guard_cubes(guards)?;
+                let body_polys = self.chc_body_polys(*body_app, &inv, &state)?;
+                let cands = inv[&hp][0].clone();
+                let mut keep = Vec::new();
+                for c in cands {
+                    let mut e = c.expr.clone();
+                    for (i, &sv) in hstate.iter().enumerate() {
+                        e = substitute_lin(&e, sv, &hargs_lin[i]);
+                    }
+                    let inst = Self::con(e, c.rel);
+                    let mut holds = true;
+                    'cases: for bpoly in &body_polys {
+                        for gcube in &guard_cubes {
+                            if budget == 0 {
+                                return None;
+                            }
+                            budget -= 1;
+                            let mut cs = bpoly.clone();
+                            cs.extend(gcube.clone());
+                            if !Self::poly_entails(&cs, &inst) {
+                                holds = false;
+                                break 'cases;
+                            }
+                        }
+                    }
+                    if holds {
+                        keep.push(c);
+                    } else {
+                        changed = true;
+                    }
+                }
+                inv.insert(hp, alloc::vec![keep]);
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (_bs, body_app, guards, head_app) in &rules.clone() {
+            if head_app.is_some() {
+                continue;
+            }
+            let guard_cubes = self.chc_guard_cubes(guards)?;
+            let body_polys = self.chc_body_polys(*body_app, &inv, &state)?;
+            for bpoly in &body_polys {
+                for gcube in &guard_cubes {
+                    let mut cs = bpoly.clone();
+                    cs.extend(gcube.clone());
+                    if feasible(&cs) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(SmtResult::Sat)
     }
 
     /// Multi-predicate CHC **unsafety** via BFS path unrolling. Each predicate's
@@ -35640,6 +35761,24 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat", "sat"]);
+    }
+
+    #[test]
+    fn chc_counter_invariant_by_houdini() {
+        // z3 regression 3759: the counter never converges under forward
+        // reachability; the candidate bound `m ≥ 0` is inductive.
+        let script = "
+            (set-logic HORN)
+            (declare-fun W (Int) Bool)
+            (declare-fun E (Int) Bool)
+            (assert (forall ((m Int)) (=> (= m 0) (W m))))
+            (assert (forall ((m Int)) (=> (W m) (E m))))
+            (assert (forall ((m Int) (n Int)) (=> (and (E m) (= n (+ m 1))) (E n))))
+            (assert (forall ((m Int)) (=> (E m) (W m))))
+            (assert (forall ((m Int)) (=> (and (W m) (< m 0)) false)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
