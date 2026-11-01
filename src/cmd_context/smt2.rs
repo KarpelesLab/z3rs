@@ -9165,9 +9165,8 @@ impl Context {
             })
             .map(|&t| (t, self.m.app_args(t).to_vec()))
             .collect();
-        if !str_concats.is_empty()
-            && let Some(lenf) = self.str_len_decl
-        {
+        if !str_concats.is_empty() {
+            let lenf = self.str_len_fn();
             let zero = self.m.mk_int(0);
             for (app, parts) in str_concats {
                 let total = self.m.mk_app(lenf, &[app]);
@@ -36419,6 +36418,20 @@ mod tests {
             (assert (= (str.indexof \"a\" s) i))
             (assert (or (and (= s s2) (< i 0)) (and (= (str.at \"A\" i) s2) (>= i 0))))
             (assert (= s2 \"a\"))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn concat_lengths_without_a_length_term() {
+        // Fuzz-found: with no `str.len` in the input the additive concat
+        // length axioms were skipped (`c = "" ∧ "ab"·b = c` stayed unknown).
+        let script = "
+            (declare-fun b () String)
+            (declare-fun c () String)
+            (assert (= c \"\"))
+            (assert (= (str.++ \"ab\" b) c))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
