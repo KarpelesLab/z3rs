@@ -28667,6 +28667,21 @@ impl Context {
                 let sel = self.m.mk_select(arr, j);
                 let sel = self.expand_select_store(sel, memo);
                 self.m.mk_ite(cond, v, sel)
+            } else if self.m.is_select(t) && self.m.is_const_array(args[0]) {
+                self.m.app_args(args[0])[0]
+            } else if let Some(points) = self.small_array_eq_indices(t) {
+                // Extensionality over a small finite index sort: equal arrays
+                // agree at every index, and only there.
+                let eqs: Vec<AstId> = points
+                    .into_iter()
+                    .map(|k| {
+                        let a = self.m.mk_select(args[0], k);
+                        let b = self.m.mk_select(args[1], k);
+                        let e = self.m.mk_eq(a, b);
+                        self.expand_select_store(e, memo)
+                    })
+                    .collect();
+                self.m.mk_and(&eqs)
             } else {
                 self.m.mk_app(decl, &args)
             }
@@ -28675,6 +28690,22 @@ impl Context {
         };
         memo.insert(t, out);
         out
+    }
+
+    /// The index values of an array equality `t` whose index sort is `Bool`
+    /// or a bit-vector of width ≤ 4 (at most 16 points), else `None`.
+    fn small_array_eq_indices(&mut self, t: AstId) -> Option<Vec<AstId>> {
+        if !self.m.is_eq(t) || self.m.app_args(t).len() != 2 {
+            return None;
+        }
+        let (idx, _) = self
+            .m
+            .array_sort_params(self.m.get_sort(self.m.app_args(t)[0]))?;
+        if self.m.is_bool_sort(idx) {
+            return Some(alloc::vec![self.m.mk_false(), self.m.mk_true()]);
+        }
+        let w = self.m.bv_sort_width(idx).filter(|&w| w <= 4)?;
+        Some((0..1i64 << w).map(|v| self.m.mk_bv(v, w)).collect())
     }
 
     fn is_bv_goal(&self, goal: AstId) -> bool {
@@ -34991,6 +35022,22 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn bv_arrays_fold_const_reads_and_finite_extensionality() {
+        // z3 regression const_array_store_chain_unsat: the two single stores
+        // can override at most two of the four indices.
+        let script = "
+            (declare-const x (_ BitVec 8)) (declare-const y (_ BitVec 8))
+            (declare-const i0 (_ BitVec 2)) (declare-const e0 (_ BitVec 8))
+            (declare-const i1 (_ BitVec 2)) (declare-const e1 (_ BitVec 8))
+            (assert (distinct x y))
+            (assert (= (store ((as const (Array (_ BitVec 2) (_ BitVec 8))) x) i0 e0)
+                       (store ((as const (Array (_ BitVec 2) (_ BitVec 8))) y) i1 e1)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
