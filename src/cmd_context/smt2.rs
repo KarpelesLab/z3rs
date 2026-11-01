@@ -19754,7 +19754,18 @@ impl Context {
         // predicates but have fixed FP semantics — the CHC engines would wrongly
         // read `∀a. fp.isNaN a` as a satisfiable free-predicate fact. Keep such
         // universals on the instantiation path (which lowers and refutes them).
+        // Nor may a rule mention a nested-quantifier sentinel: it is an opaque
+        // formula, not a predicate the engines may choose (`∀p. ¬∃q. 2q < 3`
+        // was answered `sat` with the sentinel false).
+        let sentinel_free = self.universals.iter().all(|&(_, b)| {
+            !self
+                .m
+                .postorder(b)
+                .iter()
+                .any(|t| self.quant_atoms.contains(t))
+        });
         if ground_trivial
+            && sentinel_free
             && self.fp_deferred_decls.is_empty()
             && !self.universals.is_empty()
             && let Some(r) = self
@@ -19818,7 +19829,8 @@ impl Context {
                 Some(crate::util::ParamValue::Bool(false))
             )
         };
-        let mbqi = !(off("smt.mbqi") && off("auto-config"));
+        // A sentinel is an undecided formula: no model can confirm it.
+        let mbqi = !(off("smt.mbqi") && off("auto-config")) && sentinel_free;
         // The instance set can itself defeat the ground decision (instances over
         // division witnesses breed further divisions). MBQI then restarts from
         // the instance-free goal: its model is checked against every universal
@@ -23142,11 +23154,179 @@ impl Context {
         {
             return None;
         }
-        if is_forall {
+        let qe = if is_forall {
             self.qe_forall(&vars, bodyt)
         } else {
             self.qe_exists(&vars, bodyt)
+        };
+        qe.or_else(|| self.fr_quantifier(is_forall, &vars, bodyt))
+            .or_else(|| self.prop_decided_body(&vars, bodyt))
+    }
+
+    /// Is `t` a Boolean connective (`and or not => xor`, Boolean `=` / `ite`)?
+    fn is_bool_connective(&self, t: AstId) -> bool {
+        let m = &self.m;
+        let bool_args = m
+            .app(t)
+            .is_some_and(|a| a.args.iter().all(|&x| m.is_bool_sort(m.get_sort(x))));
+        m.is_and(t)
+            || m.is_or(t)
+            || m.is_not(t)
+            || m.is_implies(t)
+            || m.is_xor(t)
+            || (m.is_eq(t) && bool_args)
+            || (m.is_ite(t) && m.is_bool_sort(m.get_sort(t)) && bool_args)
+    }
+
+    /// Ferrante–Rackoff elimination of real binders from a linear body of any
+    /// Boolean shape (no DNF): `∃x. φ ≡ φ[−∞] ∨ φ[+∞] ∨ ⋁ φ[(tᵢ+tⱼ)/2]` over
+    /// the boundary points `tᵢ` of the atoms in `x`; `∀` is `¬∃¬`.
+    fn fr_quantifier(&mut self, is_forall: bool, vars: &[AstId], body: AstId) -> Option<AstId> {
+        let real = |m: &AstManager, v: AstId| {
+            let s = m.get_sort(v);
+            m.is_arith_sort(s) && !m.is_int_sort(s)
+        };
+        if !vars.iter().all(|&v| real(&self.m, v)) {
+            return None;
         }
+        let mut f = if is_forall { self.m.mk_not(body) } else { body };
+        for &x in vars.iter().rev() {
+            f = self.fr_exists(x, f)?;
+        }
+        if is_forall {
+            f = self.m.mk_not(f);
+        }
+        Some(crate::rewriter::simplify(&mut self.m, f))
+    }
+
+    /// `∃x. f` for one real `x` (see [`Self::fr_quantifier`]); `None` unless
+    /// every occurrence of `x` is linear inside an arithmetic comparison.
+    fn fr_exists(&mut self, x: AstId, f: AstId) -> Option<AstId> {
+        const MAX_BOUNDS: usize = 16;
+        let mut atoms: Vec<(AstId, LinExpr, Rational)> = Vec::new();
+        let mut stack = alloc::vec![f];
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) || !self.m.postorder(t).contains(&x) {
+                continue;
+            }
+            if self.is_bool_connective(t) {
+                stack.extend(self.m.app_args(t).iter().copied());
+                continue;
+            }
+            let args = self.m.app_args(t).to_vec();
+            let cmp = matches!(
+                self.m.arith_op(t),
+                Some(ArithOp::Lt | ArithOp::Le | ArithOp::Gt | ArithOp::Ge)
+            ) || (self.m.is_eq(t) && self.m.is_arith_sort(self.m.get_sort(args[0])));
+            if !cmp || args.len() != 2 {
+                return None;
+            }
+            let e = ast_to_lin(&self.m, args[0]).sub(&ast_to_lin(&self.m, args[1]));
+            let a = e.coeff_of(x);
+            if a.is_zero()
+                || e.terms()
+                    .any(|(u, _)| u != x && self.m.postorder(u).contains(&x))
+            {
+                return None;
+            }
+            atoms.push((t, e, a));
+        }
+        if atoms.is_empty() {
+            return Some(f);
+        }
+        // Boundary points: the root `x = −rest/a` of each atom.
+        let mut bounds: Vec<LinExpr> = Vec::new();
+        let mut bound_terms: BTreeSet<AstId> = BTreeSet::new();
+        for (_, e, a) in &atoms {
+            let rest = e.sub(&LinExpr::var(x).scale(a));
+            let t = rest.scale(&Rational::from(-1).div(a));
+            if bound_terms.insert(self.lin_to_term(&t, false)) {
+                bounds.push(t);
+            }
+        }
+        if bounds.len() > MAX_BOUNDS {
+            return None;
+        }
+        let mut disj: Vec<AstId> = Vec::new();
+        // x → ∓∞: each atom's `lhs − rhs` takes the sign of `a·(∓1)`.
+        for neg_inf in [true, false] {
+            let pairs: Vec<(AstId, AstId)> = atoms
+                .iter()
+                .map(|(t, _, a)| {
+                    let negative = a.is_negative() != neg_inf;
+                    let holds = match self.m.arith_op(*t) {
+                        Some(ArithOp::Lt | ArithOp::Le) => negative,
+                        Some(ArithOp::Gt | ArithOp::Ge) => !negative,
+                        _ => false, // `=`
+                    };
+                    (*t, self.mk_bool(holds))
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, f, &pairs);
+            disj.push(crate::rewriter::simplify(&mut self.m, g));
+        }
+        let half = Rational::from(1).div(&Rational::from(2));
+        for i in 0..bounds.len() {
+            for j in i..bounds.len() {
+                let mid = bounds[i].add(&bounds[j]).scale(&half);
+                let term = self.lin_to_term(&mid, false);
+                let g = crate::rewriter::substitute(&mut self.m, f, &[(x, term)]);
+                disj.push(crate::rewriter::simplify(&mut self.m, g));
+            }
+        }
+        let d = self.m.mk_or(&disj);
+        Some(crate::rewriter::simplify(&mut self.m, d))
+    }
+
+    /// `true` / `false` when `body` is valid / unsatisfiable with every
+    /// atom over a binder in `vars` abstracted to a free Boolean, so the
+    /// quantifier (either one) equals that constant. `(=> (and h p) (=> q h))`
+    /// is valid whatever `p`, `q` say about the binder.
+    fn prop_decided_body(&mut self, vars: &[AstId], body: AstId) -> Option<AstId> {
+        let bound: BTreeSet<AstId> = vars.iter().copied().collect();
+        let mut atoms: Vec<AstId> = Vec::new();
+        let mut stack = alloc::vec![body];
+        while let Some(t) = stack.pop() {
+            let m = &self.m;
+            let bool_args = m
+                .app(t)
+                .is_some_and(|a| a.args.iter().all(|&x| m.is_bool_sort(m.get_sort(x))));
+            let connective = m.is_and(t)
+                || m.is_or(t)
+                || m.is_not(t)
+                || m.is_implies(t)
+                || m.is_xor(t)
+                || (m.is_eq(t) && bool_args)
+                || (m.is_ite(t) && m.is_bool_sort(m.get_sort(t)) && bool_args);
+            if connective {
+                stack.extend(m.app_args(t).iter().copied());
+            } else if m.postorder(t).iter().any(|x| bound.contains(x)) && !atoms.contains(&t) {
+                atoms.push(t);
+            }
+        }
+        if atoms.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(AstId, AstId)> = atoms
+            .iter()
+            .map(|&a| {
+                let b = self.m.mk_bool_sort();
+                (a, self.fresh_const(b))
+            })
+            .collect();
+        let abs = crate::rewriter::substitute(&mut self.m, body, &pairs);
+        if self.m.postorder(abs).iter().any(|x| bound.contains(x)) {
+            return None;
+        }
+        let neg = self.m.mk_not(abs);
+        if check_model(&self.m, neg).0 == SmtResult::Unsat {
+            return Some(self.m.mk_true());
+        }
+        if check_model(&self.m, abs).0 == SmtResult::Unsat {
+            return Some(self.m.mk_false());
+        }
+        None
     }
 
     /// Try to reduce a nested `(forall|exists xs. φ)` to a ground term without the
@@ -34563,6 +34743,50 @@ mod tests {
             (eval (= (/ x a) 3.0))
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "true"]);
+    }
+
+    #[test]
+    fn nested_quantifier_sentinels_are_never_confirmed() {
+        // `∃q:Int. 2q < 3` stays an opaque sentinel; neither MBQI nor the
+        // Horn engines may pick its value (it is true, so this is unsat).
+        let script = "
+            (declare-const a Int)
+            (assert (forall ((p Int)) (not (exists ((q Int)) (< (* 2 q) 3)))))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nested_real_quantifiers_without_dnf() {
+        // z3 regression 2450's `∃h ∀d ∃e`: the `∀d` step's negated DNF is too
+        // large; Ferrante–Rackoff test points eliminate it instead.
+        let script = "
+            (declare-fun a () Real) (declare-fun b () Real) (declare-fun f () Real)
+            (declare-fun g () Real) (declare-fun j () Real) (declare-fun k () Real)
+            (assert (or (not (=> (and (= k 1.0) (= k 0.0) (<= 1.0 f)) (<= a (+ g b))))
+              (exists ((h Real)) (forall ((d Real)) (exists ((e Real))
+                (and (or (= j 0) (not (= (+ (- h) (- b f)) 0.0)))
+                     (or (and (< 0.0 h) (= e 0)) (or (<= (- b f) 0.0) (= (- b f) 0)))
+                     (<= 0.0 (+ e (* 2.0 d) (* (- 2.0) h)))
+                     (<= (+ d (* (- 2.0) h)) 0.0)))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn propositionally_valid_quantifier_bodies() {
+        // z3 regression 2546: the body is a tautology whatever the nonlinear
+        // atom `e·f ≤ f` says, so `¬∃e` is false.
+        let script = "
+            (declare-fun a () Real) (declare-fun b () Real) (declare-fun c () Real)
+            (declare-fun d () Real) (declare-fun f () Real)
+            (assert (not (exists ((e Real)) (let ((h (= a 2)))
+              (=> (and h (< c b)) (=> (>= f 0) (=> (= (<= (* e f) f) (<= 0 d)) h)))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
