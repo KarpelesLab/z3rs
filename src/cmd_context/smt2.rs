@@ -23159,7 +23159,8 @@ impl Context {
         } else {
             self.qe_exists(&vars, bodyt)
         };
-        qe.or_else(|| self.fr_quantifier(is_forall, &vars, bodyt))
+        qe.or_else(|| self.cooper_qe(is_forall, &vars, bodyt))
+            .or_else(|| self.fr_quantifier(is_forall, &vars, bodyt))
             .or_else(|| self.prop_decided_body(&vars, bodyt))
     }
 
@@ -23871,6 +23872,100 @@ impl Context {
             dnf = cooper::forall(&dnf, x, &mut budget)?;
         }
         cooper::ground_sat(&dnf)
+    }
+
+    /// Eliminate integer binders by Cooper's QE (divisibility-exact, unlike
+    /// Fourier–Motzkin), rebuilding the result with `(mod t m) = 0` atoms.
+    /// `None` unless the body is linear integer arithmetic within budget.
+    fn cooper_qe(&mut self, is_forall: bool, vars: &[AstId], body: AstId) -> Option<AstId> {
+        use crate::smt::cooper::{self, Atom};
+        if !vars.iter().all(|&v| self.m.is_int_sort(self.m.get_sort(v))) {
+            return None;
+        }
+        let bound: BTreeSet<AstId> = vars.iter().copied().collect();
+        let cubes = self.body_dnf(body, true)?;
+        let mut dnf: cooper::Dnf = Vec::new();
+        for cube in &cubes {
+            let mut c: Vec<Atom> = Vec::new();
+            for con in cube {
+                if !con.expr.const_term().is_integer()
+                    || con.expr.terms().any(|(u, k)| {
+                        !k.is_integer()
+                            || !self.m.is_int_sort(self.m.get_sort(u))
+                            || (!bound.contains(&u)
+                                && self.m.postorder(u).iter().any(|t| bound.contains(t)))
+                    })
+                {
+                    return None;
+                }
+                c.push(match con.rel {
+                    Rel::Lt => Atom::Lt(con.expr.clone()),
+                    Rel::Le => Atom::Le(con.expr.clone()),
+                    Rel::Eq => Atom::Eq(con.expr.clone()),
+                });
+            }
+            dnf.push(c);
+        }
+        let mut budget: u64 = 200_000;
+        for &v in vars.iter().rev() {
+            dnf = if is_forall {
+                cooper::forall(&dnf, v, &mut budget)?
+            } else {
+                cooper::exists(&dnf, v, &mut budget)?
+            };
+        }
+        if dnf.len() > 256 {
+            return None;
+        }
+        let zero = self.m.mk_int(0);
+        let mut disj: Vec<AstId> = Vec::new();
+        for cube in &dnf {
+            let mut conj: Vec<AstId> = Vec::new();
+            for a in cube {
+                let atom = match a {
+                    Atom::Lt(e) => {
+                        let t = self.lin_to_term(e, true);
+                        self.m.mk_lt(t, zero)
+                    }
+                    Atom::Le(e) => {
+                        let t = self.lin_to_term(e, true);
+                        self.m.mk_le(t, zero)
+                    }
+                    Atom::Eq(e) | Atom::Ne(e) => {
+                        let t = self.lin_to_term(e, true);
+                        let eq = self.m.mk_eq(t, zero);
+                        if matches!(a, Atom::Ne(_)) {
+                            self.m.mk_not(eq)
+                        } else {
+                            eq
+                        }
+                    }
+                    Atom::Div(k, e) | Atom::Ndiv(k, e) => {
+                        let t = self.lin_to_term(e, true);
+                        let km = self.m.mk_numeral(Rational::from_integer(k.clone()), true);
+                        let md = self.m.mk_mod(t, km);
+                        let eq = self.m.mk_eq(md, zero);
+                        if matches!(a, Atom::Ndiv(..)) {
+                            self.m.mk_not(eq)
+                        } else {
+                            eq
+                        }
+                    }
+                };
+                conj.push(atom);
+            }
+            disj.push(match conj.len() {
+                0 => self.m.mk_true(),
+                1 => conj[0],
+                _ => self.m.mk_and(&conj),
+            });
+        }
+        let d = match disj.len() {
+            0 => self.m.mk_false(),
+            1 => disj[0],
+            _ => self.m.mk_or(&disj),
+        };
+        Some(crate::rewriter::simplify(&mut self.m, d))
     }
 
     /// Strip positive existentials from `body`, collecting their binder
@@ -34755,6 +34850,27 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nested_integer_quantifiers_by_cooper() {
+        // Coefficients other than ±1 need divisibility: `∃q. 3q = a` is
+        // `3 ∣ a`, and `∀q. 2q ≠ a + 1` is `a` even.
+        let script = "
+            (declare-const a Int) (declare-const b Int)
+            (assert (and (> a 0) (< a 9) (exists ((q Int)) (= (* 3 q) a))
+                         (not (= a 3)) (not (= a 6))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        for (a, want) in [(3, "unsat"), (4, "sat")] {
+            let script = alloc::format!(
+                "(declare-const a Int)
+                 (assert (and (= a {a}) (forall ((q Int)) (not (= (* 2 q) (+ a 1))))))
+                 (check-sat)"
+            );
+            assert_eq!(run(&script).unwrap(), alloc::vec![want]);
+        }
     }
 
     #[test]

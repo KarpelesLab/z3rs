@@ -215,6 +215,8 @@ fn cube_exists(cube: &[Atom], x: AstId, budget: &mut u64) -> Option<Dnf> {
                 let point = t.scale(&c).neg(); // = −t·c  (c=±1 ⇒ c⁻¹=c)
                 bset.push(point.sub(&LinExpr::constant(rat_int(&int(1)))));
             }
+            // Disequality x ≠ point: its `x > point` half is a lower bound.
+            Atom::Ne(_) => bset.push(t.scale(&c).neg()),
             _ => {}
         }
         match minus_inf(a, x) {
@@ -391,6 +393,52 @@ mod tests {
         let ey = exists(&phi, y, &mut b).unwrap();
         let all = forall(&ey, x, &mut b).unwrap();
         assert_eq!(ground_sat(&all), Some(false));
+    }
+
+    // `∃x` of random boxed cubes against brute force over the box, for each
+    // value of the free `y` (disequalities included: they need a boundary).
+    #[test]
+    fn exists_matches_brute_force() {
+        let (x, y) = (AstId(1000), AstId(1001));
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = |n: i64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((seed >> 33) % n as u64) as i64
+        };
+        let eval = |cube: &[Atom], xv: i64, yv: i64| {
+            cube.iter().all(|a| {
+                let g = subst(&subst(a, x, &c(xv)), y, &c(yv));
+                eval_ground(&g) == Some(true)
+            })
+        };
+        for _ in 0..400 {
+            let mut cube = vec![Atom::Le(lin(-1, x, -20)), Atom::Le(lin(1, x, -20))];
+            for _ in 0..1 + rnd(3) {
+                let cx = [-3, -2, -1, 1, 2, 3][rnd(6) as usize];
+                let e = lin(cx, x, rnd(11) - 5)
+                    .add(&LinExpr::var(y).scale(&Rational::from_integer(int(rnd(5) - 2))));
+                cube.push(match rnd(6) {
+                    0 => Atom::Lt(e),
+                    1 => Atom::Le(e),
+                    2 => Atom::Eq(e),
+                    3 => Atom::Ne(e),
+                    4 => Atom::Div(int(2 + rnd(2)), e),
+                    _ => Atom::Ndiv(int(2 + rnd(2)), e),
+                });
+            }
+            let mut b = 1_000_000u64;
+            let ex = exists(&vec![cube.clone()], x, &mut b).unwrap();
+            for yv in -8..=8 {
+                let want = (-20..=20).any(|xv| eval(&cube, xv, yv));
+                let got = ex.iter().any(|cb| {
+                    cb.iter()
+                        .all(|a| eval_ground(&subst(a, y, &c(yv))) == Some(true))
+                });
+                assert_eq!(got, want, "y = {yv}");
+            }
+        }
     }
 
     // ∀x ∃y. 2y = 2x  ⇒  sat (y = x)
