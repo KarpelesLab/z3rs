@@ -12998,6 +12998,33 @@ impl Context {
                     }
                 }
             }
+            if !s.is_empty() {
+                // User constants left in a product with an opaque factor
+                // (`(1/0)·v0`) are pinned too, so the residual can go linear.
+                for &t in &present {
+                    if self.m.arith_op(t) != Some(ArithOp::Mul) {
+                        continue;
+                    }
+                    let args = self.m.app_args(t);
+                    if args
+                        .iter()
+                        .filter(|a| self.m.as_numeral(**a).is_none())
+                        .count()
+                        < 2
+                    {
+                        continue;
+                    }
+                    for a in self.m.postorder(t) {
+                        let user = self.m.is_uninterp_const(a)
+                            && self
+                                .decl_name(self.m.app_decl(a))
+                                .is_some_and(|n| !n.starts_with('!'));
+                        if user && self.m.is_arith_sort(self.m.get_sort(a)) {
+                            s.insert(a);
+                        }
+                    }
+                }
+            }
             s.into_iter().collect()
         };
         if divs.is_empty() || divs.len() > 4 {
@@ -13044,22 +13071,30 @@ impl Context {
                 .collect();
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let g = crate::rewriter::simplify(&mut self.m, g);
-            // Every divisor must evaluate to a nonzero constant.
+            // Every symbolic divisor must evaluate to a nonzero constant.
             let nonzero = self.symbolic_realdiv.clone().iter().all(|&(_, b, _)| {
-                if !present.contains(&b) {
+                if !present.contains(&b) || self.m.as_numeral(b).is_some() {
                     return true;
                 }
                 let bb = crate::rewriter::substitute(&mut self.m, b, &subst);
                 let bb = crate::rewriter::simplify(&mut self.m, bb);
                 self.m.as_numeral(bb).is_some_and(|v| !v.is_zero())
             });
+            // Purified quotients pinned by `k·c = 1` become constants too.
+            let (g, lsub) = if nonzero && self.arith_nonlinear(g) {
+                self.linearize_fixed_vars(g)
+            } else {
+                (g, Vec::new())
+            };
             if nonzero
                 && !self.arith_nonlinear(g)
                 && let (SmtResult::Sat, _) = check_model(&self.m, g)
             {
                 // The model must also fix the substituted divisors.
                 let pinned = self.with_pins(g, &subst);
-                return check_model(&self.m, pinned).1;
+                return check_model(&self.m, pinned)
+                    .1
+                    .map(|m| self.complete_substituted(m, &lsub));
             }
             let mut k = 0;
             loop {
@@ -27972,6 +28007,28 @@ impl Context {
                         subst = Some((a, b));
                         break 'find;
                     }
+                    // `c·v = b` with a numeral `c ≠ 0` and a Real `v`: `v = b/c`.
+                    if self.m.arith_op(a) == Some(ArithOp::Mul)
+                        && let [x, y] = self.m.app_args(a)
+                    {
+                        let (x, y) = (*x, *y);
+                        let (c, v) = match (self.m.as_numeral(x), self.m.as_numeral(y)) {
+                            (Some(c), None) => (c, y),
+                            (None, Some(c)) => (c, x),
+                            _ => continue,
+                        };
+                        if !c.is_zero()
+                            && self.m.is_uninterp_const(v)
+                            && self.m.is_arith_sort(self.m.get_sort(v))
+                            && !self.m.is_int_sort(self.m.get_sort(v))
+                            && !self.term_contains(b, v)
+                        {
+                            let inv = self.m.mk_numeral(c.recip(), false);
+                            let to = self.m.mk_mul(&[inv, b]);
+                            subst = Some((v, to));
+                            break 'find;
+                        }
+                    }
                 }
             }
             let Some((from, to)) = subst else { break };
@@ -35805,6 +35862,19 @@ mod tests {
             (declare-fun h () Int) (declare-fun i () Int)
             (assert (= (/ c g) 1))
             (assert (= (not (<= (/ a (/ b h)) 6)) (= (+ f (/ d i)) 0)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn realdiv_witness_pins_product_variables() {
+        // z3 regression 8099: `(1/0)·(v0+v1)` stays nonlinear until v0, v1 are
+        // pinned, and the purified `1/(div …)` is solved from `k·c = 1`.
+        let script = "
+            (declare-fun v0 () Real)
+            (declare-fun v1 () Real)
+            (assert (= (+ (* (/ 1 0) v0) (* (/ 1 (div (+ 1 v0 v1) 1)) v1)) 3.0))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
