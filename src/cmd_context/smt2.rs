@@ -16766,6 +16766,261 @@ impl Context {
         subst
     }
 
+    /// The factors of a string term built from string variables, literals and
+    /// `str.++`, registering new variables in `vars`.
+    fn word_tokens(&self, t: AstId, vars: &mut Vec<AstId>) -> Option<Vec<super::word_eq::Tok>> {
+        use super::word_eq::Tok;
+        if let Some(cps) = self.str_value(t) {
+            return Some(alloc::vec![Tok::Lit(cps)]);
+        }
+        if self.m.is_app(t)
+            && self
+                .str_op_decls
+                .get(&self.m.app_decl(t))
+                .map(String::as_str)
+                == Some("str.++")
+        {
+            let mut out = Vec::new();
+            for &a in self.m.app_args(t) {
+                out.extend(self.word_tokens(a, vars)?);
+            }
+            return Some(out);
+        }
+        if Some(self.m.get_sort(t)) == self.string_sort && self.is_str_seq_var(t) {
+            let i = match vars.iter().position(|&v| v == t) {
+                Some(i) => i,
+                None => {
+                    vars.push(t);
+                    vars.len() - 1
+                }
+            };
+            return Some(alloc::vec![Tok::Var(i)]);
+        }
+        None
+    }
+
+    /// Is every string-sorted node of `c` a `str.len` argument or a factor of
+    /// a `str.++` (so `c` constrains string lengths only)? Collects the
+    /// `str.len` arguments with their factors.
+    fn length_only(
+        &self,
+        c: AstId,
+        vars: &mut Vec<AstId>,
+        out: &mut Vec<(AstId, Vec<super::word_eq::Tok>)>,
+    ) -> bool {
+        let Some(string_sort) = self.string_sort else {
+            return false;
+        };
+        let Some(len_decl) = self.str_len_decl else {
+            return false;
+        };
+        let mut stack = alloc::vec![c];
+        let mut seen = BTreeSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) || !self.m.is_app(t) {
+                continue;
+            }
+            if self.m.get_sort(t) == string_sort {
+                return false;
+            }
+            if self.m.app_decl(t) == len_decl {
+                let s = self.m.app_args(t)[0];
+                match self.word_tokens(s, vars) {
+                    Some(toks) => out.push((s, toks)),
+                    None => return false,
+                }
+                continue;
+            }
+            stack.extend(self.m.app_args(t).iter().copied());
+        }
+        true
+    }
+
+    /// Decide a goal whose string part is word equations and disequations
+    /// between concatenations of variables and literals, with constraints on
+    /// lengths (see [`super::word_eq`]). Conjuncts outside the fragment are
+    /// dropped, which only weakens the problem: an exhausted search within
+    /// proven length bounds is `unsat`, and a found assignment is `sat` only
+    /// once the whole goal is verified under it. `None` when undecided.
+    fn try_word_equations(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        use super::word_eq::{LenVerdict, Outcome, Tok, WordProblem};
+        let string_sort = self.string_sort?;
+        let len_decl = self.str_len_decl?;
+        let mut conj = Vec::new();
+        let mut stack = alloc::vec![goal];
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend(self.m.app_args(t).iter().rev());
+            } else {
+                conj.push(t);
+            }
+        }
+        let mut vars: Vec<AstId> = Vec::new();
+        let mut problem = WordProblem::default();
+        let mut arith: Vec<AstId> = Vec::new();
+        // The string terms whose length an arithmetic constraint reads.
+        let mut len_terms: Vec<(AstId, Vec<Tok>)> = Vec::new();
+        for &c in &conj {
+            let (neg, atom) = if self.m.is_not(c) {
+                (true, self.m.app_args(c)[0])
+            } else {
+                (false, c)
+            };
+            if self.m.is_eq(atom)
+                && self.m.app_args(atom).len() == 2
+                && self.m.get_sort(self.m.app_args(atom)[0]) == string_sort
+            {
+                let (l, r) = (self.m.app_args(atom)[0], self.m.app_args(atom)[1]);
+                let mut vs = vars.clone();
+                if let (Some(lt), Some(rt)) =
+                    (self.word_tokens(l, &mut vs), self.word_tokens(r, &mut vs))
+                {
+                    vars = vs;
+                    if neg {
+                        problem.neqs.push((lt, rt));
+                    } else {
+                        problem.eqs.push((lt, rt));
+                    }
+                }
+                continue;
+            }
+            let mut vs = vars.clone();
+            let mut lens_here = Vec::new();
+            if self.m.is_bool_sort(self.m.get_sort(c))
+                && self.length_only(c, &mut vs, &mut lens_here)
+            {
+                vars = vs;
+                arith.push(c);
+                len_terms.extend(lens_here);
+            }
+        }
+        if problem.eqs.is_empty() || vars.is_empty() {
+            return None;
+        }
+        problem.nvars = vars.len();
+        // The length abstraction over fresh integer lengths `L_v`: the
+        // arithmetic constraints with every `str.len` replaced by its sum of
+        // lengths, each equation's length balance, and `L_v ≥ 0`. Free of
+        // strings, so the arithmetic core decides it directly.
+        let int_sort = self.m.mk_int_sort();
+        let len_of: Vec<AstId> = vars.iter().map(|_| self.fresh_const(int_sort)).collect();
+        let sum = |me: &mut Self, toks: &[Tok]| -> AstId {
+            let mut k = 0i64;
+            let mut parts = Vec::new();
+            for t in toks {
+                match t {
+                    Tok::Var(i) => parts.push(len_of[*i]),
+                    Tok::Lit(l) => k += l.len() as i64,
+                }
+            }
+            if k != 0 || parts.is_empty() {
+                parts.push(me.m.mk_int(k));
+            }
+            if parts.len() == 1 {
+                parts[0]
+            } else {
+                me.m.mk_add(&parts)
+            }
+        };
+        let mut len_sub: Vec<(AstId, AstId)> = Vec::new();
+        for (i, &v) in vars.iter().enumerate() {
+            let lv = self.m.mk_app(len_decl, &[v]);
+            len_sub.push((lv, len_of[i]));
+        }
+        for (t, toks) in len_terms.clone() {
+            let lt = self.m.mk_app(len_decl, &[t]);
+            let s = sum(self, &toks);
+            len_sub.push((lt, s));
+        }
+        let arith_goal = match arith.len() {
+            0 => self.m.mk_true(),
+            1 => arith[0],
+            _ => self.m.mk_and(&arith),
+        };
+        let arith_goal = crate::rewriter::substitute(&mut self.m, arith_goal, &len_sub);
+        let mut abs = alloc::vec![arith_goal];
+        for (l, r) in problem.eqs.clone() {
+            let (a, b) = (sum(self, &l), sum(self, &r));
+            abs.push(self.m.mk_eq(a, b));
+        }
+        let zero = self.m.mk_int(0);
+        for &l in &len_of {
+            abs.push(self.m.mk_ge(l, zero));
+        }
+        let mut cache: BTreeMap<Vec<usize>, LenVerdict> = BTreeMap::new();
+        // The length oracle: the arithmetic constraints at fixed lengths.
+        let mut oracle = |me: &mut Self, lens: &[usize]| -> LenVerdict {
+            if let Some(&v) = cache.get(lens) {
+                return v;
+            }
+            let sub: Vec<(AstId, AstId)> = len_of
+                .iter()
+                .zip(lens)
+                .map(|(&l, &n)| (l, me.m.mk_int(n as i64)))
+                .collect();
+            let g = crate::rewriter::substitute(&mut me.m, arith_goal, &sub);
+            let g = crate::rewriter::simplify(&mut me.m, g);
+            let v = if me.m.is_true(g) {
+                LenVerdict::Feasible
+            } else if me.m.is_false(g) {
+                LenVerdict::Infeasible
+            } else {
+                match me.decide(g).0 {
+                    SmtResult::Sat => LenVerdict::Feasible,
+                    SmtResult::Unsat => LenVerdict::Infeasible,
+                    SmtResult::Unknown => LenVerdict::Unknown,
+                }
+            };
+            cache.insert(lens.to_vec(), v);
+            v
+        };
+        let witness = |me: &mut Self, values: &[Vec<u32>]| -> Option<(SmtResult, Option<Model>)> {
+            let subst: Vec<(AstId, AstId)> = vars
+                .iter()
+                .zip(values)
+                .map(|(&v, s)| {
+                    let text: String = s.iter().filter_map(|&c| char::from_u32(c)).collect();
+                    (v, me.mk_str_lit(&text))
+                })
+                .collect();
+            let wg = me.witness_base.unwrap_or(goal);
+            me.witness_check(wg, &subst)
+                .map(|m| (SmtResult::Sat, Some(m)))
+        };
+        const BUDGET: usize = 20_000;
+        // A model among short values first (no bounds needed for `sat`).
+        const CAP: usize = 4;
+        let caps = alloc::vec![CAP; vars.len()];
+        if let Outcome::Found(values) = problem.search(&caps, BUDGET, &mut |l| oracle(self, l))
+            && let Some(r) = witness(self, &values)
+        {
+            return Some(r);
+        }
+        // `unsat` needs every length bounded: the least provable common bound.
+        let mut bound = None;
+        for k in [2usize, 4, 6, 8, 12, 16] {
+            let kv = self.m.mk_int(k as i64 + 1);
+            let over: Vec<AstId> = len_of.iter().map(|&l| self.m.mk_ge(l, kv)).collect();
+            let mut q = abs.clone();
+            q.push(if over.len() == 1 {
+                over[0]
+            } else {
+                self.m.mk_or(&over)
+            });
+            let g = self.m.mk_and(&q);
+            if self.decide(g).0 == SmtResult::Unsat {
+                bound = Some(k);
+                break;
+            }
+        }
+        let bounds = alloc::vec![bound?; vars.len()];
+        match problem.search(&bounds, BUDGET, &mut |l| oracle(self, l)) {
+            Outcome::Exhausted => Some((SmtResult::Unsat, None)),
+            Outcome::Found(values) => witness(self, &values),
+            Outcome::Incomplete => None,
+        }
+    }
+
     /// Verify a witness substitution: the substituted, refolded goal must be
     /// free of symbolic markers and satisfiable together with the string
     /// axioms. Records the witness and returns the model on success.
@@ -32344,6 +32599,11 @@ impl Context {
             {
                 return (SmtResult::Unsat, None);
             }
+            // Word equations over concatenations with length constraints: the
+            // bounded position-level procedure (exact within proven bounds).
+            if let Some(r) = self.try_word_equations(goal) {
+                return r;
+            }
             // `seq.map`/`seq.foldl`/… over a sequence variable: unfold them over
             // short concrete sequences of fresh elements.
             if let Some(m) = self.try_seq_hof_witness(goal) {
@@ -37975,6 +38235,25 @@ mod tests {
             "{}",
             out[1]
         );
+    }
+
+    #[test]
+    fn word_equations_with_length_bounds() {
+        // e = a·"abc"·b = c·"ef"·d: no room for both literals in 4 characters,
+        // room in 5 (e = "efabc").
+        let base = "(declare-const a String)(declare-const b String)(declare-const c String)
+            (declare-const d String)(declare-const e String)
+            (assert (= e (str.++ a \"abc\" b)))(assert (= e (str.++ c \"ef\" d)))";
+        let out = run(&alloc::format!(
+            "{base}(assert (<= (str.len e) 4))(check-sat)"
+        ))
+        .unwrap();
+        assert_eq!(out, alloc::vec!["unsat"]);
+        let out = run(&alloc::format!(
+            "{base}(assert (= (str.len e) 5))(check-sat)(get-value (e))"
+        ))
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat", "((e \"efabc\"))"]);
     }
 
     #[test]

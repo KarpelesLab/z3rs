@@ -15,5 +15,6 @@ mod decl_table;
 mod regex_simp;
 pub mod smt2;
 mod smt2_pp;
+mod word_eq;
 
 pub use smt2::{Session, run as run_smt2, run_partial as run_smt2_partial};
