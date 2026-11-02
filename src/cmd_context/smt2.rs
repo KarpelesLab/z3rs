@@ -3624,6 +3624,24 @@ impl Regex {
         }
         Some(v)
     }
+
+    /// An upper bound on the length of the words of `self`, or `None` when
+    /// they are unbounded (or the bound is unknown).
+    fn max_len(&self) -> Option<usize> {
+        match self {
+            Regex::Lit(l) => Some(l.len()),
+            Regex::Range(_, _) | Regex::AllChar => Some(1),
+            Regex::None => Some(0),
+            Regex::All | Regex::Comp(_) => None,
+            Regex::Concat(a, b) => Some(a.max_len()? + b.max_len()?),
+            Regex::Union(a, b) => Some(a.max_len()?.max(b.max_len()?)),
+            Regex::Inter(a, b) => match (a.max_len(), b.max_len()) {
+                (Some(x), Some(y)) => Some(x.min(y)),
+                (x, y) => x.or(y),
+            },
+            Regex::Star(a) => (a.max_len()? == 0).then_some(0),
+        }
+    }
 }
 
 impl Context {
@@ -10687,6 +10705,29 @@ impl Context {
                 extra_lits.insert(lit);
                 let eq = self.m.mk_eq(*x, lit);
                 ax.push(self.m.mk_implies(*app, eq));
+            }
+            // A language of bounded word length: `in_re(x,r) ⇒ ∨ len x = k`
+            // over its achievable lengths `k`.
+            if let Some(regex) = self.regex_of.get(r).cloned()
+                && let Some(max) = regex.max_len()
+                && max <= RLMAX
+                && let Some(lens) = regex.lengths(max)
+            {
+                let lenf = self.str_len_fn();
+                let lx = self.m.mk_app(lenf, &[*x]);
+                let alts: Vec<AstId> = (0..=max)
+                    .filter(|&k| lens[k])
+                    .map(|k| {
+                        let kv = self.m.mk_int(k as i64);
+                        self.m.mk_eq(lx, kv)
+                    })
+                    .collect();
+                let disj = match alts.len() {
+                    0 => self.m.mk_false(),
+                    1 => alts[0],
+                    _ => self.m.mk_or(&alts),
+                };
+                ax.push(self.m.mk_implies(*app, disj));
             }
             // Only refute against a length the goal pins `x` to (avoids a costly
             // membership disjunction): if `x ∈ r` yet `len x = k` is unachievable,
