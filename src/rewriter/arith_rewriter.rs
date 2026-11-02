@@ -38,6 +38,17 @@ pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Optio
         return collect_sum(m, args, is_int);
     }
 
+    // A comparison of a term with itself: `t ≤ t`, `t ≥ t` hold, `t < t`,
+    // `t > t` do not (z3's `mk_le_ge_eq_core` on identical sides).
+    if args.len() == 2 && args[0] == args[1] {
+        if kind == ArithOp::Le as DeclKind || kind == ArithOp::Ge as DeclKind {
+            return Some(m.mk_true());
+        }
+        if kind == ArithOp::Lt as DeclKind || kind == ArithOp::Gt as DeclKind {
+            return Some(m.mk_false());
+        }
+    }
+
     // All remaining folds require every operand to be a numeral.
     let mut nums: Vec<Rational> = Vec::with_capacity(args.len());
     for &a in args {

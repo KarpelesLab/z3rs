@@ -2659,6 +2659,12 @@ struct Context {
     /// z3's unspecified `fp.to_real` of NaN / `+oo` / `-oo` (class 0/1/2) per
     /// `(eb, sb)` format: one fixed (unknown) real each.
     fp_real_unspec: BTreeMap<(u32, u32, u8), AstId>,
+    /// The last check's `purify-arith` sin/cos bases: `(θ, s, c)` with
+    /// `sin θ ↦ s`, `cos θ ↦ c`; `θ`'s model value is rebuilt from `s`, `c`.
+    trig_basis: Vec<(AstId, AstId, AstId)>,
+    /// Each `(root-obj p i)` node → a real variable `r` and the axioms pinning
+    /// it to that root: `p(r) = 0 ∧ lo < r < hi` over an isolating interval.
+    root_obj_vars: BTreeMap<AstId, (AstId, Vec<AstId>)>,
     /// The interned per-`(op, domain)` declarations used for deferred FP nodes,
     /// so `fpa_blast` can recognise a deferred application and recover its op.
     fp_deferred_decls: BTreeSet<AstId>,
@@ -3656,6 +3662,8 @@ impl Context {
             fp_ieee_nan: BTreeMap::new(),
             fp_ieee_alias: BTreeMap::new(),
             fp_real_unspec: BTreeMap::new(),
+            trig_basis: Vec::new(),
+            root_obj_vars: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
@@ -4050,6 +4058,7 @@ impl Context {
                 for name in self.sort_order.drain(..) {
                     self.sorts.remove(&name);
                 }
+                self.macros.clear();
                 self.last_model = None;
                 self.last_verdict = None;
                 Ok(None)
@@ -4783,7 +4792,13 @@ impl Context {
                 self.last_assumptions.clear();
                 self.reason_unknown = None;
                 self.str_witness.clear();
+                self.trig_basis.clear();
                 let plain = is_using || list.len() <= 1;
+                let purify = is_using
+                    && self.objectives.is_empty()
+                    && list
+                        .get(1)
+                        .is_some_and(|t| Self::tactic_mentions(t, "qfnra-nlsat"));
                 let (res, model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
                     for a in &list[1..] {
@@ -4797,7 +4812,14 @@ impl Context {
                         self.optimize(&assumptions)
                     }
                 } else if self.objectives.is_empty() {
-                    self.check_sat()
+                    // The opaque `sin`/`cos` already decide many goals (`unsat`);
+                    // only an open one is purified.
+                    match self.check_sat() {
+                        (SmtResult::Unknown, _) if purify => self
+                            .check_sat_trig_purified()
+                            .unwrap_or((SmtResult::Unknown, None)),
+                        r => r,
+                    }
                 } else {
                     self.optimize(&[])
                 };
@@ -21138,6 +21160,46 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        // A `(root-obj p i)` constant is a real variable pinned to that root.
+        if let Some(expanded) = self.expand_root_objs(&self.assertions.clone()) {
+            let saved = core::mem::replace(&mut self.assertions, expanded);
+            let r = self.check_sat_alias();
+            self.assertions = saved;
+            return r;
+        }
+        self.check_sat_alias()
+    }
+
+    /// `fs` with each `(root-obj p i)` node replaced by its variable and the
+    /// variable's defining constraints appended (see
+    /// [`Self::root_obj_definition`]); `None` when no node occurs.
+    fn expand_root_objs(&mut self, fs: &[AstId]) -> Option<Vec<AstId>> {
+        if self.root_obj_vars.is_empty() {
+            return None;
+        }
+        let used: BTreeSet<AstId> = fs
+            .iter()
+            .flat_map(|&a| self.m.postorder(a))
+            .filter(|t| self.root_obj_vars.contains_key(t))
+            .collect();
+        if used.is_empty() {
+            return None;
+        }
+        let mut out = fs.to_vec();
+        let mut pairs = Vec::new();
+        for t in used {
+            let (r, axioms) = self.root_obj_vars[&t].clone();
+            pairs.push((t, r));
+            out.extend(axioms);
+        }
+        for a in out.iter_mut() {
+            *a = crate::rewriter::substitute(&mut self.m, *a, &pairs);
+        }
+        Some(out)
+    }
+
+    /// [`Self::check_sat`] after its `root-obj` substitution.
+    fn check_sat_alias(&mut self) -> (SmtResult, Option<Model>) {
         // `(fp.to_ieee_bv NaN)` display nodes stand for their NaN pattern.
         if !self.fp_ieee_alias.is_empty() {
             let saved = self.assertions.clone();
@@ -24475,6 +24537,130 @@ impl Context {
         }
     }
 
+    /// z3's `purify-arith` (in `qfnra-nlsat`) for `sin`/`cos`: a real constant
+    /// `θ` used only as the argument of `sin`/`cos` is replaced there by fresh
+    /// reals `s = sin θ`, `c = cos θ` with `s² + c² = 1` (equisatisfiable: every
+    /// point of the unit circle is `(sin θ, cos θ)` for some `θ`). `None` when
+    /// there is no such `θ`; otherwise the purified verdict, recording the
+    /// bases in `trig_basis` for the model.
+    fn check_sat_trig_purified(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        if !self.universals.is_empty() {
+            return None;
+        }
+        let is_trig = |ctx: &Self, t: AstId| {
+            ctx.m.is_app(t)
+                && ctx.m.app_args(t).len() == 1
+                && ctx.str_symbolic.contains(&t)
+                && ctx
+                    .decl_name(ctx.m.app_decl(t))
+                    .is_some_and(|n| n == "sin" || n == "cos")
+        };
+        let mut uses: BTreeSet<AstId> = BTreeSet::new();
+        let mut unsafe_: BTreeSet<AstId> = BTreeSet::new();
+        for &a in &self.assertions {
+            for t in self.m.postorder(a) {
+                if !self.m.is_app(t) {
+                    continue;
+                }
+                let trig = is_trig(self, t);
+                for &x in self.m.app_args(t) {
+                    if trig {
+                        uses.insert(x);
+                    } else {
+                        unsafe_.insert(x);
+                    }
+                }
+            }
+        }
+        let real = self.m.mk_real_sort();
+        let thetas: Vec<AstId> = uses
+            .into_iter()
+            .filter(|&x| {
+                !unsafe_.contains(&x)
+                    && self.m.is_uninterp_const(x)
+                    && self.m.get_sort(x) == real
+                    && !self.assertions.contains(&x)
+            })
+            .collect();
+        if thetas.is_empty() {
+            return None;
+        }
+        let one = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(1)), false);
+        let mut pairs: Vec<(AstId, AstId)> = Vec::new();
+        let mut axioms: Vec<AstId> = Vec::new();
+        let mut basis = Vec::new();
+        let (sin_d, cos_d) = {
+            let s = self.m.mk_func_decl(Symbol::new("sin"), &[real], real);
+            let c = self.m.mk_func_decl(Symbol::new("cos"), &[real], real);
+            (s, c)
+        };
+        for th in thetas {
+            let sv = self.fresh_const(real);
+            let cv = self.fresh_const(real);
+            let st = self.m.mk_app(sin_d, &[th]);
+            let ct = self.m.mk_app(cos_d, &[th]);
+            pairs.push((st, sv));
+            pairs.push((ct, cv));
+            let ss = self.m.mk_mul(&[sv, sv]);
+            let cc = self.m.mk_mul(&[cv, cv]);
+            let sum = self.m.mk_add(&[ss, cc]);
+            axioms.push(self.m.mk_eq(one, sum));
+            basis.push((th, sv, cv));
+        }
+        let saved = self.assertions.clone();
+        let mut purified: Vec<AstId> = saved
+            .iter()
+            .map(|&a| crate::rewriter::substitute(&mut self.m, a, &pairs))
+            .collect();
+        purified.extend(axioms);
+        self.assertions = purified;
+        let (res, mut model) = self.check_sat();
+        if res == SmtResult::Sat
+            && model.is_none()
+            && let Some(Ok(md)) = self.nra_witness(&[], &mut None)
+        {
+            model = Some(md);
+        }
+        self.assertions = saved;
+        if res == SmtResult::Sat {
+            self.trig_basis = basis;
+        }
+        Some((res, model))
+    }
+
+    /// The model value of a purified `θ` (see [`Self::check_sat_trig_purified`])
+    /// as z3's model converter builds it: `acos(c)` when `s ≥ 0`, else
+    /// `acos(-c) + π`, with the algebraic `acos` argument printed as a value.
+    fn trig_theta_value(&self, model: &mut Model, s: AstId, c: AstId) -> Option<String> {
+        let val = |model: &mut Model, t: AstId| -> Option<puremp::Algebraic> {
+            if let Some(a) = model.alg_value(&self.m, t) {
+                return Some(a);
+            }
+            match model.eval(&self.m, t) {
+                Value::Num(r, _) => Some(puremp::Algebraic::from_rational(r)),
+                _ => None,
+            }
+        };
+        let sv = val(model, s)?;
+        let cv = val(model, c)?;
+        let nonneg = sv.signum() >= 0;
+        let arg = if nonneg { cv } else { cv.neg() };
+        let rendered = if arg.is_rational() {
+            render_real(arg.interval().0)
+        } else if let Some(prec) = self.pp_decimal_precision() {
+            super::algebraic_pp::format_algebraic_decimal(&arg, prec)
+        } else {
+            super::algebraic_pp::root_obj_string(&arg)?
+        };
+        Some(if nonneg {
+            alloc::format!("(acos {rendered})")
+        } else {
+            alloc::format!("(+ (acos {rendered}) pi)")
+        })
+    }
+
     /// Decide the assertions plus `fixed` by the CAD optimizer over a constant
     /// objective (a feasibility check): `Ok` with the witness model (its
     /// coordinates may be irrational algebraic numbers, pinned over `base`
@@ -24529,6 +24715,7 @@ impl Context {
         const MAX_CUBES: usize = 64;
         // Term-level `ite`s (e.g. a soft penalty) become guarded equalities.
         let all: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
+        let all = self.expand_root_objs(&all).unwrap_or(all);
         let conj = match all.len() {
             0 => self.m.mk_true(),
             1 => all[0],
@@ -30035,6 +30222,12 @@ impl Context {
             if ng == g {
                 break;
             }
+            // A valid axiom stays valid under the substitution.
+            for va in self.valid_axioms.clone() {
+                let img = substitute(&mut self.m, va, &[(from, to)]);
+                let img = crate::rewriter::simplify(&mut self.m, img);
+                self.valid_axioms.insert(img);
+            }
             done.push((from, to));
             g = ng;
         }
@@ -30045,7 +30238,9 @@ impl Context {
     /// latest first, each from its defining term under the model.
     fn complete_substituted(&self, mut model: Model, subst: &[(AstId, AstId)]) -> Model {
         for &(x, b) in subst.iter().rev() {
-            if let Value::Num(r, _) = model.eval_value(&self.m, b) {
+            if let Some(a) = model.alg_value(&self.m, b) {
+                model.set_alg(x, a);
+            } else if let Value::Num(r, _) = model.eval_value(&self.m, b) {
                 model.set_arith(x, r);
             }
         }
@@ -32064,7 +32259,14 @@ impl Context {
                     .iter()
                     .find(|(v, _)| *v == c)
                     .map_or(c, |&(_, w)| w);
-                let v = self.model_term_render(&mut model, c);
+                let basis = self.trig_basis.iter().find(|b| b.0 == c).copied();
+                let v = match basis {
+                    Some((_, sv, cv)) => match self.trig_theta_value(&mut model, sv, cv) {
+                        Some(v) => v,
+                        None => self.model_term_render(&mut model, c),
+                    },
+                    None => self.model_term_render(&mut model, c),
+                };
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
                     "\n  (define-fun {} () {sort_name}\n    {v})",
@@ -32085,6 +32287,30 @@ impl Context {
                     smt2_symbol(&decl.name)
                 ));
             }
+        }
+        // z3 registers a 0-ary `define-fun` as a defined function, and the model
+        // lists it with its (unevaluated) body after the declared constants.
+        let consts: Vec<(String, SExpr)> = self
+            .macros
+            .iter()
+            .filter(|(_, (ps, _))| ps.is_empty())
+            .map(|(n, (_, b))| (n.clone(), b.clone()))
+            .collect();
+        for (name, body) in consts {
+            let Ok(id) = self.term(&body) else { continue };
+            let pp_decimal = self.params.get_bool("pp.decimal", false);
+            let prec = self.params.get_uint("pp.decimal-precision", 10) as u32;
+            let v = super::algebraic_pp::render_root_obj_term(&self.m, id, pp_decimal, prec)
+                .unwrap_or_else(|| {
+                    let fp_of = &self.fp_of;
+                    let lit = |t: AstId| fp_of.get(&t).map(|&(b, eb, sb)| render_fp(b, eb, sb));
+                    self.m.pp_with(id, &lit)
+                });
+            let sort_name = self.sort_display(self.m.get_sort(id));
+            out.push_str(&alloc::format!(
+                "\n  (define-fun {} () {sort_name}\n    {v})",
+                smt2_symbol(&name)
+            ));
         }
         out.push_str("\n)");
         self.last_model = Some(model);
@@ -32460,7 +32686,70 @@ impl Context {
         let decl = self
             .m
             .mk_func_decl(Symbol::new("root-obj"), &domain, real_sort);
-        self.m.mk_app(decl, &args)
+        let node = self.m.mk_app(decl, &args);
+        if !self.root_obj_vars.contains_key(&node)
+            && let Some(def) = self.root_obj_definition(poly, index)
+        {
+            // Opaque to every path that does not substitute the definition.
+            self.str_symbolic.insert(node);
+            self.root_obj_vars.insert(node, def);
+        }
+        node
+    }
+
+    /// A fresh real `r` and the polynomial constraints making it the
+    /// `index`-th (1-based) real root of `poly`: `poly(r) = 0` and
+    /// `lo < r < hi` for an isolating interval (`r = q` for a rational root).
+    /// `None` when there is no such root.
+    fn root_obj_definition(
+        &mut self,
+        poly: &Poly<Rational>,
+        index: usize,
+    ) -> Option<(AstId, Vec<AstId>)> {
+        if poly.is_zero() || index == 0 {
+            return None;
+        }
+        let root = puremp::Algebraic::real_roots_of(poly)
+            .into_iter()
+            .nth(index - 1)?;
+        let real = self.m.mk_real_sort();
+        let r = self.fresh_const(real);
+        if root.is_rational() {
+            let q = self.m.mk_numeral(root.interval().0.clone(), false);
+            return Some((r, alloc::vec![self.m.mk_eq(r, q)]));
+        }
+        // poly(r) = Σ cᵢ·rⁱ
+        let mut terms = Vec::new();
+        let mut pow = None;
+        for c in poly.coeffs() {
+            let term = match pow {
+                None => self.m.mk_numeral(c.clone(), false),
+                Some(p) => {
+                    let k = self.m.mk_numeral(c.clone(), false);
+                    self.m.mk_mul(&[k, p])
+                }
+            };
+            terms.push(term);
+            pow = Some(match pow {
+                None => r,
+                Some(p) => self.m.mk_mul(&[p, r]),
+            });
+        }
+        let sum = self.m.mk_add(&terms);
+        let zero = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(0)), false);
+        let (lo, hi) = root.interval();
+        let lo = self.m.mk_numeral(lo.clone(), false);
+        let hi = self.m.mk_numeral(hi.clone(), false);
+        Some((
+            r,
+            alloc::vec![
+                self.m.mk_eq(sum, zero),
+                self.m.mk_lt(lo, r),
+                self.m.mk_lt(r, hi)
+            ],
+        ))
     }
 
     /// Is `t` a quantifier sentinel: an opaque [`Self::quant_atoms`] constant or
