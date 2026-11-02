@@ -2846,6 +2846,8 @@ struct Context {
     disj_witness_depth: u32,
     /// Set while `decide_independent_components` decides one component.
     in_components: bool,
+    /// Set while [`Self::check_sat_components`] decides its groups.
+    in_check_components: bool,
     /// `(as const …)` applications built so far in the current command.
     as_const_seen: u32,
     /// Set while `decide_by_guard_split` decides one case.
@@ -3914,6 +3916,7 @@ impl Context {
             fp_defer_depth: 0,
             disj_witness_depth: 0,
             in_components: false,
+            in_check_components: false,
             as_const_seen: 0,
             in_guard_split: false,
             universal_names: Vec::new(),
@@ -23007,6 +23010,211 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        let r = self.check_sat_split();
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_components()
+            && r2.0 != SmtResult::Unknown
+        {
+            return r2;
+        }
+        r
+    }
+
+    /// With universals present, an undecided check whose universals share no
+    /// uninterpreted symbol (nor an uninterpreted or datatype sort) with any
+    /// ground assertion is decided group by group:
+    /// any `unsat` group makes it `unsat`, all `sat` merge into one model (the
+    /// groups are independent), so a theory a universal's engine does not
+    /// handle (strings) cannot block an unrelated universal. `None` when there
+    /// is a single group.
+    fn check_sat_components(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        if self.in_check_components
+            || self.universals.is_empty()
+            || !self.objectives.is_empty()
+            // A functional array refers to its function out of band.
+            || !self.maps.is_empty()
+            || !self.as_arrays.is_empty()
+            || !self.lambdas.is_empty()
+        {
+            return None;
+        }
+        // Uninterpreted symbols, and the uninterpreted sorts mentioned: groups
+        // over one such sort interact through its cardinality (`∀x y. x = y`
+        // against `a ≠ b`).
+        let symbols = |ctx: &Self, t: AstId| -> BTreeSet<AstId> {
+            let mut out = BTreeSet::new();
+            for u in ctx.m.postorder(t) {
+                let s = ctx.m.get_sort(u);
+                // Datatype values are the instantiation candidates of a
+                // universal over that sort: keep them together too.
+                if ctx.declared_sorts.contains(&s)
+                    || ctx.datatypes.contains_key(&s)
+                    || ctx.records.contains_key(&s)
+                {
+                    out.insert(s);
+                }
+                if let Some(app) = ctx.m.app(u)
+                    && ctx
+                        .m
+                        .func_decl(app.decl)
+                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+                {
+                    out.insert(app.decl);
+                }
+            }
+            out
+        };
+        // Items: assertions (Ok) and universals (Err), grouped by shared symbols.
+        let mut groups: Vec<(BTreeSet<AstId>, Vec<usize>, Vec<usize>)> = Vec::new();
+        let items: Vec<(bool, usize, AstId)> = self
+            .assertions
+            .iter()
+            .enumerate()
+            .map(|(i, &a)| (true, i, a))
+            .chain(
+                self.universals
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(_, b))| (false, i, b)),
+            )
+            .collect();
+        for (is_a, i, t) in items {
+            let syms = symbols(self, t);
+            let mut merged = (syms, Vec::new(), Vec::new());
+            if is_a {
+                merged.1.push(i);
+            } else {
+                merged.2.push(i);
+            }
+            let mut rest = Vec::new();
+            for g in groups {
+                if g.0.is_disjoint(&merged.0) {
+                    rest.push(g);
+                } else {
+                    merged.0.extend(g.0);
+                    merged.1.extend(g.1);
+                    merged.2.extend(g.2);
+                }
+            }
+            rest.push(merged);
+            groups = rest;
+        }
+        // Only a split that separates the universals from every ground
+        // assertion: a group mixing both would just be decided again.
+        if groups.len() < 2 || groups.iter().any(|g| !g.1.is_empty() && !g.2.is_empty()) {
+            return None;
+        }
+        let saved_a = self.assertions.clone();
+        let saved_n = self.assert_names.clone();
+        let saved_u = self.universals.clone();
+        self.in_check_components = true;
+        let mut result = SmtResult::Sat;
+        let mut model: Option<Model> = Some(Model::from_bv(BTreeMap::new()));
+        for (_, ais, uis) in groups {
+            self.assertions = ais.iter().map(|&i| saved_a[i]).collect();
+            self.assert_names = ais.iter().map(|&i| saved_n[i].clone()).collect();
+            self.universals = uis.iter().map(|&i| saved_u[i].clone()).collect();
+            let (r, m) = self.check_sat_split();
+            match r {
+                SmtResult::Unsat => {
+                    result = SmtResult::Unsat;
+                    model = None;
+                    break;
+                }
+                SmtResult::Unknown => {
+                    result = SmtResult::Unknown;
+                    model = None;
+                }
+                SmtResult::Sat => {
+                    model = match (model, m) {
+                        (Some(mut a), Some(b)) => {
+                            a.absorb(&self.m, b);
+                            Some(a)
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        }
+        self.in_check_components = false;
+        self.assertions = saved_a;
+        self.assert_names = saved_n;
+        self.universals = saved_u;
+        Some((
+            result,
+            if result == SmtResult::Sat {
+                model
+            } else {
+                None
+            },
+        ))
+    }
+
+    /// [`Self::check_sat`] of one component.
+    fn check_sat_split(&mut self) -> (SmtResult, Option<Model>) {
+        if let Some(saved) = self.div_zero_as_functions() {
+            let r = self.check_sat_arrays();
+            (self.assertions, self.universals) = saved;
+            return r;
+        }
+        self.check_sat_arrays()
+    }
+
+    /// Integer division by a literal zero under universals: z3's `div0`/`mod0`
+    /// are functions of the dividend, so `div x 0` / `mod x 0` are rewritten to
+    /// applications of the shared `div0` / `mod0` functions everywhere (ground
+    /// assertions too, for consistency), which instantiation and MBQI interpret
+    /// like user functions. Returns the assertions and universals to restore.
+    #[allow(clippy::type_complexity)]
+    fn div_zero_as_functions(&mut self) -> Option<(Vec<AstId>, Vec<(Vec<AstId>, AstId)>)> {
+        let zero_div = |ctx: &Self, t: AstId| {
+            matches!(ctx.m.arith_op(t), Some(ArithOp::Idiv | ArithOp::Mod))
+                && ctx.m.app_args(t).len() == 2
+                && ctx
+                    .m
+                    .as_numeral(ctx.m.app_args(t)[1])
+                    .is_some_and(|v| v.is_zero())
+        };
+        let in_universal = self
+            .universals
+            .iter()
+            .any(|&(_, b)| self.m.postorder(b).into_iter().any(|t| zero_div(self, t)));
+        if !in_universal {
+            return None;
+        }
+        let d0 = self.div0_decl();
+        let m0 = self.mod0_decl();
+        // Registered as user functions (by internal names no input can spell
+        // as an applied symbol of another sort).
+        self.funcs.insert("!div0!".to_string(), d0);
+        self.funcs.insert("!mod0!".to_string(), m0);
+        let mut roots: Vec<AstId> = self.assertions.clone();
+        roots.extend(self.universals.iter().map(|&(_, b)| b));
+        let mut pairs = Vec::new();
+        for t in self.m.postorder_many(&roots) {
+            if zero_div(self, t) {
+                let x = self.m.app_args(t)[0];
+                let f = if self.m.arith_op(t) == Some(ArithOp::Idiv) {
+                    d0
+                } else {
+                    m0
+                };
+                let app = self.m.mk_app(f, &[x]);
+                pairs.push((t, app));
+            }
+        }
+        let saved = (self.assertions.clone(), self.universals.clone());
+        for a in self.assertions.iter_mut() {
+            *a = substitute(&mut self.m, *a, &pairs);
+        }
+        for (_, b) in self.universals.iter_mut() {
+            *b = substitute(&mut self.m, *b, &pairs);
+        }
+        Some(saved)
+    }
+
+    /// [`Self::check_sat`] after the division-by-zero rewrite.
+    fn check_sat_arrays(&mut self) -> (SmtResult, Option<Model>) {
         self.array_fns.clear();
         if let Some(saved) = self.arrays_as_functions() {
             let fns = self.array_fns.clone();
@@ -23938,6 +24146,9 @@ impl Context {
         let g = self.mbqi_modelize(goal, model, &st, &[], &mut memo);
         match g.map(|g| crate::rewriter::simplify(&mut self.m, g)) {
             Some(g) if self.m.is_true(g) => {}
+            // A ground residue the rewriter leaves (an `Int`/`Real` mixed
+            // comparison of literals) is folded by the evaluator.
+            Some(g) if matches!(model.eval_value(&self.m, g), Value::Bool(true)) => {}
             _ => return Mbqi::Unknown,
         }
         // Each function's default ("else") value: the first entry's value is
@@ -23993,6 +24204,17 @@ impl Context {
                     // Record the defaults the universals were checked under, so
                     // the model evaluates applications outside the ground goal
                     // as validated.
+                    // and the table entries themselves (their terms may be
+                    // purified away from the assignment).
+                    for (&(d, i), &t) in &entry_terms {
+                        let v = match &st.tables[&d][i].1 {
+                            MbqiVal::Bool(b) => Value::Bool(*b),
+                            MbqiVal::Num(r, n) => Value::Num(r.clone(), *n),
+                            MbqiVal::Bv(x, w) => Value::Bv(x.clone(), *w),
+                            MbqiVal::Elem(..) => continue,
+                        };
+                        model.pin_value(t, v);
+                    }
                     for (&d, v) in &st.defaults {
                         let v = match v {
                             MbqiVal::Bool(b) => Value::Bool(*b),
@@ -24378,7 +24600,7 @@ impl Context {
 
     /// The model value of a ground term as an MBQI table key.
     fn mbqi_value(&self, model: &mut Model, t: AstId) -> Option<MbqiVal> {
-        Some(match model.eval(&self.m, t) {
+        Some(match model.eval_value(&self.m, t) {
             Value::Bool(b) => MbqiVal::Bool(b),
             Value::Num(r, i) => MbqiVal::Num(r, i),
             Value::Bv(b, w) => MbqiVal::Bv(b, w),
@@ -29571,7 +29793,10 @@ impl Context {
         }
         const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
         const MAX_ROUNDS: usize = 8;
-        const MAX_TOTAL: usize = 800;
+        // The instance budget: a few universals may need deep instantiation
+        // (an equational theory), many universals (a verification-condition
+        // background) only swamp the ground decision with more instances.
+        let max_total: usize = if self.universals.len() <= 8 { 800 } else { 400 };
         let universals = self.universals.clone();
         // Set when Phase 2 enumerates a datatype-sorted binder. Such a binder
         // ranges over an infinite constructor domain, so enumerating the *present*
@@ -29779,7 +30004,7 @@ impl Context {
                                 by_decl.entry(self.m.app_decl(t)).or_default().insert(t);
                             }
                         }
-                        if instances.len() >= MAX_TOTAL {
+                        if instances.len() >= max_total {
                             return (instances, false);
                         }
                     }
@@ -29918,7 +30143,7 @@ impl Context {
                             fresh_term = true;
                         }
                     }
-                    if instances.len() >= MAX_TOTAL {
+                    if instances.len() >= max_total {
                         return (instances, false); // capped: not saturated
                     }
                 }
@@ -41644,6 +41869,34 @@ mod tests {
             run(script).unwrap(),
             alloc::vec!["sat", "(((select b 0) 65)\n ((select c 0) 65))"]
         );
+    }
+
+    #[test]
+    fn universals_independent_of_the_ground_part() {
+        // The universal shares nothing with the string assertion.
+        let script = "
+            (declare-const x1 Bool)
+            (declare-fun v () String)
+            (assert (forall ((w Int)) (or x1 (> w 0))))
+            (assert (distinct v \"l\"))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+        // But a shared uninterpreted sort couples them through its cardinality.
+        let script = "
+            (declare-sort A 0)
+            (declare-sort B 0)
+            (declare-fun f (A) B)
+            (assert (forall ((b B) (x A) (y A)) (or (= x y) (not (= (f x) b)))))
+            (declare-fun a1 () A)
+            (declare-fun a2 () A)
+            (assert (not (= a1 a2)))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+        // Division by zero under a universal is z3's function of the dividend.
+        let script = "(assert (forall ((a Int)) (distinct 0 (div a 0))))(check-sat)";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]

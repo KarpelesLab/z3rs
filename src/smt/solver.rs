@@ -142,6 +142,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         bv: BTreeMap::new(),
                         alg: BTreeMap::new(),
                         defaults: BTreeMap::new(),
+                        cong_depth: 0,
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -177,6 +178,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                             bv: BTreeMap::new(),
                             alg: BTreeMap::new(),
                             defaults: BTreeMap::new(),
+                            cong_depth: 0,
                         };
                         return (SmtResult::Sat, Some(model));
                     }
@@ -297,6 +299,9 @@ pub struct Model {
     /// The "else" value of uninterpreted functions at arguments no assigned
     /// application covers (set by model-based quantifier instantiation).
     defaults: BTreeMap<AstId, Value>,
+    /// Nesting depth of [`Model::congruent_assigned`] (its argument
+    /// evaluation can reach it again through cyclic terms).
+    cong_depth: usize,
 }
 
 /// Are two model values equal?
@@ -333,6 +338,7 @@ impl Model {
             bv,
             alg: BTreeMap::new(),
             defaults: BTreeMap::new(),
+            cong_depth: 0,
         }
     }
 
@@ -537,14 +543,21 @@ impl Model {
         if cands.is_empty() {
             return None;
         }
+        const MAX_DEPTH: usize = 4;
+        if self.cong_depth >= MAX_DEPTH {
+            return None;
+        }
+        self.cong_depth += 1;
         let mine: Vec<Value> = args.iter().map(|&a| self.eval_full(m, a)).collect();
-        cands.into_iter().find(|&k| {
+        let found = cands.into_iter().find(|&k| {
             let kargs = m.app_args(k).to_vec();
             kargs
                 .iter()
                 .zip(&mine)
                 .all(|(&x, y)| same_value(&self.eval_full(m, x), y))
-        })
+        });
+        self.cong_depth -= 1;
+        found
     }
 
     /// A fully-folding variant of [`Model::eval`] used only for value rendering.
