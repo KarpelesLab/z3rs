@@ -221,6 +221,30 @@ fn alg_model_value(
     super::algebraic_pp::root_obj_string(&a)
 }
 
+/// An irrational objective value as z3's optimizer reports it: the
+/// `(interval lo hi)` of its 12-decimal-digit bracket `lo < v < hi`.
+fn render_alg_interval(a: &puremp::Algebraic) -> String {
+    let scale = Rational::from_integer(Int::from(10).pow(12));
+    let mut a = a.clone();
+    let floor_of = |r: &Rational| r.mul(&scale).floor();
+    loop {
+        let (lo, hi) = a.interval();
+        if floor_of(lo) == floor_of(hi) || a.is_rational() {
+            break;
+        }
+        let w = hi.sub(lo).div(&Rational::from_integer(Int::from(2)));
+        a.refine_below(&w);
+    }
+    let k = floor_of(a.interval().0);
+    let lo = Rational::new(k.clone(), Int::from(10).pow(12));
+    let hi = Rational::new(k.add(&Int::from(1)), Int::from(10).pow(12));
+    alloc::format!(
+        " (interval {} {})",
+        render_rational(&lo),
+        render_rational(&hi)
+    )
+}
+
 /// The nlsat [`Alg`](crate::nlsat::realclosure::Alg) as a puremp
 /// [`Algebraic`](puremp::Algebraic).
 fn alg_to_algebraic(v: &crate::nlsat::realclosure::Alg) -> puremp::Algebraic {
@@ -233,6 +257,143 @@ fn alg_to_algebraic(v: &crate::nlsat::realclosure::Alg) -> puremp::Algebraic {
             hi.clone(),
         ),
     }
+}
+
+/// When every variable of `cons` and `obj` is pinned to a single real root
+/// by its univariate constraints (an equality and bounds isolating one of its
+/// roots): `Some(Some(point))` (indexed by variable) if every constraint holds
+/// there, `Some(None)` if one fails; `None` when some variable is not so
+/// determined.
+fn determined_point(
+    cons: &[(crate::math::polynomial::Polynomial, crate::nlsat::Rel)],
+    obj: &crate::math::polynomial::Polynomial,
+    nvars: usize,
+) -> Option<Option<Vec<Option<crate::nlsat::realclosure::Alg>>>> {
+    use crate::math::upoly::UPoly;
+    use crate::nlsat::realclosure::{Alg, sign_at_point};
+    let mut vars: BTreeSet<u32> = obj.vars().into_iter().collect();
+    for (p, _) in cons {
+        vars.extend(p.vars());
+    }
+    if vars.is_empty() || vars.iter().any(|&v| v as usize >= nvars) {
+        return None;
+    }
+    let to_upoly = |p: &crate::math::polynomial::Polynomial, v: u32| -> Option<UPoly> {
+        let d = p.degree_of(v);
+        let mut cs = Vec::with_capacity(d as usize + 1);
+        for k in 0..=d {
+            cs.push(p.coeff_of_var(v, k).as_constant()?);
+        }
+        Some(UPoly::from_coeffs(cs))
+    };
+    let mut point: Vec<Option<Alg>> = alloc::vec![None; nvars];
+    for &v in &vars {
+        let uni: Vec<(UPoly, crate::nlsat::Rel)> = cons
+            .iter()
+            .filter(|(p, _)| p.vars() == alloc::vec![v])
+            .filter_map(|(p, r)| Some((to_upoly(p, v)?, *r)))
+            .collect();
+        let eq = uni
+            .iter()
+            .find(|(q, r)| *r == crate::nlsat::Rel::Eq && !q.is_zero())?;
+        let roots: Vec<Alg> = Alg::roots_of(&eq.0)
+            .into_iter()
+            .filter(|a| {
+                uni.iter()
+                    .all(|(q, r)| crate::nlsat::cad::rel_holds(a.sign_of(q), *r))
+            })
+            .collect();
+        match roots.len() {
+            0 => return Some(None),
+            1 => point[v as usize] = roots.into_iter().next(),
+            _ => return None,
+        }
+    }
+    let full: Vec<Alg> = point
+        .iter()
+        .map(|v| {
+            v.clone()
+                .unwrap_or(Alg::Rational(Rational::from_integer(Int::from(0))))
+        })
+        .collect();
+    // `c·(xᵢ − xⱼ)`: its sign is an exact comparison of the two coordinates
+    // (the dominance constraints' shape; cheaper than a zero certification).
+    let difference_sign = |p: &crate::math::polynomial::Polynomial| -> Option<i32> {
+        let [(c1, m1), (c2, m2)] = p.terms() else {
+            return None;
+        };
+        if m1.total_degree() != 1 || m2.total_degree() != 1 || *c1 != c2.neg() {
+            return None;
+        }
+        let (i, j) = (m1.vars().next()?, m2.vars().next()?);
+        let ord = full.get(i as usize)?.compare(full.get(j as usize)?);
+        let s = match ord {
+            core::cmp::Ordering::Less => -1,
+            core::cmp::Ordering::Equal => 0,
+            core::cmp::Ordering::Greater => 1,
+        };
+        Some(if c1.is_negative() { -s } else { s })
+    };
+    for (p, r) in cons {
+        let sign = match difference_sign(p) {
+            Some(s) => s,
+            None => sign_at_point(p, &full)?,
+        };
+        if !crate::nlsat::cad::rel_holds(sign, *r) {
+            return Some(None);
+        }
+    }
+    Some(Some(point))
+}
+
+/// The value of `p` at the algebraic point `at` (every variable of `p`
+/// assigned), by exact algebraic arithmetic; `None` when a variable is
+/// unassigned.
+fn eval_poly_alg(
+    p: &crate::math::polynomial::Polynomial,
+    at: &BTreeMap<u32, puremp::Algebraic>,
+) -> Option<puremp::Algebraic> {
+    let mut sum = puremp::Algebraic::from_rational(Rational::from_integer(Int::from(0)));
+    for (c, mono) in p.terms() {
+        let mut t = puremp::Algebraic::from_rational(c.clone());
+        for v in mono.vars() {
+            let x = at.get(&v)?;
+            for _ in 0..mono.degree_of(v) {
+                t = t.mul(x);
+            }
+        }
+        sum = sum.add(&t);
+    }
+    Some(sum)
+}
+
+/// A puremp [`Algebraic`](puremp::Algebraic) as an nlsat
+/// [`Alg`](crate::nlsat::realclosure::Alg): its squarefree defining polynomial
+/// and an isolating interval refined until neither end is a root.
+fn algebraic_to_alg(a: &puremp::Algebraic) -> Option<crate::nlsat::realclosure::Alg> {
+    use crate::nlsat::realclosure::Alg;
+    if a.is_rational() {
+        return Some(Alg::Rational(a.interval().0.clone()));
+    }
+    let mut a = a.clone();
+    let poly = a.defining_polynomial().clone();
+    for _ in 0..256 {
+        let (lo, hi) = a.interval();
+        let (sl, sh) = (poly.eval(lo).signum(), poly.eval(hi).signum());
+        if sl != 0 && sh != 0 && sl != sh {
+            return Some(Alg::Irrational {
+                poly: crate::math::upoly::UPoly::from_coeffs(poly.coeffs().to_vec()),
+                lo: lo.clone(),
+                hi: hi.clone(),
+            });
+        }
+        let w = hi.sub(lo).div(&Rational::from_integer(Int::from(2)));
+        a.refine_below(&w);
+        if a.is_rational() {
+            return Some(Alg::Rational(a.interval().0.clone()));
+        }
+    }
+    None
 }
 
 /// A real algebraic number as z3 prints an objective value: a rational via
@@ -6677,6 +6838,8 @@ impl Context {
             .collect();
         self.disj_witness_depth += 1;
         let mut result = None;
+        // Every branch refuted ⇒ the goal is refuted.
+        let mut all_unsat = true;
         for &d in &disj {
             let mut parts = others.clone();
             parts.push(d);
@@ -6690,8 +6853,12 @@ impl Context {
                 result = Some((SmtResult::Sat, model));
                 break;
             }
+            all_unsat &= res == SmtResult::Unsat;
         }
         self.disj_witness_depth -= 1;
+        if result.is_none() && all_unsat {
+            return Some((SmtResult::Unsat, None));
+        }
         result
     }
 
@@ -25728,7 +25895,7 @@ impl Context {
     fn pareto_step(&mut self, mut st: ParetoState) -> (SmtResult, Option<Model>) {
         const PARETO_ROUNDS: usize = 256;
         let n = st.objs.len();
-        let (res, model) = self.check_with(&st.base);
+        let (res, model) = self.pareto_check(&st.base);
         // An exhausted front keeps reporting the last point's values.
         if !(res == SmtResult::Unsat && st.reported) {
             self.set_objective_values(res);
@@ -25744,8 +25911,18 @@ impl Context {
         let vals = loop {
             let mut vals = Vec::with_capacity(n);
             for &(o, _) in &st.objs {
+                if let Some(a) = model.alg_value(&self.m, o) {
+                    match self.alg_term(&a) {
+                        Some(t) => vals.push((
+                            Value::Num(Rational::from_integer(Int::from(0)), false),
+                            Some((a, t)),
+                        )),
+                        None => return (SmtResult::Unknown, None),
+                    }
+                    continue;
+                }
                 match model.eval(&self.m, o) {
-                    v @ (Value::Num(..) | Value::Bv(..)) => vals.push(v),
+                    v @ (Value::Num(..) | Value::Bv(..)) => vals.push((v, None)),
                     _ => return (SmtResult::Unknown, None),
                 }
             }
@@ -25762,7 +25939,7 @@ impl Context {
             }
             let better = self.m.mk_or(&gt);
             cur.push(better);
-            match self.check_with(&cur) {
+            match self.pareto_check(&cur) {
                 (SmtResult::Sat, Some(m)) => model = m,
                 (SmtResult::Unsat, _) => break vals,
                 _ => return (SmtResult::Unknown, None),
@@ -25775,15 +25952,17 @@ impl Context {
             .zip(&vals)
             .map(|(&(o, max), v)| self.pareto_cmp(o, max, v, false))
             .collect();
-        let all_le = self.m.mk_and(&le);
-        let block = self.m.mk_not(all_le);
+        // `¬(o₁ ≤ v₁ ∧ …)` as the disjunction `o₁ > v₁ ∨ …`.
+        let gt: Vec<AstId> = le.iter().map(|&l| self.m.mk_not(l)).collect();
+        let block = self.m.mk_or(&gt);
         st.base.push(block);
         self.objective_values = vals
             .iter()
             .map(|v| match v {
-                Value::Num(r, true) => render_int(r.numerator()),
-                Value::Num(r, false) => render_rational(r),
-                Value::Bv(b, _) => render_int(b),
+                (_, Some((a, _))) => render_alg_interval(a),
+                (Value::Num(r, true), _) => render_int(r.numerator()),
+                (Value::Num(r, false), _) => render_rational(r),
+                (Value::Bv(b, _), _) => render_int(b),
                 _ => unreachable!(),
             })
             .collect();
@@ -25815,10 +25994,61 @@ impl Context {
         self.objective_values = alloc::vec![v.to_string(); self.objectives.len()];
     }
 
+    /// Decide the assertions plus `fs` for a `pareto` step. A nonlinear real
+    /// problem goes to the CAD feasibility check first: it decides the
+    /// disjunctive dominance constraints exactly and its witness carries the
+    /// (possibly irrational) objective values.
+    fn pareto_check(&mut self, fs: &[AstId]) -> (SmtResult, Option<Model>) {
+        let nonlinear = self
+            .assertions
+            .iter()
+            .chain(fs)
+            .any(|&a| self.arith_nonlinear(a));
+        if nonlinear {
+            match self.nra_witness(fs, &mut None) {
+                Some(Ok(m)) => return (SmtResult::Sat, Some(m)),
+                Some(Err(())) => return (SmtResult::Unsat, None),
+                None => {}
+            }
+        }
+        match self.check_with(fs) {
+            (SmtResult::Sat, None) => match self.nra_witness(fs, &mut None) {
+                Some(Ok(m)) => (SmtResult::Sat, Some(m)),
+                _ => (SmtResult::Sat, None),
+            },
+            r => r,
+        }
+    }
+
+    /// The irrational algebraic `a` as a term: its `(root-obj p i)` node.
+    fn alg_term(&mut self, a: &puremp::Algebraic) -> Option<AstId> {
+        if a.is_rational() {
+            return Some(self.m.mk_numeral(a.interval().0.clone(), false));
+        }
+        let (poly, index) = super::algebraic_pp::root_obj_parts(a)?;
+        Some(self.mk_root_obj_node(&poly, index))
+    }
+
     /// `o` at least as good as its model value `v` (`ge`), or at most as good:
     /// z3's `opt::context::mk_ge` / `mk_le` (a minimize objective flips them).
-    fn pareto_cmp(&mut self, o: AstId, maximize: bool, v: &Value, ge: bool) -> AstId {
+    /// An irrational value is compared exactly through its `root-obj` term.
+    fn pareto_cmp(
+        &mut self,
+        o: AstId,
+        maximize: bool,
+        v: &(Value, Option<(puremp::Algebraic, AstId)>),
+        ge: bool,
+    ) -> AstId {
         let up = ge == maximize; // `o ≥ v`, else `o ≤ v`
+        if let (_, Some((_, k))) = v {
+            let k = *k;
+            return if up {
+                self.m.mk_ge(o, k)
+            } else {
+                self.m.mk_le(o, k)
+            };
+        }
+        let v = &v.0;
         match v {
             Value::Bv(b, w) => {
                 let k = self.m.mk_bv_numeral(b.clone(), *w);
@@ -26139,6 +26369,33 @@ impl Context {
                 p_obj = crate::nlsat::elim::subst_var(&p_obj, v, &kp);
                 pinned.push((ast_of[&v], k));
             }
+            // A Real variable an equality defines linearly (`a·v + rest = 0`,
+            // `a` a nonzero constant) is substituted out — one CAD dimension
+            // less — and recomputed from the witness.
+            let mut lin_defs: Vec<(u32, Polynomial)> = Vec::new();
+            while let Some((i, v, def)) = cons.iter().enumerate().find_map(|(i, (p, r))| {
+                if *r != NRel::Eq {
+                    return None;
+                }
+                p.vars().into_iter().find_map(|v| {
+                    if p.degree_of(v) != 1 || self.m.is_int_sort(self.m.get_sort(ast_of[&v])) {
+                        return None;
+                    }
+                    let a = p.coeff_of_var(v, 1).as_constant()?;
+                    let rest = p.coeff_of_var(v, 0);
+                    Some((i, v, rest.scale(&a.recip().neg())))
+                })
+            }) {
+                cons.remove(i);
+                for c in cons.iter_mut() {
+                    c.0 = crate::nlsat::elim::subst_var(&c.0, v, &def);
+                }
+                p_obj = crate::nlsat::elim::subst_var(&p_obj, v, &def);
+                for d in lin_defs.iter_mut() {
+                    d.1 = crate::nlsat::elim::subst_var(&d.1, v, &def);
+                }
+                lin_defs.push((v, def));
+            }
             // A constraint left constant is decided outright.
             let mut falsified = false;
             cons.retain(|(p, r)| match p.as_constant() {
@@ -26149,6 +26406,72 @@ impl Context {
                 None => true,
             });
             if falsified {
+                continue;
+            }
+            // A `root-obj` variable constrained only by its own (satisfiable)
+            // definition is irrelevant to this cube: drop it rather than add a
+            // CAD dimension.
+            let root_vars: BTreeSet<u32> = self
+                .root_obj_vars
+                .values()
+                .filter_map(|(r, _)| var_map.get(r).copied())
+                .collect();
+            for rv in root_vars {
+                let only_own = |p: &Polynomial| p.vars() == alloc::vec![rv];
+                let elsewhere = p_obj.vars().contains(&rv)
+                    || cons
+                        .iter()
+                        .any(|(p, _)| p.vars().contains(&rv) && !only_own(p));
+                if !elsewhere {
+                    cons.retain(|(p, _)| !only_own(p));
+                }
+            }
+            // Every variable pinned to one isolated root by its univariate
+            // constraints: decide the cube by exact signs at that point.
+            if let Some(det) = determined_point(&cons, &p_obj, var_map.len()) {
+                let Some(pt) = det else { continue };
+                let mut at: BTreeMap<u32, puremp::Algebraic> = BTreeMap::new();
+                let mut point = Vec::new();
+                for (&a, &i) in &var_map {
+                    if let Some(v) = pt.get(i as usize).and_then(|v| v.clone()) {
+                        at.insert(i, alg_to_algebraic(&v));
+                        point.push((a, v));
+                    }
+                }
+                for (a, k) in &pinned {
+                    if let Some(&vi) = var_map.get(a) {
+                        at.insert(vi, puremp::Algebraic::from_rational(k.clone()));
+                    }
+                }
+                for (v, def) in lin_defs.iter().rev() {
+                    let val = eval_poly_alg(def, &at)?;
+                    point.push((ast_of[v], algebraic_to_alg(&val)?));
+                    at.insert(*v, val);
+                }
+                let value = algebraic_to_alg(&eval_poly_alg(&p_obj, &at)?)?;
+                point.extend(
+                    pinned
+                        .iter()
+                        .map(|(a, k)| (*a, crate::nlsat::realclosure::Alg::Rational(k.clone()))),
+                );
+                let cand = NraOpt::Attained {
+                    value,
+                    point,
+                    bools: bools.into_iter().collect(),
+                };
+                any_feasible = true;
+                best = Some(match best {
+                    None => cand,
+                    Some(b) => {
+                        let ord = cand.value()?.compare(b.value()?);
+                        let better = if maximize { ord.is_gt() } else { ord.is_lt() };
+                        if better || (ord.is_eq() && matches!(cand, NraOpt::Attained { .. })) {
+                            cand
+                        } else {
+                            b
+                        }
+                    }
+                });
                 continue;
             }
             // The variables left must be plain Real constants (CAD decides ℝ
@@ -26238,19 +26561,38 @@ impl Context {
                     let k = eps_coeff(&v);
                     NraOpt::Limit(v, k)
                 }
-                CadOpt::Attained(v, point) => NraOpt::Attained {
-                    value: v,
-                    point: vars
-                        .into_iter()
-                        .zip(point.into_iter().skip(1))
-                        .chain(
-                            pinned
-                                .into_iter()
-                                .map(|(a, k)| (a, crate::nlsat::realclosure::Alg::Rational(k))),
-                        )
-                        .collect(),
-                    bools: bools.into_iter().collect(),
-                },
+                CadOpt::Attained(v, point) => {
+                    let mut pt: Vec<(AstId, crate::nlsat::realclosure::Alg)> =
+                        vars.into_iter().zip(point.into_iter().skip(1)).collect();
+                    // The linearly defined variables, from the witness.
+                    let mut at: BTreeMap<u32, puremp::Algebraic> = order
+                        .iter()
+                        .zip(&pt)
+                        .map(|(&i, (_, a))| (i, alg_to_algebraic(a)))
+                        .collect();
+                    for (a, k) in &pinned {
+                        if let Some(&vi) = var_map.get(a) {
+                            at.insert(vi, puremp::Algebraic::from_rational(k.clone()));
+                        }
+                    }
+                    for (v, def) in lin_defs.iter().rev() {
+                        let val = eval_poly_alg(def, &at)?;
+                        pt.push((ast_of[v], algebraic_to_alg(&val)?));
+                        at.insert(*v, val);
+                    }
+                    NraOpt::Attained {
+                        value: v,
+                        point: pt
+                            .into_iter()
+                            .chain(
+                                pinned
+                                    .into_iter()
+                                    .map(|(a, k)| (a, crate::nlsat::realclosure::Alg::Rational(k))),
+                            )
+                            .collect(),
+                        bools: bools.into_iter().collect(),
+                    }
+                }
             };
             any_feasible = true;
             best = Some(match best {

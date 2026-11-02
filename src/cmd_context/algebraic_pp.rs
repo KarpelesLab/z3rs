@@ -1231,6 +1231,15 @@ fn render_real_rational(r: &Rational) -> String {
 /// order. Uses only root isolation, factoring and polynomial evaluation — never
 /// algebraic arithmetic (which puremp 0.2.0 mishandles on crowded polynomials).
 pub(crate) fn root_obj_string(a: &Algebraic) -> Option<String> {
+    let (min_poly, index) = root_obj_parts(a)?;
+    let ints = primitive_integer_coeffs(&min_poly)?;
+    Some(format!("(root-obj {} {})", poly_to_smt(&ints), index))
+}
+
+/// The minimal polynomial of the irrational algebraic `a` and the 1-based
+/// index of `a` among its real roots in increasing order (see
+/// [`root_obj_string`]).
+pub(crate) fn root_obj_parts(a: &Algebraic) -> Option<(Poly<Rational>, usize)> {
     // Tighten the isolating interval so it excludes every other root of the
     // defining polynomial (adjacent factors, incl. a spurious `x`/root-0 factor);
     // otherwise an endpoint sitting on another root mis-selects the factor.
@@ -1245,7 +1254,6 @@ pub(crate) fn root_obj_string(a: &Algebraic) -> Option<String> {
         .into_iter()
         .map(|(f, _)| f)
         .find(|f| factor_has_root_in(f, lo, hi))?;
-    let ints = primitive_integer_coeffs(&min_poly)?;
     // Index of this root among the factor's real roots (increasing order).
     let af = a.to_f64();
     let roots = Algebraic::real_roots_of(&min_poly);
@@ -1258,7 +1266,7 @@ pub(crate) fn root_obj_string(a: &Algebraic) -> Option<String> {
             best_i = i;
         }
     }
-    Some(format!("(root-obj {} {})", poly_to_smt(&ints), best_i + 1))
+    Some((min_poly, best_i + 1))
 }
 
 /// Whether polynomial `f` has a real root within `[lo, hi]` (a sign change or a
