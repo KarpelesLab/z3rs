@@ -2513,6 +2513,14 @@ struct Context {
     /// `(_ as-array f)` values: array term → the function declaration.
     /// `(select (_ as-array f) i)` rewrites to `f(i)`.
     as_arrays: BTreeMap<AstId, AstId>,
+    /// Function references passed to `seq.map`/`seq.mapi`/`seq.foldl`/
+    /// `seq.foldli`: placeholder array term → the declared function or macro
+    /// name it stands for (applied by name, never read as an array).
+    fn_refs: BTreeMap<AstId, String>,
+    /// Curried `select` chains built for a multi-argument function argument
+    /// of those operations: z3 forms one multi-index `select` there, so they
+    /// print as `(select f i j)`.
+    multi_selects: BTreeSet<AstId>,
     /// Top-level universal (`forall`) assertions as `(bound-var placeholders,
     /// body)`; instantiated over ground terms at each `check-sat`.
     universals: Vec<(Vec<AstId>, AstId)>,
@@ -3646,6 +3654,8 @@ impl Context {
             lambdas: BTreeMap::new(),
             maps: BTreeMap::new(),
             as_arrays: BTreeMap::new(),
+            fn_refs: BTreeMap::new(),
+            multi_selects: BTreeSet::new(),
             params: crate::util::Params::new(),
             sort_ctors: BTreeMap::new(),
             universals: Vec::new(),
@@ -4284,6 +4294,10 @@ impl Context {
                     {
                         return Ok(Some(d));
                     }
+                }
+                // Sequence values and markers print in z3's surface syntax.
+                if self.mentions_seq_terms(s) {
+                    return Ok(Some(self.render_seq_term(s)));
                 }
                 // FP literals are fresh constants internally; print z3's spelling.
                 let fp_of = &self.fp_of;
@@ -5770,6 +5784,18 @@ impl Context {
     fn model_term_render(&mut self, model: &mut Model, id: AstId) -> String {
         if let Some(cps) = self.str_value(id) {
             return smt_string_literal(&cps);
+        }
+        // A concrete sequence (a witness value): its elements' model values.
+        if let Some(elems) = self.seq_of.get(&id).cloned() {
+            let units: Vec<String> = elems
+                .iter()
+                .map(|&e| alloc::format!("(seq.unit {})", self.model_term_render(model, e)))
+                .collect();
+            return match units.len() {
+                0 => alloc::format!("(as seq.empty {})", self.sort_display(self.m.get_sort(id))),
+                1 => units[0].clone(),
+                _ => alloc::format!("(seq.++ {})", units.join(" ")),
+            };
         }
         if let Some(s) = self.str_model_value(model, id) {
             return s;
@@ -20722,8 +20748,433 @@ impl Context {
                 }
                 self.symbolic_seq(op, args)
             }
+            "seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli" => self.seq_hof(op, args),
             _ => self.symbolic_string(op, args),
         }
+    }
+
+    /// Apply a function argument of a higher-order sequence operation: a
+    /// function/macro reference by name, otherwise an array term by
+    /// (multi-index) `select`.
+    fn apply_fn_arg(&mut self, f: AstId, args: &[AstId]) -> Result<AstId, String> {
+        if let Some(name) = self.fn_refs.get(&f).cloned() {
+            if self.macros.contains_key(&name) && !self.funcs.contains_key(&name) {
+                return self.expand_macro(&name, args.to_vec());
+            }
+            return self.apply(&name, args.to_vec());
+        }
+        let mut all = alloc::vec![f];
+        all.extend_from_slice(args);
+        let t = self.apply("select", all)?;
+        if args.len() > 1 && self.m.is_select(t) {
+            self.multi_selects.insert(t);
+        }
+        Ok(t)
+    }
+
+    /// Does `t` contain a sequence value, a sequence-operation marker or a
+    /// function reference (which [`Self::m`]'s printer shows by internal name)?
+    fn mentions_seq_terms(&self, t: AstId) -> bool {
+        self.m.postorder(t).iter().any(|&u| {
+            self.seq_of.contains_key(&u)
+                || self.fn_refs.contains_key(&u)
+                || self.multi_selects.contains(&u)
+                || (self.m.is_app(u) && self.seqop_ops.contains_key(&self.m.app_decl(u)))
+        })
+    }
+
+    /// Render a term containing sequence values/markers in z3's syntax:
+    /// `(seq.unit e)`, `(seq.++ …)`, `(as seq.empty (Seq S))`, the markers by
+    /// operation name (`seq.foldl` prints as `seq.fold_left`), function
+    /// references by name and curried `select` chains as one multi-index
+    /// `select`.
+    fn render_seq_term(&self, t: AstId) -> String {
+        if !self.mentions_seq_terms(t) {
+            return self.m.pp(t);
+        }
+        if let Some(name) = self.fn_refs.get(&t) {
+            return name.clone();
+        }
+        if let Some(elems) = self.seq_of.get(&t) {
+            return match elems.len() {
+                0 => alloc::format!("(as seq.empty {})", self.sort_display(self.m.get_sort(t))),
+                1 => alloc::format!("(seq.unit {})", self.render_seq_term(elems[0])),
+                _ => {
+                    let parts: Vec<String> = elems
+                        .iter()
+                        .map(|&e| alloc::format!("(seq.unit {})", self.render_seq_term(e)))
+                        .collect();
+                    alloc::format!("(seq.++ {})", parts.join(" "))
+                }
+            };
+        }
+        if self.multi_selects.contains(&t) {
+            let mut idx: Vec<AstId> = Vec::new();
+            let mut base = t;
+            while self.m.is_select(base) {
+                let a = self.m.app_args(base);
+                idx.push(a[1]);
+                base = a[0];
+            }
+            idx.reverse();
+            let mut out = alloc::format!("(select {}", self.render_seq_term(base));
+            for i in idx {
+                out.push(' ');
+                out.push_str(&self.render_seq_term(i));
+            }
+            out.push(')');
+            return out;
+        }
+        if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
+            let decl = self.m.app_decl(t);
+            let name = match self.seqop_ops.get(&decl).map(String::as_str) {
+                Some("seq.foldl") => "seq.fold_left".to_string(),
+                Some("seq.foldli") => "seq.fold_lefti".to_string(),
+                Some(op) => op.to_string(),
+                None => self.decl_name(decl).unwrap_or_else(|| "?".to_string()),
+            };
+            let args: Vec<String> = self
+                .m
+                .app_args(t)
+                .iter()
+                .map(|&a| self.render_seq_term(a))
+                .collect();
+            return alloc::format!("({name} {})", args.join(" "));
+        }
+        self.m.pp(t)
+    }
+
+    /// The sort a function argument returns after `arity` arguments: the
+    /// curried array range.
+    fn fn_arg_range(&self, f: AstId, arity: usize) -> Option<AstId> {
+        let mut s = self.m.get_sort(f);
+        for _ in 0..arity {
+            s = self.m.array_sort_params(s)?.1;
+        }
+        Some(s)
+    }
+
+    /// `seq.map f s`, `seq.mapi f i s`, `seq.foldl f a s`, `seq.foldli f i a s`
+    /// with z3's rewrites: over a concrete sequence they unfold to the
+    /// applications of `f`, over a concatenation they split
+    /// (`map f (s·t) = map f s · map f t`, `foldl f a (s·t) = foldl f (foldl f
+    /// a s) t`, the indexed forms shifting the index by `len s`); otherwise a
+    /// symbolic marker.
+    fn seq_hof(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        let want = match op {
+            "seq.map" => 2,
+            "seq.mapi" | "seq.foldl" => 3,
+            _ => 4,
+        };
+        if args.len() != want {
+            return Err(alloc::format!("{op} expects {want} arguments"));
+        }
+        let f = args[0];
+        let s = args[want - 1];
+        if let Some(elems) = self.seq_of.get(&s).cloned() {
+            let index = |ctx: &mut Self, k: usize| -> Result<AstId, String> {
+                if k == 0 {
+                    return Ok(args[1]);
+                }
+                let kv = ctx.m.mk_int(k as i64);
+                let sum = ctx.apply("+", alloc::vec![args[1], kv])?;
+                Ok(crate::rewriter::simplify(&mut ctx.m, sum))
+            };
+            return match op {
+                "seq.map" | "seq.mapi" => {
+                    if elems.is_empty() {
+                        let arity = if op == "seq.map" { 1 } else { 2 };
+                        let range = self
+                            .fn_arg_range(f, arity)
+                            .ok_or_else(|| alloc::format!("{op}: bad function argument"))?;
+                        let sort = self.seq_sort(range);
+                        return Ok(self.seq_empty_of(sort));
+                    }
+                    let mut out = Vec::with_capacity(elems.len());
+                    for (k, &e) in elems.iter().enumerate() {
+                        let v = if op == "seq.map" {
+                            self.apply_fn_arg(f, &[e])?
+                        } else {
+                            let i = index(self, k)?;
+                            self.apply_fn_arg(f, &[i, e])?
+                        };
+                        out.push(v);
+                    }
+                    if out.len() == 1 {
+                        return self.seq_op("seq.unit", &[out[0]]);
+                    }
+                    Ok(self.mk_seq(out))
+                }
+                _ => {
+                    let mut acc = args[want - 2];
+                    for (k, &e) in elems.iter().enumerate() {
+                        acc = if op == "seq.foldl" {
+                            self.apply_fn_arg(f, &[acc, e])?
+                        } else {
+                            let i = index(self, k)?;
+                            self.apply_fn_arg(f, &[i, acc, e])?
+                        };
+                    }
+                    Ok(acc)
+                }
+            };
+        }
+        // A concatenation splits after its first part.
+        if self.m.is_app(s)
+            && self.seqop_ops.get(&self.m.app_decl(s)).map(String::as_str) == Some("seq.++")
+            && self.m.app_args(s).len() >= 2
+        {
+            let parts = self.m.app_args(s).to_vec();
+            let s1 = parts[0];
+            let s2 = if parts.len() == 2 {
+                parts[1]
+            } else {
+                self.seq_op("seq.++", &parts[1..])?
+            };
+            let shifted = |ctx: &mut Self| -> Result<AstId, String> {
+                let l1 = ctx.seq_op("seq.len", &[s1])?;
+                let sum = ctx.apply("+", alloc::vec![args[1], l1])?;
+                Ok(crate::rewriter::simplify(&mut ctx.m, sum))
+            };
+            return match op {
+                "seq.map" => {
+                    let m1 = self.seq_hof(op, &[f, s1])?;
+                    let m2 = self.seq_hof(op, &[f, s2])?;
+                    self.seq_op("seq.++", &[m1, m2])
+                }
+                "seq.mapi" => {
+                    let m1 = self.seq_hof(op, &[f, args[1], s1])?;
+                    let j = shifted(self)?;
+                    let m2 = self.seq_hof(op, &[f, j, s2])?;
+                    self.seq_op("seq.++", &[m1, m2])
+                }
+                "seq.foldl" => {
+                    let a1 = self.seq_hof(op, &[f, args[1], s1])?;
+                    self.seq_hof(op, &[f, a1, s2])
+                }
+                _ => {
+                    let a1 = self.seq_hof(op, &[f, args[1], args[2], s1])?;
+                    let j = shifted(self)?;
+                    self.seq_hof(op, &[f, j, a1, s2])
+                }
+            };
+        }
+        self.symbolic_seq(op, args)
+    }
+
+    /// A model of `goal` in which every sequence variable that a
+    /// `seq.map`/`seq.mapi`/`seq.foldl`/`seq.foldli` marker ranges over is a
+    /// short concrete sequence of fresh elements (lengths 0‥3, shortest
+    /// first): the markers unfold to applications of the function argument,
+    /// uninterpreted applications over the now-concrete sequences get
+    /// congruence by content, and the specialised goal is decided. Its model
+    /// with the sequence assignment (recorded as the string witness) is a
+    /// model of `goal`; `None` when no assignment is found.
+    fn try_seq_hof_witness(&mut self, goal: AstId) -> Option<Model> {
+        const MAX_LEN: usize = 3;
+        const MAX_CASES: usize = 64;
+        let mut vars: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_app(t)
+                || !matches!(
+                    self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str),
+                    Some("seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli")
+                )
+            {
+                continue;
+            }
+            let s = *self.m.app_args(t).last()?;
+            if !self.m.is_uninterp_const(s) || self.seq_of.contains_key(&s) {
+                return None;
+            }
+            if !vars.contains(&s) {
+                vars.push(s);
+            }
+        }
+        if vars.is_empty() || vars.len() > 3 {
+            return None;
+        }
+        // Length tuples by total length, then lexicographically.
+        let mut tuples: Vec<Vec<usize>> = alloc::vec![Vec::new()];
+        for _ in &vars {
+            tuples = tuples
+                .into_iter()
+                .flat_map(|t| {
+                    (0..=MAX_LEN).map(move |k| {
+                        let mut t2 = t.clone();
+                        t2.push(k);
+                        t2
+                    })
+                })
+                .collect();
+        }
+        tuples.sort_by_key(|t| (t.iter().sum::<usize>(), t.clone()));
+        tuples.truncate(MAX_CASES);
+        let mut elems: BTreeMap<(AstId, usize), AstId> = BTreeMap::new();
+        for lens in tuples {
+            let mut subst: Vec<(AstId, AstId)> = Vec::new();
+            for (&v, &k) in vars.iter().zip(&lens) {
+                let sort = self.m.get_sort(v);
+                let elem_sort = self.seq_elem_sort(sort)?;
+                let seq = if k == 0 {
+                    self.seq_empty_of(sort)
+                } else {
+                    let es: Vec<AstId> = (0..k)
+                        .map(|j| {
+                            *elems
+                                .entry((v, j))
+                                .or_insert_with(|| self.fresh_const(elem_sort))
+                        })
+                        .collect();
+                    if k == 1 {
+                        self.seq_op("seq.unit", &es).ok()?
+                    } else {
+                        self.mk_seq(es)
+                    }
+                };
+                subst.push((v, seq));
+            }
+            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let mut memo = BTreeMap::new();
+            let g2 = self.refold_str_markers(g1, &mut memo);
+            let unfolded = !self.m.postorder(g2).iter().any(|&t| {
+                self.m.is_app(t)
+                    && matches!(
+                        self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str),
+                        Some("seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli")
+                    )
+            });
+            if !unfolded {
+                continue;
+            }
+            let mut conj = self.seq_content_congruence(g2);
+            conj.extend(self.string_axioms(g2));
+            let g3 = if conj.is_empty() {
+                g2
+            } else {
+                conj.push(g2);
+                self.m.mk_and(&conj)
+            };
+            // The specialised goal is its own witness base (an outer base would
+            // answer for the unspecialised goal, without these elements).
+            let base = self.witness_base.take();
+            let (r, m) = self.decide(g3);
+            self.witness_base = base;
+            if r == SmtResult::Sat {
+                self.str_witness.extend(subst);
+                return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
+            }
+        }
+        None
+    }
+
+    /// Congruence of uninterpreted applications over concrete sequences by
+    /// content: for two applications of one function whose arguments are
+    /// pairwise identical or both concrete sequences, equal contents imply
+    /// equal results (distinct sequence values are separate constants here).
+    fn seq_content_congruence(&mut self, goal: AstId) -> Vec<AstId> {
+        let apps: Vec<AstId> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter(|&t| {
+                self.m.app(t).is_some_and(|a| {
+                    !a.args.is_empty()
+                        && a.args.iter().any(|x| self.seq_of.contains_key(x))
+                        && self
+                            .m
+                            .func_decl(a.decl)
+                            .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+                })
+            })
+            .collect();
+        let mut ax = Vec::new();
+        for i in 0..apps.len() {
+            for j in i + 1..apps.len() {
+                let (p, q) = (apps[i], apps[j]);
+                if self.m.app_decl(p) != self.m.app_decl(q) {
+                    continue;
+                }
+                let (pa, qa) = (self.m.app_args(p).to_vec(), self.m.app_args(q).to_vec());
+                let mut conds = Vec::new();
+                let mut ok = true;
+                for (&x, &y) in pa.iter().zip(&qa) {
+                    if x == y {
+                        continue;
+                    }
+                    match (self.seq_of.get(&x).cloned(), self.seq_of.get(&y).cloned()) {
+                        (Some(xs), Some(ys)) => conds.push(self.seq_content_eq(&xs, &ys)),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let same = self.m.mk_eq(p, q);
+                let ax1 = match conds.len() {
+                    0 => same,
+                    1 => self.m.mk_implies(conds[0], same),
+                    _ => {
+                        let all = self.m.mk_and(&conds);
+                        self.m.mk_implies(all, same)
+                    }
+                };
+                ax.push(ax1);
+            }
+        }
+        ax
+    }
+
+    /// A placeholder array term for the function or macro `name` passed to a
+    /// higher-order sequence operation whose `f` takes arguments of sorts
+    /// `domain`. `None` when `name` is neither (or the arity disagrees).
+    fn seq_fn_ref(&mut self, name: &str, domain: &[AstId]) -> Result<Option<AstId>, String> {
+        let range = if let Some(&d) = self.funcs.get(name)
+            && let Some(fd) = self.m.func_decl(d)
+            && !fd.domain.is_empty()
+        {
+            if fd.domain.len() != domain.len() {
+                return Err(alloc::format!(
+                    "function {name:?} takes {} argument(s), not {}",
+                    fd.domain.len(),
+                    domain.len()
+                ));
+            }
+            fd.range
+        } else if let Some((params, _)) = self.macros.get(name)
+            && !params.is_empty()
+        {
+            if params.len() != domain.len() {
+                return Err(alloc::format!(
+                    "macro {name:?} takes {} argument(s), not {}",
+                    params.len(),
+                    domain.len()
+                ));
+            }
+            // The body's sort on fresh arguments of the expected sorts.
+            let probe: Vec<AstId> = domain.iter().map(|&d| self.fresh_const(d)).collect();
+            let body = self.expand_macro(name, probe)?;
+            self.m.get_sort(body)
+        } else {
+            return Ok(None);
+        };
+        let mut sort = range;
+        for &d in domain.iter().rev() {
+            sort = self.m.mk_array_sort(d, sort);
+        }
+        if let Some((&t, _)) = self
+            .fn_refs
+            .iter()
+            .find(|&(&t, n)| n == name && self.m.get_sort(t) == sort)
+        {
+            return Ok(Some(t));
+        }
+        let t = self.fresh_const(sort);
+        self.fn_refs.insert(t, name.to_string());
+        Ok(Some(t))
     }
 
     /// `a = b` for two concrete sequences by content: false on a length
@@ -20771,6 +21222,15 @@ impl Context {
             "seq.nth" => self
                 .seq_elem_sort(self.m.get_sort(args[0]))
                 .unwrap_or_else(|| self.m.mk_int_sort()),
+            "seq.map" | "seq.mapi" => {
+                let arity = if op == "seq.map" { 1 } else { 2 };
+                let range = self
+                    .fn_arg_range(args[0], arity)
+                    .ok_or_else(|| alloc::format!("{op}: bad function argument"))?;
+                self.seq_sort(range)
+            }
+            "seq.foldl" => self.m.get_sort(args[1]),
+            "seq.foldli" => self.m.get_sort(args[2]),
             // seq.++/at/extract and the rest return a sequence like args[0].
             _ => self.m.get_sort(args[0]),
         };
@@ -30002,6 +30462,18 @@ impl Context {
             }
         }
         let int_sort = self.m.mk_int_sort();
+        // Variables inside the elements of a concrete sequence value: a
+        // sequence is a constant with a side-table element list, which
+        // substitution cannot reach — inlining such a variable would leave its
+        // other occurrences unpinned (a fuzz-found wrong `sat`).
+        let mut hidden: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder(goal) {
+            if let Some(elems) = self.seq_of.get(&t) {
+                for &e in elems {
+                    hidden.extend(self.m.postorder(e));
+                }
+            }
+        }
         let mut subst: Vec<(AstId, AstId)> = Vec::new();
         let mut bound: BTreeSet<AstId> = BTreeSet::new();
         for &c in &conj {
@@ -30017,6 +30489,7 @@ impl Context {
                     && self.m.get_sort(v) == int_sort
                     && self.m.as_numeral(k).is_some()
                     && !bound.contains(&v)
+                    && !hidden.contains(&v)
                 {
                     subst.push((v, k));
                     bound.insert(v);
@@ -30426,6 +30899,11 @@ impl Context {
                 && (self.ideal_refutes(goal) || self.nonlinear_icp_refutes(goal))
             {
                 return (SmtResult::Unsat, None);
+            }
+            // `seq.map`/`seq.foldl`/… over a sequence variable: unfold them over
+            // short concrete sequences of fresh elements.
+            if let Some(m) = self.try_seq_hof_witness(goal) {
+                return (SmtResult::Sat, Some(m));
             }
             let wg = self.witness_base.unwrap_or(goal);
             // The abstract model may already pin every string variable to a
@@ -32086,6 +32564,12 @@ impl Context {
         for (&t, (_, body)) in &self.lambdas {
             side.insert(t, alloc::vec![*body]);
         }
+        // A concrete sequence value stands for its elements.
+        for (&t, elems) in &self.seq_of {
+            if !elems.is_empty() {
+                side.entry(t).or_default().extend(elems.iter().copied());
+            }
+        }
         let symbols = |ctx: &Self, c: AstId| -> BTreeSet<AstId> {
             let mut out = BTreeSet::new();
             let mut seen = BTreeSet::new();
@@ -32885,6 +33369,9 @@ impl Context {
 
     /// Render a sort as SMT-LIB2 text (a named sort by its name, arrays nested).
     fn sort_display(&self, sort: AstId) -> String {
+        if let Some(e) = self.seq_elem_sort(sort) {
+            return alloc::format!("(Seq {})", self.sort_display(e));
+        }
         if let Some((i, e)) = self.m.array_sort_params(sort) {
             return alloc::format!("(Array {} {})", self.sort_display(i), self.sort_display(e));
         }
@@ -33764,6 +34251,32 @@ impl Context {
                         self.as_const_seen += 1;
                         let array_sort = self.resolve_sort(&qid[2])?;
                         let mut value = self.term(&l[1])?;
+                        // A multi-dimensional `(Array A B … R)` (curried here)
+                        // takes a value of its final range `R`: nest the
+                        // constant arrays from the innermost dimension out.
+                        if let SExpr::List(sl) = &qid[2]
+                            && sl.len() >= 4
+                            && matches!(&sl[0], SExpr::Atom(a) if a == "Array")
+                        {
+                            let mut sorts = alloc::vec![array_sort];
+                            while sorts.len() < sl.len() - 2
+                                && let Some((_, r)) =
+                                    self.m.array_sort_params(*sorts.last().unwrap())
+                            {
+                                sorts.push(r);
+                            }
+                            let innermost = *sorts.last().unwrap();
+                            if self
+                                .m
+                                .array_sort_params(innermost)
+                                .is_some_and(|(_, r)| r == self.m.get_sort(value))
+                            {
+                                for &s in sorts.iter().rev() {
+                                    value = self.m.mk_const_array(s, value);
+                                }
+                                return Ok(value);
+                            }
+                        }
                         if let Some((_, range)) = self.m.array_sort_params(array_sort) {
                             let vs = self.m.get_sort(value);
                             if vs != range {
@@ -34344,6 +34857,40 @@ impl Context {
                     && let Some(t) = self.try_split_concat_eq(&l[1], &l[2])?
                 {
                     return Ok(t);
+                }
+                // `seq.map`/`seq.mapi`/`seq.foldl`/`seq.foldli` take a function
+                // argument: a declared function or a macro name stands for its
+                // array (z3's implicit `as-array`).
+                if matches!(
+                    head.as_str(),
+                    "seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli"
+                ) && l.len() >= 3
+                    && let SExpr::Atom(fname) = &l[1]
+                    && !self
+                        .scopes
+                        .iter()
+                        .any(|sc| sc.iter().any(|(n, _)| n == fname))
+                {
+                    let rest: Vec<AstId> = l[2..]
+                        .iter()
+                        .map(|a| self.term(a))
+                        .collect::<Result<_, _>>()?;
+                    let seq = *rest.last().unwrap();
+                    let elem = self
+                        .seq_elem_sort(self.m.get_sort(seq))
+                        .ok_or_else(|| alloc::format!("{head}: expected a sequence"))?;
+                    let int = self.m.mk_int_sort();
+                    let domain: Vec<AstId> = match head.as_str() {
+                        "seq.map" => alloc::vec![elem],
+                        "seq.mapi" => alloc::vec![int, elem],
+                        "seq.foldl" => alloc::vec![self.m.get_sort(rest[0]), elem],
+                        _ => alloc::vec![int, self.m.get_sort(rest[1]), elem],
+                    };
+                    if let Some(fref) = self.seq_fn_ref(fname, &domain)? {
+                        let mut args = alloc::vec![fref];
+                        args.extend(rest);
+                        return self.seq_op(&head, &args);
+                    }
                 }
                 let args: Vec<AstId> = l[1..]
                     .iter()
@@ -39671,6 +40218,54 @@ mod tests {
         assert_eq!(
             out,
             alloc::vec!["unsat", "unsat", "unsat", "unsat", "unsat", "sat", "sat"]
+        );
+    }
+
+    #[test]
+    fn higher_order_sequence_operations() {
+        // z3 regressions testmap / testmapi / testfoldl: z3's rewrites print
+        // in its syntax, and goals over a sequence variable are witnessed by
+        // short concrete sequences (with congruence of `p` by content).
+        let script = "
+            (declare-const f (Array Int Int Int))
+            (declare-const g (Array Int Bool Int Bool))
+            (declare-const il_1 (Seq Int))
+            (declare-const il_2 (Seq Int))
+            (declare-const i Int)
+            (simplify (seq.foldl f 2 (seq.++ il_1 il_2)))
+            (simplify (seq.foldli g 3 true (seq.unit i)))
+            (simplify (seq.mapi f 2 (seq.++ il_1 il_2)))
+            (simplify (seq.map (select f 1) (as seq.empty (Seq Int))))
+            (reset)
+            (declare-fun f (Int) Bool)
+            (declare-fun p ((Seq Bool)) Bool)
+            (declare-const il (Seq Int))
+            (assert (p (seq.map f il)))
+            (assert (not (p (seq.unit false))))
+            (assert (not (p (seq.unit true))))
+            (assert (not (= il (as seq.empty (Seq Int)))))
+            (check-sat)
+            (eval (>= (seq.len il) 2))
+            (reset)
+            (declare-const il (Seq Int))
+            (declare-const F (Array Int Bool Int Bool))
+            (assert (= (seq.foldli F 5 true il) true))
+            (assert (> (seq.len il) 0))
+            (assert (not (= F ((as const (Array Int Bool Int Bool)) true))))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(
+            out,
+            alloc::vec![
+                "(seq.fold_left f (seq.fold_left f 2 il_1) il_2)",
+                "(select g 3 true i)",
+                "(seq.++ (seq.mapi f 2 il_1) (seq.mapi f (+ 2 (seq.len il_1)) il_2))",
+                "(as seq.empty (Seq Int))",
+                "sat",
+                "true",
+                "sat",
+            ]
         );
     }
 
