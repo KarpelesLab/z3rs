@@ -31986,9 +31986,10 @@ impl Context {
             axioms.push(self.m.mk_or(&[eq_ab, neq_reads])); // a=b ∨ a[k]≠b[k]
             indices.push(k);
         }
-        // A "default" index per infinite index sort, distinct from every index
-        // above. Equisatisfiable: a model gives the finitely many index terms
-        // finitely many values, and an Int/Real sort always has another one left.
+        // A "default" index per infinite index sort (or roomy bit-vector sort),
+        // distinct from every index above. Equisatisfiable: a model gives the
+        // finitely many index terms finitely many values, and an Int/Real sort
+        // always has another one left.
         // It lets the axioms see an array *away from* its written indices:
         // `A = const 0 ∧ B = const 1 ∧ store(A,2,3) = store(B,2,3)` is refuted
         // only at an index other than 2, which nothing else guarantees exists
@@ -31997,10 +31998,17 @@ impl Context {
             let mut sorts: Vec<AstId> = Vec::new();
             for &(a, _) in &array_eqs {
                 if let Some((s, _)) = self.m.array_sort_params(self.m.get_sort(a))
-                    && self.m.is_arith_sort(s)
                     && !sorts.contains(&s)
                 {
-                    sorts.push(s);
+                    // A bit-vector sort has another value left when it has more
+                    // values than there are index terms of that sort.
+                    let roomy = self.m.bv_sort_width(s).is_some_and(|w| {
+                        let n = indices.iter().filter(|&&j| self.m.get_sort(j) == s).count();
+                        w >= 32 || (1u64 << w) > n as u64
+                    });
+                    if self.m.is_arith_sort(s) || roomy {
+                        sorts.push(s);
+                    }
                 }
             }
             for s in sorts {
@@ -32032,7 +32040,13 @@ impl Context {
             // no read folds away, so congruence closure over the reads that do
             // occur derives every needed instance (z3 relies on congruence the
             // same way); the instances are only needed when a side's reads fold.
-            if self.is_plain_array(a) && self.is_plain_array(b) {
+            // (Bit-vector-indexed arrays may be decided by bit-blasting, where
+            // there is no congruence closure: they keep every instance.)
+            let bv_index = self
+                .m
+                .array_sort_params(self.m.get_sort(a))
+                .is_some_and(|(idx, _)| self.m.bv_sort_width(idx).is_some());
+            if !bv_index && self.is_plain_array(a) && self.is_plain_array(b) {
                 continue;
             }
             let eq_ab = self.m.mk_eq(a, b);
@@ -32113,6 +32127,90 @@ impl Context {
             }
         }
         true
+    }
+
+    /// Decide a bit-vector goal whose only non-bit-vector atoms are equalities
+    /// and reads of bit-vector-indexed arrays of bit-vectors by bit-blasting,
+    /// with each such equality a free Boolean and each read a fresh bit-vector
+    /// (equal reads at equal indices). The array axioms carry their whole meaning: every
+    /// equality's reads agree at every index term when it holds
+    /// (congruence instances), differ at its Skolem index when it does not
+    /// (extensionality), and the default index sees the arrays away from all
+    /// written indices — the reduction of extensional arrays to equality over
+    /// finitely many reads. No model is built for the arrays.
+    fn decide_bv_array_equalities(&mut self, g: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let bv_array = |m: &AstManager, s: AstId| {
+            m.array_sort_params(s).is_some_and(|(idx, elem)| {
+                m.bv_sort_width(idx).is_some()
+                    && (m.bv_sort_width(elem).is_some() || m.is_bool_sort(elem))
+            })
+        };
+        // The default index exists only where the index sort has more values
+        // than the goal has terms of it (else the reduction is incomplete).
+        let sub = self.m.postorder(g);
+        let roomy = |m: &AstManager, s: AstId| {
+            let w = m
+                .array_sort_params(s)
+                .and_then(|(idx, _)| m.bv_sort_width(idx));
+            w.is_some_and(|w| {
+                let idx = m.array_sort_params(s).unwrap().0;
+                let n = sub.iter().filter(|&&t| m.get_sort(t) == idx).count();
+                w >= 32 || (1u64 << w) > n as u64
+            })
+        };
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for t in self.m.postorder(g) {
+            if self.m.is_eq(t) && bv_array(&self.m, self.m.get_sort(self.m.app_args(t)[0])) {
+                if !roomy(&self.m, self.m.get_sort(self.m.app_args(t)[0])) {
+                    return None;
+                }
+                let b = self.m.mk_bool_sort();
+                let f = self.fresh_const(b);
+                subst.push((t, f));
+            }
+        }
+        if subst.is_empty() {
+            return None;
+        }
+        let abs = crate::rewriter::substitute(&mut self.m, g, &subst);
+        // Reads of array variables become fresh bit-vectors, equal at equal
+        // indices (Ackermann's reduction).
+        let mut reads: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        for t in self.m.postorder(abs) {
+            if self.m.is_select(t) {
+                let arr = self.m.app_args(t)[0];
+                if !self.m.is_uninterp_const(arr) || !bv_array(&self.m, self.m.get_sort(arr)) {
+                    return None;
+                }
+                reads.entry(arr).or_default().push(t);
+            }
+        }
+        let mut rsub: Vec<(AstId, AstId)> = Vec::new();
+        let mut axioms: Vec<AstId> = Vec::new();
+        for terms in reads.values() {
+            let fresh: Vec<AstId> = terms
+                .iter()
+                .map(|&r| self.fresh_const(self.m.get_sort(r)))
+                .collect();
+            for i in 0..terms.len() {
+                for j in i + 1..terms.len() {
+                    let ie = self
+                        .m
+                        .mk_eq(self.m.app_args(terms[i])[1], self.m.app_args(terms[j])[1]);
+                    let ve = self.m.mk_eq(fresh[i], fresh[j]);
+                    axioms.push(self.m.mk_implies(ie, ve));
+                }
+            }
+            rsub.extend(terms.iter().copied().zip(fresh));
+        }
+        axioms.push(abs);
+        let and = self.m.mk_and(&axioms);
+        let abs = crate::rewriter::substitute(&mut self.m, and, &rsub);
+        if !self.bv_goal_is_pure(abs) {
+            return None;
+        }
+        let (res, _) = check_bv_model(&self.m, abs);
+        Some((res, None))
     }
 
     /// Is `t` a `(_ map f)` over an arithmetic index sort whose operands are
@@ -34945,6 +35043,9 @@ impl Context {
                 );
             }
             if let Some(r) = self.decide_bv_components(goal) {
+                return r;
+            }
+            if let Some(r) = self.decide_bv_array_equalities(g) {
                 return r;
             }
             return (SmtResult::Unknown, None);
