@@ -6180,6 +6180,25 @@ impl Context {
                 SExpr::List(l) => l.iter().any(|y| mentions(y, x)),
             }
         }
+        // `solve-eqs` keeps definitions with quantifiers or lambdas (a binder,
+        // or a function macro passed as a value).
+        fn binds(ctx: &Context, e: &SExpr) -> bool {
+            match e {
+                SExpr::Atom(a) => ctx.macros.get(a).is_some_and(|(ps, _)| !ps.is_empty()),
+                SExpr::List(l) => {
+                    if matches!(l.first(), Some(SExpr::Atom(h)) if h == "lambda" || h == "forall" || h == "exists")
+                    {
+                        return true;
+                    }
+                    let args = if matches!(l.first(), Some(SExpr::Atom(_))) {
+                        &l[1..]
+                    } else {
+                        &l[..]
+                    };
+                    args.iter().any(|x| binds(ctx, x))
+                }
+            }
+        }
         let SExpr::List(l) = t else {
             return;
         };
@@ -6198,6 +6217,7 @@ impl Context {
                             .and_then(|&d| self.m.func_decl(d))
                             .is_some_and(|f| f.domain.is_empty())
                         && !mentions(other, x)
+                        && !binds(self, other)
                     {
                         if !self.solved_vars.contains(x) {
                             self.solved_vars.push(x.clone());
