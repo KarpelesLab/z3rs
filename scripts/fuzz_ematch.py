@@ -4,7 +4,7 @@
 Universals over U with one or two binders whose bodies mix uninterpreted
 applications covering only some binders (`p(x)` beside `r(x, y)`), binders in
 interpreted positions (`x = c`, `x ≠ f(y)`), optional user `:pattern`s, and
-ground facts with equalities. A `sat` claimed from an E-matching fixpoint that
+ground facts with equalities, sometimes without MBQI. A `sat` claimed from an E-matching fixpoint that
 missed a needed instance shows up as a DISAGREE (a soundness bug).
 
 Usage: scripts/fuzz_ematch.py <z3rs> <z3> <n> <outdir>
@@ -31,7 +31,8 @@ def gen(r):
         if c<.6: return f"(or {form(vs,d+1)} {form(vs,d+1)})"
         if c<.85: return f"(and {form(vs,d+1)} {form(vs,d+1)})"
         return f"(=> {form(vs,d+1)} {form(vs,d+1)})"
-    a=["(declare-sort U 0)","(declare-fun f (U) U)","(declare-fun g (U U) U)",
+    a=["(set-option :auto-config false)","(set-option :smt.mbqi false)"] if r.random()<.3 else []
+    a+=["(declare-sort U 0)","(declare-fun f (U) U)","(declare-fun g (U U) U)",
        "(declare-fun p (U) Bool)","(declare-fun q (U) Bool)","(declare-fun r (U U) Bool)"]
     a+=[f"(declare-const {k} U)" for k in consts]
     for _ in range(r.randint(1,3)):

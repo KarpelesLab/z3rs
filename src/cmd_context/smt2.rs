@@ -4730,6 +4730,41 @@ impl Context {
                     let inner = self.skolemize_body(&inner, &univ, true)?;
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
                     let pats = self.user_patterns(&binders, &vars, &ql[2]);
+                    // As z3's rewriter: destructive equality resolution unless
+                    // there are patterns, then binders mentioned neither by the
+                    // body nor a pattern are dropped (sorts are non-empty); with
+                    // none left the assertion is ground. Only over uninterpreted
+                    // binders: the theory engines (CHC, bit-vector and FP
+                    // instantiation) rely on the universals' shapes.
+                    let (vars, body) = if vars
+                        .iter()
+                        .all(|&v| self.declared_sorts.contains(&self.m.get_sort(v)))
+                    {
+                        let (vars, body) = if pats.is_empty() {
+                            self.der_universal(vars, body)
+                        } else {
+                            (vars, body)
+                        };
+                        // (A ground body drops its patterns too.)
+                        let mut roots: Vec<AstId> = alloc::vec![body];
+                        if self.m.postorder(body).iter().any(|t| vars.contains(t)) {
+                            roots.extend(pats.iter().flatten().copied());
+                        }
+                        let occurring: BTreeSet<AstId> =
+                            self.m.postorder_many(&roots).into_iter().collect();
+                        let vars: Vec<AstId> =
+                            vars.into_iter().filter(|v| occurring.contains(v)).collect();
+                        if vars.is_empty() {
+                            self.assertions.push(body);
+                            self.assert_names.push(None);
+                            self.last_model = None;
+                            self.last_verdict = None;
+                            return Ok(None);
+                        }
+                        (vars, body)
+                    } else {
+                        (vars, body)
+                    };
                     if !pats.is_empty() {
                         self.universal_patterns.insert(body, pats);
                     }
@@ -21666,7 +21701,8 @@ impl Context {
             )
         };
         // A sentinel is an undecided formula: no model can confirm it.
-        let mbqi = !(off("smt.mbqi") && off("auto-config")) && sentinel_free;
+        let mbqi_on = !(off("smt.mbqi") && off("auto-config"));
+        let mbqi = mbqi_on && sentinel_free;
         // The instance set can itself defeat the ground decision (instances over
         // division witnesses breed further divisions). MBQI then restarts from
         // the instance-free goal: its model is checked against every universal
@@ -21738,6 +21774,15 @@ impl Context {
         // universals, and may not decide the goal at all. Finite model finding can
         // still *exhibit* a model when every bound variable ranges over an
         // uninterpreted sort — and exhibiting one settles `sat` outright.
+        // Without MBQI, z3's final check gives up on any candidate model of a
+        // formula that keeps a quantifier.
+        if !mbqi_on && !self.universals.is_empty() {
+            return if res == SmtResult::Unsat {
+                (res, model)
+            } else {
+                (SmtResult::Unknown, None)
+            };
+        }
         if (gated_sat || res == SmtResult::Unknown)
             && !self.universals.is_empty()
             && let Some(m) = self.try_finite_model_find()
@@ -26919,6 +26964,62 @@ impl Context {
         cache[&root]
     }
 
+    /// Destructive equality resolution (z3's `der`): `∀x ȳ. x ≠ t ∨ φ` is
+    /// `∀ȳ. φ[x := t]` when `x` does not occur in `t`. The body is read as a
+    /// disjunction (`or`, `=>` with a conjunctive antecedent, `not and`);
+    /// repeated while a binder can be eliminated.
+    fn der_universal(&mut self, mut vars: Vec<AstId>, mut body: AstId) -> (Vec<AstId>, AstId) {
+        'outer: loop {
+            let mut lits: Vec<AstId> = Vec::new();
+            self.der_disjuncts(body, false, &mut lits, 0);
+            for lit in lits {
+                // A disjunct `¬(x = t)`.
+                if !self.m.is_not(lit) {
+                    continue;
+                }
+                let eq = self.m.app_args(lit)[0];
+                if !self.m.is_eq(eq) {
+                    continue;
+                }
+                let args = self.m.app_args(eq).to_vec();
+                for (x, t) in [(args[0], args[1]), (args[1], args[0])] {
+                    if let Some(i) = vars.iter().position(|&v| v == x)
+                        && !self.m.postorder(t).contains(&x)
+                    {
+                        let b = substitute(&mut self.m, body, &[(x, t)]);
+                        body = crate::rewriter::simplify(&mut self.m, b);
+                        vars.remove(i);
+                        continue 'outer;
+                    }
+                }
+            }
+            return (vars, body);
+        }
+    }
+
+    /// The disjuncts of `t` (negated when `neg`), as literals.
+    fn der_disjuncts(&mut self, t: AstId, neg: bool, out: &mut Vec<AstId>, depth: usize) {
+        if depth < 16 {
+            if self.m.is_not(t) {
+                let a = self.m.app_args(t)[0];
+                return self.der_disjuncts(a, !neg, out, depth + 1);
+            }
+            if (!neg && self.m.is_or(t)) || (neg && self.m.is_and(t)) {
+                for a in self.m.app_args(t).to_vec() {
+                    self.der_disjuncts(a, neg, out, depth + 1);
+                }
+                return;
+            }
+            if !neg && self.m.is_implies(t) {
+                let a = self.m.app_args(t).to_vec();
+                self.der_disjuncts(a[0], true, out, depth + 1);
+                self.der_disjuncts(a[1], false, out, depth + 1);
+                return;
+            }
+        }
+        out.push(if neg { self.m.mk_not(t) } else { t });
+    }
+
     /// The user `:pattern`s of a quantifier body `(! φ :pattern (p₁ …) …)` over
     /// `binders` (bound to `vars`), each parsed as a trigger set. Patterns that
     /// fail to parse are skipped.
@@ -27199,7 +27300,7 @@ impl Context {
     }
 
     /// Rebuild the E-matching equality classes from every equality atom between
-    /// uninterpreted- or array-sorted terms in `roots`, whatever its polarity:
+    /// non-Boolean terms in `roots`, whatever its polarity:
     /// an instance is valid for any ground terms, so matching modulo these
     /// equalities only changes which instances are deemed relevant.
     fn ematch_rebuild_classes(&mut self, roots: &[AstId]) {
@@ -27222,7 +27323,7 @@ impl Context {
             let args = self.m.app_args(t);
             let (a, b) = (args[0], args[1]);
             let s = self.m.get_sort(a);
-            if !(self.declared_sorts.contains(&s) || self.m.is_array_sort(s)) {
+            if self.m.is_bool_sort(s) {
                 continue;
             }
             parent.entry(a).or_insert(a);
@@ -27394,6 +27495,13 @@ impl Context {
         }
         let mut seed_enumerated = false;
         let mut enum_capped = false;
+        let off = |k: &str| {
+            matches!(
+                self.params.get(k),
+                Some(crate::util::ParamValue::Bool(false))
+            )
+        };
+        let mbqi_on = !(off("smt.mbqi") && off("auto-config"));
 
         let mut instances: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
@@ -27502,6 +27610,12 @@ impl Context {
                 let enumerate = trigs[ui].is_empty() || ematch_counts[ui] == 0 || !ematch_ok[ui];
                 if !enumerate {
                     continue; // handled completely by E-matching
+                }
+                // Without MBQI z3 instantiates by E-matching only (and then
+                // nothing is saturated).
+                if !mbqi_on {
+                    enum_capped = true;
+                    continue;
                 }
                 if dt_binder {
                     dt_enumerated = true; // infinite domain → cannot claim saturation
@@ -38890,6 +39004,40 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn without_mbqi_only_ematching_instantiates() {
+        // The pattern `f (g x)` matches nothing: z3 gives up (no enumeration).
+        let script = "
+            (set-option :auto-config false)
+            (set-option :smt.mbqi false)
+            (declare-fun f (Int) Int)
+            (declare-fun g (Int) Int)
+            (declare-const a Int)
+            (declare-const b Int)
+            (declare-const c Int)
+            (assert (forall ((x Int)) (! (= (f (g x)) x) :pattern ((f (g x))))))
+            (assert (= (g a) c))
+            (assert (= (g b) c))
+            (assert (not (= a b)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unknown"]);
+        // Matching modulo `a = g b` finds the instance.
+        let script = "
+            (set-option :auto-config false)
+            (set-option :smt.mbqi false)
+            (declare-fun f (Int) Int)
+            (declare-fun g (Int) Int)
+            (declare-const a Int)
+            (declare-const b Int)
+            (assert (forall ((x Int)) (! (= (f (g x)) x) :pattern ((f (g x))))))
+            (assert (= a (g b)))
+            (assert (not (= (f a) b)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
