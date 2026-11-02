@@ -2786,6 +2786,24 @@ enum Regex {
 }
 
 impl Regex {
+    /// The literal words of `self` (`str.to_re` operands) and the bounds of
+    /// its character ranges, as single-character words.
+    fn literal_words(&self, out: &mut Vec<Vec<u32>>) {
+        match self {
+            Regex::Lit(l) => out.push(l.clone()),
+            Regex::Range(lo, hi) => {
+                out.push(alloc::vec![*lo]);
+                out.push(alloc::vec![*hi]);
+            }
+            Regex::AllChar | Regex::All | Regex::None => {}
+            Regex::Concat(a, b) | Regex::Union(a, b) | Regex::Inter(a, b) => {
+                a.literal_words(out);
+                b.literal_words(out);
+            }
+            Regex::Comp(a) | Regex::Star(a) => a.literal_words(out),
+        }
+    }
+
     /// The set of end positions after matching `self` in `s` starting at `from`.
     fn ends(&self, s: &[u32], from: usize) -> BTreeSet<usize> {
         let mut out = BTreeSet::new();
@@ -9178,6 +9196,80 @@ impl Context {
                 }
             }
         }
+        // Containment orders: `contains`, `prefixof` and `suffixof` are each
+        // transitive (`a ⊑ b ∧ b ⊑ c ⇒ a ⊑ c`, over the goal's own atoms), and
+        // what a short literal contains (has as a prefix/suffix) is one of its
+        // finitely many substrings (prefixes/suffixes). Refutes `contains a b ∧
+        // contains b c ∧ ¬contains a c` and `contains "abc" a ∧ contains "def" a
+        // ∧ a ≠ ""`.
+        {
+            // (kind, sub, sup, atom): `sub` is a substring/prefix/suffix of `sup`.
+            let mut rel: Vec<(u8, AstId, AstId, AstId)> = Vec::new();
+            for &t in &present {
+                if !self.m.is_app(t) || self.m.app_args(t).len() != 2 {
+                    continue;
+                }
+                let a = self.m.app_args(t);
+                match self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                {
+                    Some("str.contains") => rel.push((0, a[1], a[0], t)),
+                    Some("str.prefixof") => rel.push((1, a[0], a[1], t)),
+                    Some("str.suffixof") => rel.push((2, a[0], a[1], t)),
+                    _ => {}
+                }
+            }
+            for &(k, a, b, p) in &rel {
+                for &(k2, b2, c, q) in &rel {
+                    if k2 != k || b2 != b || p == q {
+                        continue;
+                    }
+                    if let Some(&(_, _, _, r)) = rel
+                        .iter()
+                        .find(|&&(k3, a3, c3, _)| k3 == k && a3 == a && c3 == c)
+                    {
+                        let both = self.m.mk_and(&[p, q]);
+                        ax.push(self.m.mk_implies(both, r));
+                    }
+                }
+            }
+            const MAX_LIT: usize = 8;
+            for &(k, sub, sup, atom) in &rel {
+                let Some(l) = self.str_value(sup) else {
+                    continue;
+                };
+                if l.len() > MAX_LIT || self.str_value(sub).is_some() {
+                    continue;
+                }
+                let mut pieces: Vec<Vec<u32>> = alloc::vec![Vec::new()];
+                for i in 0..l.len() {
+                    for j in i + 1..=l.len() {
+                        let fits = match k {
+                            0 => true,
+                            1 => i == 0,
+                            _ => j == l.len(),
+                        };
+                        if fits && !pieces.iter().any(|p| p[..] == l[i..j]) {
+                            pieces.push(l[i..j].to_vec());
+                        }
+                    }
+                }
+                let mut alts = Vec::with_capacity(pieces.len());
+                for p in &pieces {
+                    let lit = self.mk_str_lit(&code_points_to_string(p));
+                    extra_lits.insert(lit);
+                    alts.push(self.m.mk_eq(sub, lit));
+                }
+                let any = if alts.len() == 1 {
+                    alts[0]
+                } else {
+                    self.m.mk_or(&alts)
+                };
+                ax.push(self.m.mk_implies(atom, any));
+            }
+        }
         // indexof / contains link: `str.indexof s sub i ≥ 0` means `sub` occurs
         // in `s` at some position ≥ i, so `str.contains s sub` holds. The axiom
         // reuses the *existing* `contains` marker in the goal (so it is the same
@@ -11997,22 +12089,32 @@ impl Context {
         // axioms): `len(substr x i n) = 0` when `i < 0 ∨ n ≤ 0 ∨ i ≥ len x`,
         // else `min(n, len x − i)`; plus the emptiness link of the new length
         // term. Refutes `substr a 3 (len b) ≠ "" ∧ len a ≤ 3`.
+        // `str.at x i` is `substr x i 1`.
+        let one = self.m.mk_int(1);
         let sym_subs: Vec<(AstId, AstId, AstId, AstId)> = present
             .iter()
             .filter_map(|&t| {
-                if !self.m.is_app(t)
-                    || self
-                        .str_op_decls
-                        .get(&self.m.app_decl(t))
-                        .map(String::as_str)
-                        != Some("str.substr")
-                {
+                if !self.m.is_app(t) {
                     return None;
                 }
                 let a = self.m.app_args(t);
-                (a.len() == 3
-                    && (self.m.as_numeral(a[1]).is_none() || self.m.as_numeral(a[2]).is_none()))
-                .then(|| (t, a[0], a[1], a[2]))
+                match self
+                    .str_op_decls
+                    .get(&self.m.app_decl(t))
+                    .map(String::as_str)
+                {
+                    Some("str.substr")
+                        if a.len() == 3
+                            && (self.m.as_numeral(a[1]).is_none()
+                                || self.m.as_numeral(a[2]).is_none()) =>
+                    {
+                        Some((t, a[0], a[1], a[2]))
+                    }
+                    Some("str.at") if a.len() == 2 && self.m.as_numeral(a[1]).is_none() => {
+                        Some((t, a[0], a[1], one))
+                    }
+                    _ => None,
+                }
             })
             .collect();
         for (app, x, i, n) in sym_subs {
@@ -12079,6 +12181,13 @@ impl Context {
                 let fits = self.m.mk_le(end, lx);
                 let found = self.m.mk_ge(*app, zero);
                 ax.push(self.m.mk_implies(found, fits));
+                // Found in a word of the needle's own length: the word is the
+                // needle. Refutes `len a = 3 + indexof a "abc" ∧ len a = 3 ∧
+                // a ≠ "abc"`.
+                let same_len = self.m.mk_eq(lx, lt);
+                let whole = self.m.mk_and(&[found, same_len]);
+                let is_needle = self.m.mk_eq(args[0], args[1]);
+                ax.push(self.m.mk_implies(whole, is_needle));
             }
         }
         // `str.to_code` inverse: `str.to_code x = c` (0 ≤ c ≤ 0x10FFFF) pins x to the
@@ -15255,9 +15364,30 @@ impl Context {
         } else {
             alloc::vec![None; vars.len()]
         };
+        // The goal's literals, including the words and range bounds of its
+        // regexes (in text order) — not every literal ever interned: earlier
+        // checks' and popped scopes' literals would skew the alphabet and the
+        // substring pool from one `check-sat` to the next.
+        let goal_lits: BTreeSet<String> = {
+            let mut out: BTreeSet<String> = BTreeSet::new();
+            let present: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
+            for (text, c) in &self.str_lits {
+                if present.contains(c) {
+                    out.insert(text.clone());
+                }
+            }
+            for t in &present {
+                if let Some(r) = self.regex_of.get(t) {
+                    let mut words = Vec::new();
+                    r.literal_words(&mut words);
+                    out.extend(words.iter().map(|w| code_points_to_string(w)));
+                }
+            }
+            out
+        };
         // Alphabet: characters occurring in string literals, plus two fresh ones.
         let mut alpha: Vec<u32> = Vec::new();
-        for text in self.str_lits.keys() {
+        for text in &goal_lits {
             for ch in text.chars() {
                 let c = ch as u32;
                 if !alpha.contains(&c) {
@@ -15334,7 +15464,7 @@ impl Context {
         // which the alphabet search may not reach.
         let mut lit_subs: Vec<Vec<u32>> = Vec::new();
         let mut lit_cps: Vec<Vec<u32>> = Vec::new();
-        for text in self.str_lits.keys() {
+        for text in &goal_lits {
             let cps: Vec<u32> = text.chars().map(|c| c as u32).collect();
             if cps.len() > 12 {
                 continue;
@@ -34194,6 +34324,26 @@ impl Context {
                     return self.regex_op(&head, &args);
                 }
                 if head.starts_with("seq.") {
+                    // A string is a sequence of characters: the generic `seq.*`
+                    // operations over a `String` operand are the `str.*` ones.
+                    let str_alias = match head.as_str() {
+                        "seq.len" => Some("str.len"),
+                        "seq.at" => Some("str.at"),
+                        "seq.++" => Some("str.++"),
+                        "seq.extract" => Some("str.substr"),
+                        "seq.contains" => Some("str.contains"),
+                        "seq.prefixof" => Some("str.prefixof"),
+                        "seq.suffixof" => Some("str.suffixof"),
+                        "seq.indexof" => Some("str.indexof"),
+                        "seq.replace" => Some("str.replace"),
+                        _ => None,
+                    };
+                    if let Some(op) = str_alias
+                        && self.string_sort.is_some()
+                        && args.first().map(|&a| self.m.get_sort(a)) == self.string_sort
+                    {
+                        return self.string_op(op, &args);
+                    }
                     return self.seq_op(&head, &args);
                 }
                 if head.starts_with("fp.") {
@@ -39279,6 +39429,63 @@ mod tests {
         ";
         let out = run(script).unwrap();
         assert_eq!(out, alloc::vec!["sat", "unknown"]);
+    }
+
+    #[test]
+    fn string_containment_orders_and_symbolic_at() {
+        // z3 regression string-ops: transitivity, substrings of a literal,
+        // `str.at` out of range, a found needle filling the word, and the
+        // generic `seq.*` operations over a `String`.
+        let script = "
+            (declare-const a String)
+            (declare-const b String)
+            (declare-const c String)
+            (declare-const i Int)
+            (push)
+            (assert (str.contains a b))
+            (assert (str.contains b c))
+            (assert (not (str.contains a c)))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (str.suffixof a b))
+            (assert (str.suffixof b c))
+            (assert (not (str.suffixof a c)))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (str.contains \"abc\" a))
+            (assert (str.contains \"def\" a))
+            (assert (not (= a \"\")))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (< i 0))
+            (assert (= \"b\" (str.at a i)))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (= (str.len a) (+ 3 (str.indexof a \"abc\"))))
+            (assert (= (str.len a) 3))
+            (assert (not (= a \"abc\")))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (= (seq.len a) 2))
+            (assert (= b (seq.at a 0)))
+            (assert (= b (seq.at a 1)))
+            (check-sat)
+            (pop)
+            (push)
+            (assert (str.prefixof \"\" (str.replace \"\" b a)))
+            (check-sat)
+            (pop)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(
+            out,
+            alloc::vec!["unsat", "unsat", "unsat", "unsat", "unsat", "sat", "sat"]
+        );
     }
 
     #[test]
