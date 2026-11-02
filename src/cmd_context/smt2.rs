@@ -27341,6 +27341,12 @@ impl Context {
                 self.m.is_false(s)
             })
         };
+        let pre = if res == SmtResult::Unsat {
+            self.lia2card_preprocess()
+        } else {
+            None
+        };
+        let trivially_false = trivially_false || pre.as_ref().is_some_and(|p| p.0);
         let v = if trivially_false {
             "0"
         } else if res == SmtResult::Unsat {
@@ -27349,6 +27355,272 @@ impl Context {
             "unknown"
         };
         self.objective_values = alloc::vec![v.to_string(); self.objectives.len()];
+        // Past preprocessing, a constant objective keeps its value, and one
+        // over `lia2card` constants only the range of its Boolean encoding
+        // (the extreme it improves towards first).
+        if res == SmtResult::Unsat && !trivially_false {
+            let (boxes, pinned) = pre.map(|p| (p.1, p.2)).unwrap_or_default();
+            for (i, o) in self.objectives.clone().into_iter().enumerate() {
+                let Objective::Term { term, maximize, .. } = o else {
+                    continue;
+                };
+                let t = crate::rewriter::substitute(&mut self.m, term, &pinned);
+                let t = crate::rewriter::simplify(&mut self.m, t);
+                let int = self.m.is_int_sort(self.m.get_sort(t));
+                let render = |r: &Rational| {
+                    if int {
+                        render_int(r.numerator())
+                    } else {
+                        render_rational(r)
+                    }
+                };
+                if let Some(r) = self.m.as_numeral(t) {
+                    self.objective_values[i] = render(&r);
+                } else if int
+                    && let Some((lo, hi)) =
+                        Self::box_range(&crate::smt::solver::ast_to_lin(&self.m, t), &boxes)
+                {
+                    let (a, b) = if maximize { (hi, lo) } else { (lo, hi) };
+                    self.objective_values[i] =
+                        alloc::format!(" (interval {} {})", render(&a), render(&b));
+                }
+            }
+        }
+    }
+
+    /// The conjuncts `conj` with each one-variable integer atom `a·x + b ⋈ c`
+    /// rewritten into the bound on `x` that z3's arithmetic rewriter makes of
+    /// it (`-2·x ≤ -5` is `x ≥ 3`), which its bound collection then sees.
+    fn opt_bound_atoms(&mut self, conj: &[AstId]) -> Vec<AstId> {
+        use crate::ast::ArithOp;
+        let int_const = |ctx: &Self, u: AstId| {
+            (ctx.m.is_uninterp_const(u) && ctx.m.is_int_sort(ctx.m.get_sort(u))).then_some(u)
+        };
+        let mut normalized = Vec::new();
+        for &c in conj {
+            let (atom, neg) = if self.m.is_not(c) {
+                (self.m.app_args(c)[0], true)
+            } else {
+                (c, false)
+            };
+            let op = match self.m.arith_op(atom) {
+                Some(o @ (ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt)) => o,
+                _ => {
+                    normalized.push(c);
+                    continue;
+                }
+            };
+            let args = self.m.app_args(atom).to_vec();
+            let lin = crate::smt::solver::ast_to_lin(&self.m, args[0])
+                .sub(&crate::smt::solver::ast_to_lin(&self.m, args[1]));
+            let terms: Vec<(AstId, Rational)> = lin.terms().map(|(v, c)| (v, c.clone())).collect();
+            let [(v, a)] = terms.as_slice() else {
+                normalized.push(c);
+                continue;
+            };
+            if int_const(self, *v).is_none() {
+                normalized.push(c);
+                continue;
+            }
+            // a·v + k ⋈ 0  ⇔  v ⋈' −k/a (flipped for a < 0), rounded inward.
+            let k = lin.const_term().clone();
+            let bound = k.neg().div(a);
+            let flip = a.is_negative();
+            let op = match (op, flip) {
+                (o, false) => o,
+                (ArithOp::Le, true) => ArithOp::Ge,
+                (ArithOp::Ge, true) => ArithOp::Le,
+                (ArithOp::Lt, true) => ArithOp::Gt,
+                (_, true) => ArithOp::Lt,
+            };
+            let (op, bound) = match op {
+                ArithOp::Le => (ArithOp::Le, bound.floor()),
+                ArithOp::Lt => (
+                    ArithOp::Le,
+                    (&bound - &Rational::from_integer(Int::from(1))).ceil(),
+                ),
+                ArithOp::Ge => (ArithOp::Ge, bound.ceil()),
+                _ => (
+                    ArithOp::Ge,
+                    (&bound + &Rational::from_integer(Int::from(1))).floor(),
+                ),
+            };
+            let n = self.m.mk_numeral(Rational::from_integer(bound), true);
+            let b = if op == ArithOp::Le {
+                self.m.mk_le(*v, n)
+            } else {
+                self.m.mk_ge(*v, n)
+            };
+            normalized.push(if neg { self.m.mk_not(b) } else { b });
+        }
+        normalized
+    }
+
+    /// z3's optimizer preprocessing through `lia2card` (`opt.elim_01`,
+    /// without a logic, assumptions or `opt.incremental`): every integer
+    /// constant with top-level bounds `0 ≤ lo ≤ x ≤ hi`, `hi − lo ≤ 100`
+    /// becomes a sum of Booleans, so a linear atom over such constants only
+    /// is decided by those bounds alone. Returns whether an assertion then
+    /// simplifies to `false` (it never reaches the solver), those constants'
+    /// boxes and the constants `solve-eqs` pinned to a value; `None` when the
+    /// preprocessing does not run.
+    #[allow(clippy::type_complexity)]
+    fn lia2card_preprocess(
+        &mut self,
+    ) -> Option<(
+        bool,
+        BTreeMap<AstId, (Rational, Rational)>,
+        Vec<(AstId, AstId)>,
+    )> {
+        use crate::ast::ArithOp;
+        let off = |ctx: &Self, k: &str, default: bool| match ctx.params.get(k) {
+            Some(crate::util::ParamValue::Bool(b)) => !*b,
+            _ => !default,
+        };
+        if self.logic.is_some()
+            || !self.last_assumptions.is_empty()
+            || off(self, "opt.elim_01", true)
+            || !off(self, "opt.incremental", false)
+        {
+            return None;
+        }
+        let int_const = |ctx: &Self, u: AstId| {
+            (ctx.m.is_uninterp_const(u) && ctx.m.is_int_sort(ctx.m.get_sort(u))).then_some(u)
+        };
+        // As `solve-eqs`: an atom `x ≤ k` whose `k` is the lower bound `x`
+        // has in the formulas it starts from is `x = k`, substituted; its
+        // rounds see the new atoms but keep those starting bounds.
+        let mut all: Vec<AstId> = self.assertions.clone();
+        let mut normalized = Vec::new();
+        let mut pinned: Vec<(AstId, AstId)> = Vec::new();
+        let mut lower: BTreeMap<AstId, i64> = BTreeMap::new();
+        for round in 0..20 {
+            let mut conj = Vec::new();
+            for &a in &all {
+                let s = crate::rewriter::simplify(&mut self.m, a);
+                if self.m.is_false(s) {
+                    return Some((true, BTreeMap::new(), Vec::new()));
+                }
+                self.icp_flatten_and(s, &mut conj);
+            }
+            normalized = self.opt_bound_atoms(&conj);
+            if round == 0 {
+                lower = self
+                    .literal_int_bounds(&normalized, |u| int_const(self, u))
+                    .into_iter()
+                    .filter_map(|(v, (lo, _))| Some((v, lo?)))
+                    .collect();
+            }
+            let before = pinned.len();
+            for &c in &normalized {
+                if self.m.arith_op(c) != Some(ArithOp::Le) {
+                    continue;
+                }
+                let a = self.m.app_args(c);
+                let (v, k) = (a[0], self.int_arg(a[1]));
+                if int_const(self, v).is_some()
+                    && k.is_some()
+                    && lower.get(&v).copied() == k
+                    && !pinned.iter().any(|&(w, _)| w == v)
+                {
+                    let n = self.m.mk_int(k.unwrap_or_default());
+                    pinned.push((v, n));
+                }
+            }
+            if pinned.len() == before {
+                break;
+            }
+            all = normalized
+                .iter()
+                .map(|&c| crate::rewriter::substitute(&mut self.m, c, &pinned))
+                .collect();
+        }
+        let all = normalized;
+        let boxes: BTreeMap<AstId, (Rational, Rational)> = self
+            .literal_int_bounds(&all, |u| int_const(self, u))
+            .into_iter()
+            .filter_map(|(v, (lo, hi))| {
+                let (lo, hi) = (lo?, hi?);
+                (0 <= lo && lo <= hi && hi <= u32::MAX as i64 && hi - lo <= 100).then(|| {
+                    (
+                        v,
+                        (
+                            Rational::from_integer(Int::from(lo)),
+                            Rational::from_integer(Int::from(hi)),
+                        ),
+                    )
+                })
+            })
+            .collect();
+        if boxes.is_empty() {
+            return Some((false, boxes, pinned));
+        }
+        // Each linear atom over boxed constants decided by its range.
+        let mut decided: Vec<(AstId, AstId)> = Vec::new();
+        for t in self.m.postorder_many(&all) {
+            let op = if self.m.is_eq(t) {
+                None
+            } else {
+                match self.m.arith_op(t) {
+                    Some(o @ (ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt)) => Some(o),
+                    _ => continue,
+                }
+            };
+            let args = self.m.app_args(t);
+            if args.len() != 2 || !self.m.is_arith_sort(self.m.get_sort(args[0])) {
+                continue;
+            }
+            let lin = crate::smt::solver::ast_to_lin(&self.m, args[0])
+                .sub(&crate::smt::solver::ast_to_lin(&self.m, args[1]));
+            let Some((lo, hi)) = Self::box_range(&lin, &boxes) else {
+                continue;
+            };
+            let zero = Rational::from_integer(Int::from(0));
+            let value = match op {
+                None if lo > zero || hi < zero => Some(false),
+                None if lo == zero && hi == zero => Some(true),
+                Some(ArithOp::Le) if lo > zero => Some(false),
+                Some(ArithOp::Le) if hi <= zero => Some(true),
+                Some(ArithOp::Lt) if lo >= zero => Some(false),
+                Some(ArithOp::Lt) if hi < zero => Some(true),
+                Some(ArithOp::Ge) if hi < zero => Some(false),
+                Some(ArithOp::Ge) if lo >= zero => Some(true),
+                Some(ArithOp::Gt) if hi <= zero => Some(false),
+                Some(ArithOp::Gt) if lo > zero => Some(true),
+                _ => None,
+            };
+            if let Some(b) = value {
+                let bt = self.mk_bool(b);
+                decided.push((t, bt));
+            }
+        }
+        let refuted = all.into_iter().any(|a| {
+            let r = crate::rewriter::substitute(&mut self.m, a, &decided);
+            let r = crate::rewriter::simplify(&mut self.m, r);
+            self.m.is_false(r)
+        });
+        Some((refuted, boxes, pinned))
+    }
+
+    /// The range of the linear `lin` over the boxes of its variables
+    /// (`None` when one is not boxed).
+    fn box_range(
+        lin: &crate::smt::arith::LinExpr,
+        boxes: &BTreeMap<AstId, (Rational, Rational)>,
+    ) -> Option<(Rational, Rational)> {
+        let (mut lo, mut hi) = (lin.const_term().clone(), lin.const_term().clone());
+        for (v, c) in lin.terms() {
+            let (l, h) = boxes.get(&v)?;
+            let (a, b) = (c * l, c * h);
+            if a <= b {
+                lo = &lo + &a;
+                hi = &hi + &b;
+            } else {
+                lo = &lo + &b;
+                hi = &hi + &a;
+            }
+        }
+        Some((lo, hi))
     }
 
     /// Decide the assertions plus `fs` for a `pareto` step. A nonlinear real
@@ -45014,6 +45286,46 @@ mod tests {
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "sat");
         assert!(out[2].contains("(n 0)") || out[2].contains("(n 1)") || out[2].contains("(n 2)"));
+    }
+
+    #[test]
+    fn unsat_objective_values_follow_opt_preprocessing() {
+        // lia2card refutes `2·x0 + x1 ≤ 4` over the boxes: values stay 0.
+        let refuted = "
+            (declare-const x0 Int)
+            (declare-const x1 Int)
+            (assert (<= 3 x0 5))
+            (assert (<= 3 x1 4))
+            (assert (<= (+ (* 2 x0) x1) 4))
+            (maximize (+ x0 x1))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(refuted).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_eq!(out[1], "(objectives\n ((+ x0 x1) 0)\n)");
+        // Unsat in the solver: constant objectives keep their value, boxed
+        // ones the range of their Boolean encoding, others the full line.
+        let solved = "
+            (declare-const x0 Int)
+            (declare-const x1 Int)
+            (assert (<= 0 x0 1))
+            (assert (<= (- 1) x1 0))
+            (assert (>= (+ x0 (* 2 x1)) 3))
+            (maximize x0)
+            (minimize x0)
+            (maximize x1)
+            (minimize (+ x0 (- x0) 7))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(solved).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_eq!(
+            out[1],
+            "(objectives\n (x0  (interval 1 0))\n (x0  (interval 0 1))\n \
+             (x1  (interval (* (- 1) oo) oo))\n ((+ x0 (- x0) 7) 7)\n)"
+        );
     }
 
     #[test]

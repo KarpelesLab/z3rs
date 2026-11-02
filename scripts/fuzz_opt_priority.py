@@ -3,7 +3,7 @@
 
 Random small Int problems over bounded boxes, each with 2-3 objectives and five
 repeated (check-sat)(get-objectives). box and lex output must be byte-identical
-to z3's (apart from the interval z3 prints after `unsat`, which depends on its
+to z3's (including the values z3 prints after `unsat`, which follow its
 preprocessing). The pareto front order depends on the solver's models, so each
 pareto answer is instead checked against the front computed by brute force:
 distinct front points, `sat` once per point, then `unsat`.
