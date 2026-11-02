@@ -129,6 +129,29 @@ enum MbqiVal {
     Elem(AstId, usize),
 }
 
+/// State of [`Context::fmf_flattened`]: the domain elements, the one-hot
+/// vectors of constants, the function tables and the side constraints.
+#[derive(Default)]
+struct FdEnc {
+    /// Domain element → (its sort, its index).
+    elem: BTreeMap<AstId, (AstId, usize)>,
+    /// A domain-sorted constant → (its sort, its one-hot vector).
+    consts: BTreeMap<AstId, (AstId, Vec<AstId>)>,
+    /// (function, argument element indices) → its table entry.
+    tables: BTreeMap<(AstId, Vec<usize>), FdEntry>,
+    /// Exactly-one constraints of the one-hot vectors.
+    side: Vec<AstId>,
+    memo: BTreeMap<AstId, AstId>,
+    dom_memo: BTreeMap<AstId, Vec<AstId>>,
+}
+
+/// A function-table entry of [`FdEnc`]: a one-hot vector over a domain sort,
+/// or a fresh constant of another range sort.
+enum FdEntry {
+    Dom(AstId, Vec<AstId>),
+    Val(AstId),
+}
+
 /// The model interpretation used by [`Context::mbqi_check`]: function tables
 /// `decl → [(argument values, result)]`, a representative ground term per
 /// element, and each uninterpreted sort's elements.
@@ -2658,6 +2681,12 @@ struct Context {
     quant_defs: Vec<(Vec<AstId>, AstId)>,
     /// Set while a check runs with [`Self::quant_defs`] added.
     in_quant_defs: bool,
+    /// The [`Self::quant_pred_decls`] whose two definitions (instantiable and
+    /// skolemized) are both in [`Self::quant_defs`], with the definition count
+    /// after them. With those definitions asserted, a model in which every
+    /// universal holds gives such a predicate exactly its formula's value, so
+    /// it is no sentinel then.
+    quant_pred_exact: BTreeMap<AstId, usize>,
     /// User `:pattern` trigger sets of top-level universals, by body.
     universal_patterns: BTreeMap<AstId, Vec<Vec<AstId>>>,
     /// Arrays the last satisfiable check read as functions (array constant →
@@ -3862,6 +3891,7 @@ impl Context {
             quant_pred_decls: BTreeSet::new(),
             quant_defs: Vec::new(),
             in_quant_defs: false,
+            quant_pred_exact: BTreeMap::new(),
             universal_patterns: BTreeMap::new(),
             array_fns: BTreeMap::new(),
             ematch_class: BTreeMap::new(),
@@ -4308,6 +4338,8 @@ impl Context {
                     self.quant_defs.truncate(mark.quant_defs);
                     self.quant_preds
                         .retain(|_, &mut (_, u)| u <= mark.quant_defs);
+                    self.quant_pred_exact
+                        .retain(|_, &mut u| u <= mark.quant_defs);
                     self.universal_names
                         .retain(|&(u, _, _)| u < mark.universals);
                     // Undeclare constants/functions and sorts made since the push.
@@ -4334,6 +4366,7 @@ impl Context {
                 self.universal_names.clear();
                 self.quant_preds.clear();
                 self.quant_defs.clear();
+                self.quant_pred_exact.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -4365,6 +4398,7 @@ impl Context {
                 self.universal_names.clear();
                 self.quant_preds.clear();
                 self.quant_defs.clear();
+                self.quant_pred_exact.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -23364,8 +23398,10 @@ impl Context {
     fn check_sat_quant_defs(&mut self) -> (SmtResult, Option<Model>) {
         let r = self.check_sat_rootobj();
         // Undecided with quantifier abstractions in play: retry with their
-        // definitions, taking only a refutation (they only constrain the
-        // abstractions, which already keep any `sat` from being confirmed).
+        // definitions. They are valid for the formulas the abstractions stand
+        // for, so a refutation holds; a `sat` needs a model where every universal
+        // (the definitions included) holds, which pins each exact abstraction to
+        // its formula's value.
         if r.0 == SmtResult::Unknown && !self.in_quant_defs && !self.quant_defs.is_empty() {
             let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
             roots.extend(self.assertions.iter().copied());
@@ -23389,8 +23425,10 @@ impl Context {
                 self.in_quant_defs = false;
                 self.assert_names.truncate(saved.0.len());
                 (self.assertions, self.universals) = saved;
-                if r2.0 == SmtResult::Unsat {
-                    return (SmtResult::Unsat, None);
+                // `sat` is confirmed only with every abstraction exact (see
+                // [`Self::quant_pred_exact`]): the remaining ones stay sentinels.
+                if r2.0 != SmtResult::Unknown {
+                    return r2;
                 }
             }
         }
@@ -31348,19 +31386,126 @@ impl Context {
         if usorts.is_empty() {
             return None;
         }
-        (1..=4usize).find_map(|k| self.fmf_with_size(k, &usorts))
+        // A sort with `n` provably distinct constants needs `n` elements: start
+        // its domain there (a smaller one is pigeonhole-unsat, and costly).
+        let witnesses = self.fmf_distinct_witnesses(&usorts);
+        // Bound the expansion: the instances of every universal together.
+        const FMF_MAX_INSTANCES: usize = 20_000;
+        let mut prev: Option<BTreeMap<AstId, usize>> = None;
+        (1..=4usize).find_map(|k| {
+            let sizes: BTreeMap<AstId, usize> = usorts
+                .iter()
+                .map(|&s| (s, k.max(witnesses.get(&s).map_or(0, Vec::len))))
+                .collect();
+            // Floors can make several `k` give the same sizes: try those once.
+            if prev.as_ref() == Some(&sizes) {
+                return None;
+            }
+            prev = Some(sizes.clone());
+            let instances: usize = self
+                .universals
+                .iter()
+                .map(|(vars, _)| {
+                    vars.iter()
+                        .map(|v| sizes[&self.m.get_sort(*v)])
+                        .fold(1usize, |a, b| a.saturating_mul(b))
+                })
+                .fold(0usize, |a, b| a.saturating_add(b));
+            if instances > FMF_MAX_INSTANCES {
+                return None;
+            }
+            self.fmf_with_size(&sizes, &witnesses, &usorts)
+        })
     }
 
-    /// One finite-model-finding round: give each sort in `usorts` a `k`-element
-    /// domain and decide the resulting ground system.
-    fn fmf_with_size(&mut self, k: usize, usorts: &[AstId]) -> Option<Model> {
+    /// Constants of each sort in `usorts` that every model keeps pairwise
+    /// different, by the ground assertions: constants pinned by `f(c) = v` to
+    /// different values `v` of one function `f`, or the operands of a
+    /// `distinct`. They bound the domain size from below, and up to a
+    /// permutation of the domain they *are* its first elements.
+    fn fmf_distinct_witnesses(&self, usorts: &[AstId]) -> BTreeMap<AstId, Vec<AstId>> {
+        let mut best: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        let mut offer = |s: AstId, cs: Vec<AstId>| {
+            let e = best.entry(s).or_default();
+            if cs.len() > e.len() {
+                *e = cs;
+            }
+        };
+        let mut conj = Vec::new();
+        for &a in &self.assertions {
+            self.icp_flatten_and(a, &mut conj);
+        }
+        let is_value =
+            |t: AstId| self.m.as_numeral(t).is_some() || self.m.bv_numeral_value(t).is_some();
+        // (function, sort) → value → the first constant pinned to it.
+        let mut pinned: BTreeMap<(AstId, AstId), BTreeMap<AstId, AstId>> = BTreeMap::new();
+        for &c in &conj {
+            if self.m.is_distinct(c) {
+                let args = self.m.app_args(c).to_vec();
+                let s = self.m.get_sort(args[0]);
+                let distinct_consts = args.iter().all(|&a| self.m.is_uninterp_const(a))
+                    && args.iter().collect::<BTreeSet<_>>().len() == args.len();
+                if usorts.contains(&s) && distinct_consts {
+                    offer(s, args);
+                }
+                continue;
+            }
+            if !self.m.is_eq(c) || self.m.app_args(c).len() != 2 {
+                continue;
+            }
+            let a = self.m.app_args(c);
+            for (lhs, v) in [(a[0], a[1]), (a[1], a[0])] {
+                let Some(app) = self.m.app(lhs) else { continue };
+                if app.args.len() == 1
+                    && is_value(v)
+                    && self.m.is_uninterp_const(app.args[0])
+                    && usorts.contains(&self.m.get_sort(app.args[0]))
+                {
+                    let s = self.m.get_sort(app.args[0]);
+                    pinned
+                        .entry((app.decl, s))
+                        .or_default()
+                        .entry(v)
+                        .or_insert(app.args[0]);
+                }
+            }
+        }
+        for ((_, s), vals) in pinned {
+            let mut cs: Vec<AstId> = vals.into_values().collect();
+            cs.dedup();
+            // One constant pinned to two values would be no witness set.
+            if cs.iter().collect::<BTreeSet<_>>().len() == cs.len() {
+                offer(s, cs);
+            }
+        }
+        best
+    }
+
+    /// One finite-model-finding round: give each sort in `usorts` a domain of
+    /// its size in `sizes` and decide the resulting ground system. The sort's
+    /// pairwise-different `witnesses` (see [`Self::fmf_distinct_witnesses`])
+    /// serve as its first elements — any model can be permuted so — with
+    /// fresh constants for the rest.
+    fn fmf_with_size(
+        &mut self,
+        sizes: &BTreeMap<AstId, usize>,
+        witnesses: &BTreeMap<AstId, Vec<AstId>>,
+        usorts: &[AstId],
+    ) -> Option<Model> {
         let mut domain: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        let mut parts = alloc::vec![self.conjunction()];
         for &s in usorts {
-            let elems: Vec<AstId> = (0..k).map(|_| self.fresh_const(s)).collect();
+            let mut elems: Vec<AstId> = witnesses.get(&s).cloned().unwrap_or_default();
+            elems.truncate(sizes[&s]);
+            if elems.len() > 1 {
+                parts.push(self.m.mk_distinct(&elems));
+            }
+            while elems.len() < sizes[&s] {
+                elems.push(self.fresh_const(s));
+            }
             domain.insert(s, elems);
         }
         // Ground assertions, plus each universal expanded over the domain.
-        let mut parts = alloc::vec![self.conjunction()];
         for (vars, body) in self.universals.clone() {
             if vars.is_empty() {
                 continue;
@@ -31377,7 +31522,7 @@ impl Context {
                 let mut i = 0;
                 while i < vars.len() {
                     idx[i] += 1;
-                    if idx[i] < k {
+                    if idx[i] < sizes[&self.m.get_sort(vars[i])] {
                         break;
                     }
                     idx[i] = 0;
@@ -31422,10 +31567,385 @@ impl Context {
             closure.push(goal);
             self.m.mk_and(&closure)
         };
+        // The flattened encoding first: exact, and far easier than congruence
+        // closure over the domains; that search remains for the shapes it does
+        // not cover.
+        match self.fmf_flattened(final_goal, &domain) {
+            Some(Some(m)) => return Some(m),
+            Some(None) => return None,
+            None => {}
+        }
         match check_model(&self.m, final_goal) {
             (SmtResult::Sat, m) => Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()))),
             _ => None,
         }
+    }
+
+    /// [`Self::fmf_with_size`]'s goal decided by *flattening* the finite
+    /// domains (as MACE/Paradox do) when the congruence-closure search gives
+    /// up: a term of a domain sort becomes a one-hot vector of Booleans ("it is
+    /// element `j`"), each application of a function to domain (or Boolean)
+    /// arguments a lookup in a table of fresh entries, one per argument tuple.
+    /// That propositional + arithmetic problem has no uninterpreted functions
+    /// over the domains left. Its solution then pins every constant and table
+    /// entry in the original goal, which is decided again for the model —
+    /// so only that check's `sat` is returned. `Some(None)` when the encoding
+    /// is unsatisfiable (no model of these sizes), `None` when it does not
+    /// apply or is undecided.
+    fn fmf_flattened(
+        &mut self,
+        goal: AstId,
+        domain: &BTreeMap<AstId, Vec<AstId>>,
+    ) -> Option<Option<Model>> {
+        let mut st = FdEnc::default();
+        for (&s, elems) in domain {
+            for (j, &e) in elems.iter().enumerate() {
+                st.elem.insert(e, (s, j));
+            }
+        }
+        let enc = self.fd_term(&mut st, domain, goal)?;
+        let mut parts = core::mem::take(&mut st.side);
+        parts.push(enc);
+        let enc = self.fd_and(&parts);
+        let (enc, fixed) = self.fd_propagate(enc);
+        let mut model = match check_model(&self.m, enc) {
+            (SmtResult::Sat, Some(m)) => m,
+            (SmtResult::Unsat, _) => return Some(None),
+            _ => return None,
+        };
+        let holds = |model: &mut Model, m: &AstManager, b: AstId| match fixed.get(&b) {
+            Some(&v) => m.is_true(v),
+            None => matches!(model.eval(m, b), Value::Bool(true)),
+        };
+        // The solution as a substitution: constants by elements, table
+        // applications by their entries' values.
+        let mut pins: Vec<(AstId, AstId)> = Vec::new();
+        for (c, (s, bits)) in core::mem::take(&mut st.consts) {
+            let j = bits.iter().position(|&b| holds(&mut model, &self.m, b))?;
+            pins.push((c, domain[&s][j]));
+        }
+        for ((decl, key), entry) in core::mem::take(&mut st.tables) {
+            let fd = self.m.func_decl(decl)?;
+            let dom_sorts = fd.domain.clone();
+            let args: Vec<AstId> = key
+                .iter()
+                .zip(&dom_sorts)
+                .map(|(&j, s)| match domain.get(s) {
+                    Some(elems) => elems[j],
+                    None => self.mk_bool(j == 0),
+                })
+                .collect();
+            let app = self.m.mk_app(decl, &args);
+            let val = match entry {
+                FdEntry::Dom(s, bits) => {
+                    let j = bits.iter().position(|&b| holds(&mut model, &self.m, b))?;
+                    domain[&s][j]
+                }
+                FdEntry::Val(v) if fixed.contains_key(&v) => fixed[&v],
+                FdEntry::Val(v) => match model.eval(&self.m, v) {
+                    Value::Bool(b) => self.mk_bool(b),
+                    Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+                    Value::Bv(b, w) => self.m.mk_bv_numeral(b, w),
+                    Value::Uninterp(..) => return None,
+                },
+            };
+            pins.push((app, val));
+        }
+        // The goal under that substitution (nested applications resolve one
+        // layer per round), with the substitution itself asserted for the model.
+        let mut g = goal;
+        for _ in 0..16 {
+            let g2 = crate::rewriter::substitute(&mut self.m, g, &pins);
+            let g2 = crate::rewriter::simplify(&mut self.m, g2);
+            if g2 == g {
+                break;
+            }
+            g = g2;
+        }
+        let mut hints = alloc::vec![g];
+        for &(t, v) in &pins {
+            hints.push(self.m.mk_eq(t, v));
+        }
+        let pinned = self.fd_and(&hints);
+        match check_model(&self.m, pinned) {
+            (SmtResult::Sat, m) => Some(Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())))),
+            _ => None,
+        }
+    }
+
+    /// Unit propagation over the top-level conjuncts of `g`: a Boolean
+    /// constant asserted (or negated) and a constant equated to a numeral are
+    /// substituted by their values throughout, to a fixpoint. Returns the
+    /// simplified goal and the values fixed so (constant → literal).
+    fn fd_propagate(&mut self, mut g: AstId) -> (AstId, BTreeMap<AstId, AstId>) {
+        let mut fixed: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for _ in 0..64 {
+            let mut conj = Vec::new();
+            self.icp_flatten_and(g, &mut conj);
+            let mut subst: Vec<(AstId, AstId)> = Vec::new();
+            for &c in &conj {
+                let (x, v) = if self.m.is_uninterp_const(c) {
+                    (c, self.m.mk_true())
+                } else if self.m.is_not(c) && self.m.is_uninterp_const(self.m.app_args(c)[0]) {
+                    (self.m.app_args(c)[0], self.m.mk_false())
+                } else if self.m.is_eq(c) {
+                    let a = self.m.app_args(c);
+                    if self.m.is_uninterp_const(a[0]) && self.m.as_numeral(a[1]).is_some() {
+                        (a[0], a[1])
+                    } else if self.m.is_uninterp_const(a[1]) && self.m.as_numeral(a[0]).is_some() {
+                        (a[1], a[0])
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                };
+                if !fixed.contains_key(&x) && !subst.iter().any(|&(y, _)| y == x) {
+                    subst.push((x, v));
+                }
+            }
+            if subst.is_empty() {
+                break;
+            }
+            fixed.extend(subst.iter().copied());
+            g = crate::rewriter::substitute(&mut self.m, g, &subst);
+            g = crate::rewriter::simplify(&mut self.m, g);
+        }
+        (g, fixed)
+    }
+
+    /// `and` of any number of conjuncts.
+    fn fd_and(&mut self, xs: &[AstId]) -> AstId {
+        match xs.len() {
+            0 => self.m.mk_true(),
+            1 => xs[0],
+            _ => self.m.mk_and(xs),
+        }
+    }
+
+    /// `or` of any number of disjuncts.
+    fn fd_or(&mut self, xs: &[AstId]) -> AstId {
+        match xs.len() {
+            0 => self.m.mk_false(),
+            1 => xs[0],
+            _ => self.m.mk_or(xs),
+        }
+    }
+
+    /// `n` fresh Booleans of which exactly one holds (recorded in `st.side`).
+    fn fd_one_hot(&mut self, st: &mut FdEnc, n: usize) -> Vec<AstId> {
+        let b = self.m.mk_bool_sort();
+        let bits: Vec<AstId> = (0..n).map(|_| self.fresh_const(b)).collect();
+        let some = self.fd_or(&bits);
+        st.side.push(some);
+        for i in 0..n {
+            for j in i + 1..n {
+                let (ni, nj) = (self.m.mk_not(bits[i]), self.m.mk_not(bits[j]));
+                let amo = self.m.mk_or(&[ni, nj]);
+                st.side.push(amo);
+            }
+        }
+        bits
+    }
+
+    /// The one-hot vector of a term of a domain sort (see
+    /// [`Self::fmf_flattened`]); `None` outside the supported shapes.
+    fn fd_dom(
+        &mut self,
+        st: &mut FdEnc,
+        domain: &BTreeMap<AstId, Vec<AstId>>,
+        t: AstId,
+    ) -> Option<Vec<AstId>> {
+        if let Some(v) = st.dom_memo.get(&t) {
+            return Some(v.clone());
+        }
+        let s = self.m.get_sort(t);
+        let n = domain.get(&s)?.len();
+        let out = if let Some(&(_, j)) = st.elem.get(&t) {
+            (0..n).map(|i| self.mk_bool(i == j)).collect()
+        } else if self.m.is_uninterp_const(t) {
+            let bits = self.fd_one_hot(st, n);
+            st.consts.insert(t, (s, bits.clone()));
+            bits
+        } else if self.m.is_ite(t) {
+            let a = self.m.app_args(t).to_vec();
+            let c = self.fd_term(st, domain, a[0])?;
+            let x = self.fd_dom(st, domain, a[1])?;
+            let y = self.fd_dom(st, domain, a[2])?;
+            (0..n).map(|j| self.m.mk_ite(c, x[j], y[j])).collect()
+        } else if self.is_fd_user_app(t) {
+            let combos = self.fd_combos(st, domain, t)?;
+            let decl = self.m.app_decl(t);
+            let mut out: Vec<Vec<AstId>> = alloc::vec![Vec::new(); n];
+            for (key, guard) in combos {
+                let bits = match st.tables.get(&(decl, key.clone())) {
+                    Some(FdEntry::Dom(_, bits)) => bits.clone(),
+                    Some(FdEntry::Val(_)) => return None,
+                    None => {
+                        let bits = self.fd_one_hot(st, n);
+                        st.tables.insert((decl, key), FdEntry::Dom(s, bits.clone()));
+                        bits
+                    }
+                };
+                for j in 0..n {
+                    out[j].push(self.m.mk_and(&[guard, bits[j]]));
+                }
+            }
+            out.iter().map(|d| self.fd_or(d)).collect()
+        } else {
+            return None;
+        };
+        st.dom_memo.insert(t, out.clone());
+        Some(out)
+    }
+
+    /// Is `t` an application of a user function with arguments?
+    fn is_fd_user_app(&self, t: AstId) -> bool {
+        self.m.app(t).is_some_and(|a| {
+            !a.args.is_empty()
+                && self
+                    .m
+                    .func_decl(a.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+        })
+    }
+
+    /// The argument tuples an application may take, as (element indices,
+    /// guard that the arguments are exactly those): Boolean arguments index
+    /// `0` for true and `1` for false. `None` with any other argument sort or
+    /// too many tuples.
+    fn fd_combos(
+        &mut self,
+        st: &mut FdEnc,
+        domain: &BTreeMap<AstId, Vec<AstId>>,
+        t: AstId,
+    ) -> Option<Vec<(Vec<usize>, AstId)>> {
+        const MAX_TUPLES: usize = 4096;
+        let mut options: Vec<Vec<(usize, AstId)>> = Vec::new();
+        for a in self.m.app_args(t).to_vec() {
+            let s = self.m.get_sort(a);
+            let opts: Vec<(usize, AstId)> = if domain.contains_key(&s) {
+                let bits = self.fd_dom(st, domain, a)?;
+                bits.into_iter()
+                    .enumerate()
+                    .filter(|&(_, b)| !self.m.is_false(b))
+                    .collect()
+            } else if self.m.is_bool_sort(s) {
+                let c = self.fd_term(st, domain, a)?;
+                let nc = self.m.mk_not(c);
+                alloc::vec![(0, c), (1, nc)]
+            } else {
+                return None;
+            };
+            options.push(opts);
+        }
+        let mut combos: Vec<(Vec<usize>, Vec<AstId>)> = alloc::vec![(Vec::new(), Vec::new())];
+        for opts in options {
+            if combos.len() * opts.len() > MAX_TUPLES {
+                return None;
+            }
+            let mut next = Vec::with_capacity(combos.len() * opts.len());
+            for (key, guard) in &combos {
+                for &(j, lit) in &opts {
+                    let mut k = key.clone();
+                    k.push(j);
+                    let mut g = guard.clone();
+                    if !self.m.is_true(lit) {
+                        g.push(lit);
+                    }
+                    next.push((k, g));
+                }
+            }
+            combos = next;
+        }
+        Some(
+            combos
+                .into_iter()
+                .map(|(k, g)| (k, self.fd_and(&g)))
+                .collect(),
+        )
+    }
+
+    /// `t` (not of a domain sort) with its domain-sorted parts flattened (see
+    /// [`Self::fmf_flattened`]).
+    fn fd_term(
+        &mut self,
+        st: &mut FdEnc,
+        domain: &BTreeMap<AstId, Vec<AstId>>,
+        t: AstId,
+    ) -> Option<AstId> {
+        if let Some(&r) = st.memo.get(&t) {
+            return Some(r);
+        }
+        let Some(app) = self.m.app(t) else {
+            return Some(t);
+        };
+        let (decl, args) = (app.decl, app.args.clone());
+        if args.is_empty() {
+            return Some(t);
+        }
+        let dom_args = args
+            .iter()
+            .any(|&a| domain.contains_key(&self.m.get_sort(a)));
+        let out = if dom_args && (self.m.is_eq(t) || self.m.is_distinct(t)) {
+            let vs: Vec<Vec<AstId>> = args
+                .iter()
+                .map(|&a| self.fd_dom(st, domain, a))
+                .collect::<Option<_>>()?;
+            let mut pairs = Vec::new();
+            for i in 0..vs.len() {
+                for k in i + 1..vs.len() {
+                    let both: Vec<AstId> = (0..vs[i].len())
+                        .map(|j| self.m.mk_and(&[vs[i][j], vs[k][j]]))
+                        .collect();
+                    let same = self.fd_or(&both);
+                    pairs.push(if self.m.is_eq(t) {
+                        same
+                    } else {
+                        self.m.mk_not(same)
+                    });
+                }
+            }
+            self.fd_and(&pairs)
+        } else if dom_args && self.is_fd_user_app(t) {
+            let combos = self.fd_combos(st, domain, t)?;
+            let range = self.m.get_sort(t);
+            let mut entries = Vec::new();
+            for (key, guard) in combos {
+                let v = match st.tables.get(&(decl, key.clone())) {
+                    Some(FdEntry::Val(v)) => *v,
+                    Some(FdEntry::Dom(..)) => return None,
+                    None => {
+                        let v = self.fresh_const(range);
+                        st.tables.insert((decl, key), FdEntry::Val(v));
+                        v
+                    }
+                };
+                entries.push((guard, v));
+            }
+            // Exactly one guard holds: a cascade over the tuples.
+            let (_, mut acc) = *entries.last()?;
+            for &(g, v) in entries.iter().rev().skip(1) {
+                acc = self.m.mk_ite(g, v, acc);
+            }
+            acc
+        } else if dom_args {
+            // Another operation over a domain sort (a domain-sorted `ite` is
+            // only reached through `fd_dom`).
+            return None;
+        } else {
+            let mut new_args = Vec::with_capacity(args.len());
+            for &a in &args {
+                new_args.push(self.fd_term(st, domain, a)?);
+            }
+            if new_args == args {
+                t
+            } else {
+                self.m.mk_app(decl, &new_args)
+            }
+        };
+        st.memo.insert(t, out);
+        Some(out)
     }
 
     /// Decide `goal`, capping a `sat` verdict to `unknown` when the formula
@@ -36482,7 +37002,8 @@ impl Context {
         self.quant_atoms.contains(&t)
             || (!self.quant_pred_decls.is_empty()
                 && self.m.is_app(t)
-                && self.quant_pred_decls.contains(&self.m.app_decl(t)))
+                && self.quant_pred_decls.contains(&self.m.app_decl(t))
+                && !(self.in_quant_defs && self.quant_pred_exact.contains_key(&self.m.app_decl(t))))
     }
 
     /// Has any quantifier sentinel been created?
@@ -36594,6 +37115,7 @@ impl Context {
         let pf = self.m.mk_app(p, &fs);
         let npf = self.m.mk_not(pf);
         // The instantiable direction: `P ⇒ ∀xs. φ` (`¬P ⇒ ∀xs. ¬φ` for `∃`).
+        let generic_ok = generic.is_ok();
         if let Ok((xs, phi)) = generic {
             let (guard, phi) = if is_forall {
                 (pf, phi)
@@ -36614,6 +37136,9 @@ impl Context {
                 self.m.mk_implies(pf, phi)
             };
             self.quant_defs.push((fs, ax));
+            if generic_ok {
+                self.quant_pred_exact.insert(p, self.quant_defs.len());
+            }
         }
     }
 
@@ -40952,6 +41477,51 @@ mod tests {
                  (assert (<= y 10.0))(assert (>= x y))(maximize x)(maximize y)"),
             "(objectives\n (x oo)\n (y  (interval (* (- 1) oo) oo))\n)"
         );
+    }
+
+    #[test]
+    fn quantifiers_under_iff_are_decided_both_ways() {
+        // `l = ∀d. φ`: the abstraction's two definitions pin it to the formula.
+        let pre = "(declare-sort T 0)(declare-fun D () (Array T Bool))\
+             (declare-fun N () (Array T T))(declare-const t T)(declare-const l Bool)";
+        let q = "(forall ((d T)) (=> (select D d) (or (select D (select N d)) (= d t))))";
+        assert_eq!(
+            run(&alloc::format!("{pre}(assert (= {q} l))(check-sat)")).unwrap(),
+            ["sat"]
+        );
+        // `∀x. p x` both holds (asserted) and fails (iff with false): unsat.
+        assert_eq!(
+            run(
+                "(declare-sort U 0)(declare-fun p (U) Bool)(declare-const k Bool)\
+                 (assert (forall ((x U)) (p x)))(assert (= (forall ((y U)) (p y)) k))\
+                 (assert (not k))(check-sat)"
+            )
+            .unwrap(),
+            ["unsat"]
+        );
+    }
+
+    #[test]
+    fn finite_model_finding_over_enumerated_sorts() {
+        // Five constants pinned to distinct codes of an injective map into
+        // [1, 5]: the sort has exactly five elements.
+        let mut script = String::from(
+            "(declare-sort A 0)(declare-fun code (A) Int)(declare-fun p (A) Bool)\
+             (assert (forall ((u A) (v A)) (=> (= (code u) (code v)) (= u v))))\
+             (assert (forall ((u A)) (and (<= 1 (code u)) (<= (code u) 5))))",
+        );
+        for i in 1..=5 {
+            script.push_str(&alloc::format!(
+                "(declare-const a{i} A)(assert (= (code a{i}) {i}))"
+            ));
+        }
+        let sat =
+            alloc::format!("{script}(assert (forall ((u A)) (= (p u) (< (code u) 3))))(check-sat)");
+        assert_eq!(run(&sat).unwrap(), ["sat"]);
+        let unsat = alloc::format!(
+            "{script}(assert (forall ((u A)) (p u)))(assert (not (p a4)))(check-sat)"
+        );
+        assert_eq!(run(&unsat).unwrap(), ["unsat"]);
     }
 
     #[test]
