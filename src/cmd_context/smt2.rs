@@ -34768,7 +34768,7 @@ impl Context {
     fn linearize_fixed_vars(&mut self, goal: AstId) -> (AstId, Vec<(AstId, AstId)>) {
         let mut g = goal;
         let mut done: Vec<(AstId, AstId)> = Vec::new();
-        for _ in 0..16 {
+        for _ in 0..64 {
             let mut conjuncts = Vec::new();
             self.icp_flatten_and(g, &mut conjuncts);
             let mut subst: Option<(AstId, AstId)> = None;
@@ -35070,8 +35070,14 @@ impl Context {
                 }
             }
         }
-        if nl_vars.is_empty() || nl_vars.len() > 4 {
+        if nl_vars.is_empty() {
             return None;
+        }
+        if let Some(m) = self.try_cover_witness(goal) {
+            return Some(m);
+        }
+        if nl_vars.len() > 4 {
+            return self.try_pinned_nonlinear_witness(goal, &nl_vars);
         }
         // Grid half-width shrinks with the variable count so the product of
         // enumerations stays bounded (17 / 17² / 11³ / 5⁴ candidates); the 4-var
@@ -35166,6 +35172,181 @@ impl Context {
                     }
                     return Some(model);
                 }
+            }
+        }
+        None
+    }
+
+    /// Witness a nonlinear goal by pinning a *cover* of its products — a few
+    /// variables such that every product keeps at most one free factor, so the
+    /// pinned goal is linear (a lifted quotient `k` with `k·(x+8) = 18x` is
+    /// solved once `x` is pinned) — to small integers, nearest to zero first.
+    /// Declared variables are preferred to lifted ones in the cover.
+    fn try_cover_witness(&mut self, goal: AstId) -> Option<Model> {
+        let products: Vec<BTreeSet<AstId>> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter(|&t| {
+                matches!(self.m.arith_op(t), Some(ArithOp::Mul))
+                    && self
+                        .m
+                        .app_args(t)
+                        .iter()
+                        .filter(|a| self.m.as_numeral(**a).is_none())
+                        .count()
+                        >= 2
+            })
+            .map(|t| {
+                self.m
+                    .postorder(t)
+                    .into_iter()
+                    .filter(|&s| {
+                        self.m.is_uninterp_const(s) && self.m.is_arith_sort(self.m.get_sort(s))
+                    })
+                    .collect()
+            })
+            .collect();
+        // Any other nonlinear shape (powers, symbolic divisors) is left to the
+        // grid passes.
+        let other_nl = self
+            .m
+            .postorder(goal)
+            .iter()
+            .any(|&t| match self.m.arith_op(t) {
+                Some(ArithOp::Power) => true,
+                Some(ArithOp::Div | ArithOp::Idiv | ArithOp::Mod | ArithOp::Rem) => {
+                    self.m.as_numeral(self.m.app_args(t)[1]).is_none()
+                }
+                _ => false,
+            });
+        if products.is_empty() || other_nl {
+            return None;
+        }
+        let declared = |ctx: &Self, v: AstId| {
+            ctx.m
+                .app(v)
+                .and_then(|a| ctx.m.func_decl(a.decl))
+                .and_then(|d| d.name.as_str())
+                .is_some_and(|n| ctx.decl_order.iter().any(|o| o == n))
+        };
+        let mut pins: Vec<AstId> = Vec::new();
+        loop {
+            let open: Vec<&BTreeSet<AstId>> = products
+                .iter()
+                .filter(|p| p.iter().filter(|v| !pins.contains(v)).count() >= 2)
+                .collect();
+            if open.is_empty() {
+                break;
+            }
+            let mut best: Option<(usize, bool, AstId)> = None;
+            for p in &open {
+                for &v in p.iter() {
+                    if pins.contains(&v) {
+                        continue;
+                    }
+                    let key = (
+                        open.iter().filter(|q| q.contains(&v)).count(),
+                        declared(self, v),
+                        v,
+                    );
+                    if best.as_ref().is_none_or(|b| (key.0, key.1) > (b.0, b.1)) {
+                        best = Some(key);
+                    }
+                }
+            }
+            pins.push(best?.2);
+            if pins.len() > 3 {
+                return None;
+            }
+        }
+        // Values nearest to zero first: 0, 1, −1, 2, −2, …
+        const B: i64 = 6;
+        let values: Vec<i64> = (0..=2 * B)
+            .map(|i| if i % 2 == 1 { i / 2 + 1 } else { -(i / 2) })
+            .collect();
+        let side = values.len();
+        let total = side.pow(pins.len() as u32).min(2500);
+        for idx in 0..total {
+            let mut rem = idx;
+            let subst: Vec<(AstId, AstId)> = pins
+                .iter()
+                .map(|&v| {
+                    let d = values[rem % side];
+                    rem /= side;
+                    let lit = if self.m.is_int_sort(self.m.get_sort(v)) {
+                        self.m.mk_int(d)
+                    } else {
+                        self.m.mk_real(d)
+                    };
+                    (v, lit)
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if self.arith_nonlinear(g) {
+                continue;
+            }
+            if let (SmtResult::Sat, m) = check_model(&self.m, g) {
+                let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                for &(v, val) in &subst {
+                    if let Some(r) = self.m.as_numeral(val) {
+                        model.set_arith(v, r);
+                    }
+                }
+                return Some(model);
+            }
+        }
+        None
+    }
+
+    /// Witness a nonlinear goal with many nonlinear-critical variables
+    /// `nl_vars` by pinning them all: to their values in the model of the
+    /// linear abstraction (products as free terms), then to `0`, then to `1`.
+    /// Each pinned goal is linear, so its `sat` (re-deciding the Boolean
+    /// structure around the now-concrete products) is a genuine model.
+    fn try_pinned_nonlinear_witness(&mut self, goal: AstId, nl_vars: &[AstId]) -> Option<Model> {
+        let mut candidates: Vec<Vec<Rational>> = Vec::new();
+        if let (SmtResult::Sat, Some(mut abs)) = check_model(&self.m, goal) {
+            let vals = nl_vars
+                .iter()
+                .map(|&v| match abs.eval(&self.m, v) {
+                    Value::Num(r, _) => r,
+                    _ => Rational::from_integer(Int::from(0)),
+                })
+                .collect();
+            candidates.push(vals);
+        }
+        for k in [0, 1] {
+            candidates.push(alloc::vec![Rational::from_integer(Int::from(k)); nl_vars.len()]);
+        }
+        for vals in candidates {
+            let subst: Vec<(AstId, AstId)> = nl_vars
+                .iter()
+                .zip(&vals)
+                .map(|(&v, r)| {
+                    let is_int = self.m.is_int_sort(self.m.get_sort(v));
+                    let r = if is_int {
+                        Rational::from_integer(r.floor())
+                    } else {
+                        r.clone()
+                    };
+                    (v, self.m.mk_numeral(r, is_int))
+                })
+                .collect();
+            let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g = crate::rewriter::simplify(&mut self.m, g);
+            if self.arith_nonlinear(g) {
+                continue;
+            }
+            if let (SmtResult::Sat, m) = check_model(&self.m, g) {
+                let mut model = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                for &(v, val) in &subst {
+                    if let Some(r) = self.m.as_numeral(val) {
+                        model.set_arith(v, r);
+                    }
+                }
+                return Some(model);
             }
         }
         None
@@ -39470,6 +39651,29 @@ impl Context {
             "+" | "-" | "*" | "/" | "<=" | "<" | ">=" | ">" | "=" | "distinct"
         ) {
             coerce_mixed_reals(&mut self.m, &mut args);
+        }
+        // `div` / `mod` / `rem` are integer operators: z3 coerces a `Real`
+        // operand with `to_int`, and `div` is left-associative (`(div a b c)` is
+        // `(div (div a b) c)`).
+        if matches!(head, "div" | "mod" | "rem") && !self.funcs.contains_key(head) {
+            for a in args.iter_mut() {
+                if self.m.is_arith_sort(self.m.get_sort(*a))
+                    && !self.m.is_int_sort(self.m.get_sort(*a))
+                {
+                    *a = match self.m.as_numeral(*a) {
+                        Some(r) => self.m.mk_numeral(Rational::from_integer(r.floor()), true),
+                        None => self.m.mk_to_int(*a),
+                    };
+                }
+            }
+            if head == "div" && args.len() > 2 {
+                let rest = args.split_off(2);
+                let mut acc = self.apply("div", args)?;
+                for b in rest {
+                    acc = self.apply("div", alloc::vec![acc, b])?;
+                }
+                return Ok(acc);
+            }
         }
         // `distinct` of more terms than a finite sort has inhabitants is
         // unsatisfiable — fold to `false` before the equality expansion (which
