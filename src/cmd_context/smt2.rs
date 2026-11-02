@@ -670,6 +670,7 @@ fn render_int(v: &Int) -> String {
         alloc::format!("{v}")
     }
 }
+use super::decl_table::DeclTable;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -2403,6 +2404,10 @@ struct Scope {
     sorts: usize,
     universals: usize,
     quant_defs: usize,
+    /// Length of `decl_table_stack` at the push.
+    table: usize,
+    /// Length of `asserted_mentions` at the push.
+    mentions: usize,
 }
 
 struct Context {
@@ -2448,6 +2453,15 @@ struct Context {
     /// Declared constants/functions in declaration order (for `get-model` and
     /// declaration scoping).
     decl_order: Vec<String>,
+    /// The slot layout of z3's declaration dictionary, which orders the
+    /// constants and functions `get-model` lists beyond the solver's own.
+    decl_table: DeclTable,
+    /// Every name entered into `decl_table`, in order, for scoped removal.
+    decl_table_stack: Vec<String>,
+    /// The declared function and `define-fun` names each `assert` mentions
+    /// (scoped like the assertions), which decide the declarations the
+    /// printed model lists first.
+    asserted_mentions: Vec<String>,
     /// Declared (uninterpreted) sort names in declaration order, for scoping.
     sort_order: Vec<String>,
     /// The model from the most recent satisfiable `check-sat`, if still current.
@@ -3632,6 +3646,9 @@ impl Context {
             scopes: Vec::new(),
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
+            decl_table: DeclTable::default(),
+            decl_table_stack: Vec::new(),
+            asserted_mentions: Vec::new(),
             sort_order: Vec::new(),
             last_model: None,
             fresh_counter: 0,
@@ -4060,6 +4077,8 @@ impl Context {
                         sorts: self.sort_order.len(),
                         universals: self.universals.len(),
                         quant_defs: self.quant_defs.len(),
+                        table: self.decl_table_stack.len(),
+                        mentions: self.asserted_mentions.len(),
                     });
                 }
                 self.last_model = None;
@@ -4085,6 +4104,10 @@ impl Context {
                     for name in self.decl_order.drain(mark.decls..) {
                         self.funcs.remove(&name);
                     }
+                    for name in self.decl_table_stack.drain(mark.table..) {
+                        self.decl_table.erase(&name);
+                    }
+                    self.asserted_mentions.truncate(mark.mentions);
                     for name in self.sort_order.drain(mark.sorts..) {
                         self.sorts.remove(&name);
                     }
@@ -4107,6 +4130,9 @@ impl Context {
                 for name in self.decl_order.drain(..) {
                     self.funcs.remove(&name);
                 }
+                self.decl_table.reset();
+                self.decl_table_stack.clear();
+                self.asserted_mentions.clear();
                 for name in self.sort_order.drain(..) {
                     self.sorts.remove(&name);
                 }
@@ -4539,6 +4565,7 @@ impl Context {
                 let range = self.resolve_sort(&list[2])?;
                 let d = self.m.mk_func_decl(Symbol::new(&name), &[], range);
                 self.funcs.insert(name.clone(), d);
+                self.note_declared(&name);
                 self.decl_order.push(name);
                 self.last_model = None;
                 Ok(None)
@@ -4556,6 +4583,7 @@ impl Context {
                 let range = self.resolve_sort(&list[3])?;
                 let d = self.m.mk_func_decl(Symbol::new(&name), &domain, range);
                 self.funcs.insert(name.clone(), d);
+                self.note_declared(&name);
                 self.decl_order.push(name);
                 self.last_model = None;
                 Ok(None)
@@ -4618,6 +4646,9 @@ impl Context {
                 Ok(None)
             }
             "assert" => {
+                if let Some(t) = list.get(1) {
+                    self.note_mentions(t);
+                }
                 // A top-level quantifier gets real (sound) handling: `exists` is
                 // skolemized (its body asserted with fresh constants), `forall` is
                 // recorded for ground instantiation at check-sat. Quantifiers
@@ -5498,6 +5529,15 @@ impl Context {
                     _ => return Err("declare-datatypes: malformed constructor".to_string()),
                 }
             }
+            // z3's `dt_eh` enters each constructor, its recognizer, and its
+            // accessors into the declaration dictionary.
+            for (cname, fields) in &parsed {
+                self.note_declared(cname);
+                self.note_declared(&alloc::format!("is-{cname}"));
+                for (fname, _) in fields {
+                    self.note_declared(fname);
+                }
+            }
             let all_nullary = parsed.iter().all(|(_, f)| f.is_empty());
             if all_nullary {
                 // Enumeration: distinct constants, domain axiom.
@@ -5650,6 +5690,31 @@ impl Context {
     /// The set of every declaration that is a datatype constructor, selector, or
     /// tester (across enums, records, and general datatypes). These are part of a
     /// datatype declaration, not user-declared functions, so `get-model` skips them.
+    /// Record the declared functions and `define-fun` names `t` mentions.
+    fn note_mentions(&mut self, t: &SExpr) {
+        let mut stack = alloc::vec![t];
+        let mut found: BTreeSet<&str> = BTreeSet::new();
+        while let Some(e) = stack.pop() {
+            match e {
+                SExpr::Atom(a) => {
+                    if self.funcs.contains_key(a) || self.macros.contains_key(a) {
+                        found.insert(a);
+                    }
+                }
+                SExpr::List(l) => stack.extend(l.iter()),
+            }
+        }
+        let found: Vec<String> = found.into_iter().map(str::to_string).collect();
+        self.asserted_mentions.extend(found);
+    }
+
+    /// Enter one declaration of `name` into the replica of z3's declaration
+    /// dictionary (removed again when its scope is popped).
+    fn note_declared(&mut self, name: &str) {
+        self.decl_table.insert(name);
+        self.decl_table_stack.push(name.to_string());
+    }
+
     fn datatype_member_decls(&self) -> BTreeSet<AstId> {
         let mut set = BTreeSet::new();
         for ctors in self.datatypes.values() {
@@ -27198,6 +27263,7 @@ impl Context {
         let range = self.resolve_sort(ret)?;
         let d = self.m.mk_func_decl(Symbol::new(&name), &domain, range);
         self.funcs.insert(name.clone(), d);
+        self.note_declared(&name);
         self.decl_order.push(name);
         Ok(())
     }
@@ -33295,8 +33361,12 @@ impl Context {
         let fn_bodies: BTreeMap<AstId, String> =
             chosen.into_iter().map(|(d, r, _)| (d, r)).collect();
 
+        let decls = self.model_listing_order(decls, |d| &d.name);
+        // z3 prints the model's constants before its functions.
+        let (consts, funs): (Vec<Decl>, Vec<Decl>) =
+            decls.into_iter().partition(|d| d.domain.is_empty());
         let mut out = String::from("(");
-        for decl in &decls {
+        for decl in consts.iter().chain(&funs) {
             if decl.domain.is_empty() {
                 if self.m.is_array_sort(decl.range) {
                     continue; // array interpretations not yet emitted (invalid)
@@ -33365,6 +33435,50 @@ impl Context {
         out.push_str("\n)");
         self.last_model = Some(model);
         Ok(out)
+    }
+
+    /// Order `decls` (given in declaration order) as z3 registers them in the
+    /// model it prints: first the declarations the solver's model interprets —
+    /// approximated by those occurring in the current assertions, kept in
+    /// declaration order — then the rest as `cmd_context::add_declared_functions`
+    /// appends them, in the slot order of z3's declaration dictionary.
+    fn model_listing_order<T>(&self, decls: Vec<T>, name: impl Fn(&T) -> &String) -> Vec<T> {
+        // The mentioned names, closed under the bodies of mentioned macros.
+        let mut used: BTreeSet<&str> = BTreeSet::new();
+        let mut todo: Vec<&str> = self.asserted_mentions.iter().map(String::as_str).collect();
+        while let Some(n) = todo.pop() {
+            if !used.insert(n) {
+                continue;
+            }
+            if let Some((_, body)) = self.macros.get(n) {
+                let mut stack = alloc::vec![body];
+                while let Some(e) = stack.pop() {
+                    match e {
+                        SExpr::Atom(a)
+                            if self.funcs.contains_key(a) || self.macros.contains_key(a) =>
+                        {
+                            todo.push(a)
+                        }
+                        SExpr::List(l) => stack.extend(l.iter()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let (mut first, rest): (Vec<T>, Vec<T>) = decls
+            .into_iter()
+            .partition(|d| used.contains(name(d).as_str()));
+        let mut rest: Vec<Option<T>> = rest.into_iter().map(Some).collect();
+        for n in self.decl_table.names() {
+            if let Some(slot) = rest
+                .iter_mut()
+                .find(|d| d.as_ref().is_some_and(|d| name(d) == n))
+            {
+                first.push(slot.take().unwrap());
+            }
+        }
+        first.extend(rest.into_iter().flatten());
+        first
     }
 
     /// Render a sort as SMT-LIB2 text (a named sort by its name, arrays nested).
