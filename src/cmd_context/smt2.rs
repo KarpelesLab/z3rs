@@ -203,11 +203,20 @@ fn render_real(r: &Rational) -> String {
 }
 
 /// A model value that depends on an irrational algebraic leaf (see
-/// [`Model::alg_value`]), printed as z3 does: a real numeral, or `root-obj`.
-fn alg_model_value(m: &AstManager, model: &mut Model, id: AstId) -> Option<String> {
+/// [`Model::alg_value`]), printed as z3 does: a real numeral, or `root-obj`
+/// (a truncated decimal at `decimal` digits under `:pp.decimal`).
+fn alg_model_value(
+    m: &AstManager,
+    model: &mut Model,
+    id: AstId,
+    decimal: Option<u32>,
+) -> Option<String> {
     let a = model.alg_value(m, id)?;
     if a.is_rational() {
         return Some(render_real(a.interval().0));
+    }
+    if let Some(prec) = decimal {
+        return Some(super::algebraic_pp::format_algebraic_decimal(&a, prec));
     }
     super::algebraic_pp::root_obj_string(&a)
 }
@@ -3945,6 +3954,13 @@ impl Context {
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
+                // Undeclare every user constant/function and sort (options stay).
+                for name in self.decl_order.drain(..) {
+                    self.funcs.remove(&name);
+                }
+                for name in self.sort_order.drain(..) {
+                    self.sorts.remove(&name);
+                }
                 self.last_model = None;
                 self.last_verdict = None;
                 Ok(None)
@@ -4230,6 +4246,7 @@ impl Context {
                     id = self.refold_str_markers(id, &mut memo);
                     id = crate::rewriter::simplify(&mut self.m, id);
                 }
+                let decimal = self.pp_decimal_precision();
                 let mut model = self.last_model.take().unwrap();
                 let v = self
                     .eval_array_value(id)
@@ -4237,7 +4254,7 @@ impl Context {
                     .or_else(|| self.str_model_value(&mut model, id))
                     .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
-                    .or_else(|| alg_model_value(&self.m, &mut model, id))
+                    .or_else(|| alg_model_value(&self.m, &mut model, id, decimal))
                     .unwrap_or_else(|| model.value_string(&self.m, id));
                 self.last_model = Some(model);
                 Ok(Some(v))
@@ -4684,6 +4701,17 @@ impl Context {
                     && let Some(better) = self.complete_div0()
                 {
                     model = Some(better);
+                }
+                // A nonlinear real `sat` decided without a witness (e.g. an
+                // irrational solution of `x² = 2`): the CAD feasibility check
+                // supplies one with algebraic coordinates.
+                if plain
+                    && res == SmtResult::Sat
+                    && model.is_none()
+                    && self.objectives.is_empty()
+                    && let Some(Ok(md)) = self.nra_witness(&[], &mut None)
+                {
+                    model = Some(md);
                 }
                 self.last_model = model;
                 self.last_verdict = Some(res);
@@ -5501,6 +5529,13 @@ impl Context {
         Some(out)
     }
 
+    /// The `:pp.decimal-precision` digit count when `:pp.decimal` is on.
+    fn pp_decimal_precision(&self) -> Option<u32> {
+        self.params
+            .get_bool("pp.decimal", false)
+            .then(|| self.params.get_uint("pp.decimal-precision", 10) as u32)
+    }
+
     /// Render a term's model value through the full value stack, including the
     /// datatype constructor-term form for datatype/record-sorted terms.
     fn model_term_render(&mut self, model: &mut Model, id: AstId) -> String {
@@ -5519,7 +5554,8 @@ impl Context {
         if let Some(s) = self.fp_model_value(model, id) {
             return s;
         }
-        if let Some(s) = alg_model_value(&self.m, model, id) {
+        let decimal = self.pp_decimal_precision();
+        if let Some(s) = alg_model_value(&self.m, model, id, decimal) {
             return s;
         }
         model.value_string(&self.m, id)
@@ -23278,24 +23314,10 @@ impl Context {
             // A nonlinear real problem the solver leaves open: the CAD
             // optimizer decides it (optimizing a constant is a feasibility
             // check, and an attained optimum carries a witness).
-            let zero = self
-                .m
-                .mk_numeral(Rational::from_integer(Int::from(0)), false);
-            match self.nra_optimize(zero, true, &fixed) {
-                Some(NraOpt::Infeasible) => res = SmtResult::Unsat,
-                Some(NraOpt::Attained { point, bools, .. }) => {
-                    let mut md = model
-                        .take()
-                        .unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
-                    for (v, a) in &point {
-                        md.set_alg(*v, alg_to_algebraic(a));
-                    }
-                    for &(b, val) in &bools {
-                        md.set_bool(b, val);
-                    }
-                    (res, model) = (SmtResult::Sat, Some(md));
-                }
-                _ => {}
+            match self.nra_witness(&fixed, &mut model) {
+                Some(Ok(md)) => (res, model) = (SmtResult::Sat, Some(md)),
+                Some(Err(())) => res = SmtResult::Unsat,
+                None => {}
             }
         }
         if res != SmtResult::Sat {
@@ -23905,6 +23927,37 @@ impl Context {
                     self.m.mk_lt(t, hv)
                 ]
             }
+        }
+    }
+
+    /// Decide the assertions plus `fixed` by the CAD optimizer over a constant
+    /// objective (a feasibility check): `Ok` with the witness model (its
+    /// coordinates may be irrational algebraic numbers, pinned over `base`
+    /// when given) when feasible, `Err` when infeasible, `None` when outside
+    /// the CAD fragment or its caps.
+    fn nra_witness(
+        &mut self,
+        fixed: &[AstId],
+        base: &mut Option<Model>,
+    ) -> Option<Result<Model, ()>> {
+        let zero = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(0)), false);
+        match self.nra_optimize(zero, true, fixed)? {
+            NraOpt::Infeasible => Some(Err(())),
+            NraOpt::Attained { point, bools, .. } => {
+                let mut md = base
+                    .take()
+                    .unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                for (v, a) in &point {
+                    md.set_alg(*v, alg_to_algebraic(a));
+                }
+                for &(b, val) in &bools {
+                    md.set_bool(b, val);
+                }
+                Some(Ok(md))
+            }
+            _ => None,
         }
     }
 
@@ -31306,6 +31359,7 @@ impl Context {
         }
         // Then evaluate against the model (disjoint immutable borrow of `m`).
         let mut model = self.last_model.take().unwrap();
+        let decimal = self.pp_decimal_precision();
         let mut out = String::from("(");
         for (i, (text, id)) in terms.iter().enumerate() {
             // z3 puts each `(term value)` pair on its own line.
@@ -31319,7 +31373,7 @@ impl Context {
                     .or_else(|| self.str_model_value(&mut model, id))
                     .or_else(|| self.enum_value_name(&mut model, id))
                     .or_else(|| self.fp_model_value(&mut model, id))
-                    .or_else(|| alg_model_value(&self.m, &mut model, id))
+                    .or_else(|| alg_model_value(&self.m, &mut model, id, decimal))
                     .unwrap_or_else(|| model.value_string(&self.m, id)),
                 Err((d, dom, ran)) => {
                     let body = self

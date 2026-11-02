@@ -1398,7 +1398,7 @@ pub fn root_obj_value(
 /// and truncate the magnitude's UPPER endpoint (not a round-to-nearest value), so
 /// a value just below a decimal boundary rounds its last kept digit up exactly as
 /// z3 does. A negative value is wrapped `(- …)`.
-fn format_algebraic_decimal(a: &Algebraic, precision: u32) -> String {
+pub(crate) fn format_algebraic_decimal(a: &Algebraic, precision: u32) -> String {
     let mut r = a.clone();
     r.refine_below(&Rational::power_of_two(-((precision as i32) * 4)));
     let (lo, hi) = r.interval();
