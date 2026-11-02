@@ -2486,6 +2486,9 @@ struct Context {
     in_quant_defs: bool,
     /// User `:pattern` trigger sets of top-level universals, by body.
     universal_patterns: BTreeMap<AstId, Vec<Vec<AstId>>>,
+    /// Arrays the last satisfiable check read as functions (array constant →
+    /// function), see [`Self::arrays_as_functions`].
+    array_fns: BTreeMap<AstId, AstId>,
     /// E-matching equality classes (term → class index) and their members,
     /// rebuilt by [`Self::ematch_rebuild_classes`] during instantiation.
     ematch_class: BTreeMap<AstId, usize>,
@@ -3658,6 +3661,7 @@ impl Context {
             quant_defs: Vec::new(),
             in_quant_defs: false,
             universal_patterns: BTreeMap::new(),
+            array_fns: BTreeMap::new(),
             ematch_class: BTreeMap::new(),
             ematch_members: Vec::new(),
             enums: BTreeMap::new(),
@@ -4394,6 +4398,7 @@ impl Context {
                     return Err("eval requires a preceding satisfiable check-sat".to_string());
                 }
                 let mut id = self.term(&list[1])?;
+                id = self.apply_array_fns(id);
                 if !self.fp_ieee_alias.is_empty() {
                     let alias: Vec<(AstId, AstId)> =
                         self.fp_ieee_alias.iter().map(|(&k, &v)| (k, v)).collect();
@@ -21880,6 +21885,140 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        self.array_fns.clear();
+        if let Some(saved) = self.arrays_as_functions() {
+            let fns = self.array_fns.clone();
+            let r = self.check_sat_quant_defs();
+            let (assertions, universals, names) = saved;
+            self.assertions = assertions;
+            self.universals = universals;
+            for n in names {
+                self.funcs.remove(&n);
+            }
+            // (Nested checks may have reset it.)
+            self.array_fns = if r.0 == SmtResult::Sat {
+                fns
+            } else {
+                BTreeMap::new()
+            };
+            return r;
+        }
+        self.check_sat_quant_defs()
+    }
+
+    /// `t` with each `select(c, i)` of an array read as a function by the last
+    /// check (see [`Self::arrays_as_functions`]) replaced by `f_c(i)`, so it
+    /// evaluates in that check's model.
+    fn apply_array_fns(&mut self, t: AstId) -> AstId {
+        if self.array_fns.is_empty() {
+            return t;
+        }
+        let mut pairs = Vec::new();
+        for u in self.m.postorder(t) {
+            if self.m.is_select(u) {
+                let args = self.m.app_args(u).to_vec();
+                if args.len() == 2
+                    && let Some(&f) = self.array_fns.get(&args[0])
+                {
+                    let app = self.m.mk_app(f, &args[1..]);
+                    pairs.push((u, app));
+                }
+            }
+        }
+        if pairs.is_empty() {
+            t
+        } else {
+            substitute(&mut self.m, t, &pairs)
+        }
+    }
+
+    /// Arrays that are only read: when universals are present and every
+    /// array-sorted term of the assertions and universals is a declared constant
+    /// used solely as the array of a `select`, each array is just a function of
+    /// its index. Replace every `select(c, i)` by `f_c(i)` for a fresh function
+    /// `f_c`, so instantiation and MBQI (which interpret user functions) reach
+    /// universals over them. Returns the assertions, universals and temporary
+    /// function names to restore after the check.
+    #[allow(clippy::type_complexity)]
+    fn arrays_as_functions(
+        &mut self,
+    ) -> Option<(Vec<AstId>, Vec<(Vec<AstId>, AstId)>, Vec<String>)> {
+        if self.universals.is_empty() {
+            return None;
+        }
+        let mut roots: Vec<AstId> = self.assertions.clone();
+        roots.extend(self.universals.iter().map(|&(_, b)| b));
+        let binders: BTreeSet<AstId> = self
+            .universals
+            .iter()
+            .flat_map(|(vs, _)| vs.iter().copied())
+            .collect();
+        let functional: BTreeSet<AstId> = self
+            .maps
+            .keys()
+            .chain(self.as_arrays.keys())
+            .chain(self.lambdas.keys())
+            .copied()
+            .collect();
+        let mut selects: Vec<AstId> = Vec::new();
+        let mut arrays: BTreeSet<AstId> = BTreeSet::new();
+        for t in self.m.postorder_many(&roots) {
+            let is_array = |m: &AstManager, x: AstId| m.is_array_sort(m.get_sort(x));
+            if is_array(&self.m, t) {
+                if !self.m.is_uninterp_const(t) || binders.contains(&t) || functional.contains(&t) {
+                    return None;
+                }
+                arrays.insert(t);
+            }
+            let Some(app) = self.m.app(t) else { continue };
+            for (j, &a) in app.args.iter().enumerate() {
+                if is_array(&self.m, a) && !(j == 0 && self.m.is_select(t)) {
+                    return None;
+                }
+            }
+            if self.m.is_select(t) {
+                selects.push(t);
+            }
+        }
+        if arrays.is_empty() {
+            return None;
+        }
+        let mut fns: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let mut names = Vec::new();
+        for &c in &arrays {
+            let (idx, elem) = self.m.array_sort_params(self.m.get_sort(c))?;
+            let name = alloc::format!("!arr!{}", self.fresh_counter);
+            self.fresh_counter += 1;
+            let d = self.m.mk_func_decl(Symbol::new(&name), &[idx], elem);
+            self.funcs.insert(name.clone(), d);
+            names.push(name);
+            fns.insert(c, d);
+        }
+        self.array_fns = fns.clone();
+        let mut pairs: Vec<(AstId, AstId)> = Vec::new();
+        for t in selects {
+            let args = self.m.app_args(t).to_vec();
+            if args.len() != 2 {
+                for n in &names {
+                    self.funcs.remove(n);
+                }
+                return None;
+            }
+            let app = self.m.mk_app(fns[&args[0]], &args[1..]);
+            pairs.push((t, app));
+        }
+        let saved = (self.assertions.clone(), self.universals.clone(), names);
+        for a in self.assertions.iter_mut() {
+            *a = substitute(&mut self.m, *a, &pairs);
+        }
+        for (_, b) in self.universals.iter_mut() {
+            *b = substitute(&mut self.m, *b, &pairs);
+        }
+        Some(saved)
+    }
+
+    /// [`Self::check_sat`] after the array-as-function reduction.
+    fn check_sat_quant_defs(&mut self) -> (SmtResult, Option<Model>) {
         let r = self.check_sat_rootobj();
         // Undecided with quantifier abstractions in play: retry with their
         // definitions, taking only a refutation (they only constrain the
@@ -22728,7 +22867,21 @@ impl Context {
             }
             match self.mbqi_round(model, &st) {
                 None => return Mbqi::Unknown,
-                Some(inst) if inst.is_empty() => return Mbqi::Valid,
+                Some(inst) if inst.is_empty() => {
+                    // Record the defaults the universals were checked under, so
+                    // the model evaluates applications outside the ground goal
+                    // as validated.
+                    for (&d, v) in &st.defaults {
+                        let v = match v {
+                            MbqiVal::Bool(b) => Value::Bool(*b),
+                            MbqiVal::Num(r, i) => Value::Num(r.clone(), *i),
+                            MbqiVal::Bv(x, w) => Value::Bv(x.clone(), *w),
+                            MbqiVal::Elem(..) => continue,
+                        };
+                        model.set_default(d, v);
+                    }
+                    return Mbqi::Valid;
+                }
                 Some(inst) => {
                     if first_refine.is_none() {
                         first_refine = Some(inst);
@@ -33250,6 +33403,7 @@ impl Context {
                 continue;
             }
             let mut id = self.term(q)?;
+            id = self.apply_array_fns(id);
             // Substitute the string-witness assignment and re-fold, so a string
             // term evaluates to its concrete literal instead of a placeholder.
             if !self.str_witness.is_empty() {
@@ -39737,6 +39891,26 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn read_only_arrays_under_universals() {
+        // Arrays only read by `select` are functions of their index: MBQI then
+        // confirms the model, and `get-value` reads it consistently.
+        let script = "
+            (declare-const b (Array Int Int))
+            (declare-const c (Array Int Int))
+            (declare-const n Int)
+            (assert (< 0 n))
+            (assert (= 65 (select c 0)))
+            (assert (forall ((x Int)) (=> (and (>= x 0) (< x n)) (= (select c x) (select b x)))))
+            (check-sat)
+            (get-value ((select b 0) (select c 0)))
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "(((select b 0) 65)\n ((select c 0) 65))"]
+        );
     }
 
     #[test]

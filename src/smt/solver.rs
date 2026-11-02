@@ -141,6 +141,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         euf: Egraph::new(m, &[]),
                         bv: BTreeMap::new(),
                         alg: BTreeMap::new(),
+                        defaults: BTreeMap::new(),
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -175,6 +176,7 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                             euf,
                             bv: BTreeMap::new(),
                             alg: BTreeMap::new(),
+                            defaults: BTreeMap::new(),
                         };
                         return (SmtResult::Sat, Some(model));
                     }
@@ -292,6 +294,20 @@ pub struct Model {
     /// Irrational real algebraic values of arithmetic leaf variables (e.g. an
     /// optimum on a nonlinear objective), overriding `arith`.
     alg: BTreeMap<AstId, puremp::Algebraic>,
+    /// The "else" value of uninterpreted functions at arguments no assigned
+    /// application covers (set by model-based quantifier instantiation).
+    defaults: BTreeMap<AstId, Value>,
+}
+
+/// Are two model values equal?
+fn same_value(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Num(x, _), Value::Num(y, _)) => x == y,
+        (Value::Uninterp(s, x), Value::Uninterp(t, y)) => s == t && x == y,
+        (Value::Bv(x, w), Value::Bv(y, v)) => x == y && w == v,
+        _ => false,
+    }
 }
 
 /// A concrete value in a [`Model`].
@@ -316,6 +332,7 @@ impl Model {
             euf: Egraph::new_empty(),
             bv,
             alg: BTreeMap::new(),
+            defaults: BTreeMap::new(),
         }
     }
 
@@ -326,7 +343,24 @@ impl Model {
         self.bools.extend(other.bools);
         self.arith.extend(other.arith);
         self.alg.extend(other.alg);
+        self.defaults.extend(other.defaults);
         self.euf.absorb(m, other.euf);
+    }
+
+    /// Set the value of the uninterpreted function `decl` at arguments no
+    /// assigned application covers.
+    pub fn set_default(&mut self, decl: AstId, v: Value) {
+        self.defaults.insert(decl, v);
+    }
+
+    /// The default value of `t`'s function, when `t` is an application of one
+    /// that has a default.
+    fn default_of(&self, m: &AstManager, t: AstId) -> Option<&Value> {
+        let app = m.app(t)?;
+        if app.args.is_empty() {
+            return None;
+        }
+        self.defaults.get(&app.decl)
     }
 
     /// Pin a Boolean constant (or atom) to a truth value.
@@ -454,6 +488,41 @@ impl Model {
     /// Used by model construction to reconstruct a concrete argument/result term.
     pub fn eval_value(&mut self, m: &AstManager, t: AstId) -> Value {
         self.eval_full(m, t)
+    }
+
+    /// For an uninterpreted application or array read `t = f(a…)`, an assigned
+    /// term (among `keys`) `f(b…)` whose arguments evaluate to the same values
+    /// as `a…`.
+    fn congruent_assigned(
+        &mut self,
+        m: &AstManager,
+        t: AstId,
+        keys: impl Fn(&Self) -> Vec<AstId>,
+    ) -> Option<AstId> {
+        let app = m.app(t)?;
+        if app.args.is_empty()
+            || !(m.is_select(t)
+                || m.func_decl(app.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID))
+        {
+            return None;
+        }
+        let (decl, args) = (app.decl, app.args.clone());
+        let cands: Vec<AstId> = keys(self)
+            .into_iter()
+            .filter(|&k| k != t && m.app(k).is_some_and(|a| a.decl == decl))
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+        let mine: Vec<Value> = args.iter().map(|&a| self.eval_full(m, a)).collect();
+        cands.into_iter().find(|&k| {
+            let kargs = m.app_args(k).to_vec();
+            kargs
+                .iter()
+                .zip(&mine)
+                .all(|(&x, y)| same_value(&self.eval_full(m, x), y))
+        })
     }
 
     /// A fully-folding variant of [`Model::eval`] used only for value rendering.
@@ -673,6 +742,15 @@ impl Model {
                 return Some(Rational::from_integer(v));
             }
         }
+        // An uninterpreted application the assignment does not mention: the
+        // value of an assigned application of the same function whose arguments
+        // evaluate equal (`f(1)` when `f(n)` is assigned and `n = 1`).
+        if let Some(k) = self.congruent_assigned(m, t, |s| s.arith.keys().copied().collect()) {
+            return self.arith.get(&k).cloned();
+        }
+        if let Some(Value::Num(r, _)) = self.default_of(m, t) {
+            return Some(r.clone());
+        }
         let op = m.arith_op(t)?;
         let args = m.app_args(t).to_vec();
         let ev = |s: &mut Self, x: AstId| s.eval_num_full(m, x);
@@ -735,6 +813,12 @@ impl Model {
     /// Fold a Boolean term to a concrete truth value.
     fn eval_bool_full(&mut self, m: &AstManager, t: AstId) -> bool {
         if let Some(&b) = self.bools.get(&t) {
+            return b;
+        }
+        if let Some(k) = self.congruent_assigned(m, t, |s| s.bools.keys().copied().collect()) {
+            return self.bools[&k];
+        }
+        if let Some(&Value::Bool(b)) = self.default_of(m, t) {
             return b;
         }
         if m.is_true(t) {
