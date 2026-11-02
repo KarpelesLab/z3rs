@@ -3710,6 +3710,42 @@ impl Context {
         }
     }
 
+    /// Is a `check-sat-using` tactic a pure preprocessing pipeline — a
+    /// preprocessing tactic, or a `then`/`and-then` of them — with no
+    /// decision procedure? z3 then reports `sat` only when the preprocessing
+    /// empties the goal; otherwise the goal is left undecided (`unknown`).
+    fn tactic_is_preprocessing_only(t: &SExpr) -> bool {
+        const PRE: &[&str] = &[
+            "simplify",
+            "propagate-values",
+            "ctx-simplify",
+            "solve-eqs",
+            "elim-uncnstr",
+            "fix-dl-var",
+            "nnf",
+            "snf",
+            "purify-arith",
+            "normalize-bounds",
+            "elim-term-ite",
+            "tseitin-cnf",
+            "propagate-ineqs",
+            "max-bv-sharing",
+            "der",
+            "distribute-forall",
+            "reduce-args",
+            "elim-and",
+            "skip",
+        ];
+        match t {
+            SExpr::Atom(a) => PRE.contains(&a.as_str()),
+            SExpr::List(l) => {
+                matches!(l.first(), Some(SExpr::Atom(h)) if h == "then" || h == "and-then")
+                    && l.len() > 1
+                    && l[1..].iter().all(Self::tactic_is_preprocessing_only)
+            }
+        }
+    }
+
     /// Whether the active logic admits the array theory. z3's `logic_has_array`
     /// (substring-based); with no logic set, everything is permitted.
     fn logic_has_array(&self) -> bool {
@@ -4748,7 +4784,7 @@ impl Context {
                 self.reason_unknown = None;
                 self.str_witness.clear();
                 let plain = is_using || list.len() <= 1;
-                let (res, mut model) = if !is_using && list.len() > 1 {
+                let (res, model) = if !is_using && list.len() > 1 {
                     let mut assumptions = Vec::with_capacity(list.len() - 1);
                     for a in &list[1..] {
                         let id = self.term(a)?;
@@ -4764,6 +4800,20 @@ impl Context {
                     self.check_sat()
                 } else {
                     self.optimize(&[])
+                };
+                // A preprocessing-only tactic decides `sat` only by simplifying
+                // every assertion away (issue-3023: `fix-dl-var` leaves a
+                // string conversion goal undecided).
+                let (res, mut model) = if is_using
+                    && res == SmtResult::Sat
+                    && list.get(1).is_some_and(Self::tactic_is_preprocessing_only)
+                    && !self.assertions.clone().into_iter().all(|a| {
+                        let s = crate::rewriter::simplify(&mut self.m, a);
+                        self.m.is_true(s)
+                    }) {
+                    (SmtResult::Unknown, None)
+                } else {
+                    (res, model)
                 };
                 // z3 completes division-by-zero to 0 in the model. On the plain
                 // (assumption-free, non-optimize) `sat` path, prefer that completion
@@ -15457,7 +15507,9 @@ impl Context {
             // `contains`-but-distinct variable is witnessed past the `default_len`
             // cap. Only when the length isn't already pinned to an exact value.
             if exact.is_none() {
-                for c in &lit_ext {
+                // The goal's literals themselves, past `default_len` too (a
+                // variable equal to what a `replace` chain must produce).
+                for c in lit_cps.iter().chain(&lit_ext) {
                     if !cands.contains(c) {
                         cands.push(c.clone());
                     }
@@ -15500,8 +15552,23 @@ impl Context {
                 .collect();
             per_term.push(terms);
         }
-        // Cartesian product of candidates over the variables, capped.
+        // When the candidate space exceeds the enumeration cap, a coordinate
+        // search first: each dimension in turn takes the candidate under which
+        // the most top-level conjuncts fold to `true` (independent constraints
+        // on several variables need not share a short prefix of the product).
         const MAX_TRIES: usize = 3000;
+        let space = per_term
+            .iter()
+            .try_fold(1usize, |acc, c| acc.checked_mul(c.len()))
+            .unwrap_or(usize::MAX);
+        if space > MAX_TRIES
+            && all_vars.len() >= 2
+            && let Some(m) =
+                self.witness_coordinate_search(goal, &all_vars, &per_term, &derived, &derived_prod)
+        {
+            return Some(m);
+        }
+        // Cartesian product of candidates over the variables, capped.
         let mut idx = alloc::vec![0usize; all_vars.len()];
         let mut tries = 0;
         loop {
@@ -15509,83 +15576,10 @@ impl Context {
                 return None;
             }
             tries += 1;
-            let mut subst: Vec<(AstId, AstId)> = all_vars
-                .iter()
-                .enumerate()
-                .map(|(k, &v)| (v, per_term[k][idx[k]]))
-                .collect();
-            // Compute each concat-determined variable from its (now-substituted) parts.
-            for (dv, parts) in &derived {
-                let mut val: Vec<u32> = Vec::new();
-                let mut ok = true;
-                for &p in parts {
-                    let pv = subst
-                        .iter()
-                        .find(|(v, _)| *v == p)
-                        .and_then(|(_, term)| self.str_value(*term))
-                        .or_else(|| self.str_value(p));
-                    match pv {
-                        Some(v) => val.extend(v),
-                        None => {
-                            ok = false;
-                            break;
-                        }
-                    }
-                }
-                if ok {
-                    let lit = self.mk_str_lit(&code_points_to_string(&val));
-                    subst.push((*dv, lit));
-                }
-            }
-            // Compute each producer-determined variable (`s = int.to.str(t)`) by
-            // substituting the now-concrete integer args into the producer term and
-            // folding it to a literal; skip this combination if it doesn't fold.
-            for (dv, prod) in &derived_prod {
-                let p1 = crate::rewriter::substitute(&mut self.m, *prod, &subst);
-                let mut pmemo = BTreeMap::new();
-                let p2 = self.refold_str_markers(p1, &mut pmemo);
-                if let Some(val) = self.str_value(p2) {
-                    let lit = self.mk_str_lit(&code_points_to_string(&val));
-                    subst.push((*dv, lit));
-                }
-            }
-            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
-            let mut memo = BTreeMap::new();
-            let g2 = self.refold_str_markers(g1, &mut memo);
-            // Only trust the result if every symbolic marker folded away.
-            let clean = !self
-                .m
-                .postorder(g2)
-                .iter()
-                .any(|t| self.str_symbolic.contains(t) || self.str_op_marker(*t));
-            if clean {
-                // Re-assert the string axioms for the concretised goal: literals
-                // are uninterpreted constants, so without the distinctness /
-                // length axioms `check_model` could equate two *different* literals
-                // (e.g. `"c" = "xyz"`) and report a spurious `sat`.
-                let mut conj = self.string_axioms(g2);
-                let g3 = if conj.is_empty() {
-                    g2
-                } else {
-                    conj.push(g2);
-                    self.m.mk_and(&conj)
-                };
-                let g3 = self.lift_term_ites(g3);
-                let (res, m) = check_model(&self.m, g3);
-                if res == SmtResult::Sat {
-                    self.str_witness = subst.clone(); // record for get-value/get-model
-                    // `check_model` may report `sat` without a model when the goal
-                    // folded to a ground truth; a concrete assignment still exists,
-                    // so return an (empty) model rather than a spurious `None`.
-                    let m = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
-                    // The enumerated index integers were substituted away.
-                    let ints: Vec<(AstId, AstId)> = subst
-                        .iter()
-                        .copied()
-                        .filter(|&(v, _)| self.m.is_int_sort(self.m.get_sort(v)))
-                        .collect();
-                    return Some(self.complete_substituted(m, &ints));
-                }
+            let choice: Vec<AstId> = (0..all_vars.len()).map(|k| per_term[k][idx[k]]).collect();
+            let subst = self.witness_subst(&all_vars, &choice, &derived, &derived_prod);
+            if let Some(m) = self.witness_check(goal, &subst) {
+                return Some(m);
             }
             // Advance the mixed-radix counter over candidate indices.
             let mut k = 0;
@@ -15599,6 +15593,173 @@ impl Context {
                 }
                 idx[k] = 0;
                 k += 1;
+            }
+        }
+    }
+
+    /// The witness substitution for one choice of candidate values: each
+    /// enumerated variable to its chosen term, then the concat- and
+    /// producer-determined variables computed from them.
+    fn witness_subst(
+        &mut self,
+        all_vars: &[AstId],
+        choice: &[AstId],
+        derived: &[(AstId, Vec<AstId>)],
+        derived_prod: &[(AstId, AstId)],
+    ) -> Vec<(AstId, AstId)> {
+        let mut subst: Vec<(AstId, AstId)> = all_vars
+            .iter()
+            .copied()
+            .zip(choice.iter().copied())
+            .collect();
+        // Compute each concat-determined variable from its (now-substituted) parts.
+        for (dv, parts) in derived {
+            let mut val: Vec<u32> = Vec::new();
+            let mut ok = true;
+            for &p in parts {
+                let pv = subst
+                    .iter()
+                    .find(|(v, _)| *v == p)
+                    .and_then(|(_, term)| self.str_value(*term))
+                    .or_else(|| self.str_value(p));
+                match pv {
+                    Some(v) => val.extend(v),
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                let lit = self.mk_str_lit(&code_points_to_string(&val));
+                subst.push((*dv, lit));
+            }
+        }
+        // Compute each producer-determined variable (`s = int.to.str(t)`) by
+        // substituting the now-concrete integer args into the producer term and
+        // folding it to a literal; skip it if it doesn't fold.
+        for (dv, prod) in derived_prod {
+            let p1 = crate::rewriter::substitute(&mut self.m, *prod, &subst);
+            let mut pmemo = BTreeMap::new();
+            let p2 = self.refold_str_markers(p1, &mut pmemo);
+            if let Some(val) = self.str_value(p2) {
+                let lit = self.mk_str_lit(&code_points_to_string(&val));
+                subst.push((*dv, lit));
+            }
+        }
+        subst
+    }
+
+    /// Verify a witness substitution: the substituted, refolded goal must be
+    /// free of symbolic markers and satisfiable together with the string
+    /// axioms. Records the witness and returns the model on success.
+    fn witness_check(&mut self, goal: AstId, subst: &[(AstId, AstId)]) -> Option<Model> {
+        let g1 = crate::rewriter::substitute(&mut self.m, goal, subst);
+        let mut memo = BTreeMap::new();
+        let g2 = self.refold_str_markers(g1, &mut memo);
+        // Only trust the result if every symbolic marker folded away.
+        let clean = !self
+            .m
+            .postorder(g2)
+            .iter()
+            .any(|t| self.str_symbolic.contains(t) || self.str_op_marker(*t));
+        if !clean {
+            return None;
+        }
+        // Re-assert the string axioms for the concretised goal: literals are
+        // uninterpreted constants, so without the distinctness / length axioms
+        // `check_model` could equate two *different* literals (e.g. `"c" =
+        // "xyz"`) and report a spurious `sat`.
+        let mut conj = self.string_axioms(g2);
+        let g3 = if conj.is_empty() {
+            g2
+        } else {
+            conj.push(g2);
+            self.m.mk_and(&conj)
+        };
+        let g3 = self.lift_term_ites(g3);
+        let (res, m) = check_model(&self.m, g3);
+        if res != SmtResult::Sat {
+            return None;
+        }
+        self.str_witness = subst.to_vec(); // record for get-value/get-model
+        // `check_model` may report `sat` without a model when the goal folded to
+        // a ground truth; a concrete assignment still exists, so return an
+        // (empty) model rather than a spurious `None`.
+        let m = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+        // The enumerated index integers were substituted away.
+        let ints: Vec<(AstId, AstId)> = subst
+            .iter()
+            .copied()
+            .filter(|&(v, _)| self.m.is_int_sort(self.m.get_sort(v)))
+            .collect();
+        Some(self.complete_substituted(m, &ints))
+    }
+
+    /// Coordinate search over the witness candidates: starting from every
+    /// dimension's first candidate, each dimension in turn takes the candidate
+    /// under which the most top-level conjuncts of `goal` fold to `true`,
+    /// until all do (then verified by [`Self::witness_check`]) or no dimension
+    /// improves. Bounded by a fixed number of evaluations.
+    fn witness_coordinate_search(
+        &mut self,
+        goal: AstId,
+        all_vars: &[AstId],
+        per_term: &[Vec<AstId>],
+        derived: &[(AstId, Vec<AstId>)],
+        derived_prod: &[(AstId, AstId)],
+    ) -> Option<Model> {
+        const MAX_EVALS: usize = 1500;
+        let mut conjuncts: Vec<AstId> = Vec::new();
+        self.icp_flatten_and(goal, &mut conjuncts);
+        let total = conjuncts.len();
+        let mut evals = 0usize;
+        let score = |ctx: &mut Self, choice: &[AstId]| -> usize {
+            let subst = ctx.witness_subst(all_vars, choice, derived, derived_prod);
+            let mut memo = BTreeMap::new();
+            conjuncts
+                .iter()
+                .filter(|&&c| {
+                    let c1 = crate::rewriter::substitute(&mut ctx.m, c, &subst);
+                    let c2 = ctx.refold_str_markers(c1, &mut memo);
+                    let c3 = crate::rewriter::simplify(&mut ctx.m, c2);
+                    ctx.m.is_true(c3)
+                })
+                .count()
+        };
+        let mut choice: Vec<AstId> = per_term.iter().map(|c| c[0]).collect();
+        let mut best = score(self, &choice);
+        loop {
+            let mut improved = false;
+            for k in 0..all_vars.len() {
+                for &cand in &per_term[k] {
+                    if evals >= MAX_EVALS {
+                        return None;
+                    }
+                    if cand == choice[k] {
+                        continue;
+                    }
+                    let prev = choice[k];
+                    choice[k] = cand;
+                    evals += 1;
+                    let s = score(self, &choice);
+                    if s > best {
+                        best = s;
+                        improved = true;
+                        if best == total {
+                            let subst =
+                                self.witness_subst(all_vars, &choice, derived, derived_prod);
+                            if let Some(m) = self.witness_check(goal, &subst) {
+                                return Some(m);
+                            }
+                        }
+                    } else {
+                        choice[k] = prev;
+                    }
+                }
+            }
+            if !improved {
+                return None;
             }
         }
     }
@@ -38377,6 +38538,33 @@ mod tests {
         if out[2] == "sat" {
             assert_ne!(out[3], "((i 3))");
         }
+    }
+
+    #[test]
+    fn string_witness_coordinate_search_and_preprocessing_tactics() {
+        // z3 regression 2478 (reduced): three independently constrained
+        // variables whose witnesses lie far apart in the candidate product.
+        let script = "
+            (declare-fun f () String)
+            (declare-fun g () String)
+            (declare-fun s () String)
+            (declare-fun c () String)
+            (declare-fun b () String)
+            (assert (not (= \"\" g)))
+            (assert (= (str.replace g \"Pkgwt\" \"\") \"Example:\"))
+            (assert (not (= (str.len f) 0)))
+            (assert (not (str.contains f \"E\")))
+            (assert (= (str.indexof s \"=\" 0) 0))
+            (assert (= c (str.++ f g)))
+            (assert (= b (str.++ s g)))
+            (check-sat)
+            (reset)
+            (declare-fun a () Int)
+            (assert (distinct a (str.to.int (int.to.str a))))
+            (check-sat-using fix-dl-var)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out, alloc::vec!["sat", "unknown"]);
     }
 
     #[test]
