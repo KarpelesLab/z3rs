@@ -76,7 +76,29 @@ impl AstManager {
         out
     }
 
+    /// Render `id` like [`AstManager::pp`], printing any subterm for which
+    /// `custom` returns a string as that string instead (e.g. a front end's
+    /// own spelling of a literal it encodes as a fresh constant).
+    pub fn pp_with(&self, id: AstId, custom: &dyn Fn(AstId) -> Option<String>) -> String {
+        let mut out = String::new();
+        self.pp_into_with(id, &mut out, Some(custom));
+        out
+    }
+
     fn pp_into(&self, id: AstId, out: &mut String) {
+        self.pp_into_with(id, out, None);
+    }
+
+    fn pp_into_with(
+        &self,
+        id: AstId,
+        out: &mut String,
+        custom: Option<&dyn Fn(AstId) -> Option<String>>,
+    ) {
+        if let Some(s) = custom.and_then(|c| c(id)) {
+            out.push_str(&s);
+            return;
+        }
         match self.node(id) {
             AstNode::Sort(s) => {
                 let _ = write!(out, "{}", s.name);
@@ -113,7 +135,7 @@ impl AstManager {
                     && a.args.len() == 1
                 {
                     out.push_str("(* (- 1) ");
-                    self.pp_into(a.args[0], out);
+                    self.pp_into_with(a.args[0], out, custom);
                     out.push(')');
                     return;
                 }
@@ -137,7 +159,7 @@ impl AstManager {
                     }
                     for &arg in &a.args {
                         out.push(' ');
-                        self.pp_into(arg, out);
+                        self.pp_into_with(arg, out, custom);
                     }
                     out.push(')');
                 }
@@ -161,7 +183,7 @@ impl AstManager {
                     out.push(')');
                 }
                 out.push_str(") ");
-                self.pp_into(q.body, out);
+                self.pp_into_with(q.body, out, custom);
                 out.push(')');
             }
         }

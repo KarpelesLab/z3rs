@@ -2615,6 +2615,12 @@ struct Context {
     /// Cache of opaque FP-operation results by `(op, args)`, so a symbolic FP op
     /// is congruent — two occurrences with equal arguments share one term.
     fp_symbolic_cache: BTreeMap<(alloc::string::String, Vec<AstId>), AstId>,
+    /// z3's unspecified `fp.to_ieee_bv` of NaN per `(eb, sb)` format: one
+    /// fixed (unknown) NaN bit pattern, shared by every NaN argument.
+    fp_ieee_nan: BTreeMap<(u32, u32), AstId>,
+    /// `(fp.to_ieee_bv NaN)` display nodes → their [`Self::fp_ieee_nan`]
+    /// value, substituted before solving and evaluation.
+    fp_ieee_alias: BTreeMap<AstId, AstId>,
     /// The interned per-`(op, domain)` declarations used for deferred FP nodes,
     /// so `fpa_blast` can recognise a deferred application and recover its op.
     fp_deferred_decls: BTreeSet<AstId>,
@@ -3604,6 +3610,8 @@ impl Context {
             dl_rels: BTreeMap::new(),
             dl_vars: Vec::new(),
             fp_symbolic_cache: BTreeMap::new(),
+            fp_ieee_nan: BTreeMap::new(),
+            fp_ieee_alias: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
@@ -4143,7 +4151,10 @@ impl Context {
                         return Ok(Some(d));
                     }
                 }
-                Ok(Some(self.m.pp(s)))
+                // FP literals are fresh constants internally; print z3's spelling.
+                let fp_of = &self.fp_of;
+                let lit = |t: AstId| fp_of.get(&t).map(|&(b, eb, sb)| render_fp(b, eb, sb));
+                Ok(Some(self.m.pp_with(s, &lit)))
             }
             "apply" => {
                 // (apply tactic) — apply a goal-transforming tactic and print the
@@ -4208,7 +4219,12 @@ impl Context {
                 if self.last_model.is_none() {
                     return Err("eval requires a preceding satisfiable check-sat".to_string());
                 }
-                let id = self.term(&list[1])?;
+                let mut id = self.term(&list[1])?;
+                if !self.fp_ieee_alias.is_empty() {
+                    let alias: Vec<(AstId, AstId)> =
+                        self.fp_ieee_alias.iter().map(|(&k, &v)| (k, v)).collect();
+                    id = crate::rewriter::substitute(&mut self.m, id, &alias);
+                }
                 // Fold ground algebraic (in)equalities (e.g. over a nested
                 // `root-obj`) to `true`/`false` before model evaluation, matching
                 // z3's exact algebraic decision.
@@ -19693,13 +19709,11 @@ impl Context {
                 self.symbolic_fp(op, args)
             }
             "fp.to_ieee_bv" if args.len() == 1 => {
-                // The IEEE-754 packed bit-vector of an FP value. z3rs already
-                // represents every FP term by exactly this packed bit-vector
-                // (`fp_to_bv`), so for a finite/∞ value or a *symbolic* term the
-                // result is that bit-vector — sound in QF_BV. A concrete NaN
-                // literal is the one exception: z3 leaves `fp.to_ieee_bv` of a
-                // NaN *unspecified* (any NaN significand), so folding it to a
-                // fixed pattern could be unsound; keep it uninterpreted.
+                // The IEEE-754 packed bit-vector of an FP value. z3rs represents
+                // every FP term by such a packed bit-vector (`fp_to_bv`), which is
+                // the result for a non-NaN value. Of a NaN, z3 (`mk_to_ieee_bv`)
+                // yields one unspecified NaN pattern per format, the same for
+                // every NaN (they are one value): `fp_ieee_nan`.
                 if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0]) {
                     let exp_mask = ((1u64 << eb) - 1) << (sb - 1);
                     let sig_mask = (1u64 << (sb - 1)) - 1;
@@ -19707,10 +19721,24 @@ impl Context {
                     if !is_nan {
                         return Ok(self.m.mk_bv_numeral(Int::from(bits as i64), eb + sb));
                     }
-                    return self.symbolic_fp(op, args);
+                    let nan = self.fp_ieee_nan(eb, sb);
+                    if self.m.bv_numeral_value(nan).is_some() {
+                        return Ok(nan);
+                    }
+                    // Kept as `(fp.to_ieee_bv (_ NaN eb sb))` for display.
+                    let fs = self.m.get_sort(args[0]);
+                    let bs = self.m.get_sort(nan);
+                    let d = self.m.mk_func_decl(Symbol::new("fp.to_ieee_bv"), &[fs], bs);
+                    let t = self.m.mk_app(d, args);
+                    self.fp_ieee_alias.insert(t, nan);
+                    return Ok(t);
                 }
-                if let Some(bv) = self.fp_to_bv(args[0]) {
-                    return Ok(bv);
+                if let Some(bv) = self.fp_to_bv(args[0])
+                    && let Some((eb, sb)) = self.fp_format_of(self.m.get_sort(args[0]))
+                    && let Some(is_nan) = self.fp_classify_bv("fp.isNaN", args[0])
+                {
+                    let nan = self.fp_ieee_nan(eb, sb);
+                    return Ok(self.m.mk_ite(is_nan, nan, bv));
                 }
                 self.symbolic_fp(op, args)
             }
@@ -19832,6 +19860,39 @@ impl Context {
         } else {
             self.m.mk_false()
         }
+    }
+
+    /// The bit pattern `fp.to_ieee_bv` gives every NaN of format `(eb, sb)`:
+    /// under `:rewriter.hi_fp_unspecified` z3's canonical NaN `0 1…1 0…01`,
+    /// otherwise an unspecified (fixed per format) NaN pattern — a free sign,
+    /// all-ones exponent and a free significand forced nonzero.
+    fn fp_ieee_nan(&mut self, eb: u32, sb: u32) -> AstId {
+        if let Some(&t) = self.fp_ieee_nan.get(&(eb, sb)) {
+            return t;
+        }
+        let hi = self.params.get_bool("rewriter.hi_fp_unspecified", false)
+            || self.params.get_bool("rewriter.hi-fp-unspecified", false);
+        let ones_v = Int::from(2).pow(u64::from(eb)).sub(&Int::from(1));
+        let ones = self.m.mk_bv_numeral(ones_v.clone(), eb);
+        let t = if hi {
+            let canon = ones_v
+                .mul(&Int::from(2).pow(u64::from(sb - 1)))
+                .add(&Int::from(1));
+            self.m.mk_bv_numeral(canon, eb + sb)
+        } else {
+            let s1 = self.m.mk_bv_sort(1);
+            let sign = self.fresh_const(s1);
+            let ss = self.m.mk_bv_sort(sb - 1);
+            let free = self.fresh_const(ss);
+            let zero = self.m.mk_bv(0, sb - 1);
+            let one = self.m.mk_bv(1, sb - 1);
+            let is_zero = self.m.mk_eq(free, zero);
+            let sig = self.m.mk_ite(is_zero, one, free);
+            let low = self.m.mk_bv_concat(ones, sig);
+            self.m.mk_bv_concat(sign, low)
+        };
+        self.fp_ieee_nan.insert((eb, sb), t);
+        t
     }
 
     /// A fresh uninterpreted term for a symbolic FP operation, gated to `unknown`.
@@ -20697,6 +20758,23 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        // `(fp.to_ieee_bv NaN)` display nodes stand for their NaN pattern.
+        if !self.fp_ieee_alias.is_empty() {
+            let saved = self.assertions.clone();
+            let alias: Vec<(AstId, AstId)> =
+                self.fp_ieee_alias.iter().map(|(&k, &v)| (k, v)).collect();
+            for a in self.assertions.iter_mut() {
+                *a = crate::rewriter::substitute(&mut self.m, *a, &alias);
+            }
+            let r = self.check_sat_macros();
+            self.assertions = saved;
+            return r;
+        }
+        self.check_sat_macros()
+    }
+
+    /// [`Self::check_sat`] after its NaN-alias substitution.
+    fn check_sat_macros(&mut self) -> (SmtResult, Option<Model>) {
         // z3's macro finder: a universal `∀x̄. f(x̄) = t` (f not in t) defines
         // `f`; with `f` used elsewhere, inline it everywhere and drop the
         // universal (for this check only).
