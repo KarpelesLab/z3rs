@@ -29296,7 +29296,7 @@ impl Context {
         }
         const MAX_INSTANCES_PER_UNIVERSAL: usize = 64;
         const MAX_ROUNDS: usize = 8;
-        const MAX_TOTAL: usize = 400;
+        const MAX_TOTAL: usize = 800;
         let universals = self.universals.clone();
         // Set when Phase 2 enumerates a datatype-sorted binder. Such a binder
         // ranges over an infinite constructor domain, so enumerating the *present*
