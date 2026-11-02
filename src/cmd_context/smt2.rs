@@ -2047,6 +2047,34 @@ fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u
     }
 }
 
+/// Does `e` contain a body-less `(let (bindings))`?
+fn has_bodyless_let(e: &SExpr) -> bool {
+    match e {
+        SExpr::Atom(_) => false,
+        SExpr::List(l) => {
+            (l.len() == 2 && matches!(&l[0], SExpr::Atom(h) if h == "let"))
+                || l.iter().any(has_bodyless_let)
+        }
+    }
+}
+
+/// Replace every body-less `(let ((x₁ t₁) … (xₙ tₙ)))` by `tₙ`, as z3's
+/// stack-based parser does: when the `let` frame closes without a body, the
+/// expression on top of its stack — the last binding's value, parsed in the
+/// outer scope — becomes the result (`smt2parser::pop_let_frame`).
+fn fill_bodyless_let(e: &SExpr) -> SExpr {
+    let SExpr::List(l) = e else { return e.clone() };
+    if l.len() == 2
+        && matches!(&l[0], SExpr::Atom(h) if h == "let")
+        && let SExpr::List(bs) = &l[1]
+        && let Some(SExpr::List(last)) = bs.last()
+        && last.len() == 2
+    {
+        return fill_bodyless_let(&last[1]);
+    }
+    SExpr::List(l.iter().map(fill_bodyless_let).collect())
+}
+
 /// Push a leading `not` through a top-level quantifier so negated quantifiers
 /// get sound handling instead of falling back to `unknown`:
 /// `¬∃x.φ ⇒ ∀x.¬φ`, `¬∀x.φ ⇒ ∃x.¬φ`, and `¬¬φ ⇒ φ`. Applied repeatedly.
@@ -2428,6 +2456,13 @@ struct Context {
     /// Boolean sentinels standing in for (not-yet-decided) quantified formulas;
     /// a goal that mentions any of these is answered `unknown` (see `decide`).
     quant_atoms: BTreeSet<AstId>,
+    /// Predicates abstracting nested quantified formulas over their free
+    /// variables (`∀y. q(x, y)` inside `∀x. …` becomes `!qp!k(x)`), one per
+    /// alpha-equivalence class keyed by the canonical text. Applications are
+    /// sentinels like [`Self::quant_atoms`]: never confirmed by a model.
+    quant_preds: BTreeMap<String, AstId>,
+    /// The declarations in [`Self::quant_preds`].
+    quant_pred_decls: BTreeSet<AstId>,
     /// Enumeration datatypes: sort → its constructor constants. Reasoned about
     /// as a finite uninterpreted sort with distinct elements and a domain axiom.
     enums: BTreeMap<AstId, Vec<AstId>>,
@@ -2662,6 +2697,9 @@ struct Context {
     in_divmod_witness: bool,
     /// Re-entrancy guard for the opaque-atom strengthening in `decide`.
     in_opaque_strengthen: bool,
+    /// Set while `decide` looks for a refutation of a goal with quantifier
+    /// abstractions free (only its `unsat` is taken).
+    in_quant_refute: bool,
     /// `seq.len` function declarations (one per element sort), tracked so a
     /// non-negativity axiom can be attached to each application.
     seq_len_decls: BTreeSet<AstId>,
@@ -3550,6 +3588,8 @@ impl Context {
             last_model: None,
             fresh_counter: 0,
             quant_atoms: BTreeSet::new(),
+            quant_preds: BTreeMap::new(),
+            quant_pred_decls: BTreeSet::new(),
             enums: BTreeMap::new(),
             records: BTreeMap::new(),
             datatypes: BTreeMap::new(),
@@ -3624,6 +3664,7 @@ impl Context {
             int_mod0_decl: None,
             in_divmod_witness: false,
             in_opaque_strengthen: false,
+            in_quant_refute: false,
             seq_len_decls: BTreeSet::new(),
             seq_concat: Vec::new(),
             seq_nth_oob: BTreeMap::new(),
@@ -4478,6 +4519,11 @@ impl Context {
                 // so it gets sound handling rather than becoming an opaque `unknown`.
                 // A named quantifier `(! (forall …) :named n)` is asserted as the
                 // bare quantifier (handled below), remembering `n` for cores.
+                if list.len() == 2 && has_bodyless_let(&list[1]) {
+                    let filled =
+                        SExpr::List(alloc::vec![list[0].clone(), fill_bodyless_let(&list[1])]);
+                    return self.command(&filled);
+                }
                 if let Some(n) = named_label(&list[1])
                     && let SExpr::List(parts) = &list[1]
                     && parts.len() >= 2
@@ -20943,13 +20989,10 @@ impl Context {
         // Nor may a rule mention a nested-quantifier sentinel: it is an opaque
         // formula, not a predicate the engines may choose (`∀p. ¬∃q. 2q < 3`
         // was answered `sat` with the sentinel false).
-        let sentinel_free = self.universals.iter().all(|&(_, b)| {
-            !self
-                .m
-                .postorder(b)
-                .iter()
-                .any(|t| self.quant_atoms.contains(t))
-        });
+        let sentinel_free = self
+            .universals
+            .iter()
+            .all(|&(_, b)| !self.m.postorder(b).iter().any(|t| self.is_quant_atom(*t)));
         // CHC answers range over fixed domains: over an uninterpreted sort the
         // domain is part of the model (a guard `b ≠ x` is vacuous when the sort
         // has one element), so a "reachable" query proves nothing there.
@@ -21188,7 +21231,7 @@ impl Context {
             .m
             .postorder_many(&roots)
             .iter()
-            .any(|t| self.quant_atoms.contains(t))
+            .any(|t| self.is_quant_atom(*t))
         {
             return None;
         }
@@ -21261,7 +21304,7 @@ impl Context {
                 && !uf
                 && !self.str_symbolic.contains(&u)
                 && !self.is_opaque_fp_marker(u)
-                && !self.quant_atoms.contains(&u)
+                && !self.is_quant_atom(u)
         })
     }
 
@@ -24763,7 +24806,7 @@ impl Context {
             .m
             .postorder(bodyt)
             .iter()
-            .any(|t| self.quant_atoms.contains(t))
+            .any(|t| self.is_quant_atom(*t))
         {
             return None;
         }
@@ -25998,8 +26041,15 @@ impl Context {
             return Ok(body.clone());
         };
         let recur = |ctx: &mut Self, e: &SExpr, pos: bool| ctx.skolemize_body(e, univ, pos);
+        // A `∀` in negative position is an `∃` in positive position (only over
+        // non-arithmetic binders: arithmetic ones are eliminated exactly).
+        let negative_forall = !positive
+            && head == "forall"
+            && matches!(l.get(1), Some(SExpr::List(bs)) if bs.iter().all(|b| matches!(b,
+                SExpr::List(pv) if !matches!(pv.get(1), Some(SExpr::Atom(s)) if s == "Int" || s == "Real"))));
+        let skolemize = (positive && head == "exists") || negative_forall;
         match (head.as_str(), l.len()) {
-            ("exists", 3) if positive => {
+            ("exists" | "forall", 3) if skolemize => {
                 let mut subst: Vec<(String, SExpr)> = Vec::new();
                 for b in as_list(&l[1])? {
                     let pair = as_list(b)?;
@@ -27708,12 +27758,12 @@ impl Context {
         // vacuous with it false — issue-628 answered `sat`).
         let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
         roots.extend(self.assertions.iter().copied());
-        if !self.quant_atoms.is_empty()
+        if self.has_quant_atoms()
             && self
                 .m
                 .postorder_many(&roots)
                 .iter()
-                .any(|t| self.quant_atoms.contains(t))
+                .any(|t| self.is_quant_atom(*t))
         {
             return None;
         }
@@ -29178,14 +29228,30 @@ impl Context {
             return (SmtResult::Unsat, None);
         }
         // Quantified formulas are not decided here (the instantiation engine ran
-        // upstream); a residual quantifier sentinel ⇒ sound `unknown`.
-        if !self.quant_atoms.is_empty()
+        // upstream); a residual quantifier sentinel ⇒ sound `unknown` — unless the
+        // goal is refuted with the sentinels free: each one abstracts a fixed
+        // formula of its arguments, so that `unsat` holds for the real formula.
+        if !self.in_quant_refute
+            && self.has_quant_atoms()
             && self
                 .m
                 .postorder(goal)
                 .iter()
-                .any(|t| self.quant_atoms.contains(t))
+                .any(|t| self.is_quant_atom(*t))
         {
+            let opaque = self
+                .m
+                .postorder(goal)
+                .iter()
+                .any(|t| self.quant_atoms.contains(t));
+            if !opaque {
+                self.in_quant_refute = true;
+                let r = self.decide_inner_core(goal).0;
+                self.in_quant_refute = false;
+                if r == SmtResult::Unsat {
+                    return (SmtResult::Unsat, None);
+                }
+            }
             return (SmtResult::Unknown, None);
         }
         // Symbolic string operations are opaque uninterpreted markers: a `sat`
@@ -32031,12 +32097,173 @@ impl Context {
         self.m.mk_app(decl, &args)
     }
 
+    /// Is `t` a quantifier sentinel: an opaque [`Self::quant_atoms`] constant or
+    /// an application of a [`Self::quant_preds`] abstraction?
+    fn is_quant_atom(&self, t: AstId) -> bool {
+        self.quant_atoms.contains(&t)
+            || (!self.quant_pred_decls.is_empty()
+                && self.m.is_app(t)
+                && self.quant_pred_decls.contains(&self.m.app_decl(t)))
+    }
+
+    /// Has any quantifier sentinel been created?
+    fn has_quant_atoms(&self) -> bool {
+        !self.quant_atoms.is_empty() || !self.quant_pred_decls.is_empty()
+    }
+
+    /// Abstract the quantified formula `q` (a `forall`/`exists` term) by an
+    /// application `!qp!k(v1 ... vn)` of an uninterpreted predicate to its free
+    /// variables: the enclosing binders and `let` names it mentions. The
+    /// predicate is keyed by `q`'s canonical text (bound names renamed, free
+    /// names numbered, globals tagged with their declaration), so alpha-equivalent
+    /// occurrences share it: `∀v. m(v, x) ⇒ c(v)` under `∀x` and `∀w. m(w, y) ⇒
+    /// c(w)` under `∀y` both become `P(·)`. Each predicate denotes one fixed
+    /// formula of its arguments, so a refutation with it free is a refutation of
+    /// the original. `None` when `q` mentions something the key cannot pin
+    /// (a macro, a `:named` term, a `match`).
+    fn quant_abstraction(&mut self, q: &SExpr) -> Option<AstId> {
+        let mut free: Vec<AstId> = Vec::new();
+        let mut key = String::new();
+        let mut renames: Vec<(String, String)> = Vec::new();
+        let mut counter = 0u32;
+        self.quant_canon(q, &mut renames, &mut counter, &mut free, &mut key)?;
+        let sorts: Vec<AstId> = free.iter().map(|&v| self.m.get_sort(v)).collect();
+        for s in &sorts {
+            key.push_str(&alloc::format!(" S{s:?}"));
+        }
+        let decl = match self.quant_preds.get(&key) {
+            Some(&d) => d,
+            None => {
+                let name = alloc::format!("!qp!{}", self.fresh_counter);
+                self.fresh_counter += 1;
+                let b = self.m.mk_bool_sort();
+                let d = self.m.mk_func_decl(Symbol::new(&name), &sorts, b);
+                self.quant_preds.insert(key, d);
+                self.quant_pred_decls.insert(d);
+                d
+            }
+        };
+        Some(self.m.mk_app(decl, &free))
+    }
+
+    /// Append the canonical text of `e` to `key` for [`Self::quant_abstraction`]:
+    /// locally bound names become their `renames` alias, names bound outside
+    /// `e` become `#i` (collected in `free`), declared functions carry their
+    /// declaration id, and annotations are dropped.
+    fn quant_canon(
+        &mut self,
+        e: &SExpr,
+        renames: &mut Vec<(String, String)>,
+        counter: &mut u32,
+        free: &mut Vec<AstId>,
+        key: &mut String,
+    ) -> Option<()> {
+        match e {
+            SExpr::Atom(a) => {
+                if let Some((_, alias)) = renames.iter().rev().find(|(n, _)| n == a) {
+                    key.push_str(alias);
+                } else if let Some(id) = self.lookup_bound(a) {
+                    let i = free.iter().position(|&f| f == id).unwrap_or_else(|| {
+                        free.push(id);
+                        free.len() - 1
+                    });
+                    key.push_str(&alloc::format!("#{i}"));
+                } else if self.macros.contains_key(a)
+                    || self.named_terms.iter().any(|(n, _, _)| n == a)
+                {
+                    return None;
+                } else if let Some(d) = self.funcs.get(a) {
+                    key.push_str(&alloc::format!("{a}@{d:?}"));
+                } else {
+                    key.push_str(a);
+                }
+                key.push(' ');
+                Some(())
+            }
+            SExpr::List(l) => {
+                let head = match l.first() {
+                    Some(SExpr::Atom(h)) => h.as_str(),
+                    _ => "",
+                };
+                match head {
+                    "!" if l.len() >= 2 => self.quant_canon(&l[1], renames, counter, free, key),
+                    "match" => None,
+                    "forall" | "exists" | "lambda" if l.len() == 3 => {
+                        let SExpr::List(bs) = &l[1] else { return None };
+                        key.push_str(&alloc::format!("({head} ("));
+                        let mark = renames.len();
+                        for b in bs {
+                            let SExpr::List(p) = b else { return None };
+                            let [SExpr::Atom(n), sort] = p.as_slice() else {
+                                return None;
+                            };
+                            let s = self.resolve_sort(sort).ok()?;
+                            let alias = alloc::format!("?b{counter}");
+                            *counter += 1;
+                            key.push_str(&alloc::format!("({alias} S{s:?})"));
+                            renames.push((n.clone(), alias));
+                        }
+                        key.push_str(") ");
+                        let r = self.quant_canon(&l[2], renames, counter, free, key);
+                        renames.truncate(mark);
+                        key.push_str(") ");
+                        r
+                    }
+                    "let" if l.len() == 3 => {
+                        let SExpr::List(bs) = &l[1] else { return None };
+                        key.push_str("(let (");
+                        let mut aliases = Vec::new();
+                        for b in bs {
+                            let SExpr::List(p) = b else { return None };
+                            let [SExpr::Atom(n), v] = p.as_slice() else {
+                                return None;
+                            };
+                            let alias = alloc::format!("?b{counter}");
+                            *counter += 1;
+                            key.push_str(&alloc::format!("({alias} "));
+                            self.quant_canon(v, renames, counter, free, key)?;
+                            key.push_str(") ");
+                            aliases.push((n.clone(), alias));
+                        }
+                        key.push_str(") ");
+                        let mark = renames.len();
+                        renames.extend(aliases);
+                        let r = self.quant_canon(&l[2], renames, counter, free, key);
+                        renames.truncate(mark);
+                        key.push_str(") ");
+                        r
+                    }
+                    _ => {
+                        key.push('(');
+                        for x in l {
+                            self.quant_canon(x, renames, counter, free, key)?;
+                        }
+                        key.push_str(") ");
+                        Some(())
+                    }
+                }
+            }
+        }
+    }
+
     /// Build a term from an s-expression.
     fn term(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
             SExpr::Atom(a) => match a.as_str() {
                 "true" => Ok(self.m.mk_true()),
                 "false" => Ok(self.m.mk_false()),
+                // A bare n-ary Boolean connective is its 0-argument application
+                // (z3's basic plugin accepts arity 0): `and`/`distinct` are
+                // `true`, `or`/`xor` are `false`.
+                "and" | "distinct" | "or" | "xor"
+                    if self.lookup_bound(a).is_none() && !self.funcs.contains_key(a) =>
+                {
+                    Ok(if matches!(a.as_str(), "and" | "distinct") {
+                        self.m.mk_true()
+                    } else {
+                        self.m.mk_false()
+                    })
+                }
                 name if name.starts_with('"') => {
                     // A string literal "…" → its interned distinct constant.
                     let text = unquote_string(name);
@@ -32725,9 +32952,15 @@ impl Context {
                         return Ok(t);
                     }
                     // Quantifiers are not decided yet. Sound over-approximation:
-                    // replace the quantified formula by a fresh, unconstrained
-                    // Boolean sentinel; any goal that mentions one forces a sound
-                    // `unknown` (see `decide`). The body is intentionally not
+                    // abstract the quantified formula by a predicate over its free
+                    // variables, shared by alpha-equivalent occurrences; any goal
+                    // that mentions one decides `unsat` or a sound `unknown` (see
+                    // `decide`).
+                    if let Some(t) = self.quant_abstraction(s) {
+                        return Ok(t);
+                    }
+                    // Otherwise a fresh Boolean sentinel, which is sound only
+                    // without free variables. The body is intentionally not
                     // parsed (its bound variables are undeclared).
                     let name = alloc::format!("!q!{}", self.fresh_counter);
                     self.fresh_counter += 1;
@@ -37395,6 +37628,51 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn nested_quantifiers_abstracted_per_free_variables() {
+        // Alpha-equivalent nested universals under different binders share one
+        // abstraction predicate of their free variable, so `p a = q a` follows.
+        let script = "
+            (declare-sort U 0)
+            (declare-fun p (U) Bool)
+            (declare-fun q (U) Bool)
+            (declare-fun r (U U) Bool)
+            (declare-const a U)
+            (assert (forall ((x U)) (= (p x) (forall ((y U)) (r x y)))))
+            (assert (forall ((z U)) (= (q z) (forall ((w U)) (r z w)))))
+            (assert (not (= (p a) (q a))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+        // But the abstraction is a function of the free variable: `p a` and
+        // `p b` may differ (no shared Boolean sentinel).
+        let script = "
+            (declare-sort U 0)
+            (declare-fun p (U) Bool)
+            (declare-fun r (U U) Bool)
+            (declare-const a U)
+            (declare-const b U)
+            (assert (forall ((x U)) (= (p x) (forall ((y U)) (r x y)))))
+            (assert (p a))
+            (assert (not (p b)))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn bodyless_let_and_bare_connectives() {
+        // z3 reads `(let ((x t)))` as `t`, and a bare `and`/`or` as `true`/`false`.
+        let script = "
+            (declare-const p Bool)
+            (assert (let ((x (and p or))) ))
+            (check-sat)
+            (assert (not (let ((x false) (y (or p and))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat", "unsat"]);
     }
 
     #[test]

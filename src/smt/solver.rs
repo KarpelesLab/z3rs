@@ -210,9 +210,28 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                                 croots.push(b);
                             }
                         }
+                        // Predicate atoms of the core, with their asserted truth.
+                        let cpreds: Vec<(AstId, bool)> = pred_atoms
+                            .iter()
+                            .filter_map(|&(lit, t)| {
+                                if core_set.contains(&lit) {
+                                    Some((t, true))
+                                } else if core_set.contains(&!lit) {
+                                    Some((t, false))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        croots.extend(cpreds.iter().map(|&(t, _)| t));
                         let euf_bad = {
                             let mut g = Egraph::new(m, &croots);
                             !g.is_consistent(m, &ceqs, &cdiseqs)
+                                || cpreds.iter().any(|&(t, v)| {
+                                    cpreds.iter().any(|&(u, w)| {
+                                        v && !w && g.class_of(m, t) == g.class_of(m, u)
+                                    })
+                                })
                         };
                         // Arith re-check: rebuild the linear system from only the core's
                         // arith atoms (asserted polarity) and confirm it is genuinely
@@ -2099,6 +2118,28 @@ fn theory_check(
                     .map(|id| euf_eq[id].0)
                     .collect();
                 core.push(!lit);
+                return TheoryOutcome::Conflict(core);
+            }
+        }
+        // Predicate congruence clash: two predicate applications forced into one
+        // class with opposite truth values. Core: the equalities on the proof path
+        // plus both predicate literals in their asserted polarity.
+        let asserted = |lit: Lit| if sat.model_holds(lit) { lit } else { !lit };
+        let mut by_class: BTreeMap<usize, [Option<(Lit, AstId)>; 2]> = BTreeMap::new();
+        for &(lit, t) in pred_atoms {
+            let slot = by_class.entry(pg.class_of(m, t)).or_default();
+            let v = usize::from(sat.model_holds(lit));
+            if slot[v].is_none() {
+                slot[v] = Some((lit, t));
+            }
+            if let [Some((lf, tf)), Some((lt, tt))] = *slot {
+                let mut core: Vec<Lit> = pg
+                    .explain(m, tf, tt)
+                    .into_iter()
+                    .map(|id| euf_eq[id].0)
+                    .collect();
+                core.push(asserted(lf));
+                core.push(asserted(lt));
                 return TheoryOutcome::Conflict(core);
             }
         }
