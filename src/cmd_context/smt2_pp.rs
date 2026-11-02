@@ -318,6 +318,70 @@ pub fn pp_term(nodes: &[PpNode], root: usize, assoc: &dyn Fn(&str) -> bool) -> S
     layout(&Fmt::Compose(buf))
 }
 
+/// A function interpretation as z3's `model_smt2_pp` (`pp_funs`) prints it in
+/// a model listed at indentation 2: `(define-fun f ((x!0 S) …) R` then the
+/// body, which is the `else` value preceded by one `(ite cond result` per
+/// entry. `params` are the rendered domain sorts, each entry is `(argument
+/// values, result)` and every value is already rendered. Returns the text
+/// including its leading indentation and without a trailing newline.
+pub fn pp_func_interp(
+    name: &str,
+    params: &[String],
+    range: &str,
+    entries: &[(Vec<String>, String)],
+    els: &str,
+) -> String {
+    const TAB: usize = 2;
+    let vars: Vec<String> = (0..params.len()).map(|i| alloc::format!("x!{i}")).collect();
+    let mut body = s(els);
+    if !entries.is_empty() {
+        let mut parts: Vec<Fmt> = Vec::new();
+        for (i, (args, result)) in entries.iter().enumerate() {
+            let mut conds: Vec<Fmt> = args
+                .iter()
+                .zip(&vars)
+                .map(|(a, v)| seq1(vec![s(v), s(a)], "="))
+                .collect();
+            let cond = if conds.len() > 1 {
+                seq1(conds, "and")
+            } else {
+                conds.pop().unwrap_or_else(|| s("true"))
+            };
+            if i > 0 {
+                parts.push(Fmt::LineBreak);
+            }
+            parts.push(group(Fmt::Compose(vec![
+                s("(ite "),
+                indent(5, cond),
+                indent(TAB, Fmt::Compose(vec![Fmt::LineBreak, s(result)])),
+            ])));
+        }
+        parts.push(indent(TAB, Fmt::Compose(vec![Fmt::LineBreak, body])));
+        for _ in entries {
+            parts.push(s(")"));
+        }
+        body = Fmt::Compose(parts);
+    }
+    let decls: Vec<Fmt> = params
+        .iter()
+        .zip(&vars)
+        .map(|(p, v)| seq5(vec![s(v), s(p)]))
+        .collect();
+    let def = indent(
+        TAB,
+        Fmt::Compose(vec![
+            s("(define-fun "),
+            s(name),
+            s(" "),
+            seq5(decls),
+            s(" "),
+            s(range),
+            indent(TAB, Fmt::Compose(vec![Fmt::LineBreak, body, s(")")])),
+        ]),
+    );
+    alloc::format!("  {}", layout(&def))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

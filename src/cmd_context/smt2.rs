@@ -225,6 +225,14 @@ fn render_real(r: &Rational) -> String {
     }
 }
 
+/// A function interpretation as a finite table (see
+/// `Context::fn_table_interps`): `(argument values, result)` entries and the
+/// value elsewhere.
+struct FnTable {
+    entries: Vec<(Vec<AstId>, AstId)>,
+    els: AstId,
+}
+
 /// A model value that depends on an irrational algebraic leaf (see
 /// [`Model::alg_value`]), printed as z3 does: a real numeral, or `root-obj`
 /// (a truncated decimal at `decimal` digits under `:pp.decimal`).
@@ -34489,6 +34497,9 @@ impl Context {
             // otherwise-pure goal like `select m i = i+1 ∧ select m i = 0`
             // bit-blasts. Sound: a free array can realise any read value.
             let mut g = goal;
+            // Each replaced read / application and its fresh constant: the
+            // model gives the original term the constant's value.
+            let mut replaced: Vec<(AstId, AstId)> = Vec::new();
             if !self.bv_goal_is_pure(goal) {
                 let groups = self.free_array_read_groups(goal);
                 let mut subst: Vec<(AstId, AstId)> = Vec::new();
@@ -34576,10 +34587,34 @@ impl Context {
                     };
                     g = crate::rewriter::substitute(&mut self.m, combined, &subst);
                 }
+                replaced = subst;
             }
             if self.bv_goal_is_pure(g) {
-                let (res, bv) = check_bv_model(&self.m, g);
-                return (res, bv.map(Model::from_bv));
+                if replaced.is_empty() {
+                    let (res, bv) = check_bv_model(&self.m, g);
+                    return (res, bv.map(Model::from_bv));
+                }
+                let (res, val) = check_bv_model_with_bools(&self.m, g);
+                return (
+                    res,
+                    val.map(|(mut bv, bools)| {
+                        for &(t, f) in &replaced {
+                            if let Some(&(ref v, w)) = bv.get(&f) {
+                                bv.insert(t, (v.clone(), w));
+                            }
+                        }
+                        let mut model = Model::from_bv(bv);
+                        for (&t, &b) in &bools {
+                            model.set_bool(t, b);
+                        }
+                        for &(t, f) in &replaced {
+                            if self.m.is_bool_sort(self.m.get_sort(t)) {
+                                model.set_bool(t, bools.get(&f).copied().unwrap_or(false));
+                            }
+                        }
+                        model
+                    }),
+                );
             }
             if let Some(r) = self.decide_bv_components(goal) {
                 return r;
@@ -36922,9 +36957,22 @@ impl Context {
         // constants. Greedily drop offenders until the emitted set is sound
         // (dropped functions stay free, so re-checking the model is still SAT).
         let csub = self.model_const_subst(&mut model);
+        // z3's finite-table interpretations of every function, when they can
+        // be built and jointly satisfy the assertions.
+        let fdecls: Vec<(String, AstId)> = decls
+            .iter()
+            .filter(|d| !d.domain.is_empty() && !self.m.is_array_sort(d.range))
+            .map(|d| (d.name.clone(), d.d))
+            .collect();
+        let fn_tables = if fdecls.is_empty() {
+            None
+        } else {
+            self.fn_table_interps(&fdecls, &mut model, &csub)
+        };
         let mut chosen: Vec<(AstId, String, Option<AstId>)> = Vec::new();
         for decl in &decls {
-            if !decl.domain.is_empty()
+            if fn_tables.is_none()
+                && !decl.domain.is_empty()
                 && !self.m.is_array_sort(decl.range)
                 && let Some((render, term)) = self.fn_const_interp(decl.d, &mut model, &csub)
             {
@@ -36973,6 +37021,9 @@ impl Context {
                     "\n  (define-fun {} () {sort_name}\n    {v})",
                     smt2_symbol(&decl.name)
                 ));
+            } else if let Some(text) = fn_tables.as_ref().and_then(|t| t.get(&decl.d)) {
+                out.push('\n');
+                out.push_str(text);
             } else if let Some(body) = fn_bodies.get(&decl.d) {
                 // An n-ary function with a (jointly validated) constant interpretation.
                 let params = decl
@@ -37427,6 +37478,204 @@ impl Context {
         let csub = self.model_const_subst(model);
         self.fn_const_interp(d, model, &csub)
             .map(|(render, _)| render)
+    }
+
+    /// The quantifier-free applications of the declarations in `wanted` in the
+    /// assertions, each once, in the order z3 internalizes them: assertion by
+    /// assertion, arguments left to right before their application.
+    fn ground_apps_in_order(&self, wanted: &BTreeSet<AstId>) -> Vec<AstId> {
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for &a in &self.assertions {
+            let mut stack: Vec<(AstId, bool)> = alloc::vec![(a, false)];
+            while let Some((t, expanded)) = stack.pop() {
+                if self.m.is_quantifier(t) || (!expanded && seen.contains(&t)) {
+                    continue;
+                }
+                if expanded {
+                    if seen.insert(t) && self.m.app(t).is_some_and(|ap| wanted.contains(&ap.decl)) {
+                        out.push(t);
+                    }
+                    continue;
+                }
+                stack.push((t, true));
+                if let Some(ap) = self.m.app(t) {
+                    for &c in ap.args.iter().rev() {
+                        stack.push((c, false));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Replace in `root` the 0-ary constants of `csub` by their values and each
+    /// application of a function of `tables` by its interpretation instantiated
+    /// at the (rewritten) arguments: `(ite (and (= a₁ k₁) …) r … else)`.
+    /// Quantifiers are left as they are.
+    fn subst_tables(
+        &mut self,
+        root: AstId,
+        csub: &BTreeMap<AstId, AstId>,
+        tables: &BTreeMap<AstId, FnTable>,
+    ) -> AstId {
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for id in self.m.postorder(root) {
+            let new = match self.m.app(id).map(|a| (a.decl, a.args.clone())) {
+                Some((decl, args)) if args.is_empty() => csub.get(&decl).copied().unwrap_or(id),
+                Some((decl, args)) => {
+                    let nargs: Vec<AstId> = args.iter().map(|c| memo[c]).collect();
+                    if let Some(tab) = tables.get(&decl) {
+                        let mut r = tab.els;
+                        for (key, val) in tab.entries.iter().rev() {
+                            let eqs: Vec<AstId> = nargs
+                                .iter()
+                                .zip(key)
+                                .map(|(&a, &k)| self.m.mk_eq(a, k))
+                                .collect();
+                            let cond = if eqs.len() == 1 {
+                                eqs[0]
+                            } else {
+                                self.m.mk_and(&eqs)
+                            };
+                            r = self.m.mk_ite(cond, *val, r);
+                        }
+                        r
+                    } else if nargs == args {
+                        id
+                    } else {
+                        self.m.mk_app(decl, &nargs)
+                    }
+                }
+                None => id,
+            };
+            memo.insert(id, new);
+        }
+        memo[&root]
+    }
+
+    /// z3's interpretations of the n-ary uninterpreted functions `fdecls`
+    /// (name, declaration) as finite tables, built the way its model generator
+    /// does (`smt_model_generator::mk_func_interps`, `proto_model::
+    /// complete_partial_func`, `func_interp::compress`): one entry per distinct
+    /// argument-value tuple of a ground application (first application wins),
+    /// the `else` value being the result that occurs most often (the default
+    /// value of the range when there is no application), and entries whose
+    /// result is the `else` value dropped.
+    ///
+    /// The tables are checked jointly: with the constants and every function
+    /// replaced by its table, each assertion must evaluate to `true` and each
+    /// universal over a tabled function must simplify to `true`. Returns the
+    /// rendered `define-fun` of each function, or `None` when a sort is not a
+    /// Boolean, arithmetic or bit-vector one, a value cannot be read, or the
+    /// check fails.
+    fn fn_table_interps(
+        &mut self,
+        fdecls: &[(String, AstId)],
+        model: &mut Model,
+        csub: &BTreeMap<AstId, AstId>,
+    ) -> Option<BTreeMap<AstId, String>> {
+        let supported = |m: &AstManager, s: AstId| {
+            m.is_bool_sort(s) || m.is_arith_sort(s) || m.bv_sort_width(s).is_some()
+        };
+        for (_, d) in fdecls {
+            let fd = self.m.func_decl(*d)?;
+            if !supported(&self.m, fd.range) || !fd.domain.iter().all(|&s| supported(&self.m, s)) {
+                return None;
+            }
+        }
+        let wanted: BTreeSet<AstId> = fdecls.iter().map(|x| x.1).collect();
+        let mut raw: BTreeMap<AstId, Vec<(Vec<AstId>, AstId)>> = BTreeMap::new();
+        for t in self.ground_apps_in_order(&wanted) {
+            let decl = self.m.app_decl(t);
+            let mut key = Vec::new();
+            for a in self.m.app_args(t).to_vec() {
+                key.push(self.eval_value_term(model, a)?);
+            }
+            let r = self.eval_value_term(model, t)?;
+            let e = raw.entry(decl).or_default();
+            if !e.iter().any(|(k, _)| *k == key) {
+                e.push((key, r));
+            }
+        }
+        let mut tables: BTreeMap<AstId, FnTable> = BTreeMap::new();
+        for (_, d) in fdecls {
+            let range = self.m.func_decl(*d)?.range;
+            let mut entries = raw.remove(d).unwrap_or_default();
+            let els = if entries.is_empty() {
+                if self.m.is_arith_sort(range) && !self.m.is_int_sort(range) {
+                    self.m.mk_numeral(Rational::from(0), false)
+                } else {
+                    self.const_candidates(range).first()?.0
+                }
+            } else {
+                // `func_interp::get_max_occ_result`: the first result to reach
+                // the highest count.
+                let mut counts: BTreeMap<AstId, usize> = BTreeMap::new();
+                let (mut best, mut max) = (entries[0].1, 0);
+                for (_, r) in &entries {
+                    let c = counts.entry(*r).or_insert(0);
+                    *c += 1;
+                    if *c > max {
+                        max = *c;
+                        best = *r;
+                    }
+                }
+                best
+            };
+            entries.retain(|(_, r)| *r != els);
+            tables.insert(*d, FnTable { entries, els });
+        }
+        // Joint check against the assertions and the universals.
+        for a in self.assertions.clone() {
+            let t = self.subst_tables(a, csub, &tables);
+            let t = crate::rewriter::simplify(&mut self.m, t);
+            if self.m.is_true(t) {
+                continue;
+            }
+            if self.m.postorder(t).iter().any(|&x| self.m.is_quantifier(x))
+                || self.model_value_str(model, t) != "true"
+            {
+                return None;
+            }
+        }
+        for (_, body) in self.universals.clone() {
+            let mentions = self
+                .m
+                .postorder(body)
+                .iter()
+                .any(|&t| self.m.app(t).is_some_and(|a| tables.contains_key(&a.decl)));
+            if mentions {
+                let sub = self.subst_tables(body, csub, &tables);
+                let sub = crate::rewriter::simplify(&mut self.m, sub);
+                if !self.m.is_true(sub) {
+                    return None;
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        for (name, d) in fdecls {
+            let fd = self.m.func_decl(*d)?.clone();
+            let tab = &tables[d];
+            let params: Vec<String> = fd.domain.iter().map(|&s| self.sort_display(s)).collect();
+            let entries: Vec<(Vec<String>, String)> = tab
+                .entries
+                .iter()
+                .map(|(k, r)| {
+                    (
+                        k.iter().map(|&x| self.model_value_str(model, x)).collect(),
+                        self.model_value_str(model, *r),
+                    )
+                })
+                .collect();
+            let els = self.model_value_str(model, tab.els);
+            let range = self.sort_display(fd.range);
+            out.insert(
+                *d,
+                super::smt2_pp::pp_func_interp(&smt2_symbol(name), &params, &range, &entries, &els),
+            );
+        }
+        Some(out)
     }
 
     /// `((_ repeat k) x)` — concatenate `x` with itself `k` times.
@@ -42105,6 +42354,46 @@ mod tests {
         .unwrap();
         assert_eq!(out[0], "sat");
         assert!(!out[1].contains("define-fun q"), "{}", out[1]);
+    }
+
+    #[test]
+    fn model_functions_print_as_tables() {
+        // Disagreeing applications: z3's table with the most frequent result
+        // as the `else` value.
+        let out = run(
+            "(declare-fun f (Int) Int)(declare-fun q (Int Int) Bool)\
+             (assert (= (f 1) 7))(assert (= (f 2) 8))(assert (= (f 3) 7))\
+             (assert (q 1 2))(assert (not (q 2 1)))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(
+            out[1].contains(
+                "  (define-fun f ((x!0 Int)) Int\n    (ite (= x!0 2) 8\n      7))\n"
+            ),
+            "{}",
+            out[1]
+        );
+        assert!(
+            out[1].contains(
+                "  (define-fun q ((x!0 Int) (x!1 Int)) Bool\n    \
+                 (ite (and (= x!0 2) (= x!1 1)) false\n      true))\n"
+            ),
+            "{}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn ackermannized_bv_applications_keep_their_values() {
+        let out = run(
+            "(declare-fun f ((_ BitVec 4)) (_ BitVec 4))(declare-fun h ((_ BitVec 4)) Bool)\
+             (declare-const x (_ BitVec 4))(assert (= (f x) #x3))(assert (h x))\
+             (check-sat)(get-value ((f x) (h x)))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "(((f x) #x3)\n ((h x) true))");
     }
 
     #[test]
