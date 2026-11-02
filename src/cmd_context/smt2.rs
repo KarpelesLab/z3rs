@@ -4447,11 +4447,17 @@ impl Context {
                 }
                 let decimal = self.pp_decimal_precision();
                 let mut model = self.last_model.take().unwrap();
+                let id = self.str_ground(&mut model, id);
                 let completion = list.windows(2).any(|w| {
                     matches!(&w[0], SExpr::Atom(k) if k == ":model_completion" || k == ":model-completion")
                         && matches!(&w[1], SExpr::Atom(v) if v == "true")
                 });
                 if !completion && let Some(v) = self.eval_partial(&mut model, id) {
+                    self.last_model = Some(model);
+                    return Ok(Some(v));
+                }
+                if self.is_seq_value_term(id) {
+                    let v = self.model_term_render(&mut model, id);
                     self.last_model = Some(model);
                     return Ok(Some(v));
                 }
@@ -4995,6 +5001,11 @@ impl Context {
                     && let Some(Ok(md)) = self.nra_witness(&[], &mut None)
                 {
                     model = Some(md);
+                }
+                if res == SmtResult::Sat
+                    && let Some(md) = model.as_mut()
+                {
+                    self.complete_str_witness(md);
                 }
                 self.last_model = model;
                 self.last_verdict = Some(res);
@@ -5760,9 +5771,6 @@ impl Context {
         Some(render_fp(bits, eb, sb))
     }
 
-    /// The set of every declaration that is a datatype constructor, selector, or
-    /// tester (across enums, records, and general datatypes). These are part of a
-    /// datatype declaration, not user-declared functions, so `get-model` skips them.
     /// Record the declared functions and `define-fun` names `t` mentions.
     fn note_mentions(&mut self, t: &SExpr) {
         let mut stack = alloc::vec![t];
@@ -5788,6 +5796,9 @@ impl Context {
         self.decl_table_stack.push(name.to_string());
     }
 
+    /// The set of every declaration that is a datatype constructor, selector, or
+    /// tester (across enums, records, and general datatypes). These are part of a
+    /// datatype declaration, not user-declared functions, so `get-model` skips them.
     fn datatype_member_decls(&self) -> BTreeSet<AstId> {
         let mut set = BTreeSet::new();
         for ctors in self.datatypes.values() {
@@ -5917,6 +5928,15 @@ impl Context {
             .then(|| self.params.get_uint("pp.decimal-precision", 10) as u32)
     }
 
+    /// Does `id` render through [`Self::model_term_render`] as a sequence value:
+    /// a concrete sequence, or a sequence constant no assertion mentions?
+    fn is_seq_value_term(&self, id: AstId) -> bool {
+        self.seq_of.contains_key(&id)
+            || (self.seq_elem_sort(self.m.get_sort(id)).is_some()
+                && self.m.is_uninterp_const(id)
+                && !self.occurs_in_assertions(id))
+    }
+
     /// Render a term's model value through the full value stack, including the
     /// datatype constructor-term form for datatype/record-sorted terms.
     fn model_term_render(&mut self, model: &mut Model, id: AstId) -> String {
@@ -5937,6 +5957,14 @@ impl Context {
         }
         if let Some(s) = self.str_model_value(model, id) {
             return s;
+        }
+        // A sequence constant absent from every assertion: z3's model gives it
+        // the empty sequence.
+        if self.seq_elem_sort(self.m.get_sort(id)).is_some()
+            && self.m.is_uninterp_const(id)
+            && !self.occurs_in_assertions(id)
+        {
+            return alloc::format!("(as seq.empty {})", self.sort_display(self.m.get_sort(id)));
         }
         if let Some(s) = self.dt_model_value(model, id) {
             return s;
@@ -8577,6 +8605,13 @@ impl Context {
                 if self.m.is_app(n) {
                     in_model.insert(self.m.app_decl(n));
                 }
+            }
+        }
+        // A symbol the assertions mention is in the model even when it was
+        // folded into a concrete sequence's elements.
+        for n in self.asserted_names() {
+            if let Some(&d) = self.funcs.get(n) {
+                in_model.insert(d);
             }
         }
         let free: BTreeSet<AstId> = nodes
@@ -15299,6 +15334,247 @@ impl Context {
             return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
         }
         None
+    }
+
+    /// Substitute `subst` into `t` and fold the string/sequence operations
+    /// over the resulting concrete values (as `eval` and `get-value` do).
+    fn str_concretize(&mut self, t: AstId, subst: &[(AstId, AstId)]) -> AstId {
+        let t = crate::rewriter::substitute(&mut self.m, t, subst);
+        let mut memo = BTreeMap::new();
+        let t = self.refold_str_markers(t, &mut memo);
+        crate::rewriter::simplify(&mut self.m, t)
+    }
+
+    /// For a term over strings or sequences, substitute the model's values of
+    /// the Boolean/numeric/bit-vector constants the assertions mention and fold
+    /// the string/sequence operations over them, so `eval`/`get-value` see the
+    /// concrete value (`str.at "ab" i` with `i = 1` is `"b"`). Other terms are
+    /// returned unchanged.
+    fn str_ground(&mut self, model: &mut Model, t: AstId) -> AstId {
+        let stringy = self.m.postorder(t).iter().any(|&u| {
+            let s = self.m.get_sort(u);
+            Some(s) == self.string_sort || self.seq_elem_sort(s).is_some()
+        });
+        if !stringy {
+            return t;
+        }
+        let mentioned: BTreeSet<AstId> = self
+            .asserted_names()
+            .into_iter()
+            .filter_map(|n| self.funcs.get(n).copied())
+            .collect();
+        let mut csub = self.model_const_subst(model);
+        csub.retain(|d, _| mentioned.contains(d));
+        let g = self.subst_all(t, &csub, &BTreeMap::new());
+        self.str_concretize(g, &[])
+    }
+
+    /// Is `t` a string or sequence variable: an uninterpreted constant of a
+    /// string/sequence sort that is not a literal or a concrete sequence?
+    fn is_str_seq_var(&self, t: AstId) -> bool {
+        let s = self.m.get_sort(t);
+        (Some(s) == self.string_sort || self.seq_elem_sort(s).is_some())
+            && self.m.is_uninterp_const(t)
+            && self.str_value(t).is_none()
+            && !self.seq_of.contains_key(&t)
+            && !self.str_symbolic.contains(&t)
+    }
+
+    /// Complete the string witness after a `sat` so every string/sequence
+    /// variable of the assertions has a concrete value — the value `get-model`,
+    /// `get-value` and `eval` report. Each unassigned variable takes, in turn,
+    /// the concrete value of a top-level `v = t` whose `t` is concrete under the
+    /// assignment so far, the literal or concrete sequence the model equates it
+    /// with, or a fresh value of the length the model gives it (one per model
+    /// class). The completion is kept only if every assertion folds to `true`
+    /// under it; otherwise the witness stays as the solver left it.
+    fn complete_str_witness(&mut self, model: &mut Model) {
+        if self.string_sort.is_none() && self.seq_sorts.is_empty() {
+            return;
+        }
+        if !self.universals.is_empty() {
+            return;
+        }
+        let assertions = self.assertions.clone();
+        let mut vars: Vec<AstId> = Vec::new();
+        for &a in &assertions {
+            for t in self.m.postorder(a) {
+                if self.is_str_seq_var(t) && !vars.contains(&t) {
+                    vars.push(t);
+                }
+            }
+        }
+        let mut subst = self.str_witness.clone();
+        let assigned = |subst: &[(AstId, AstId)], v: AstId| subst.iter().any(|(w, _)| *w == v);
+        vars.retain(|&v| !assigned(&subst, v));
+        if vars.is_empty() {
+            return;
+        }
+        // Top-level equalities `v = t`, in assertion order.
+        let mut eqs: Vec<(AstId, AstId)> = Vec::new();
+        let mut stack: Vec<AstId> = assertions.iter().rev().copied().collect();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend(self.m.app_args(t).iter().rev().copied());
+            } else if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
+                let a = self.m.app_args(t);
+                eqs.push((a[0], a[1]));
+                eqs.push((a[1], a[0]));
+            }
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &(v, t) in &eqs {
+                if !vars.contains(&v) || assigned(&subst, v) {
+                    continue;
+                }
+                let c = self.str_concretize(t, &subst);
+                let concrete = (self.str_value(c).is_some() || self.seq_of.contains_key(&c))
+                    && !self.m.postorder(c).iter().any(|&u| self.is_str_seq_var(u));
+                if concrete {
+                    subst.push((v, c));
+                    changed = true;
+                }
+            }
+        }
+        // The model's own concrete values.
+        let known: Vec<AstId> = self
+            .str_lits
+            .values()
+            .copied()
+            .chain(self.seq_of.keys().copied())
+            .collect();
+        for &v in &vars {
+            if assigned(&subst, v) {
+                continue;
+            }
+            let sort = self.m.get_sort(v);
+            if let Some(&c) = known
+                .iter()
+                .find(|&&c| self.m.get_sort(c) == sort && model.terms_equal(&self.m, v, c))
+            {
+                subst.push((v, c));
+            }
+        }
+        // Fresh values, one per model class: first of the lengths the model
+        // gives, then of small length tuples.
+        let mut classes: Vec<(Vec<AstId>, usize)> = Vec::new();
+        for &v in &vars {
+            if assigned(&subst, v) {
+                continue;
+            }
+            let sort = self.m.get_sort(v);
+            if let Some(cl) = classes.iter_mut().find(|(ms, _)| {
+                self.m.get_sort(ms[0]) == sort && model.terms_equal(&self.m, v, ms[0])
+            }) {
+                cl.0.push(v);
+                continue;
+            }
+            let len_term = if Some(sort) == self.string_sort {
+                let d = self.str_len_fn();
+                self.m.mk_app(d, &[v])
+            } else {
+                let d = self.seq_len_decl_for(sort);
+                self.m.mk_app(d, &[v])
+            };
+            let len = match model.eval_value(&self.m, len_term) {
+                Value::Num(r, _) if r.is_integer() && !r.is_negative() => {
+                    r.to_i64().map_or(usize::MAX, |n| n as usize)
+                }
+                _ => 0,
+            };
+            classes.push((alloc::vec![v], len));
+        }
+        const MAX_LEN: usize = 3;
+        const MAX_CANDIDATES: usize = 64;
+        let mut candidates: Vec<Vec<usize>> = Vec::new();
+        let model_lens: Vec<usize> = classes.iter().map(|c| c.1).collect();
+        if model_lens.iter().all(|&l| l <= 64) {
+            candidates.push(model_lens.clone());
+        }
+        if classes.len() <= 4 {
+            let mut tuples: Vec<Vec<usize>> = alloc::vec![Vec::new()];
+            for _ in &classes {
+                tuples = tuples
+                    .into_iter()
+                    .flat_map(|t| {
+                        (0..=MAX_LEN).map(move |k| {
+                            let mut t2 = t.clone();
+                            t2.push(k);
+                            t2
+                        })
+                    })
+                    .collect();
+            }
+            tuples.sort_by_key(|t| (t.iter().sum::<usize>(), t.clone()));
+            candidates.extend(tuples.into_iter().filter(|t| *t != model_lens));
+        }
+        candidates.truncate(MAX_CANDIDATES);
+        // The model's values of the other (Boolean/numeric/bit-vector)
+        // constants, so a candidate's assertions fold to ground truth values.
+        let csub = self.model_const_subst(model);
+        let taken: BTreeSet<String> = self.str_lits.keys().cloned().collect();
+        'cand: for lens in candidates {
+            let mut full = subst.clone();
+            let mut next_char: u32 = 'A' as u32;
+            let mut next_elem: i64 = 0;
+            for ((members, _), &len) in classes.iter().zip(&lens) {
+                let sort = self.m.get_sort(members[0]);
+                let c = if Some(sort) == self.string_sort {
+                    let mut text = String::new();
+                    loop {
+                        text.clear();
+                        for _ in 0..len {
+                            text.push(char::from_u32(next_char).unwrap_or('A'));
+                            next_char += 1;
+                        }
+                        if len == 0 || !taken.contains(&text) {
+                            break;
+                        }
+                    }
+                    self.mk_str_lit(&text)
+                } else {
+                    let Some(elem) = self.seq_elem_sort(sort) else {
+                        return;
+                    };
+                    if len == 0 {
+                        self.seq_empty_of(sort)
+                    } else if self.m.is_arith_sort(elem) {
+                        let is_int = self.m.is_int_sort(elem);
+                        let es: Vec<AstId> = (0..len)
+                            .map(|_| self.m.mk_numeral(Rational::from(next_elem), is_int))
+                            .collect();
+                        next_elem += 1;
+                        if len == 1 {
+                            match self.seq_op("seq.unit", &es) {
+                                Ok(c) => c,
+                                Err(_) => return,
+                            }
+                        } else {
+                            self.mk_seq(es)
+                        }
+                    } else {
+                        return;
+                    }
+                };
+                full.extend(members.iter().map(|&v| (v, c)));
+            }
+            for &a in &assertions {
+                let c = self.str_concretize(a, &full);
+                let g = self.subst_all(c, &csub, &BTreeMap::new());
+                let g = self.str_concretize(g, &[]);
+                if self.m.is_false(g)
+                    || (!self.m.is_true(c)
+                        && !self.m.is_true(g)
+                        && self.model_value_str(model, c) != "true")
+                {
+                    continue 'cand;
+                }
+            }
+            self.str_witness = full;
+            return;
+        }
     }
 
     fn try_string_witness(&mut self, goal: AstId, hint: Option<&mut Model>) -> Option<Model> {
@@ -33609,7 +33885,12 @@ impl Context {
             if i > 0 {
                 out.push_str("\n ");
             }
-            let v = match *id {
+            let id = match *id {
+                Ok(id) => Ok(self.str_ground(&mut model, id)),
+                Err(e) => Err(e),
+            };
+            let v = match id {
+                Ok(id) if self.is_seq_value_term(id) => self.model_term_render(&mut model, id),
                 Ok(id) => self
                     .str_value(id)
                     .map(|cps| smt_string_literal(&cps))
@@ -33776,13 +34057,9 @@ impl Context {
         Ok(out)
     }
 
-    /// Order `decls` (given in declaration order) as z3 registers them in the
-    /// model it prints: first the declarations the solver's model interprets —
-    /// approximated by those occurring in the current assertions, kept in
-    /// declaration order — then the rest as `cmd_context::add_declared_functions`
-    /// appends them, in the slot order of z3's declaration dictionary.
-    fn model_listing_order<T>(&self, decls: Vec<T>, name: impl Fn(&T) -> &String) -> Vec<T> {
-        // The mentioned names, closed under the bodies of mentioned macros.
+    /// The declared names the assertions mention, closed under the bodies of
+    /// the mentioned macros: the declarations z3's model interprets.
+    fn asserted_names(&self) -> BTreeSet<&str> {
         let mut used: BTreeSet<&str> = BTreeSet::new();
         let mut todo: Vec<&str> = self.asserted_mentions.iter().map(String::as_str).collect();
         while let Some(n) = todo.pop() {
@@ -33804,6 +34081,16 @@ impl Context {
                 }
             }
         }
+        used
+    }
+
+    /// Order `decls` (given in declaration order) as z3 registers them in the
+    /// model it prints: first the declarations the solver's model interprets —
+    /// approximated by those occurring in the current assertions, kept in
+    /// declaration order — then the rest as `cmd_context::add_declared_functions`
+    /// appends them, in the slot order of z3's declaration dictionary.
+    fn model_listing_order<T>(&self, decls: Vec<T>, name: impl Fn(&T) -> &String) -> Vec<T> {
+        let used = self.asserted_names();
         let (mut first, rest): (Vec<T>, Vec<T>) = decls
             .into_iter()
             .partition(|d| used.contains(name(d).as_str()));
@@ -36753,6 +37040,34 @@ mod tests {
             out[1].contains("(define-fun b () Bool\n    false)"),
             "{}",
             out[1]
+        );
+    }
+
+    #[test]
+    fn string_and_sequence_models_are_concrete() {
+        // A string constrained only by its length gets a concrete literal of that
+        // length; `eval`/`get-value` fold string operations over the model.
+        let out = run(
+            "(declare-const a String)(declare-const b String)(declare-const i Int)
+            (assert (= (str.len a) 3))(assert (distinct b (str.at \"ab\" i)))(assert (= i 1))
+            (check-sat)(get-value (a (str.len a) (str.at \"ab\" i)))(eval (= a b))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(!out[1].contains("!val!"), "{}", out[1]);
+        assert!(out[1].contains("((str.len a) 3)"), "{}", out[1]);
+        assert!(out[1].contains("((str.at \"ab\" i) \"b\")"), "{}", out[1]);
+        assert_eq!(out[2], "false");
+        // A sequence bound by an equation evaluates to that concrete sequence,
+        // and an equality against it evaluates by content.
+        let out = run("(declare-const a (Seq Int))(declare-const i Int)
+            (define-fun add ((x Int) (y Int)) Int (+ x y))
+            (assert (= a (seq.++ (seq.unit 3) (seq.mapi add i (seq.unit 3)))))(assert (= i 1))
+            (check-sat)(eval a)(eval (= a (seq.++ (seq.unit 3) (seq.unit 4))))")
+        .unwrap();
+        assert_eq!(
+            out,
+            alloc::vec!["sat", "(seq.++ (seq.unit 3) (seq.unit 4))", "true"]
         );
     }
 

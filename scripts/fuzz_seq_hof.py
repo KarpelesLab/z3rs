@@ -59,10 +59,7 @@ def one(n):
     p=f"{OUT}/hof_{n}.smt2"; open(p,"w").write(src)
     b=run(Z3,p)[0]
     pe=f"{OUT}/hof_{n}_eval.smt2"
-    # Sequence (dis)equalities are not re-evaluated: `eval` rebuilds a
-    # concrete sequence as a new value constant, unrelated to the model's.
-    checked=[x for x in atoms if not x.startswith(("(= (seq.","(distinct (seq.","(= a","(= b","(distinct a","(distinct b"))]
-    open(pe,"w").write(src+"".join(f"(eval {x})\n" for x in checked))
+    open(pe,"w").write(src+"".join(f"(eval {x})\n" for x in atoms))
     out=run(RS,pe)
     a=out[0]
     if a=="sat" and "false" in out[1:]: return "BADMODEL",pe
