@@ -1339,6 +1339,82 @@ fn smt_string_literal(cps: &[u32]) -> String {
     out
 }
 
+/// z3's warnings for the attributes it does not know in the `(! term attr…)`
+/// annotations of a command, in order (`smt2parser::consume_attributes`):
+/// each unknown keyword is reported and skips one value. A keyword glued to a
+/// quoted symbol (`:||`) is a keyword followed by that symbol, as z3's scanner
+/// reads it.
+fn unknown_attribute_warnings(form: &SExpr) -> Vec<String> {
+    const KNOWN: [&str; 8] = [
+        ":named",
+        ":pattern",
+        ":no-pattern",
+        ":weight",
+        ":qid",
+        ":skolemid",
+        ":lblpos",
+        ":lblneg",
+    ];
+    /// The scanner tokens of an atom our tokenizer kept whole.
+    fn split(a: &str) -> Vec<String> {
+        if !a.starts_with(':') || !a.contains('|') {
+            return alloc::vec![a.to_string()];
+        }
+        let cs: Vec<char> = a.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < cs.len() {
+            let mut j = i + 1;
+            if cs[i] == '|' {
+                while j < cs.len() && cs[j] != '|' {
+                    j += 1;
+                }
+                j = (j + 1).min(cs.len());
+            } else {
+                while j < cs.len() && cs[j] != ':' && cs[j] != '|' {
+                    j += 1;
+                }
+            }
+            out.push(cs[i..j].iter().collect());
+            i = j;
+        }
+        out
+    }
+    fn walk(e: &SExpr, out: &mut Vec<String>) {
+        let SExpr::List(l) = e else { return };
+        if l.len() >= 2 && matches!(&l[0], SExpr::Atom(h) if h == "!") {
+            // `None` stands for a list value.
+            let mut items: Vec<Option<String>> = Vec::new();
+            for x in &l[2..] {
+                match x {
+                    SExpr::Atom(a) => items.extend(split(a).into_iter().map(Some)),
+                    SExpr::List(_) => items.push(None),
+                }
+            }
+            let mut i = 0;
+            while let Some(Some(k)) = items.get(i) {
+                if !k.starts_with(':') {
+                    break;
+                }
+                if !KNOWN.contains(&k.as_str()) {
+                    out.push(alloc::format!("WARNING: unknown attribute {k}"));
+                }
+                i += 2;
+            }
+        }
+        for x in l {
+            walk(x, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let SExpr::List(l) = form
+        && !matches!(l.first(), Some(SExpr::Atom(h)) if h == "set-info" || h == "set-option")
+    {
+        walk(form, &mut out);
+    }
+    out
+}
+
 /// The `:named` label of an assertion written `(! term :named name …)`, if any.
 fn named_label(s: &SExpr) -> Option<String> {
     let SExpr::List(l) = s else { return None };
@@ -1482,6 +1558,7 @@ fn run_into(script: &str, out: &mut Vec<String>) -> Result<(), String> {
             ));
             continue;
         }
+        out.extend(unknown_attribute_warnings(&form));
         match ctx.command(&form) {
             Ok(Some(resp)) => out.push(resp),
             // A state-changing command that produced no output prints `success`
