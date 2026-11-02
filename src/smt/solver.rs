@@ -291,106 +291,14 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     // explanation can only ever weaken a lemma, never cause a wrong
                     // `unsat`.
                     TheoryOutcome::Conflict(core) => {
-                        let core_set: BTreeSet<Lit> = core.iter().copied().collect();
-                        // Re-verify the core is *genuinely* inconsistent, restricted to
-                        // ONLY the atoms it names, via BOTH theories independently. The
-                        // core is trusted if EITHER theory confirms its atoms clash.
-                        //
-                        // EUF re-check: rebuild the EUF problem from only the core's
-                        // atoms, each in its asserted polarity (lit ∈ core ⇒ equality;
-                        // ¬lit ∈ core ⇒ disequality).
-                        let mut ceqs: Vec<(AstId, AstId)> = Vec::new();
-                        let mut cdiseqs: Vec<(AstId, AstId)> = Vec::new();
-                        let mut croots: Vec<AstId> = Vec::new();
-                        for &(lit, a, b) in &euf_eq {
-                            if core_set.contains(&lit) {
-                                ceqs.push((a, b));
-                                croots.push(a);
-                                croots.push(b);
-                            } else if core_set.contains(&!lit) {
-                                cdiseqs.push((a, b));
-                                croots.push(a);
-                                croots.push(b);
-                            }
-                        }
-                        // Predicate atoms of the core, with their asserted truth.
-                        let cpreds: Vec<(AstId, bool)> = pred_atoms
-                            .iter()
-                            .filter_map(|&(lit, t)| {
-                                if core_set.contains(&lit) {
-                                    Some((t, true))
-                                } else if core_set.contains(&!lit) {
-                                    Some((t, false))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        croots.extend(cpreds.iter().map(|&(t, _)| t));
-                        // The core's comparison atoms, in asserted polarity; their
-                        // sides join the congruence closure too.
-                        let mut ccmp: Vec<(&ArithAtom, bool)> = Vec::new();
-                        for atom in arith_atoms.iter().filter(|a| !a.is_eq) {
-                            if core_set.contains(&atom.lit) {
-                                ccmp.push((atom, true));
-                            } else if core_set.contains(&!atom.lit) {
-                                ccmp.push((atom, false));
-                            } else {
-                                continue;
-                            }
-                            croots.extend(atom.sides.iter().copied());
-                        }
-                        let mut g = Egraph::new(m, &croots);
-                        let euf_bad = !g.is_consistent(m, &ceqs, &cdiseqs)
-                            || cpreds.iter().any(|&(t, v)| {
-                                cpreds
-                                    .iter()
-                                    .any(|&(u, w)| v && !w && g.class_of(m, t) == g.class_of(m, u))
-                            });
-                        // Arith re-check: the linear system of only the core's atoms
-                        // (asserted polarity), plus the equalities congruence derives
-                        // from the core's equalities between arithmetic terms, must
-                        // be infeasible (over the integers for integer terms).
-                        let arith_bad = !euf_bad && {
-                            let mut cons: Vec<Constraint> = Vec::new();
-                            let mut diseqs: Vec<LinExpr> = Vec::new();
-                            for &(a, b) in &cdiseqs {
-                                if m.is_arith_sort(m.get_sort(a)) {
-                                    diseqs.push(ast_to_lin(m, a).sub(&ast_to_lin(m, b)));
-                                }
-                            }
-                            for &(atom, holds) in &ccmp {
-                                cons.push(comparison_constraint(atom.op, holds, atom.diff.clone()));
-                            }
-                            let mut rep: BTreeMap<usize, AstId> = BTreeMap::new();
-                            for t in m.postorder_many(&croots) {
-                                if !m.is_arith_sort(m.get_sort(t)) {
-                                    continue;
-                                }
-                                match rep.get(&g.class_of(m, t)) {
-                                    Some(&r) => cons.push(Constraint::eq(
-                                        ast_to_lin(m, t).sub(&ast_to_lin(m, r)),
-                                    )),
-                                    None => {
-                                        rep.insert(g.class_of(m, t), t);
-                                    }
-                                }
-                            }
-                            let mut int_set = BTreeSet::new();
-                            for e in cons.iter().map(|c| &c.expr).chain(diseqs.iter()) {
-                                collect_int_vars(m, e, &mut int_set);
-                            }
-                            let sys = ArithSystem {
-                                con_lits: Vec::new(),
-                                diseq_lits: Vec::new(),
-                                cons,
-                                diseqs,
-                                int_set,
-                            };
-                            let mut verify_budget = CORE_VERIFY_BUDGET;
-                            matches!(arith_feasible(&sys, &mut verify_budget), Feas::Unsat)
-                        };
-                        if euf_bad || arith_bad {
+                        if core_is_inconsistent(
+                            m,
+                            &core,
+                            &euf_roots,
+                            &euf_eq,
+                            &arith_atoms,
+                            &pred_atoms,
+                        ) {
                             // Verified inconsistent → learn the strong lemma ¬core.
                             let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
                             sat.add_clause(&clause);
@@ -533,6 +441,124 @@ fn split_atom(
     arith_atoms.push(atom);
     memo.insert(key, lit);
     lit
+}
+
+/// Is the conflict `core` (currently-true literals) genuinely inconsistent,
+/// restricted to the atoms it names (over the term `universe`)? The mandatory soundness net under every
+/// learnt theory lemma: congruence closure over the core's equalities (and
+/// predicate clashes), or — with the equalities congruence derives between
+/// arithmetic terms — infeasibility of the core's arithmetic over the
+/// integers.
+fn core_is_inconsistent(
+    m: &AstManager,
+    core: &[Lit],
+    universe: &[AstId],
+    euf_eq: &[(Lit, AstId, AstId)],
+    arith_atoms: &[ArithAtom],
+    pred_atoms: &[(Lit, AstId)],
+) -> bool {
+    let core_set: BTreeSet<Lit> = core.iter().copied().collect();
+    // Re-verify the core is *genuinely* inconsistent, restricted to
+    // ONLY the atoms it names, via BOTH theories independently. The
+    // core is trusted if EITHER theory confirms its atoms clash.
+    //
+    // EUF re-check: rebuild the EUF problem from only the core's
+    // atoms, each in its asserted polarity (lit ∈ core ⇒ equality;
+    // ¬lit ∈ core ⇒ disequality).
+    let mut ceqs: Vec<(AstId, AstId)> = Vec::new();
+    let mut cdiseqs: Vec<(AstId, AstId)> = Vec::new();
+    let mut croots: Vec<AstId> = Vec::new();
+    for &(lit, a, b) in euf_eq {
+        if core_set.contains(&lit) {
+            ceqs.push((a, b));
+            croots.push(a);
+            croots.push(b);
+        } else if core_set.contains(&!lit) {
+            cdiseqs.push((a, b));
+            croots.push(a);
+            croots.push(b);
+        }
+    }
+    // Predicate atoms of the core, with their asserted truth.
+    let cpreds: Vec<(AstId, bool)> = pred_atoms
+        .iter()
+        .filter_map(|&(lit, t)| {
+            if core_set.contains(&lit) {
+                Some((t, true))
+            } else if core_set.contains(&!lit) {
+                Some((t, false))
+            } else {
+                None
+            }
+        })
+        .collect();
+    croots.extend(cpreds.iter().map(|&(t, _)| t));
+    // The core's comparison atoms, in asserted polarity; their
+    // sides join the congruence closure too.
+    let mut ccmp: Vec<(&ArithAtom, bool)> = Vec::new();
+    for atom in arith_atoms.iter().filter(|a| !a.is_eq) {
+        if core_set.contains(&atom.lit) {
+            ccmp.push((atom, true));
+        } else if core_set.contains(&!atom.lit) {
+            ccmp.push((atom, false));
+        } else {
+            continue;
+        }
+        croots.extend(atom.sides.iter().copied());
+    }
+    // Congruence may relate terms beyond the core's atoms (`f(a)`, `f(b)`
+    // under `a = b`): close over the whole term universe, merging only the
+    // core's equalities.
+    croots.extend(universe.iter().copied());
+    let mut g = Egraph::new(m, &croots);
+    let euf_bad = !g.is_consistent(m, &ceqs, &cdiseqs)
+        || cpreds.iter().any(|&(t, v)| {
+            cpreds
+                .iter()
+                .any(|&(u, w)| v && !w && g.class_of(m, t) == g.class_of(m, u))
+        });
+    // Arith re-check: the linear system of only the core's atoms
+    // (asserted polarity), plus the equalities congruence derives
+    // from the core's equalities between arithmetic terms, must
+    // be infeasible (over the integers for integer terms).
+    let arith_bad = !euf_bad && {
+        let mut cons: Vec<Constraint> = Vec::new();
+        let mut diseqs: Vec<LinExpr> = Vec::new();
+        for &(a, b) in &cdiseqs {
+            if m.is_arith_sort(m.get_sort(a)) {
+                diseqs.push(ast_to_lin(m, a).sub(&ast_to_lin(m, b)));
+            }
+        }
+        for &(atom, holds) in &ccmp {
+            cons.push(comparison_constraint(atom.op, holds, atom.diff.clone()));
+        }
+        let mut rep: BTreeMap<usize, AstId> = BTreeMap::new();
+        for t in m.postorder_many(&croots) {
+            if !m.is_arith_sort(m.get_sort(t)) {
+                continue;
+            }
+            match rep.get(&g.class_of(m, t)) {
+                Some(&r) => cons.push(Constraint::eq(ast_to_lin(m, t).sub(&ast_to_lin(m, r)))),
+                None => {
+                    rep.insert(g.class_of(m, t), t);
+                }
+            }
+        }
+        let mut int_set = BTreeSet::new();
+        for e in cons.iter().map(|c| &c.expr).chain(diseqs.iter()) {
+            collect_int_vars(m, e, &mut int_set);
+        }
+        let sys = ArithSystem {
+            con_lits: Vec::new(),
+            diseq_lits: Vec::new(),
+            cons,
+            diseqs,
+            int_set,
+        };
+        let mut verify_budget = CORE_VERIFY_BUDGET;
+        matches!(arith_feasible(&sys, &mut verify_budget), Feas::Unsat)
+    };
+    euf_bad || arith_bad
 }
 
 /// A satisfying assignment, able to evaluate terms to concrete [`Value`]s.

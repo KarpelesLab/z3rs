@@ -9419,6 +9419,32 @@ impl Context {
         out
     }
 
+    /// The sort of `(_ map f) arrays…`: the operands' index sort, and `f`'s
+    /// range — read off `f` applied to reads of the operands (`(_ map <=)` over
+    /// `Int` arrays is a `Bool` array). Operands whose reads are arrays
+    /// themselves (a map over the inner dimension) keep the operand's sort.
+    fn map_array_sort(&mut self, fname: &str, arrays: &[AstId]) -> AstId {
+        let sort = self.m.get_sort(arrays[0]);
+        let Some((idx, _)) = self.m.array_sort_params(sort) else {
+            return sort;
+        };
+        let k = self.fresh_const(idx);
+        let reads: Vec<AstId> = arrays.iter().map(|&a| self.m.mk_select(a, k)).collect();
+        if reads
+            .iter()
+            .any(|&r| self.m.is_array_sort(self.m.get_sort(r)))
+        {
+            return sort;
+        }
+        match self.apply(fname, reads) {
+            Ok(v) => {
+                let range = self.m.get_sort(v);
+                self.m.mk_array_sort(idx, range)
+            }
+            Err(_) => sort,
+        }
+    }
+
     /// Rewrite `select(arr, idx)` pushing through `(_ map f)` layers:
     /// `select((_ map f) a…, i) → f(select(a, i)…)`, recursively, leaving a
     /// select over a non-map array (plain variable, store, const) symbolic. This
@@ -31552,7 +31578,33 @@ impl Context {
     /// (extensional) QF_AX; the congruence closure supplies the rest. It is finite
     /// and terminating.
     fn array_axioms(&mut self, goal: AstId) -> Vec<AstId> {
-        let subterms = self.m.postorder(goal);
+        // The operands of `(_ map f)` arrays are read through the map
+        // (`select_expand_map`), so their stores, constants and indices need
+        // the axioms too, though they are not subterms of the goal.
+        let mut roots = alloc::vec![goal];
+        let mut stack: Vec<AstId> = self
+            .m
+            .postorder(goal)
+            .into_iter()
+            .filter(|t| self.maps.contains_key(t))
+            .collect();
+        let mut seen_maps: BTreeSet<AstId> = BTreeSet::new();
+        while let Some(t) = stack.pop() {
+            if !seen_maps.insert(t) {
+                continue;
+            }
+            if let Some((_, ops)) = self.maps.get(&t) {
+                for &a in ops {
+                    roots.push(a);
+                    for u in self.m.postorder(a) {
+                        if self.maps.contains_key(&u) {
+                            stack.push(u);
+                        }
+                    }
+                }
+            }
+        }
+        let subterms = self.m.postorder_many(&roots);
         let mut stores: Vec<AstId> = Vec::new();
         let mut const_arrays: Vec<AstId> = Vec::new();
         let mut indices: Vec<AstId> = Vec::new();
@@ -31698,6 +31750,53 @@ impl Context {
             }
         }
         axioms
+    }
+
+    /// Does every functional array constant in `goal` stand for a
+    /// [`plain_map`](Self::plain_map) that occurs only as a side of array
+    /// equalities? Then the array axioms define it completely: every
+    /// equality's instances (and its extensionality witness) read the map
+    /// pointwise at every index term and at the default index distinct from
+    /// them all — z3's `theory_array_full` map and default axioms.
+    fn maps_only_in_equalities(&self, goal: AstId) -> bool {
+        let functional = |t: AstId| {
+            self.maps.contains_key(&t)
+                || self.as_arrays.contains_key(&t)
+                || self.lambdas.contains_key(&t)
+        };
+        let sub = self.m.postorder(goal);
+        for &t in &sub {
+            if functional(t) && !self.plain_map(t) {
+                return false;
+            }
+            let Some(a) = self.m.app(t) else { continue };
+            if a.args.iter().any(|&x| functional(x))
+                && !(self.m.is_eq(t) && self.m.is_array_sort(self.m.get_sort(a.args[0])))
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Is `t` a `(_ map f)` over an arithmetic index sort whose operands are
+    /// such maps or arrays free of functional constants — so reading it at an
+    /// index reads arrays the array axioms cover (map operands included)?
+    fn plain_map(&self, t: AstId) -> bool {
+        let Some((_, operands)) = self.maps.get(&t) else {
+            return false;
+        };
+        self.m
+            .array_sort_params(self.m.get_sort(t))
+            .is_some_and(|(idx, _)| self.m.is_arith_sort(idx))
+            && operands.iter().all(|&a| {
+                self.plain_map(a)
+                    || !self.m.postorder(a).iter().any(|u| {
+                        self.maps.contains_key(u)
+                            || self.as_arrays.contains_key(u)
+                            || self.lambdas.contains_key(u)
+                    })
+            })
     }
 
     /// Is `arr` a *plain* array term — a variable or an uninterpreted
@@ -34009,10 +34108,18 @@ impl Context {
                 // `v` then fold via read-over-write and const-array collapse. Chains
                 // like `a = const 2 ∧ b = store a 1 5` resolve because the fallback
                 // iterates this to a fixpoint.
+                // A functional constant inside the value (`(_ map f) …`) may
+                // be defined over `v` itself, which the substitution would
+                // leave unconstrained: such a binding is not a definition.
                 if self.m.is_uninterp_const(v)
                     && (self.m.is_const_array(ca) || self.m.is_store(ca))
                     && v != ca
                     && !bound.contains(&v)
+                    && !self.m.postorder(ca).iter().any(|t| {
+                        self.maps.contains_key(t)
+                            || self.as_arrays.contains_key(t)
+                            || self.lambdas.contains_key(t)
+                    })
                 {
                     subst.push((v, ca));
                     bound.insert(v);
@@ -34150,7 +34257,10 @@ impl Context {
             // appear past the point instantiation ran, so the definition must be
             // substituted here. Also collapses the now-redundant `foo` enumeration
             // instances to `true`, keeping the goal within `check_model`'s reach.
-            self.inline_free_macros(g)
+            let g = self.inline_free_macros(g);
+            // Reads through `(_ map ite)` expand to arithmetic `ite`s, which
+            // `check_model` would read as free terms: lift them too.
+            self.lift_arith_ites(g)
         };
         // Eager UNSAT check for variable-bound ground datatype selector chains:
         // inline `v = <ground ctor>` to a fixpoint and fold the selector towers, then
@@ -34275,6 +34385,7 @@ impl Context {
                 .postorder(goal)
                 .iter()
                 .any(|t| functional.contains(t))
+                && !self.maps_only_in_equalities(goal)
             {
                 return (SmtResult::Unknown, None);
             }
@@ -36106,6 +36217,12 @@ impl Context {
                     if let Some(extra) = side.get(&t) {
                         stack.extend(extra.iter().copied());
                     }
+                    // An array read is a term of its own: the axioms that give
+                    // it meaning (a read of a constant array or a `store`) may
+                    // mention no symbol, yet must stay with the read.
+                    if ctx.m.is_select(t) {
+                        out.insert(t);
+                    }
                     for u in [Some(t), fp_link.get(&t).copied()].into_iter().flatten() {
                         if let Some(a) = ctx.m.app(u)
                             && let Some(fd) = ctx.m.func_decl(a.decl)
@@ -37909,7 +38026,7 @@ impl Context {
                             .iter()
                             .map(|a| self.term(a))
                             .collect::<Result<_, _>>()?;
-                        let sort = self.m.get_sort(arrays[0]);
+                        let sort = self.map_array_sort(&fname, &arrays);
                         let t = self.fresh_const(sort);
                         self.maps.insert(t, (fname, arrays));
                         return Ok(t);
