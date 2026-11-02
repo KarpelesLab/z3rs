@@ -2402,6 +2402,7 @@ struct Scope {
     decls: usize,
     sorts: usize,
     universals: usize,
+    quant_defs: usize,
 }
 
 struct Context {
@@ -2460,9 +2461,21 @@ struct Context {
     /// variables (`∀y. q(x, y)` inside `∀x. …` becomes `!qp!k(x)`), one per
     /// alpha-equivalence class keyed by the canonical text. Applications are
     /// sentinels like [`Self::quant_atoms`]: never confirmed by a model.
-    quant_preds: BTreeMap<String, AstId>,
+    quant_preds: BTreeMap<String, (AstId, usize)>,
     /// The declarations in [`Self::quant_preds`].
     quant_pred_decls: BTreeSet<AstId>,
+    /// The definitions of the [`Self::quant_preds`] abstractions (see
+    /// [`Self::quant_definition`]), as universals (no binder: a ground fact);
+    /// added only to look for a refutation once a check is undecided.
+    quant_defs: Vec<(Vec<AstId>, AstId)>,
+    /// Set while a check runs with [`Self::quant_defs`] added.
+    in_quant_defs: bool,
+    /// User `:pattern` trigger sets of top-level universals, by body.
+    universal_patterns: BTreeMap<AstId, Vec<Vec<AstId>>>,
+    /// E-matching equality classes (term → class index) and their members,
+    /// rebuilt by [`Self::ematch_rebuild_classes`] during instantiation.
+    ematch_class: BTreeMap<AstId, usize>,
+    ematch_members: Vec<Vec<AstId>>,
     /// Enumeration datatypes: sort → its constructor constants. Reasoned about
     /// as a finite uninterpreted sort with distinct elements and a domain axiom.
     enums: BTreeMap<AstId, Vec<AstId>>,
@@ -3599,6 +3612,11 @@ impl Context {
             quant_atoms: BTreeSet::new(),
             quant_preds: BTreeMap::new(),
             quant_pred_decls: BTreeSet::new(),
+            quant_defs: Vec::new(),
+            in_quant_defs: false,
+            universal_patterns: BTreeMap::new(),
+            ematch_class: BTreeMap::new(),
+            ematch_members: Vec::new(),
             enums: BTreeMap::new(),
             records: BTreeMap::new(),
             datatypes: BTreeMap::new(),
@@ -4013,6 +4031,7 @@ impl Context {
                         decls: self.decl_order.len(),
                         sorts: self.sort_order.len(),
                         universals: self.universals.len(),
+                        quant_defs: self.quant_defs.len(),
                     });
                 }
                 self.last_model = None;
@@ -4029,6 +4048,9 @@ impl Context {
                     self.assert_names.truncate(mark.assertions);
                     self.named_terms.retain(|&(_, _, i)| i < mark.assertions);
                     self.universals.truncate(mark.universals);
+                    self.quant_defs.truncate(mark.quant_defs);
+                    self.quant_preds
+                        .retain(|_, &mut (_, u)| u <= mark.quant_defs);
                     self.universal_names
                         .retain(|&(u, _, _)| u < mark.universals);
                     // Undeclare constants/functions and sorts made since the push.
@@ -4048,6 +4070,8 @@ impl Context {
                 self.named_terms.clear();
                 self.universals.clear();
                 self.universal_names.clear();
+                self.quant_preds.clear();
+                self.quant_defs.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -4071,6 +4095,8 @@ impl Context {
                 self.named_terms.clear();
                 self.universals.clear();
                 self.universal_names.clear();
+                self.quant_preds.clear();
+                self.quant_defs.clear();
                 self.objectives.clear();
                 self.objective_values.clear();
                 self.scope_stack.clear();
@@ -4685,6 +4711,10 @@ impl Context {
                         .collect::<Result<_, _>>()?;
                     let inner = self.skolemize_body(&inner, &univ, true)?;
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
+                    let pats = self.user_patterns(&binders, &vars, &ql[2]);
+                    if !pats.is_empty() {
+                        self.universal_patterns.insert(body, pats);
+                    }
                     if let Some(expanded) = self.expand_finite_forall(&vars, body) {
                         // Every bound sort is finite → the ground conjunction over
                         // the domain is exact (no instantiation heuristics needed).
@@ -21160,6 +21190,43 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        let r = self.check_sat_rootobj();
+        // Undecided with quantifier abstractions in play: retry with their
+        // definitions, taking only a refutation (they only constrain the
+        // abstractions, which already keep any `sat` from being confirmed).
+        if r.0 == SmtResult::Unknown && !self.in_quant_defs && !self.quant_defs.is_empty() {
+            let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
+            roots.extend(self.assertions.iter().copied());
+            if self
+                .m
+                .postorder_many(&roots)
+                .iter()
+                .any(|&t| self.is_quant_atom(t))
+            {
+                let saved = (self.assertions.clone(), self.universals.clone());
+                for (vars, ax) in self.quant_defs.clone() {
+                    if vars.is_empty() {
+                        self.assertions.push(ax);
+                        self.assert_names.push(None);
+                    } else {
+                        self.universals.push((vars, ax));
+                    }
+                }
+                self.in_quant_defs = true;
+                let r2 = self.check_sat_rootobj();
+                self.in_quant_defs = false;
+                self.assert_names.truncate(saved.0.len());
+                (self.assertions, self.universals) = saved;
+                if r2.0 == SmtResult::Unsat {
+                    return (SmtResult::Unsat, None);
+                }
+            }
+        }
+        r
+    }
+
+    /// [`Self::check_sat`] without the quantifier-definition retry.
+    fn check_sat_rootobj(&mut self) -> (SmtResult, Option<Model>) {
         // A `(root-obj p i)` constant is a real variable pinned to that root.
         if let Some(expanded) = self.expand_root_objs(&self.assertions.clone()) {
             let saved = core::mem::replace(&mut self.assertions, expanded);
@@ -26722,6 +26789,50 @@ impl Context {
         cache[&root]
     }
 
+    /// The user `:pattern`s of a quantifier body `(! φ :pattern (p₁ …) …)` over
+    /// `binders` (bound to `vars`), each parsed as a trigger set. Patterns that
+    /// fail to parse are skipped.
+    fn user_patterns(
+        &mut self,
+        binders: &SExpr,
+        vars: &[AstId],
+        annotated: &SExpr,
+    ) -> Vec<Vec<AstId>> {
+        let SExpr::List(l) = annotated else {
+            return Vec::new();
+        };
+        if !matches!(l.first(), Some(SExpr::Atom(h)) if h == "!") {
+            return Vec::new();
+        }
+        let Ok(bs) = as_list(binders) else {
+            return Vec::new();
+        };
+        let mut scope = Vec::new();
+        for (b, &v) in bs.iter().zip(vars) {
+            if let Ok(pair) = as_list(b)
+                && let Ok(n) = Self::sym(&pair[0])
+            {
+                scope.push((n.to_string(), v));
+            }
+        }
+        self.scopes.push(scope);
+        let mut out = Vec::new();
+        for w in l[2..].windows(2) {
+            if let [SExpr::Atom(k), SExpr::List(terms)] = w
+                && k == ":pattern"
+                && let Ok(set) = terms
+                    .iter()
+                    .map(|t| self.term(t))
+                    .collect::<Result<Vec<_>, _>>()
+                && !set.is_empty()
+            {
+                out.push(set);
+            }
+        }
+        self.scopes.pop();
+        out
+    }
+
     /// Trigger *sets* for E-matching. Each returned set is a group of
     /// user-function applications from `body` that jointly contain every bound
     /// variable; matching a set binds all binders. A single application covering
@@ -26734,6 +26845,26 @@ impl Context {
         body: AstId,
         user_decls: &BTreeSet<AstId>,
     ) -> Vec<Vec<AstId>> {
+        // User `:pattern`s, as z3 uses them: only those whose terms are all
+        // applications of user functions jointly covering every binder.
+        if let Some(pats) = self.universal_patterns.get(&body) {
+            let usable: Vec<Vec<AstId>> = pats
+                .iter()
+                .filter(|set| {
+                    set.iter()
+                        .all(|&t| self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)))
+                        && {
+                            let covered: BTreeSet<AstId> =
+                                self.m.postorder_many(set).into_iter().collect();
+                            vars.iter().all(|v| covered.contains(v))
+                        }
+                })
+                .cloned()
+                .collect();
+            if !usable.is_empty() {
+                return usable;
+            }
+        }
         // Candidate trigger applications and the binders each one covers.
         let mut apps: Vec<(AstId, BTreeSet<AstId>)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -26843,7 +26974,7 @@ impl Context {
     ) -> bool {
         if vars.contains(&pat) {
             return match binding.get(&pat) {
-                Some(&x) => x == g,
+                Some(&x) => self.ematch_equal(x, g),
                 None => {
                     binding.insert(pat, g);
                     true
@@ -26851,18 +26982,139 @@ impl Context {
             };
         }
         if !self.m.postorder(pat).iter().any(|x| vars.contains(x)) {
-            return pat == g;
+            return self.ematch_equal(pat, g);
         }
-        if self.m.is_app(pat) && self.m.is_app(g) && self.m.app_decl(pat) == self.m.app_decl(g) {
-            let pa = self.m.app_args(pat).to_vec();
-            let ga = self.m.app_args(g).to_vec();
-            return pa.len() == ga.len()
-                && pa
-                    .iter()
-                    .zip(&ga)
-                    .all(|(&p, &q)| self.ematch(p, q, vars, binding));
+        if !self.m.is_app(pat) {
+            return false;
+        }
+        // `g` itself, then the other members of its class (matching modulo the
+        // equalities, as z3's E-matching runs over the E-graph).
+        let decl = self.m.app_decl(pat);
+        let members = self
+            .ematch_class
+            .get(&g)
+            .map(|&c| self.ematch_members[c].as_slice())
+            .unwrap_or_default();
+        for &h in core::iter::once(&g).chain(members.iter().filter(|&&h| h != g)) {
+            if !self.m.is_app(h) || self.m.app_decl(h) != decl {
+                continue;
+            }
+            let pa = self.m.app_args(pat);
+            let ga = self.m.app_args(h);
+            if pa.len() != ga.len() {
+                continue;
+            }
+            let mut b = binding.clone();
+            if pa
+                .iter()
+                .zip(ga)
+                .all(|(&p, &q)| self.ematch(p, q, vars, &mut b))
+            {
+                *binding = b;
+                return true;
+            }
         }
         false
+    }
+
+    /// Are `a` and `b` the same term, or in one E-matching equality class?
+    fn ematch_equal(&self, a: AstId, b: AstId) -> bool {
+        a == b
+            || matches!((self.ematch_class.get(&a), self.ematch_class.get(&b)), (Some(x), Some(y)) if x == y)
+    }
+
+    /// Does E-matching (with the automatic triggers: every user-function
+    /// application covering all binders) instantiate `∀vars. body` completely
+    /// once it reaches a fixpoint? Only when every binder occurrence sits under
+    /// a user-function application and every such application containing a
+    /// binder covers all of them: then an element no trigger matched sees only
+    /// fresh applications, which can copy the values of a matched instance. A
+    /// binder in an interpreted position (`x ≠ c`) or an application missing a
+    /// binder (`p(x)` beside `r(x, y)`) breaks that, as do user patterns.
+    fn ematch_complete(&self, vars: &[AstId], body: AstId, user_decls: &BTreeSet<AstId>) -> bool {
+        if self.universal_patterns.contains_key(&body) {
+            return false;
+        }
+        let vs: BTreeSet<AstId> = vars.iter().copied().collect();
+        let mut seen: BTreeSet<(AstId, bool)> = BTreeSet::new();
+        let mut stack = alloc::vec![(body, false)];
+        while let Some((t, under)) = stack.pop() {
+            if !seen.insert((t, under)) {
+                continue;
+            }
+            if vs.contains(&t) {
+                if !under {
+                    return false;
+                }
+                continue;
+            }
+            let Some(app) = self.m.app(t) else { continue };
+            let uf = user_decls.contains(&app.decl);
+            if uf {
+                let covered: BTreeSet<AstId> = self
+                    .m
+                    .postorder(t)
+                    .into_iter()
+                    .filter(|x| vs.contains(x))
+                    .collect();
+                if !covered.is_empty() && covered.len() != vs.len() {
+                    return false;
+                }
+            }
+            for &a in &app.args {
+                stack.push((a, under || uf));
+            }
+        }
+        true
+    }
+
+    /// Rebuild the E-matching equality classes from every equality atom between
+    /// uninterpreted- or array-sorted terms in `roots`, whatever its polarity:
+    /// an instance is valid for any ground terms, so matching modulo these
+    /// equalities only changes which instances are deemed relevant.
+    fn ematch_rebuild_classes(&mut self, roots: &[AstId]) {
+        let mut parent: BTreeMap<AstId, AstId> = BTreeMap::new();
+        fn find(parent: &mut BTreeMap<AstId, AstId>, x: AstId) -> AstId {
+            let mut r = x;
+            while let Some(&p) = parent.get(&r) {
+                if p == r {
+                    break;
+                }
+                r = p;
+            }
+            parent.insert(x, r);
+            r
+        }
+        for t in self.m.postorder_many(roots) {
+            if !self.m.is_eq(t) {
+                continue;
+            }
+            let args = self.m.app_args(t);
+            let (a, b) = (args[0], args[1]);
+            let s = self.m.get_sort(a);
+            if !(self.declared_sorts.contains(&s) || self.m.is_array_sort(s)) {
+                continue;
+            }
+            parent.entry(a).or_insert(a);
+            parent.entry(b).or_insert(b);
+            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
+            if ra != rb {
+                parent.insert(ra, rb);
+            }
+        }
+        self.ematch_class.clear();
+        self.ematch_members.clear();
+        let mut root_idx: BTreeMap<AstId, usize> = BTreeMap::new();
+        let keys: Vec<AstId> = parent.keys().copied().collect();
+        for t in keys {
+            let r = find(&mut parent, t);
+            let c = *root_idx.entry(r).or_insert_with(|| {
+                self.ematch_members.push(Vec::new());
+                self.ematch_members.len() - 1
+            });
+            self.ematch_members[c].push(t);
+            self.ematch_class.insert(t, c);
+        }
     }
 
     fn universal_instances(&mut self) -> (Vec<AstId>, bool) {
@@ -26938,6 +27190,17 @@ impl Context {
                 self.trigger_sets(&vs, *body, &user_decls)
             })
             .collect();
+        // Whether E-matching alone can saturate each universal (see
+        // `ematch_complete`, or a functional definition, which extends to the
+        // unmatched points); the others are also enumerated.
+        let ematch_ok: Vec<bool> = universals
+            .iter()
+            .map(|(vars, body)| {
+                self.ematch_complete(vars, *body, &user_decls)
+                    || (!self.universal_patterns.contains_key(body)
+                        && self.universal_is_definition(vars, *body, &user_decls))
+            })
+            .collect();
 
         // Ground terms by sort, and user-function applications by decl (for
         // E-matching), seeded from the assertions.
@@ -27000,6 +27263,7 @@ impl Context {
             }
         }
         let mut seed_enumerated = false;
+        let mut enum_capped = false;
 
         let mut instances: Vec<AstId> = Vec::new();
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
@@ -27014,10 +27278,17 @@ impl Context {
         // instead of flooding the budget with irrelevant ground combinations).
         for _ in 0..MAX_ROUNDS {
             let mut fresh = false;
+            let mut roots = self.assertions.clone();
+            roots.extend(instances.iter().copied());
+            self.ematch_rebuild_classes(&roots);
+            // Match against this round's ground terms only (breadth-first by
+            // generation, like z3's instantiation cost), so one universal's
+            // instances cannot starve the others within a round.
+            let round_decl = by_decl.clone();
             for (ui, (vars, body)) in universals.iter().enumerate() {
                 let vs: BTreeSet<AstId> = vars.iter().copied().collect();
                 for set in &trigs[ui] {
-                    for binding in self.ematch_set(set, &vs, &by_decl) {
+                    for binding in self.ematch_set(set, &vs, &round_decl) {
                         let subst: Vec<(AstId, AstId)> =
                             vars.iter().map(|&v| (v, binding[&v])).collect();
                         let subst = self.with_fp_bits(subst);
@@ -27098,7 +27369,7 @@ impl Context {
                 // trigger matched nothing, OR when E-matching produced *no*
                 // instance for this universal (a triggered predicate/function with
                 // no ground application to seed it — e.g. `∀x. p(x) ∧ ¬p(x)`).
-                let enumerate = trigs[ui].is_empty() || ematch_counts[ui] == 0;
+                let enumerate = trigs[ui].is_empty() || ematch_counts[ui] == 0 || !ematch_ok[ui];
                 if !enumerate {
                     continue; // handled completely by E-matching
                 }
@@ -27118,9 +27389,21 @@ impl Context {
                 }
                 let cands: Vec<Vec<AstId>> = vars
                     .iter()
-                    .map(|&v| by_sort[&self.m.get_sort(v)].iter().copied().collect())
+                    .map(|&v| {
+                        let all = by_sort[&self.m.get_sort(v)].iter().copied();
+                        // A binder the body never mentions needs one value only.
+                        if self.m.postorder(*body).contains(&v) {
+                            all.collect()
+                        } else {
+                            all.take(1).collect()
+                        }
+                    })
                     .collect();
-                // Bounded cartesian product of the candidate ground terms.
+                // Bounded cartesian product of the candidate ground terms; a
+                // truncated product is not a complete enumeration.
+                if cands.iter().map(Vec::len).product::<usize>() > MAX_INSTANCES_PER_UNIVERSAL {
+                    enum_capped = true;
+                }
                 let mut combos: Vec<Vec<AstId>> = alloc::vec![Vec::new()];
                 for c in &cands {
                     let mut next = Vec::new();
@@ -27186,6 +27469,7 @@ impl Context {
                 return (
                     instances,
                     ematch_saturated
+                        && !enum_capped
                         && !dt_enumerated
                         && !arith_enumerated
                         && !seed_enumerated
@@ -32778,27 +33062,119 @@ impl Context {
     /// (a macro, a `:named` term, a `match`).
     fn quant_abstraction(&mut self, q: &SExpr) -> Option<AstId> {
         let mut free: Vec<AstId> = Vec::new();
+        let mut names: Vec<(String, usize)> = Vec::new();
         let mut key = String::new();
         let mut renames: Vec<(String, String)> = Vec::new();
         let mut counter = 0u32;
-        self.quant_canon(q, &mut renames, &mut counter, &mut free, &mut key)?;
+        let mut fv = (&mut free, &mut names);
+        self.quant_canon(q, &mut renames, &mut counter, &mut fv, &mut key)?;
         let sorts: Vec<AstId> = free.iter().map(|&v| self.m.get_sort(v)).collect();
         for s in &sorts {
             key.push_str(&alloc::format!(" S{s:?}"));
         }
         let decl = match self.quant_preds.get(&key) {
-            Some(&d) => d,
+            Some(&(d, _)) => d,
             None => {
                 let name = alloc::format!("!qp!{}", self.fresh_counter);
                 self.fresh_counter += 1;
                 let b = self.m.mk_bool_sort();
                 let d = self.m.mk_func_decl(Symbol::new(&name), &sorts, b);
-                self.quant_preds.insert(key, d);
                 self.quant_pred_decls.insert(d);
+                self.quant_definition(d, q, &sorts, &names);
+                // Keyed with the definition count after its own, so a `pop` that
+                // drops the definition also forgets the predicate.
+                self.quant_preds.insert(key, (d, self.quant_defs.len()));
                 d
             }
         };
         Some(self.m.mk_app(decl, &free))
+    }
+
+    /// Define the abstraction `P` of the quantified formula `q` (see
+    /// [`Self::quant_abstraction`]) the way z3 treats a quantifier atom: for
+    /// `q = ∀xs. φ` over free variables `fs` (named by `names`),
+    /// `∀fs xs. P(fs) ⇒ φ` — instantiated like any universal once `P` holds —
+    /// and the skolemized `∀fs. ¬P(fs) ⇒ ¬φ[xs := sk(fs)]`; dually for `∃`. Both
+    /// are valid for the formula `P` stands for, so refutations stay sound. A
+    /// body that fails to parse just leaves `P` undefined.
+    fn quant_definition(
+        &mut self,
+        p: AstId,
+        q: &SExpr,
+        sorts: &[AstId],
+        names: &[(String, usize)],
+    ) {
+        let SExpr::List(l) = q else { return };
+        let (Some(SExpr::Atom(head)), Some(SExpr::List(binders)), Some(body)) =
+            (l.first(), l.get(1), l.get(2))
+        else {
+            return;
+        };
+        // Only binders over uninterpreted sorts: instances of a theory-sorted
+        // one rarely help the ground decision and can swamp it.
+        let uninterp = binders.iter().all(|b| {
+            as_list(b)
+                .ok()
+                .and_then(|p| self.resolve_sort(&p[1]).ok())
+                .is_some_and(|s| self.declared_sorts.contains(&s))
+        });
+        if !uninterp {
+            return;
+        }
+        let is_forall = head == "forall";
+        let fs: Vec<AstId> = sorts.iter().map(|&s| self.fresh_const(s)).collect();
+        let scope: Vec<(String, AstId)> = names.iter().map(|(n, i)| (n.clone(), fs[*i])).collect();
+        self.scopes.push(scope);
+        let generic = self.parse_quantifier(&l[1], body);
+        let mut sk_scope = Vec::new();
+        let mut ok = true;
+        for b in binders {
+            let Ok(pair) = as_list(b) else {
+                ok = false;
+                break;
+            };
+            let (Ok(n), Ok(s)) = (Self::sym(&pair[0]), self.resolve_sort(&pair[1])) else {
+                ok = false;
+                break;
+            };
+            let fname = alloc::format!("!sk!{}", self.fresh_counter);
+            self.fresh_counter += 1;
+            let d = self.m.mk_func_decl(Symbol::new(&fname), sorts, s);
+            sk_scope.push((n.to_string(), self.m.mk_app(d, &fs)));
+        }
+        let skolem = if ok {
+            self.scopes.push(sk_scope);
+            let t = self.term(body);
+            self.scopes.pop();
+            t.ok()
+        } else {
+            None
+        };
+        self.scopes.pop();
+        let pf = self.m.mk_app(p, &fs);
+        let npf = self.m.mk_not(pf);
+        // The instantiable direction: `P ⇒ ∀xs. φ` (`¬P ⇒ ∀xs. ¬φ` for `∃`).
+        if let Ok((xs, phi)) = generic {
+            let (guard, phi) = if is_forall {
+                (pf, phi)
+            } else {
+                (npf, self.m.mk_not(phi))
+            };
+            let mut vars = fs.clone();
+            vars.extend(xs);
+            let ax = self.m.mk_implies(guard, phi);
+            self.quant_defs.push((vars, ax));
+        }
+        // The skolemized direction: `¬P ⇒ ¬φ[sk]` (`P ⇒ φ[sk]` for `∃`).
+        if let Some(phi) = skolem {
+            let ax = if is_forall {
+                let n = self.m.mk_not(phi);
+                self.m.mk_implies(npf, n)
+            } else {
+                self.m.mk_implies(pf, phi)
+            };
+            self.quant_defs.push((fs, ax));
+        }
     }
 
     /// Append the canonical text of `e` to `key` for [`Self::quant_abstraction`]:
@@ -32810,7 +33186,7 @@ impl Context {
         e: &SExpr,
         renames: &mut Vec<(String, String)>,
         counter: &mut u32,
-        free: &mut Vec<AstId>,
+        fv: &mut (&mut Vec<AstId>, &mut Vec<(String, usize)>),
         key: &mut String,
     ) -> Option<()> {
         match e {
@@ -32818,10 +33194,14 @@ impl Context {
                 if let Some((_, alias)) = renames.iter().rev().find(|(n, _)| n == a) {
                     key.push_str(alias);
                 } else if let Some(id) = self.lookup_bound(a) {
+                    let (free, names) = fv;
                     let i = free.iter().position(|&f| f == id).unwrap_or_else(|| {
                         free.push(id);
                         free.len() - 1
                     });
+                    if !names.iter().any(|(n, _)| n == a) {
+                        names.push((a.clone(), i));
+                    }
                     key.push_str(&alloc::format!("#{i}"));
                 } else if self.macros.contains_key(a)
                     || self.named_terms.iter().any(|(n, _, _)| n == a)
@@ -32841,7 +33221,7 @@ impl Context {
                     _ => "",
                 };
                 match head {
-                    "!" if l.len() >= 2 => self.quant_canon(&l[1], renames, counter, free, key),
+                    "!" if l.len() >= 2 => self.quant_canon(&l[1], renames, counter, fv, key),
                     "match" => None,
                     "forall" | "exists" | "lambda" if l.len() == 3 => {
                         let SExpr::List(bs) = &l[1] else { return None };
@@ -32859,7 +33239,7 @@ impl Context {
                             renames.push((n.clone(), alias));
                         }
                         key.push_str(") ");
-                        let r = self.quant_canon(&l[2], renames, counter, free, key);
+                        let r = self.quant_canon(&l[2], renames, counter, fv, key);
                         renames.truncate(mark);
                         key.push_str(") ");
                         r
@@ -32876,14 +33256,14 @@ impl Context {
                             let alias = alloc::format!("?b{counter}");
                             *counter += 1;
                             key.push_str(&alloc::format!("({alias} "));
-                            self.quant_canon(v, renames, counter, free, key)?;
+                            self.quant_canon(v, renames, counter, fv, key)?;
                             key.push_str(") ");
                             aliases.push((n.clone(), alias));
                         }
                         key.push_str(") ");
                         let mark = renames.len();
                         renames.extend(aliases);
-                        let r = self.quant_canon(&l[2], renames, counter, free, key);
+                        let r = self.quant_canon(&l[2], renames, counter, fv, key);
                         renames.truncate(mark);
                         key.push_str(") ");
                         r
@@ -32891,7 +33271,7 @@ impl Context {
                     _ => {
                         key.push('(');
                         for x in l {
-                            self.quant_canon(x, renames, counter, free, key)?;
+                            self.quant_canon(x, renames, counter, fv, key)?;
                         }
                         key.push_str(") ");
                         Some(())
@@ -38315,6 +38695,51 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn ematching_fixpoint_is_not_a_model_when_incomplete() {
+        // A binder in an interpreted position: `x = c` is never matched.
+        let script = "
+            (declare-sort U 0)
+            (declare-fun f (U) U)
+            (declare-const a U)
+            (declare-const c U)
+            (declare-const d U)
+            (assert (forall ((x U)) (and (= (f x) a) (not (= x c)))))
+            (assert (= (f d) a))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+        // `p x`/`q y` beside the covering trigger `r x y`.
+        let script = "
+            (declare-sort U 0)
+            (declare-fun p (U) Bool)
+            (declare-fun q (U) Bool)
+            (declare-fun r (U U) Bool)
+            (declare-const c U)
+            (declare-const e U)
+            (assert (forall ((x U) (y U)) (or (and (p x) (r x y)) (and (q y) (not (r x y))))))
+            (assert (r e e))
+            (assert (p e))
+            (assert (not (p c)))
+            (assert (not (q c)))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+        // A user pattern restricts the triggers: `p b` is never matched.
+        let script = "
+            (declare-sort U 0)
+            (declare-fun f (U) U)
+            (declare-fun p (U) Bool)
+            (declare-const a U)
+            (declare-const b U)
+            (assert (forall ((x U)) (! (p x) :pattern ((f x)))))
+            (assert (= (f a) a))
+            (assert (not (p b)))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
