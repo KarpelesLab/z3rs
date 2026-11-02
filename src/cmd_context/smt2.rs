@@ -11887,6 +11887,56 @@ impl Context {
             let eavail = self.m.mk_eq(sublen, avail3);
             ax.push(self.m.mk_implies(c2, eavail));
         }
+        // The same clamped length for a symbolic offset or count (z3's extract
+        // axioms): `len(substr x i n) = 0` when `i < 0 ∨ n ≤ 0 ∨ i ≥ len x`,
+        // else `min(n, len x − i)`; plus the emptiness link of the new length
+        // term. Refutes `substr a 3 (len b) ≠ "" ∧ len a ≤ 3`.
+        let sym_subs: Vec<(AstId, AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_app(t)
+                    || self
+                        .str_op_decls
+                        .get(&self.m.app_decl(t))
+                        .map(String::as_str)
+                        != Some("str.substr")
+                {
+                    return None;
+                }
+                let a = self.m.app_args(t);
+                (a.len() == 3
+                    && (self.m.as_numeral(a[1]).is_none() || self.m.as_numeral(a[2]).is_none()))
+                .then(|| (t, a[0], a[1], a[2]))
+            })
+            .collect();
+        for (app, x, i, n) in sym_subs {
+            let lenf = self.str_len_fn();
+            let lx = self.m.mk_app(lenf, &[x]);
+            let sublen = self.m.mk_app(lenf, &[app]);
+            let zero = self.m.mk_int(0);
+            let empty = self.mk_str_lit("");
+            let is_empty = self.m.mk_eq(app, empty);
+            let len_zero = self.m.mk_eq(sublen, zero);
+            ax.push(self.m.mk_eq(len_zero, is_empty));
+            ax.push(self.m.mk_ge(sublen, zero));
+            let i_neg = self.m.mk_lt(i, zero);
+            let n_nonpos = self.m.mk_le(n, zero);
+            let oob = self.m.mk_ge(i, lx);
+            let out = self.m.mk_or(&[i_neg, n_nonpos, oob]);
+            ax.push(self.m.mk_implies(out, len_zero));
+            let i_ok = self.m.mk_ge(i, zero);
+            let n_pos = self.m.mk_gt(n, zero);
+            let inb = self.m.mk_lt(i, lx);
+            let avail = self.m.mk_sub(&[lx, i]);
+            let enough = self.m.mk_ge(avail, n);
+            let c1 = self.m.mk_and(&[i_ok, n_pos, inb, enough]);
+            let len_n = self.m.mk_eq(sublen, n);
+            ax.push(self.m.mk_implies(c1, len_n));
+            let short = self.m.mk_lt(avail, n);
+            let c2 = self.m.mk_and(&[i_ok, n_pos, inb, short]);
+            let len_avail = self.m.mk_eq(sublen, avail);
+            ax.push(self.m.mk_implies(c2, len_avail));
+        }
         // `str.to_code x`: a valid code (≥ 0) requires a single character, so
         // `str.to_code x ≥ 0 ⇒ len x = 1`. Refutes `str.to_code x = 97 ∧ len x = 2`.
         // `str.indexof x t i`: a found index (≥ 0) leaves room for the needle, so
@@ -14754,7 +14804,7 @@ impl Context {
                 // element equalities left by `refold` collapse (simplify_eq now
                 // handles bit-vector numerals) rather than leaking to the EUF core.
                 let g3 = crate::rewriter::simplify(&mut self.m, g3);
-                let g3 = self.lift_arith_ites(g3);
+                let g3 = self.lift_term_ites(g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
                     // `check_model` may report `sat` without a model when the goal
@@ -14828,7 +14878,7 @@ impl Context {
             conj.push(g2);
             self.m.mk_and(&conj)
         };
-        let g3 = self.lift_arith_ites(g3);
+        let g3 = self.lift_term_ites(g3);
         let (res, m) = check_model(&self.m, g3);
         if res == SmtResult::Sat {
             self.str_witness = subst;
@@ -14908,10 +14958,11 @@ impl Context {
             }
         }
         vars.retain(|v| !derived.iter().any(|(d, _)| d == v));
-        // A string var bound by `x = int.to.str(t)` (`str.from_int`, a producer
-        // whose value is determined once its integer argument is fixed by the index
-        // enumeration below) is COMPUTED by folding the producer — the search can't
-        // guess an arbitrary decimal-digit string otherwise (issue-1846 #2).
+        // A string var bound by `x = op(…)` for a string-op producer (`int.to.str
+        // t`, `str.at (str.replace a b c) i`, …), whose value is determined once
+        // its arguments are fixed by the enumeration below, is COMPUTED by folding
+        // the producer — the search can't guess an arbitrary decimal-digit string
+        // otherwise (issue-1846 #2), and it is one dimension fewer (issue-1841).
         let mut derived_prod: Vec<(AstId, AstId)> = Vec::new();
         {
             let mut top: Vec<AstId> = Vec::new();
@@ -14927,20 +14978,30 @@ impl Context {
             }
             for t in top {
                 if self.m.is_eq(t) && self.m.app_args(t).len() == 2 {
-                    let a = self.m.app_args(t);
+                    let a = self.m.app_args(t).to_vec();
                     for (v, p) in [(a[0], a[1]), (a[1], a[0])] {
-                        if vars.contains(&v)
-                            && !derived_prod.iter().any(|(d, _)| *d == v)
-                            && self.m.is_app(p)
-                            && matches!(
-                                self.str_op_decls
-                                    .get(&self.m.app_decl(p))
-                                    .map(String::as_str),
-                                Some("str.from_int") | Some("str.from-int")
-                            )
+                        if !vars.contains(&v)
+                            || derived_prod.iter().any(|(d, _)| *d == v)
+                            || !self.m.is_app(p)
+                            || !self.str_op_decls.contains_key(&self.m.app_decl(p))
                         {
-                            derived_prod.push((v, p));
+                            continue;
                         }
+                        // Any string-op producer over other variables determines
+                        // `v` once they are fixed (`src = str.at(…)`); acyclic:
+                        // `v` and the variables already derived stay out of it.
+                        let deps = self.m.postorder(p);
+                        if deps
+                            .iter()
+                            .any(|d| *d == v || derived_prod.iter().any(|(dv, _)| dv == d))
+                            || derived_prod
+                                .iter()
+                                .any(|(_, dp)| self.m.postorder(*dp).contains(&v))
+                        {
+                            continue;
+                        }
+                        derived_prod.push((v, p));
+                        break;
                     }
                 }
             }
@@ -15023,14 +15084,13 @@ impl Context {
         if vars.is_empty() && derived.is_empty() && derived_prod.is_empty() && !has_index_var {
             return None;
         }
-        // Up to four free string variables. The Cartesian enumeration is bounded
-        // by `MAX_TRIES` regardless of the variable count, so a fourth variable
-        // does not blow up the work — it just widens the (still-capped) search,
-        // which lets a disjunctive goal over four strings (`a ≠ b·c ∨ …`, 3500)
-        // find a satisfying branch.
-        if vars.len() > 4 {
-            return None;
-        }
+        // Up to six free string variables are enumerated. The Cartesian
+        // enumeration is bounded by `MAX_TRIES` regardless of the variable count,
+        // so another variable does not blow up the work — it just widens the
+        // (still-capped) search, which lets a disjunctive goal over four strings
+        // (`a ≠ b·c ∨ …`, 3500) find a satisfying branch. Past six, only the
+        // model-guided filler words below are tried.
+        let fill_only = vars.len() > 6;
         // Model-guided filler words: when the abstract (length-only) model pins each
         // string variable's length, a word of exactly that length is a candidate —
         // one distinct character per model congruence class, so variables the model
@@ -15312,6 +15372,16 @@ impl Context {
                 per_var.push(alloc::vec![lv.clone()]);
                 continue;
             }
+            if fill_only {
+                let fill = model_fill[vi].clone()?;
+                let uniform = alloc::vec!['a' as u32; fill.len()];
+                let mut cands = alloc::vec![fill];
+                if !cands.contains(&uniform) {
+                    cands.push(uniform);
+                }
+                per_var.push(cands);
+                continue;
+            }
             let exact = self.str_exact_len(goal, v);
             // Try literal substrings first (a concat piece is usually one of them).
             let mut cands: Vec<Vec<u32>> = Vec::new();
@@ -15353,6 +15423,13 @@ impl Context {
                 && !cands.contains(fill)
             {
                 cands.push(fill.clone());
+                // The same length over one shared character: a shorter variable's
+                // uniform word then occurs in a longer one's (`replace a b ""`
+                // with `b` inside `a`).
+                let uniform = alloc::vec!['a' as u32; fill.len()];
+                if !cands.contains(&uniform) {
+                    cands.push(uniform);
+                }
             }
             for sub in &lit_subs {
                 let ok = match exact {
@@ -15489,7 +15566,7 @@ impl Context {
                     conj.push(g2);
                     self.m.mk_and(&conj)
                 };
-                let g3 = self.lift_arith_ites(g3);
+                let g3 = self.lift_term_ites(g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
                     self.str_witness = subst.clone(); // record for get-value/get-model
@@ -29094,6 +29171,19 @@ impl Context {
         if has { self.lift(goal) } else { goal }
     }
 
+    /// `goal` with every non-Boolean term-level `ite` lifted: a refolded string
+    /// witness can carry a string `ite` (a symbolic-offset `substr` of a
+    /// now-literal word) under `str.len`, which `check_model` would otherwise
+    /// read as a free term (a fuzz-found invalid model).
+    fn lift_term_ites(&mut self, goal: AstId) -> AstId {
+        let has = self
+            .m
+            .postorder(goal)
+            .iter()
+            .any(|&t| self.m.is_ite(t) && !self.m.is_bool_sort(self.m.get_sort(t)));
+        if has { self.lift(goal) } else { goal }
+    }
+
     fn decide_inner_core(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.eliminate_pure_bv2int(goal);
         let goal = self.lift_arith_ites(goal);
@@ -31698,6 +31788,13 @@ impl Context {
                     continue; // array interpretations not yet emitted (invalid)
                 }
                 let c = self.m.mk_const(decl.d);
+                // A string/index constant the witness search assigned renders as
+                // its witness value (as `get-value` does).
+                let c = self
+                    .str_witness
+                    .iter()
+                    .find(|(v, _)| *v == c)
+                    .map_or(c, |&(_, w)| w);
                 let v = self.model_term_render(&mut model, c);
                 let sort_name = self.sort_display(decl.range);
                 out.push_str(&alloc::format!(
@@ -38128,6 +38225,50 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn string_witness_derives_producer_bound_variables() {
+        // z3 regressions issue-1841 / 3105: `src` is computed from its producer
+        // rather than enumerated, and a symbolic-length `substr` gets its
+        // clamped-length axioms (so the length hint is `len a ≥ 4`).
+        let script = "
+            (declare-fun str0 () String)
+            (declare-fun str1 () String)
+            (declare-fun str2 () String)
+            (declare-fun src () String)
+            (declare-fun dst () String)
+            (declare-fun s () String)
+            (declare-const i Int)
+            (assert (= src (str.at (str.replace str0 str1 str2) i)))
+            (assert (= (str.replace s src dst) \"a\"))
+            (check-sat)
+            (reset)
+            (declare-fun a () String)
+            (declare-fun b () String)
+            (declare-fun c () String)
+            (assert (distinct (str.substr a 3 (str.len b)) \"\"))
+            (assert (distinct
+                     (ite (= (str.len (str.substr (str.replace a b \"\") 0 (- (str.len c)))) 1) 0 2)
+                     (ite (= (str.at (str.replace a b \"\") 2) \"\") 1 2)))
+            (check-sat)
+            (reset)
+            (declare-const a String)
+            (declare-const b String)
+            (declare-const i Int)
+            (assert (= (str.len (str.substr (str.++ \"aab\" a) i 1)) i))
+            (assert (distinct (str.++ a b) (str.substr \"aab\" i 1)))
+            (check-sat)
+            (get-value (i))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "sat");
+        // Fuzz-found: a refolded string `ite` under `str.len` was read as a free
+        // term (`i = 3` with `len(substr "aabc" 3 1) = 1`); now lifted.
+        if out[2] == "sat" {
+            assert_ne!(out[3], "((i 3))");
+        }
     }
 
     #[test]
