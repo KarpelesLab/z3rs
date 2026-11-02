@@ -2257,6 +2257,18 @@ fn rename_free(e: &SExpr, from: &str, to: &str) -> SExpr {
 /// is `∀x y. ite(c, φ, ψ)`, which instantiation handles instead of an opaque
 /// nested quantifier.
 fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u32) -> SExpr {
+    prenex_positive_with(e, pos, extra, counter, false)
+}
+
+/// [`prenex_positive`], also pulling out arithmetic binders when `arith`
+/// (for quantifiers that quantifier elimination could not remove).
+fn prenex_positive_with(
+    e: &SExpr,
+    pos: bool,
+    extra: &mut Vec<SExpr>,
+    counter: &mut u32,
+    arith: bool,
+) -> SExpr {
     let SExpr::List(l) = e else { return e.clone() };
     let Some(SExpr::Atom(h)) = l.first() else {
         return e.clone();
@@ -2267,24 +2279,24 @@ fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u
                 .chain(
                     l[1..]
                         .iter()
-                        .map(|x| prenex_positive(x, pos, extra, counter)),
+                        .map(|x| prenex_positive_with(x, pos, extra, counter, arith)),
                 )
                 .collect(),
         ),
         "not" if l.len() == 2 => SExpr::List(alloc::vec![
             l[0].clone(),
-            prenex_positive(&l[1], !pos, extra, counter)
+            prenex_positive_with(&l[1], !pos, extra, counter, arith)
         ]),
         "=>" if l.len() == 3 => SExpr::List(alloc::vec![
             l[0].clone(),
-            prenex_positive(&l[1], !pos, extra, counter),
-            prenex_positive(&l[2], pos, extra, counter),
+            prenex_positive_with(&l[1], !pos, extra, counter, arith),
+            prenex_positive_with(&l[2], pos, extra, counter, arith),
         ]),
         "ite" if l.len() == 4 => SExpr::List(alloc::vec![
             l[0].clone(),
             l[1].clone(),
-            prenex_positive(&l[2], pos, extra, counter),
-            prenex_positive(&l[3], pos, extra, counter),
+            prenex_positive_with(&l[2], pos, extra, counter, arith),
+            prenex_positive_with(&l[3], pos, extra, counter, arith),
         ]),
         "forall" | "exists" if l.len() == 3 && (h == "forall") == pos => {
             let SExpr::List(bs) = &l[1] else {
@@ -2292,8 +2304,8 @@ fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u
             };
             // Arithmetic binders stay nested: quantifier elimination decides
             // those exactly (inner block first).
-            let arith = |b: &SExpr| matches!(b, SExpr::List(pv) if matches!(pv.get(1), Some(SExpr::Atom(s)) if s == "Int" || s == "Real"));
-            if bs.iter().any(arith) {
+            let is_arith = |b: &SExpr| matches!(b, SExpr::List(pv) if matches!(pv.get(1), Some(SExpr::Atom(s)) if s == "Int" || s == "Real"));
+            if !arith && bs.iter().any(is_arith) {
                 return e.clone();
             }
             let mut body = l[2].clone();
@@ -2307,7 +2319,7 @@ fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u
                 body = rename_free(&body, n, &fresh);
                 extra.push(SExpr::List(alloc::vec![SExpr::Atom(fresh), sort.clone()]));
             }
-            prenex_positive(&body, pos, extra, counter)
+            prenex_positive_with(&body, pos, extra, counter, arith)
         }
         _ => e.clone(),
     }
@@ -5202,6 +5214,40 @@ impl Context {
                 }
                 let t = self.term(&asserted)?;
                 let name = named_label(&list[1]);
+                // A quantifier left opaque (nested quantifier elimination and
+                // abstraction both failed) whose binders, arithmetic ones
+                // included, can be pulled to the top: assert it as that
+                // universal instead.
+                if list.len() == 2 && self.m.postorder(t).iter().any(|&u| self.is_quant_atom(u)) {
+                    let mut extra = Vec::new();
+                    let mut counter = self.fresh_counter;
+                    // (A `:named` assertion's formula is under its annotation.)
+                    let core = match (&name, &list[1]) {
+                        (Some(_), SExpr::List(parts)) if parts.len() >= 2 => {
+                            push_not_quantifier(&parts[1])
+                        }
+                        _ => asserted.clone(),
+                    };
+                    let pren = prenex_positive_with(&core, true, &mut extra, &mut counter, true);
+                    if !extra.is_empty() {
+                        self.fresh_counter = counter;
+                        let q = SExpr::List(alloc::vec![
+                            SExpr::Atom("forall".into()),
+                            SExpr::List(extra),
+                            pren
+                        ]);
+                        let (u0, a0) = (self.universals.len(), self.assertions.len());
+                        self.command(&SExpr::List(alloc::vec![list[0].clone(), q]))?;
+                        if let Some(n) = name {
+                            if self.universals.len() > u0 {
+                                self.universal_names.push((u0, n, a0));
+                            } else if self.assertions.len() > a0 {
+                                self.assert_names[a0] = Some(n);
+                            }
+                        }
+                        return Ok(None);
+                    }
+                }
                 if let Some(n) = &name {
                     // `:named n` makes `n` denote the asserted term.
                     self.named_terms.push((n.clone(), t, self.assertions.len()));
@@ -23755,6 +23801,9 @@ impl Context {
         if let Some(r) = self.solve_bv_universals() {
             return r;
         }
+        if let Some(r) = self.solve_range_universals() {
+            return r;
+        }
         if ground_trivial
             && sentinel_free
             && interpreted_only
@@ -23916,6 +23965,262 @@ impl Context {
         } else {
             (res, model)
         }
+    }
+
+    /// Universals whose integer binders are confined by their bodies to
+    /// ranges between ground terms (`∀k. 0 ≤ k < len s ⇒ φ`, also as
+    /// `¬(… ∧ k < t ∧ …)` disjuncts), decided by model-based instantiation
+    /// over those ranges: decide the ground goal with the instances so far,
+    /// evaluate the range bounds in its model, and instantiate every binder
+    /// value inside them not yet instantiated. A model whose ranges are all
+    /// instantiated satisfies every universal (outside its range a body is
+    /// true by the bounds' values), so it is `sat`; an unsat ground goal is
+    /// `unsat` (instances are consequences). `None` outside the fragment or
+    /// when the rounds or the instance budget run out.
+    fn solve_range_universals(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        const MAX_ROUNDS: usize = 16;
+        const MAX_POINTS: usize = 64;
+        if self.universals.is_empty() {
+            return None;
+        }
+        let universals = self.universals.clone();
+        let int = self.m.mk_int_sort();
+        if !universals
+            .iter()
+            .all(|(vs, _)| vs.iter().all(|&v| self.m.get_sort(v) == int))
+        {
+            return None;
+        }
+        // The probes: each ground term or formula a range depends on, named by
+        // a fresh constant so the model gives its exact value.
+        let mut probes: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for (vs, body) in &universals {
+            for &k in vs {
+                let others: Vec<AstId> = vs.iter().copied().filter(|&v| v != k).collect();
+                let mut eval = |ctx: &mut Self, t: AstId| -> Option<i64> {
+                    if let alloc::collections::btree_map::Entry::Vacant(e) = probes.entry(t) {
+                        e.insert(ctx.fresh_const(ctx.m.get_sort(t)));
+                    }
+                    // Formulas as true (the shape check concerns the
+                    // binder's bounds; a false one is caught per model).
+                    Some(ctx.m.is_bool_sort(ctx.m.get_sort(t)) as i64)
+                };
+                // A dry run: the shape must give bounded ranges.
+                let set = self.range_falsifiers(*body, false, k, &others, &mut eval)?;
+                if !set.iter().all(|&(lo, hi)| lo.is_some() && hi.is_some()) {
+                    return None;
+                }
+            }
+        }
+        let mut parts = alloc::vec![self.conjunction()];
+        for (&t, &c) in &probes {
+            parts.push(self.m.mk_eq(c, t));
+        }
+        let mut done: BTreeSet<(usize, Vec<i64>)> = BTreeSet::new();
+        for _ in 0..MAX_ROUNDS {
+            let g = self.m.mk_and(&parts);
+            let (r, model, _) = self.decide_combined(g);
+            let mut model = match (r, model) {
+                (SmtResult::Unsat, _) => return Some((SmtResult::Unsat, None)),
+                (SmtResult::Sat, Some(m)) => m,
+                _ => return None,
+            };
+            let mut fresh = false;
+            for (ui, (vs, body)) in universals.iter().enumerate() {
+                // The binder values to instantiate: the product of each
+                // binder's falsifier range.
+                let mut points: Vec<Vec<i64>> = alloc::vec![Vec::new()];
+                for &k in vs {
+                    let others: Vec<AstId> = vs.iter().copied().filter(|&v| v != k).collect();
+                    let mut eval = |ctx: &mut Self, t: AstId| -> Option<i64> {
+                        let c = *probes.get(&t)?;
+                        match model.eval_value(&ctx.m, c) {
+                            Value::Num(r, _) => r.to_integer()?.to_i64(),
+                            Value::Bool(b) => Some(b as i64),
+                            _ => None,
+                        }
+                    };
+                    let set = self.range_falsifiers(*body, false, k, &others, &mut eval)?;
+                    let mut vals: Vec<i64> = Vec::new();
+                    for (lo, hi) in set {
+                        match (lo, hi) {
+                            (Some(lo), Some(hi)) => {
+                                if hi.checked_sub(lo)? >= MAX_POINTS as i64 {
+                                    return None;
+                                }
+                                vals.extend(lo..=hi);
+                            }
+                            // Unbounded in this model (a binder-free part is
+                            // false): one instance inside refines it.
+                            (Some(v), None) | (None, Some(v)) => vals.push(v),
+                            (None, None) => vals.push(0),
+                        }
+                    }
+                    vals.sort_unstable();
+                    vals.dedup();
+                    let mut next = Vec::new();
+                    for p in &points {
+                        for &v in &vals {
+                            let mut q = p.clone();
+                            q.push(v);
+                            next.push(q);
+                        }
+                    }
+                    if next.len() > MAX_POINTS {
+                        return None;
+                    }
+                    points = next;
+                }
+                for p in points {
+                    if !done.insert((ui, p.clone())) {
+                        continue;
+                    }
+                    if done.len() > MAX_POINTS * MAX_ROUNDS {
+                        return None;
+                    }
+                    let sub: Vec<(AstId, AstId)> = vs
+                        .iter()
+                        .zip(&p)
+                        .map(|(&v, &n)| (v, self.m.mk_int(n)))
+                        .collect();
+                    let inst = crate::rewriter::substitute(&mut self.m, *body, &sub);
+                    parts.push(crate::rewriter::simplify(&mut self.m, inst));
+                    fresh = true;
+                }
+            }
+            if !fresh {
+                // Confirm with the probes pinned to the values the ranges were
+                // read from (a model may not carry an eliminated constant).
+                let mut pinned = parts.clone();
+                for &c in probes.values() {
+                    let lit = match model.eval_value(&self.m, c) {
+                        Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+                        Value::Bool(b) => self.mk_bool(b),
+                        _ => return None,
+                    };
+                    pinned.push(self.m.mk_eq(c, lit));
+                }
+                let g = self.m.mk_and(&pinned);
+                return match self.decide_combined(g) {
+                    (SmtResult::Sat, Some(m), _) => Some((SmtResult::Sat, Some(m))),
+                    _ => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// A superset of the values of the integer binder `k` at which `t` (its
+    /// negation when `neg`) is false, as a union of intervals (`None` bounds
+    /// unbounded), or `None` when the shape is not understood. Comparisons
+    /// of `k` with a term free of the binders bound it; a binder-free
+    /// formula is false everywhere or nowhere. `eval` gives the value of
+    /// such a term (or `1`/`0` for a formula).
+    #[allow(clippy::type_complexity)]
+    fn range_falsifiers(
+        &mut self,
+        t: AstId,
+        neg: bool,
+        k: AstId,
+        others: &[AstId],
+        eval: &mut dyn FnMut(&mut Self, AstId) -> Option<i64>,
+    ) -> Option<Vec<(Option<i64>, Option<i64>)>> {
+        use crate::ast::ArithOp;
+        let all = alloc::vec![(None, None)];
+        let terms = self.m.postorder(t);
+        if !terms.contains(&k) {
+            if others.iter().any(|o| terms.contains(o)) {
+                return Some(all);
+            }
+            let v = eval(self, t)?;
+            let truth = (v != 0) != neg;
+            return Some(if truth { Vec::new() } else { all });
+        }
+        let args = self.m.app_args(t).to_vec();
+        // Conjunction-like (false where any part is) or disjunction-like
+        // (false where every part is), after pushing the negation.
+        let parts: Option<(bool, Vec<(AstId, bool)>)> = if self.m.is_not(t) {
+            return self.range_falsifiers(args[0], !neg, k, others, eval);
+        } else if self.m.is_and(t) {
+            Some((!neg, args.iter().map(|&a| (a, neg)).collect()))
+        } else if self.m.is_or(t) {
+            Some((neg, args.iter().map(|&a| (a, neg)).collect()))
+        } else if self.m.is_implies(t) && args.len() == 2 {
+            Some((neg, alloc::vec![(args[0], !neg), (args[1], neg)]))
+        } else {
+            None
+        };
+        if let Some((conj, parts)) = parts {
+            let mut acc: Option<Vec<(Option<i64>, Option<i64>)>> = None;
+            for (p, n) in parts {
+                let s = self.range_falsifiers(p, n, k, others, eval)?;
+                acc = Some(match acc {
+                    None => s,
+                    Some(a) if conj => a.into_iter().chain(s).collect(),
+                    Some(a) => {
+                        let mut out = Vec::new();
+                        for &(l1, h1) in &a {
+                            for &(l2, h2) in &s {
+                                let lo = match (l1, l2) {
+                                    (Some(x), Some(y)) => Some(x.max(y)),
+                                    (x, None) | (None, x) => x,
+                                };
+                                let hi = match (h1, h2) {
+                                    (Some(x), Some(y)) => Some(x.min(y)),
+                                    (x, None) | (None, x) => x,
+                                };
+                                if !matches!((lo, hi), (Some(l), Some(h)) if l > h) {
+                                    out.push((lo, hi));
+                                }
+                            }
+                        }
+                        out
+                    }
+                });
+            }
+            return Some(acc.unwrap_or_default());
+        }
+        // A comparison `k ⋈ e` (or `e ⋈ k`) with `e` free of the binders.
+        let Some(op) = self.m.arith_op(t) else {
+            return Some(all);
+        };
+        if args.len() != 2 || !self.m.is_int_sort(self.m.get_sort(args[0])) {
+            return Some(all);
+        }
+        let free = |ctx: &Self, e: AstId| {
+            let ts = ctx.m.postorder(e);
+            !ts.contains(&k) && !others.iter().any(|o| ts.contains(o))
+        };
+        let (e, op) = if args[0] == k && free(self, args[1]) {
+            (args[1], op)
+        } else if args[1] == k && free(self, args[0]) {
+            let flipped = match op {
+                ArithOp::Le => ArithOp::Ge,
+                ArithOp::Ge => ArithOp::Le,
+                ArithOp::Lt => ArithOp::Gt,
+                ArithOp::Gt => ArithOp::Lt,
+                _ => return Some(all),
+            };
+            (args[0], flipped)
+        } else {
+            return Some(all);
+        };
+        // The falsifying set of the literal `k ⋈ e` (of its negation when
+        // `neg`): flip to the comparison that must hold for it to be false.
+        let holds = match (op, neg) {
+            (ArithOp::Lt, false) | (ArithOp::Ge, true) => ArithOp::Ge,
+            (ArithOp::Le, false) | (ArithOp::Gt, true) => ArithOp::Gt,
+            (ArithOp::Gt, false) | (ArithOp::Le, true) => ArithOp::Le,
+            (ArithOp::Ge, false) | (ArithOp::Lt, true) => ArithOp::Lt,
+            _ => return Some(all),
+        };
+        let v = eval(self, e)?;
+        Some(alloc::vec![match holds {
+            ArithOp::Ge => (Some(v), None),
+            ArithOp::Gt => (Some(v.checked_add(1)?), None),
+            ArithOp::Le => (None, Some(v)),
+            _ => (None, Some(v.checked_sub(1)?)),
+        }])
     }
 
     /// Universals over Bool/bit-vector/arithmetic binders with interpreted
@@ -32292,14 +32597,24 @@ impl Context {
         out
     }
 
-    /// Lower and upper bounds on `seq.len v` for each sequence variable `v`
-    /// with a top-level comparison of its length against a numeral.
+    /// Is `t` a datatype field read `sel(x)` (for a sequence: a term the
+    /// split may treat like a variable, which only the datatype axioms
+    /// constrain beyond equalities)?
+    fn is_field_read(&self, t: AstId) -> bool {
+        self.m
+            .app(t)
+            .is_some_and(|a| a.args.len() == 1 && self.datatype_member_decls().contains(&a.decl))
+    }
+
+    /// Lower and upper bounds on `seq.len v` for each sequence variable (or
+    /// field read, see [`Self::is_field_read`]) `v` with
+    /// a top-level comparison of its length against a numeral.
     fn seq_len_bounds(&self, conj: &[AstId]) -> BTreeMap<AstId, (i64, Option<i64>)> {
         let len_of = |u: AstId| {
             let app = self.m.app(u)?;
             (app.args.len() == 1
                 && self.seq_len_decls.contains(&app.decl)
-                && self.m.is_uninterp_const(app.args[0])
+                && (self.m.is_uninterp_const(app.args[0]) || self.is_field_read(app.args[0]))
                 && !self.seq_of.contains_key(&app.args[0]))
             .then(|| app.args[0])
         };
@@ -32314,24 +32629,47 @@ impl Context {
     /// of fresh element constants, so its reads at concrete positions fold.
     /// Reads at symbolic positions of a now-concrete sequence are split
     /// further on the position (see [`Self::seq_position_split`]). `unsat`
-    /// when every case is, `sat` with the first satisfiable case.
+    /// when every case is, `sat` with the first satisfiable case. Without
+    /// a bounded variable, the shortest lengths above the lower bounds are
+    /// searched for a `sat` only. A datatype field read is split like
+    /// a variable, its equality with the case's sequence kept.
     fn decide_by_seq_length_split(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        const MAX_LEN: i64 = 8;
+        const MAX_CASES: usize = 64;
+        const SAT_ONLY_VARS: usize = 3;
+        const SAT_ONLY_EXTRA: i64 = 2;
         if self.in_seq_len_split {
             return None;
         }
         let mut conj = Vec::new();
         self.icp_flatten_and(goal, &mut conj);
-        let bounds = self.seq_len_bounds(&conj);
         let ss = self.string_sort;
-        let vars: Vec<(AstId, i64, i64)> = bounds
+        let bounds: Vec<(AstId, i64, Option<i64>)> = self
+            .seq_len_bounds(&conj)
             .into_iter()
-            .filter_map(|(v, (lo, hi))| {
+            .filter(|&(v, _)| {
                 let s = self.m.get_sort(v);
-                (Some(s) != ss && self.seq_elem_sort(s).is_some()).then_some((v, lo, hi?))
+                Some(s) != ss && self.seq_elem_sort(s).is_some()
             })
+            .map(|(v, (lo, hi))| (v, lo, hi))
             .collect();
-        const MAX_LEN: i64 = 8;
-        const MAX_CASES: usize = 64;
+        let bounded: Vec<(AstId, i64, i64)> = bounds
+            .iter()
+            .filter_map(|&(v, lo, hi)| Some((v, lo, hi?)))
+            .collect();
+        // Exhaustive over the bounded variables, else a sat-only search.
+        let exhaustive = !bounded.is_empty();
+        let vars: Vec<(AstId, i64, i64)> = if exhaustive {
+            bounded
+        } else {
+            if bounds.len() > SAT_ONLY_VARS {
+                return None;
+            }
+            bounds
+                .iter()
+                .map(|&(v, lo, _)| (v, lo, lo + SAT_ONLY_EXTRA))
+                .collect()
+        };
         let mut cases = 1usize;
         for &(_, lo, hi) in &vars {
             if hi > MAX_LEN {
@@ -32344,11 +32682,17 @@ impl Context {
         }
         self.in_seq_len_split = true;
         let mut lens: Vec<i64> = vars.iter().map(|&(_, lo, _)| lo).collect();
-        let mut budget = 512usize;
-        let mut out = Some((SmtResult::Unsat, None));
+        // Leaves to decide: the sat-only search is a cheap probe.
+        let mut budget = if exhaustive { 512usize } else { 6 };
+        let mut out = if exhaustive {
+            Some((SmtResult::Unsat, None))
+        } else {
+            None
+        };
         if cases > 0 {
             loop {
                 let mut subst = Vec::new();
+                let mut links = Vec::new();
                 let mut witness = Vec::new();
                 for (&(v, _, _), &n) in vars.iter().zip(&lens) {
                     let s = self.m.get_sort(v);
@@ -32362,9 +32706,17 @@ impl Context {
                         self.mk_seq(elems.clone())
                     };
                     subst.push((v, sq));
-                    witness.push((v, s, elems));
+                    if self.m.is_uninterp_const(v) {
+                        witness.push((v, s, elems));
+                    } else {
+                        links.push(self.m.mk_eq(v, sq));
+                    }
                 }
-                let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+                let mut g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+                if !links.is_empty() {
+                    links.push(g);
+                    g = self.m.mk_and(&links);
+                }
                 let mut kept = BTreeSet::new();
                 match self.seq_position_split(g, &mut kept, &mut budget) {
                     Some((SmtResult::Unsat, _)) => {}
@@ -32372,10 +32724,11 @@ impl Context {
                         out = self.seq_split_witness(model, &witness);
                         break;
                     }
-                    _ => {
+                    _ if exhaustive => {
                         out = None;
                         break;
                     }
+                    _ => {}
                 }
                 // Next length tuple.
                 let mut k = 0;
@@ -32428,8 +32781,10 @@ impl Context {
     /// Decide a leaf of [`Self::seq_position_split`]. Its concrete sequences
     /// are distinct constants to the core, so each pair is linked by content
     /// (`s = u ⇔ content equal`). A `sat` is kept only when every other
-    /// sequence-sorted term is a constant that occurs only in equalities,
-    /// which the content links fully decide; `None` when undecided.
+    /// sequence-sorted term is a constant (or a datatype field read) that
+    /// occurs only in equalities and datatype terms, which the content links
+    /// and congruence fully decide;
+    /// `None` when undecided.
     fn decide_seq_split_leaf(&mut self, g: AstId) -> Option<(SmtResult, Option<Model>)> {
         let terms = self.m.postorder(g);
         let seqish = |ctx: &Self, u: AstId| {
@@ -32441,15 +32796,23 @@ impl Context {
             .copied()
             .filter(|t| self.seq_of.contains_key(t))
             .collect();
+        // Equalities and datatype constructors/fields only relate such terms
+        // by congruence.
+        let members = self.datatype_member_decls();
         let mut pure = true;
         for &t in &terms {
             let Some(app) = self.m.app(t) else { continue };
+            let congruence_only = self.m.is_eq(t) || members.contains(&app.decl);
             for &a in &app.args {
-                if seqish(self, a) && !self.seq_of.contains_key(&a) && !self.m.is_eq(t) {
+                if seqish(self, a) && !self.seq_of.contains_key(&a) && !congruence_only {
                     pure = false;
                 }
             }
-            if seqish(self, t) && !self.seq_of.contains_key(&t) && !self.m.is_uninterp_const(t) {
+            if seqish(self, t)
+                && !self.seq_of.contains_key(&t)
+                && !self.m.is_uninterp_const(t)
+                && !self.is_field_read(t)
+            {
                 pure = false;
             }
         }
@@ -32564,16 +32927,21 @@ impl Context {
             // `extract` at a concrete offset, symbolic length.
             let i = self.int_arg(args[1])?;
             let rest = len - i;
-            intervals.push((None, Some(0), Some(empty)));
-            for k in 1..rest {
-                intervals.push((Some(k), Some(k), None));
-            }
-            let suffix = if rest > 0 {
-                self.mk_seq(content[i as usize..].to_vec())
+            if i < 0 || rest < 0 {
+                // Out of range: empty whatever the length.
+                intervals.push((None, None, Some(empty)));
             } else {
-                empty
-            };
-            intervals.push((Some(rest.max(1)), None, Some(suffix)));
+                intervals.push((None, Some(0), Some(empty)));
+                for k in 1..rest {
+                    intervals.push((Some(k), Some(k), None));
+                }
+                let suffix = if rest > 0 {
+                    self.mk_seq(content[i as usize..].to_vec())
+                } else {
+                    empty
+                };
+                intervals.push((Some(rest.max(1)), None, Some(suffix)));
+            }
         }
         let mut all_unsat = true;
         for (lo, hi, val) in intervals {
@@ -32594,10 +32962,10 @@ impl Context {
                     let n = self.m.mk_int(h);
                     c.push(self.m.mk_le(x, n));
                 }
-                let cond = if c.len() == 1 {
-                    c[0]
-                } else {
-                    self.m.mk_and(&c)
+                let cond = match c.len() {
+                    0 => self.m.mk_true(),
+                    1 => c[0],
+                    _ => self.m.mk_and(&c),
                 };
                 (cond, val.map(|v| alloc::vec![(t, v)]).unwrap_or_default())
             };
@@ -33972,7 +34340,10 @@ impl Context {
             if let Some(m) = self.try_string_witness(wg, model0.as_mut()) {
                 return (SmtResult::Sat, Some(m));
             }
-            if let Some(m) = self.try_seq_witness(wg) {
+            // (Not inside a length split: its cases are already concrete.)
+            if !self.in_seq_len_split
+                && let Some(m) = self.try_seq_witness(wg)
+            {
                 return (SmtResult::Sat, Some(m));
             }
             // A model of a strengthening is a model of the goal: an atom over an
@@ -43975,6 +44346,33 @@ mod tests {
         assert_eq!(out[0], "unsat");
         assert_eq!(out[1], "sat");
         assert!(out[2].contains("(seq.++ (seq.unit 3)"), "{}", out[2]);
+    }
+
+    #[test]
+    fn range_restricted_universals_by_model_ranges() {
+        // z3 regression 2431's shape: a named negated implication whose
+        // existential is a universal over `0 ≤ k < len s` reading a sequence
+        // field and an array field.
+        let script = "
+            (declare-datatypes () ((L (mk (sq (Seq Int)) (ct (Array (Seq Int) Int))))))
+            (declare-const r L)
+            (assert (! (not (=> (> (seq.len (sq r)) 0)
+                (exists ((k Int)) (and (>= k 0) (< k (seq.len (sq r)))
+                    (< (select (ct r) (seq.at (sq r) k)) 5))))) :named g))
+            (check-sat)
+            (reset)
+            (declare-const a (Array Int Int))
+            (declare-const n Int)
+            (assert (<= 0 n 3))
+            (assert (forall ((k Int)) (=> (and (<= 0 k) (< k n)) (> (select a k) k))))
+            (assert (< (select a 2) 2))
+            (check-sat)
+            (get-value (n))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "sat");
+        assert!(out[2].contains("(n 0)") || out[2].contains("(n 1)") || out[2].contains("(n 2)"));
     }
 
     #[test]
