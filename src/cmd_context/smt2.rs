@@ -4399,6 +4399,10 @@ impl Context {
             }
             "simplify" => {
                 // (simplify term [:opt v …]) — return the simplified term.
+                // A regular-expression term goes through z3's regex rewriter.
+                if let Some(out) = self.simplify_regex(&list[1]) {
+                    return Ok(Some(out));
+                }
                 let t = self.term(&list[1])?;
                 let folded = self.dt_fold(t);
                 let s = crate::rewriter::simplify(&mut self.m, folded);
@@ -5242,6 +5246,157 @@ impl Context {
             "get-proof" => self.get_proof().map(Some),
             other => Err(alloc::format!("unsupported command {other:?}")),
         }
+    }
+
+    /// `(simplify t)` for a term over regular expressions: build it in the regex
+    /// rewriter's arena (see [`super::regex_simp`]), simplify, and print as z3.
+    /// `None` when `t` has no regex operator or uses something outside the
+    /// fragment (the general path handles it then).
+    fn simplify_regex(&self, t: &SExpr) -> Option<String> {
+        use super::regex_simp::{Op, ReSimp, Srt};
+        fn mentions_regex(ctx: &Context, e: &SExpr) -> bool {
+            match e {
+                SExpr::Atom(a) => {
+                    a.starts_with("re.")
+                        || a.starts_with("str.in")
+                        || a.starts_with("str.to")
+                        || ctx.funcs.get(a).is_some_and(|&d| {
+                            ctx.m
+                                .func_decl(d)
+                                .is_some_and(|f| Some(f.range) == ctx.reglan_sort)
+                        })
+                }
+                SExpr::List(l) => l.iter().any(|x| mentions_regex(ctx, x)),
+            }
+        }
+        if !mentions_regex(self, t) {
+            return None;
+        }
+        fn build(ctx: &Context, rs: &mut ReSimp, e: &SExpr) -> Option<super::regex_simp::Id> {
+            match e {
+                SExpr::Atom(a) => {
+                    if a.starts_with('"') {
+                        let cps: Vec<u32> = unquote_string(a).chars().map(|c| c as u32).collect();
+                        return Some(rs.lit(&cps));
+                    }
+                    match a.as_str() {
+                        "true" => return Some(rs.boolean(true)),
+                        "false" => return Some(rs.boolean(false)),
+                        "re.none" | "re.nostr" | "re.empty" => {
+                            return Some(rs.app(Op::ReNone, &[]));
+                        }
+                        "re.all" => return Some(rs.app(Op::ReAll, &[])),
+                        "re.allchar" => return Some(rs.app(Op::ReAllChar, &[])),
+                        _ => {}
+                    }
+                    if let Ok(n) = a.parse::<i64>() {
+                        return Some(rs.num(n));
+                    }
+                    if ctx.macros.contains_key(a) {
+                        return None;
+                    }
+                    let d = *ctx.funcs.get(a)?;
+                    let fd = ctx.m.func_decl(d)?;
+                    if !fd.domain.is_empty() {
+                        return None;
+                    }
+                    let srt = if Some(fd.range) == ctx.string_sort {
+                        Srt::Str
+                    } else if Some(fd.range) == ctx.reglan_sort {
+                        Srt::Re
+                    } else if ctx.m.is_int_sort(fd.range) {
+                        Srt::Int
+                    } else if ctx.m.is_bool_sort(fd.range) {
+                        Srt::Bool
+                    } else {
+                        return None;
+                    };
+                    Some(rs.var(a, srt))
+                }
+                SExpr::List(l) => {
+                    let (head, rest) = l.split_first()?;
+                    // Indexed `((_ re.loop lo hi) r)` / `((_ re.^ n) r)`.
+                    if let SExpr::List(ix) = head {
+                        let name = match ix.get(1)? {
+                            SExpr::Atom(n) => n.as_str(),
+                            _ => return None,
+                        };
+                        let nums: Vec<u32> = ix[2..]
+                            .iter()
+                            .map(|x| match x {
+                                SExpr::Atom(n) => n.parse::<u32>().ok(),
+                                _ => None,
+                            })
+                            .collect::<Option<_>>()?;
+                        if !matches!(&ix[0], SExpr::Atom(u) if u == "_") || rest.len() != 1 {
+                            return None;
+                        }
+                        let op = match (name, nums.as_slice()) {
+                            ("re.loop", [lo]) => Op::Loop(*lo, None),
+                            ("re.loop", [lo, hi]) => Op::Loop(*lo, Some(*hi)),
+                            ("re.^", [n]) => Op::Loop(*n, Some(*n)),
+                            _ => return None,
+                        };
+                        let a = build(ctx, rs, &rest[0])?;
+                        return Some(rs.app(op, &[a]));
+                    }
+                    let SExpr::Atom(h) = head else {
+                        return None;
+                    };
+                    // The legacy `(re.loop r lo [hi])` with numeral bounds.
+                    if h == "re.loop" {
+                        let a = build(ctx, rs, rest.first()?)?;
+                        let num = |x: &SExpr| match x {
+                            SExpr::Atom(n) => n.parse::<u32>().ok(),
+                            _ => None,
+                        };
+                        let op = match rest.len() {
+                            2 => Op::Loop(num(&rest[1])?, None),
+                            3 => Op::Loop(num(&rest[1])?, Some(num(&rest[2])?)),
+                            _ => return None,
+                        };
+                        return Some(rs.app(op, &[a]));
+                    }
+                    let (op, arity): (Op, Option<usize>) = match h.as_str() {
+                        "not" => (Op::Not, Some(1)),
+                        "=" => (Op::Eq, Some(2)),
+                        "and" => (Op::And, None),
+                        "or" => (Op::Or, None),
+                        "ite" => (Op::Ite, Some(3)),
+                        "str.in_re" | "str.in.re" => (Op::InRe, Some(2)),
+                        "str.to_re" | "str.to.re" => (Op::ToRe, Some(1)),
+                        "re.range" => (Op::Range, Some(2)),
+                        "re.++" | "re.union" | "re.inter" | "re.diff" if rest.len() >= 2 => (
+                            match h.as_str() {
+                                "re.++" => Op::Concat,
+                                "re.union" => Op::Union,
+                                "re.inter" => Op::Inter,
+                                _ => Op::Diff,
+                            },
+                            None,
+                        ),
+                        "re.*" => (Op::Star, Some(1)),
+                        "re.+" => (Op::Plus, Some(1)),
+                        "re.opt" => (Op::Opt, Some(1)),
+                        "re.comp" | "re.complement" => (Op::Comp, Some(1)),
+                        "str.len" => (Op::StrLen, Some(1)),
+                        _ => return None,
+                    };
+                    if arity.is_some_and(|n| n != rest.len()) || rest.is_empty() {
+                        return None;
+                    }
+                    let args: Vec<_> = rest
+                        .iter()
+                        .map(|x| build(ctx, rs, x))
+                        .collect::<Option<_>>()?;
+                    Some(rs.app(op, &args))
+                }
+            }
+        }
+        let mut rs = ReSimp::default();
+        let root = build(self, &mut rs, t)?;
+        let s = rs.simplify(root);
+        Some(rs.pp(s, &smt_string_literal, &|n| smt2_symbol(n).into_owned()))
     }
 
     /// Lift theory terms the linear core cannot reason about opaquely into fresh
@@ -6164,6 +6319,15 @@ impl Context {
             && !self.occurs_in_assertions(id)
         {
             return alloc::format!("(as seq.empty {})", self.sort_display(self.m.get_sort(id)));
+        }
+        // A regular-expression constant absent from every assertion: z3's
+        // `get_some_value` for a regex sort is the empty-word language.
+        if Some(self.m.get_sort(id)) == self.reglan_sort
+            && self.m.is_uninterp_const(id)
+            && !self.regex_of.contains_key(&id)
+            && !self.occurs_in_assertions(id)
+        {
+            return "(str.to_re \"\")".to_string();
         }
         if let Some(s) = self.dt_model_value(model, id) {
             return s;
@@ -34605,6 +34769,9 @@ impl Context {
 
     /// Render a sort as SMT-LIB2 text (a named sort by its name, arrays nested).
     fn sort_display(&self, sort: AstId) -> String {
+        if Some(sort) == self.reglan_sort {
+            return "(RegEx String)".to_string();
+        }
         if let Some(e) = self.seq_elem_sort(sort) {
             return alloc::format!("(Seq {})", self.sort_display(e));
         }
