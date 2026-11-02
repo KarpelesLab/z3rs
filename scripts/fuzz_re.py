@@ -3,7 +3,8 @@
 
 Random conjunctions over two string variables: `str.in_re` against random
 constant regexes (literals, ranges, union, concatenation, star, plus, opt,
-loops, intersection, complement), together with length constraints and
+loops, intersection, complement, and `str.to_re` over symbolic string
+terms), together with length constraints and
 literal (dis)equalities. Definite verdicts are compared with z3 (DISAGREE =
 soundness bug), and each z3rs `sat` model is replayed through z3 as
 define-funs (BADMODEL = wrong model or a non-literal string value).
@@ -30,6 +31,7 @@ def gen(r):
         if d<3 and c<.64: return f"(re.comp {rx(d+1)})"
         if c<.7: return f'(re.range "a" "{r.choice("abc")}")'
         if c<.75: return r.choice(["re.allchar","re.all","re.none"])
+        if c<.82: return f"(str.to_re {r.choice([var(), f'(str.++ {var()} {lit()})', f'(str.substr {var()} 0 {r.randint(0,2)})'])})"
         return f"(str.to_re {lit()})"
     def var(): return r.choice(["a","b"])
     def atom():

@@ -2762,6 +2762,9 @@ struct Context {
     reglan_sort: Option<AstId>,
     /// Regex terms whose structure is fully constant, for `str.in_re` folding.
     regex_of: BTreeMap<AstId, Regex>,
+    /// `(str.to_re t)` regex terms over a non-literal string `t`, mapped to `t`,
+    /// so `(str.in_re s (str.to_re t))` lowers to `s = t` as z3's seq rewriter does.
+    regex_to_re_arg: BTreeMap<AstId, AstId>,
     /// Parametric sort macros from `define-sort`: name → (params, body).
     sort_defs: BTreeMap<String, (Vec<String>, SExpr)>,
     /// Floating-point sorts `(_ FloatingPoint eb sb)`, keyed by `(eb, sb)`.
@@ -3894,6 +3897,7 @@ impl Context {
             str_marker_cache: BTreeMap::new(),
             reglan_sort: None,
             regex_of: BTreeMap::new(),
+            regex_to_re_arg: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
@@ -18357,6 +18361,10 @@ impl Context {
                         });
                     }
                 }
+                // (str.in_re s (str.to_re t)) ≡ s = t (seq_rewriter::mk_str_in_regexp).
+                if let Some(&t) = self.regex_to_re_arg.get(&raw[1]) {
+                    return Ok(self.m.mk_eq(raw[0], t));
+                }
                 self.symbolic_string(op, raw)
             }
             "str.to_re" | "str.to.re" => self.regex_op(op, raw),
@@ -22479,6 +22487,8 @@ impl Context {
         let term = self.m.mk_const(d);
         if let Some(r) = structure {
             self.regex_of.insert(term, r);
+        } else if matches!(op, "str.to_re" | "str.to.re") {
+            self.regex_to_re_arg.insert(term, args[0]);
         }
         Ok(term)
     }
