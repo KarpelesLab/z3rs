@@ -24297,6 +24297,148 @@ impl Context {
     /// lift, add the theory axioms and run [`Self::decide`]. Returns the
     /// verdict, the model and the axiom-laden goal that was decided.
     fn decide_combined(&mut self, combined: AstId) -> (SmtResult, Option<Model>, AstId) {
+        let (combined, table) = self.finite_function_tables(combined);
+        let (r, m, g) = self.decide_combined_tabled(combined);
+        let m = m.map(|mut m| {
+            // The applications replaced by their table entries take those values.
+            for (app, v) in table {
+                match m.eval_value(&self.m, v) {
+                    Value::Uninterp(..) => m.pin_equal(&self.m, app, v),
+                    val => m.pin_value(app, val),
+                }
+            }
+            m
+        });
+        (r, m, g)
+    }
+
+    /// The values of a finite sort (`Bool` or an enumeration), if it is one.
+    fn finite_sort_values(&mut self, sort: AstId) -> Option<Vec<AstId>> {
+        if self.m.is_bool_sort(sort) {
+            return Some(alloc::vec![self.m.mk_true(), self.m.mk_false()]);
+        }
+        self.enums.get(&sort).cloned()
+    }
+
+    /// Uninterpreted functions over finite argument sorts as value tables
+    /// (Ackermannization over a finite domain): an application at constant
+    /// arguments becomes a fresh constant (one per argument tuple), and one at
+    /// a symbolic argument a case split `ite(x = v₁, f(v₁…), …)` over that
+    /// argument's values. Congruence then holds by construction, so the goal
+    /// needs no EUF reasoning about these functions. Returns the goal and the
+    /// replaced constant-argument applications with their constants.
+    fn finite_function_tables(&mut self, goal: AstId) -> (AstId, Vec<(AstId, AstId)>) {
+        let members = self.datatype_member_decls();
+        let user: BTreeSet<AstId> = self
+            .funcs
+            .values()
+            .copied()
+            .filter(|d| !members.contains(d))
+            .collect();
+        let finite = |ctx: &Self, s: AstId| ctx.m.is_bool_sort(s) || ctx.enums.contains_key(&s);
+        let applies = self.m.postorder(goal).into_iter().any(|t| {
+            self.m.app(t).is_some_and(|a| {
+                !a.args.is_empty()
+                    && user.contains(&a.decl)
+                    && a.args.iter().all(|&x| finite(self, self.m.get_sort(x)))
+            })
+        });
+        if !applies {
+            return (goal, Vec::new());
+        }
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let mut table: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let g = self.table_rw(goal, &user, &mut memo, &mut table);
+        (g, table.into_iter().collect())
+    }
+
+    /// The rewrite of [`Self::finite_function_tables`], bottom-up.
+    fn table_rw(
+        &mut self,
+        t: AstId,
+        user: &BTreeSet<AstId>,
+        memo: &mut BTreeMap<AstId, AstId>,
+        table: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let Some(app) = self.m.app(t).cloned() else {
+            return t;
+        };
+        let args: Vec<AstId> = app
+            .args
+            .iter()
+            .map(|&a| self.table_rw(a, user, memo, table))
+            .collect();
+        let finite_args = !args.is_empty()
+            && user.contains(&app.decl)
+            && args.iter().all(|&x| {
+                self.m.is_bool_sort(self.m.get_sort(x))
+                    || self.enums.contains_key(&self.m.get_sort(x))
+            });
+        let out = if finite_args {
+            self.table_entry(app.decl, args, table)
+        } else if args == app.args {
+            t
+        } else {
+            self.m.mk_app(app.decl, &args)
+        };
+        memo.insert(t, out);
+        out
+    }
+
+    /// `f(args)` over finite argument sorts as a table entry, splitting on the
+    /// first non-constant argument.
+    fn table_entry(
+        &mut self,
+        f: AstId,
+        args: Vec<AstId>,
+        table: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        let is_value = |ctx: &Self, x: AstId| {
+            ctx.m.is_true(x)
+                || ctx.m.is_false(x)
+                || ctx
+                    .enums
+                    .get(&ctx.m.get_sort(x))
+                    .is_some_and(|vs| vs.contains(&x))
+        };
+        match args.iter().position(|&x| !is_value(self, x)) {
+            None => {
+                let app = self.m.mk_app(f, &args);
+                if let Some(&v) = table.get(&app) {
+                    return v;
+                }
+                let v = self.fresh_const(self.m.get_sort(app));
+                table.insert(app, v);
+                v
+            }
+            Some(k) => {
+                let values = self
+                    .finite_sort_values(self.m.get_sort(args[k]))
+                    .unwrap_or_default();
+                let mut branches: Vec<(AstId, AstId)> = Vec::new();
+                for &v in &values {
+                    let mut a2 = args.clone();
+                    a2[k] = v;
+                    let e = self.table_entry(f, a2, table);
+                    let cond = self.m.mk_eq(args[k], v);
+                    branches.push((cond, e));
+                }
+                let Some(&(_, mut acc)) = branches.last() else {
+                    return self.m.mk_app(f, &args);
+                };
+                for &(c, e) in branches.iter().rev().skip(1) {
+                    acc = self.m.mk_ite(c, e, acc);
+                }
+                acc
+            }
+        }
+    }
+
+    /// [`Self::decide_combined`] after the finite function tables.
+    fn decide_combined_tabled(&mut self, combined: AstId) -> (SmtResult, Option<Model>, AstId) {
         let lifted = self.lift(combined);
         // For a divisor the goal proves nonzero, add the Euclidean identity
         // `a = d·q + r` UNCONDITIONALLY: the lifted form only guards it by `d ≠ 0`

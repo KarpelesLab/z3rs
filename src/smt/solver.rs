@@ -380,6 +380,11 @@ impl Model {
         }
     }
 
+    /// Record that `a` and `b` are equal (merging their congruence classes).
+    pub fn pin_equal(&mut self, m: &AstManager, a: AstId, b: AstId) {
+        self.euf.is_consistent(m, &[(a, b)], &[]);
+    }
+
     /// Pin a Boolean constant (or atom) to a truth value.
     pub fn set_bool(&mut self, var: AstId, val: bool) {
         self.bools.insert(var, val);
