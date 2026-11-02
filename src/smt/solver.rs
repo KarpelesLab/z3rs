@@ -1347,7 +1347,11 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // makes its disequality hold (`v = 0` unless that hits 0, then `v = 1`).
     let finish = |mut a: Assignment| -> Assignment {
         for (d, v) in &free_diseqs {
-            let rest = d.eval(&a); // `a` lacks `v`, so its term contributes 0
+            // `v`'s own term must contribute 0: a witness may already have
+            // assigned it (as 1, making `rest` nonzero and the pick `v = 0`
+            // violate `v ≠ 0`).
+            a.remove(v);
+            let rest = d.eval(&a);
             let val = if rest.is_zero() {
                 Rational::from_integer(Int::from(1))
             } else {
@@ -3088,5 +3092,31 @@ mod tests {
         let le12 = m.mk_le(x, twelve);
         let f = m.mk_and(&[or, le12]);
         assert_eq!(check(&m, f), SmtResult::Sat);
+    }
+
+    #[test]
+    fn free_disequality_model_respects_the_disequality() {
+        // Fuzz-found: `len(s0) = 1 ∧ i ≠ 0` returned a model with `i = 0` —
+        // the free-disequality completion read `i`'s own (already assigned)
+        // term when picking its value.
+        let mut m = AstManager::new();
+        let is = m.mk_int_sort();
+        let i = constant(&mut m, "i", is);
+        let s = m.mk_uninterpreted_sort(Symbol::new("S"));
+        let s0 = constant(&mut m, "s0", s);
+        let lend = m.mk_func_decl(Symbol::new("len"), &[s], is);
+        let l0 = m.mk_app(lend, &[s0]);
+        let zero = m.mk_int(0);
+        let one = m.mk_int(1);
+        let pin = m.mk_eq(l0, one);
+        let e = m.mk_eq(i, zero);
+        let ne = m.mk_not(e);
+        let g = m.mk_and(&[pin, ne]);
+        let (r, model) = check_model(&m, g);
+        assert_eq!(r, SmtResult::Sat);
+        match model.unwrap().eval(&m, i) {
+            Value::Num(v, _) => assert!(!v.is_zero()),
+            other => panic!("unexpected value {other:?}"),
+        }
     }
 }
