@@ -1194,6 +1194,10 @@ struct LiftCtx {
     /// consistency axioms (a lone zero-divisor term is genuinely free, and
     /// emitting the axiom for every term needlessly bloats div/mod-heavy goals).
     coincident_dividends: BTreeSet<AstId>,
+    /// Memo of `(^ b 1/2)` bases → their square-root constant.
+    sqrt: BTreeMap<AstId, AstId>,
+    /// The goal's top-level linear conjuncts (for entailed side conditions).
+    lin_facts: Vec<Constraint>,
 }
 
 /// An s-expression.
@@ -5070,6 +5074,8 @@ impl Context {
                 q
             } else if let Some(k) = self.lift_to_int(rebuilt, ctx) {
                 k
+            } else if let Some(r) = self.sqrt_piece(rebuilt, ctx) {
+                r
             } else {
                 rebuilt
             }
@@ -5318,6 +5324,68 @@ impl Context {
             return self.eq_distrib_ite(b, a);
         }
         self.m.mk_eq(a, b)
+    }
+
+    /// Whether `t` is `(^ b 1/2)`: the opaque power with exponent one half.
+    fn is_sqrt_term(&self, t: AstId) -> bool {
+        self.m.is_app(t)
+            && self.m.app_args(t).len() == 2
+            && self.decl_name(self.m.app_decl(t)).as_deref() == Some("^")
+            && self
+                .m
+                .as_numeral(self.m.app_args(t)[1])
+                .is_some_and(|e| e == Rational::new(Int::from(1), Int::from(2)))
+    }
+
+    /// If `t` is `(^ b 1/2)` over the reals, return a fresh `r` that is the
+    /// square root of `b` where `b ≥ 0`: `b ≥ 0 ⇒ r ≥ 0 ∧ r·r = b` (z3 leaves a
+    /// negative base unspecified). The side condition is dropped when the
+    /// goal's linear conjuncts already entail `b ≥ 0`. Memoized per base, with
+    /// `b₁ = b₂ ⇒ r₁ = r₂` across bases so the root stays a function.
+    fn sqrt_piece(&mut self, t: AstId, ctx: &mut LiftCtx) -> Option<AstId> {
+        if !self.is_sqrt_term(t) || self.m.is_int_sort(self.m.get_sort(t)) {
+            return None;
+        }
+        let b = self.m.app_args(t)[0];
+        if let Some(&r) = ctx.sqrt.get(&b) {
+            return Some(r);
+        }
+        let real = self.m.mk_real_sort();
+        let r = self.fresh_const(real);
+        let zero = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(0)), false);
+        let rr = self.m.mk_mul(&[r, r]);
+        let sq = self.m.mk_eq(rr, b);
+        let nonneg = self.m.mk_ge(r, zero);
+        let body = self.m.mk_and(&[nonneg, sq]);
+        let entailed = match self.m.as_numeral(b) {
+            Some(c) => Some(!c.is_negative()),
+            None => {
+                // `lin_facts ∧ b < 0` infeasible ⇒ `b ≥ 0` holds.
+                let lb = ast_to_lin(&self.m, b);
+                let mut cons = ctx.lin_facts.clone();
+                cons.push(Constraint::lt(lb));
+                (!ctx.lin_facts.is_empty() && !feasible(&cons)).then_some(true)
+            }
+        };
+        match entailed {
+            Some(true) => ctx.defs.push(body),
+            _ => {
+                // A possibly negative base: z3 gives the root no value there, so
+                // `r` stays opaque for `sat` (only refutations are trusted).
+                let bge = self.m.mk_ge(b, zero);
+                ctx.defs.push(self.m.mk_implies(bge, body));
+                self.str_symbolic.insert(r);
+            }
+        }
+        for (&b2, &r2) in &ctx.sqrt.clone() {
+            let same = self.m.mk_eq(b, b2);
+            let eqr = self.m.mk_eq(r, r2);
+            ctx.defs.push(self.m.mk_implies(same, eqr));
+        }
+        ctx.sqrt.insert(b, r);
+        Some(r)
     }
 
     /// If `t` is `(to_int a)`, return a fresh integer `k` with `k ≤ a < k + 1`
@@ -21804,6 +21872,16 @@ impl Context {
             .filter(|(_, terms)| terms.len() >= 2)
             .map(|(a, _)| a)
             .collect();
+        let mut lin_facts = Vec::new();
+        if self.m.postorder(base).iter().any(|&t| self.is_sqrt_term(t)) {
+            let mut conj = Vec::new();
+            self.icp_flatten_and(base, &mut conj);
+            for c in conj {
+                if let Some(cs) = linear_constraints(&self.m, c) {
+                    lin_facts.extend(cs);
+                }
+            }
+        }
         let mut ctx = LiftCtx {
             defs: Vec::new(),
             cache: BTreeMap::new(),
@@ -21811,6 +21889,8 @@ impl Context {
             toint: BTreeMap::new(),
             rdiv: BTreeMap::new(),
             coincident_dividends,
+            sqrt: BTreeMap::new(),
+            lin_facts,
         };
         let lifted = self.lift_terms(base, &mut ctx);
         if ctx.defs.is_empty() {
