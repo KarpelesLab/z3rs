@@ -38042,6 +38042,9 @@ impl Context {
         let range = self.m.func_decl(d)?.range;
         // Read one value per constrained argument tuple (first occurrence wins).
         let mut entries: Vec<(Vec<String>, String, Option<AstId>)> = Vec::new();
+        // Applications whose arguments have no renderable value (an array, …):
+        // their results still constrain a constant interpretation.
+        let mut unkeyed: Vec<(String, Option<AstId>)> = Vec::new();
         let assertions = self.assertions.clone();
         for a in assertions {
             for t in self.m.postorder(a) {
@@ -38054,7 +38057,13 @@ impl Context {
                                 .map(|vt| self.model_value_str(model, vt))
                         })
                         .collect();
-                    let Some(key) = key else { continue };
+                    let Some(key) = key else {
+                        unkeyed.push((
+                            self.model_value_str(model, t),
+                            self.eval_value_term(model, t),
+                        ));
+                        continue;
+                    };
                     if !entries.iter().any(|(k, _, _)| *k == key) {
                         let result = self.model_value_str(model, t);
                         let term = self.eval_value_term(model, t);
@@ -38062,6 +38071,16 @@ impl Context {
                     }
                 }
             }
+        }
+        if !unkeyed.is_empty() {
+            // Only a constant all the applications agree on is safe.
+            let first = unkeyed[0].0.clone();
+            if unkeyed.iter().all(|(r, _)| *r == first)
+                && entries.iter().all(|(_, r, _)| *r == first)
+            {
+                return Some((first, unkeyed[0].1));
+            }
+            return None;
         }
         if entries.is_empty() {
             // Unconstrained: the range default (Boolean / integer / bit-vector only).
