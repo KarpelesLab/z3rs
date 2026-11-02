@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Differential soundness fuzz of `fp.to_ieee_bv`, NaN patterns included.
+"""Differential soundness fuzz of `fp.to_ieee_bv`/`fp.to_real` of NaN and ±oo.
 
 Random conjunctions over small-format floats (`(_ FloatingPoint 3 5)`) and
 bit-vectors relating `fp.to_ieee_bv` of variables, NaN/inf/zero literals and
 `to_fp` of bit-vectors, with `:rewriter.hi_fp_unspecified` on or off. Every
 NaN is one value whose `fp.to_ieee_bv` is one fixed (unspecified) NaN
-pattern. Only definite answers are compared: a DISAGREE is a soundness bug.
+pattern; `fp.to_real` of NaN/+oo/-oo is a fixed unspecified real each (0
+under hi_fp_unspecified). Only definite answers are compared: a DISAGREE is a soundness bug.
 
 Usage: scripts/fuzz_fp_ieee_bv.py <z3rs> <z3> <n> <outdir>
 """
@@ -19,7 +20,7 @@ def gen(r):
     def fp():
         k=r.random()
         if k<.45: return r.choice(fs)
-        if k<.6: return r.choice([f"(_ NaN {EB} {SB})",f"(_ +oo {EB} {SB})",f"(_ -zero {EB} {SB})"])
+        if k<.6: return r.choice([f"(_ NaN {EB} {SB})",f"(_ +oo {EB} {SB})",f"(_ -oo {EB} {SB})",f"(_ -zero {EB} {SB})"])
         if k<.75: return f"((_ to_fp {EB} {SB}) {r.choice(bs)})"
         if k<.85: return f"((_ to_fp {EB} {SB}) #b{r.getrandbits(W):0{W}b})"
         return f"(fp.abs {r.choice(fs)})"
@@ -32,7 +33,8 @@ def gen(r):
         k=r.random()
         if k<.4: a=f"(= {bv()} {bv()})"
         elif k<.6: a=f"(fp.isNaN {fp()})"
-        elif k<.8: a=f"(= {fp()} {fp()})"
+        elif k<.7: a=f"(= {fp()} {fp()})"
+        elif k<.8: a=f"(= (fp.to_real {fp()}) {r.choice(['(fp.to_real '+fp()+')','0.0','1.5','(- 2.0)'])})"
         else: a=f"(bvult {bv()} {bv()})"
         return a if r.random()<.6 else f"(not {a})"
     src=""

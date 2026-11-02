@@ -2656,6 +2656,9 @@ struct Context {
     /// `(fp.to_ieee_bv NaN)` display nodes → their [`Self::fp_ieee_nan`]
     /// value, substituted before solving and evaluation.
     fp_ieee_alias: BTreeMap<AstId, AstId>,
+    /// z3's unspecified `fp.to_real` of NaN / `+oo` / `-oo` (class 0/1/2) per
+    /// `(eb, sb)` format: one fixed (unknown) real each.
+    fp_real_unspec: BTreeMap<(u32, u32, u8), AstId>,
     /// The interned per-`(op, domain)` declarations used for deferred FP nodes,
     /// so `fpa_blast` can recognise a deferred application and recover its op.
     fp_deferred_decls: BTreeSet<AstId>,
@@ -3652,6 +3655,7 @@ impl Context {
             fp_symbolic_cache: BTreeMap::new(),
             fp_ieee_nan: BTreeMap::new(),
             fp_ieee_alias: BTreeMap::new(),
+            fp_real_unspec: BTreeMap::new(),
             fp_deferred_decls: BTreeSet::new(),
             fp_deferred_by_op: BTreeMap::new(),
             seq_sorts: BTreeMap::new(),
@@ -16815,11 +16819,10 @@ impl Context {
                 .m
                 .bv_sort_width(self.m.get_sort(a))
                 .ok_or_else(|| "fp: expected bit-vector fields".to_string())?;
-            let v = self
-                .m
-                .bv_numeral_value(a)
-                .and_then(|n| n.to_i64())
-                .ok_or_else(|| "fp: non-constant field".to_string())? as u64;
+            let Some(v) = self.m.bv_numeral_value(a).and_then(|n| n.to_i64()) else {
+                return self.mk_fp_symbolic(args);
+            };
+            let v = v as u64;
             bits = (bits << w) | (v & ((1u128 << w) - 1) as u64);
             width += w;
         }
@@ -16828,6 +16831,31 @@ impl Context {
         let sb = self.m.bv_sort_width(self.m.get_sort(args[2])).unwrap() + 1;
         debug_assert_eq!(width, eb + sb);
         Ok(self.mk_fp(bits, eb, sb))
+    }
+
+    /// `(fp sign exp significand)` with a symbolic field: the FP term whose
+    /// IEEE bit pattern is the concatenated fields (as `(_ to_fp eb sb)` of a
+    /// bit-vector).
+    fn mk_fp_symbolic(&mut self, args: &[AstId]) -> Result<AstId, String> {
+        let mut ws = Vec::with_capacity(3);
+        for &a in args {
+            ws.push(
+                self.m
+                    .bv_sort_width(self.m.get_sort(a))
+                    .ok_or_else(|| "fp: expected bit-vector fields".to_string())?,
+            );
+        }
+        if args.len() != 3 || ws[0] != 1 {
+            return Err("fp: expected (fp sign exp significand)".to_string());
+        }
+        let (eb, sb) = (ws[1], ws[2] + 1);
+        let low = self.m.mk_bv_concat(args[1], args[2]);
+        let x = self.m.mk_bv_concat(args[0], low);
+        let s = self.fp_sort(eb, sb);
+        let t = self.fresh_const(s);
+        self.str_symbolic.insert(t);
+        self.fp_from_bv.insert(t, (x, eb, sb));
+        Ok(t)
     }
 
     /// A named FP special value (`+oo`/`-oo`/`NaN`/`+zero`/`-zero`) of format
@@ -19824,10 +19852,20 @@ impl Context {
             }
             "fp.to_real" if args.len() == 1 => {
                 // Exact real value of a finite FP constant of *any* format.
-                if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0])
-                    && let Some(val) = Self::fp_real_value(bits, eb, sb)
-                {
-                    return Ok(self.m.mk_numeral(val, false));
+                if let Some(&(bits, eb, sb)) = self.fp_of.get(&args[0]) {
+                    if let Some(val) = Self::fp_real_value(bits, eb, sb) {
+                        return Ok(self.m.mk_numeral(val, false));
+                    }
+                    // NaN / ±oo: z3's unspecified (but fixed) value.
+                    let sig_mask = (1u64 << (sb - 1)) - 1;
+                    let class = if bits & sig_mask != 0 {
+                        0
+                    } else if bits >> (eb + sb - 1) == 0 {
+                        1
+                    } else {
+                        2
+                    };
+                    return Ok(self.fp_real_unspec(eb, sb, class));
                 }
                 self.symbolic_fp(op, args)
             }
@@ -20016,6 +20054,64 @@ impl Context {
         };
         self.fp_ieee_nan.insert((eb, sb), t);
         t
+    }
+
+    /// The value z3 gives `fp.to_real` of NaN (`class` 0), `+oo` (1) or `-oo`
+    /// (2) in format `(eb, sb)`: `0` under `:rewriter.hi_fp_unspecified`,
+    /// otherwise an unspecified real, fixed per format and class (z3 applies
+    /// one uninterpreted function to the NaN-normalised argument).
+    fn fp_real_unspec(&mut self, eb: u32, sb: u32, class: u8) -> AstId {
+        if let Some(&t) = self.fp_real_unspec.get(&(eb, sb, class)) {
+            return t;
+        }
+        let hi = self.params.get_bool("rewriter.hi_fp_unspecified", false)
+            || self.params.get_bool("rewriter.hi-fp-unspecified", false);
+        let t = if hi {
+            self.m
+                .mk_numeral(Rational::from_integer(Int::from(0)), false)
+        } else {
+            let real = self.m.mk_real_sort();
+            self.fresh_const(real)
+        };
+        self.fp_real_unspec.insert((eb, sb, class), t);
+        t
+    }
+
+    /// A model of `goal` with every symbolic `fp.to_real(x)` marker's argument
+    /// forced to NaN is a model of `goal`: there `fp.to_real(x)` is the NaN
+    /// value [`Self::fp_real_unspec`]. The strengthened goal (markers replaced,
+    /// `isNaN(x)` conjoined), or `None` without such a marker. `goal` must be
+    /// the whole problem: the guards constrain the bit-vectors behind the FP
+    /// terms, which a component of a split goal does not mention, and sibling
+    /// components could pin the shared NaN value differently.
+    fn specialize_to_real_nan(&mut self, goal: AstId) -> Option<AstId> {
+        if self.in_components {
+            return None;
+        }
+        let mut pairs: Vec<(AstId, AstId)> = Vec::new();
+        let mut guards: Vec<AstId> = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.m.is_app(t)
+                || !self
+                    .decl_name(self.m.app_decl(t))
+                    .is_some_and(|n| n.starts_with("!fpop!fp.to_real!"))
+            {
+                continue;
+            }
+            let x = *self.m.app_args(t).first()?;
+            let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+            let is_nan = self.fp_classify_bv("fp.isNaN", x)?;
+            let u = self.fp_real_unspec(eb, sb, 0);
+            pairs.push((t, u));
+            guards.push(is_nan);
+        }
+        if pairs.is_empty() {
+            return None;
+        }
+        let g = crate::rewriter::substitute(&mut self.m, goal, &pairs);
+        guards.push(g);
+        let g = self.m.mk_and(&guards);
+        Some(crate::rewriter::simplify(&mut self.m, g))
     }
 
     /// A fresh uninterpreted term for a symbolic FP operation, gated to `unknown`.
@@ -28199,6 +28295,18 @@ impl Context {
         {
             let (r2, m2) = self.decide_inner(g);
             if r2 != SmtResult::Unknown {
+                return (r2, m2);
+            }
+        }
+        // Fallback: a model with every symbolic `fp.to_real` argument NaN.
+        if res == SmtResult::Unknown
+            && !self.in_opaque_strengthen
+            && let Some(g) = self.specialize_to_real_nan(goal)
+        {
+            self.in_opaque_strengthen = true;
+            let (r2, m2) = self.decide_inner(g);
+            self.in_opaque_strengthen = false;
+            if r2 == SmtResult::Sat {
                 return (r2, m2);
             }
         }
