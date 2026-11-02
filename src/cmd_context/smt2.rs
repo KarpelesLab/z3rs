@@ -29821,7 +29821,7 @@ impl Context {
                 }
             };
         }
-        if !self.m.postorder(pat).iter().any(|x| vars.contains(x)) {
+        if !self.pattern_mentions(pat, vars) {
             return self.ematch_equal(pat, g);
         }
         if !self.m.is_app(pat) {
@@ -29855,6 +29855,16 @@ impl Context {
             }
         }
         false
+    }
+
+    /// Does the pattern term `t` mention one of `vars`? A plain recursive walk:
+    /// patterns are small trees, unlike the (manager-sized) postorder.
+    fn pattern_mentions(&self, t: AstId, vars: &BTreeSet<AstId>) -> bool {
+        vars.contains(&t)
+            || self
+                .m
+                .app(t)
+                .is_some_and(|a| a.args.iter().any(|&x| self.pattern_mentions(x, vars)))
     }
 
     /// Are `a` and `b` the same term, or in one E-matching equality class?
