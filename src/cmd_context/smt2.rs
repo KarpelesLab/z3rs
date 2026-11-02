@@ -37201,6 +37201,23 @@ impl Context {
                 return false;
             }
         }
+        // A universal over a chosen function must hold under it too: with the
+        // constants and the chosen functions substituted, its body has to
+        // simplify to `true` whatever the binders (else the function stays out).
+        for (_, body) in self.universals.clone() {
+            let mentions = self
+                .m
+                .postorder(body)
+                .iter()
+                .any(|&t| self.m.app(t).is_some_and(|a| fsub.contains_key(&a.decl)));
+            if mentions {
+                let sub = self.subst_all(body, csub, &fsub);
+                let sub = crate::rewriter::simplify(&mut self.m, sub);
+                if !self.m.is_true(sub) {
+                    return false;
+                }
+            }
+        }
         true
     }
 
@@ -41957,6 +41974,20 @@ mod tests {
             .unwrap(),
             ["unsat"]
         );
+    }
+
+    #[test]
+    fn model_functions_respect_universals() {
+        // `q ≡ false` satisfies the ground `¬q(a, b)` but not `∀x. q(x, f x)`:
+        // that interpretation must not be printed.
+        let out = run(
+            "(declare-sort U 0)(declare-fun f (U) U)(declare-fun q (U U) Bool)\
+             (declare-const a U)(declare-const b U)(assert (forall ((x U)) (q x (f x))))\
+             (assert (not (q a b)))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(!out[1].contains("define-fun q"), "{}", out[1]);
     }
 
     #[test]
