@@ -6,15 +6,18 @@
 //! ## Ported so far
 //! - [x] congruence closure for equality + uninterpreted functions → [`euf`]
 //! - [x] a lazy DPLL(T) loop deciding QF_UF → [`solver`]
-//! - [ ] online theory propagation, minimized explanations, more theories
-//!   (arith/bv/arrays), quantifier instantiation
+//! - [x] online DPLL(T): backtrackable congruence closure → [`euf_online`],
+//!   simplex following the trail → [`arith_online`]
+//! - [ ] more theories (bv/arrays) online, quantifier instantiation
 //!
 //! ## Status: IN PROGRESS
 
 pub mod arith;
+pub mod arith_online;
 pub mod bv;
 pub mod cooper;
 pub mod euf;
+pub mod euf_online;
 pub mod solver;
 
 pub use arith::{

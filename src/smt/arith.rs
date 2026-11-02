@@ -114,6 +114,11 @@ impl LinExpr {
         self.is_constant().then(|| self.constant.clone())
     }
 
+    /// The constant term.
+    pub fn constant_part(&self) -> &Rational {
+        &self.constant
+    }
+
     /// The variables (with nonzero coefficient) mentioned by this expression.
     pub fn vars(&self) -> impl Iterator<Item = AstId> + '_ {
         self.coeffs.keys().copied()
@@ -399,6 +404,18 @@ pub fn feasible_core(constraints: &[Constraint]) -> Option<Vec<usize>> {
     match simplex_solve(constraints, &mut budget) {
         SimplexOutcome::Unsat(core) => Some(core),
         _ => None,
+    }
+}
+
+/// Decide `constraints` over the rationals: a model, or the indices of an
+/// infeasible subset (a Farkas core). Unbounded — for callers whose systems
+/// the online simplex has already kept feasible up to a few new rows.
+pub fn model_or_core(constraints: &[Constraint]) -> Result<Assignment, Vec<usize>> {
+    let mut unbounded = u64::MAX;
+    match simplex_solve(constraints, &mut unbounded) {
+        SimplexOutcome::Sat(a) => Ok(a),
+        SimplexOutcome::Unsat(core) => Err(core),
+        SimplexOutcome::Exhausted => unreachable!("unbounded simplex budget"),
     }
 }
 

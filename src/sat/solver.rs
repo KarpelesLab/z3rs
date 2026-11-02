@@ -60,8 +60,28 @@ pub struct TheoryProp {
 /// analysis resolves through, so an unsound return is an unsound lemma —
 /// implementers MUST independently verify each implication/conflict.
 pub trait TheoryHook {
-    /// Called at the Boolean fixpoint. `val(l)` gives `l`'s current value.
-    fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp;
+    /// Called at the Boolean fixpoint with a view of the current assignment.
+    fn propagate(&mut self, ctx: &TheoryCtx<'_>) -> TheoryProp;
+}
+
+/// The solver state a [`TheoryHook`] sees: the assignment trail, and how much of
+/// it is unchanged since the previous call (so an incremental theory asserts
+/// only the new literals and undoes what was backtracked).
+pub struct TheoryCtx<'a> {
+    /// The assigned literals, in assignment order.
+    pub trail: &'a [Lit],
+    /// Length of the trail prefix that has stayed assigned since the previous
+    /// call (literals beyond it were retracted or are new).
+    pub stable: usize,
+    assign: &'a [LBool],
+}
+
+impl TheoryCtx<'_> {
+    /// The current value of `l`.
+    #[inline]
+    pub fn value(&self, l: Lit) -> LBool {
+        lit_value_from(self.assign, l)
+    }
 }
 
 /// Outcome of one theory-propagation pass (see [`Solver::theory_pass`]).
@@ -109,6 +129,9 @@ pub struct Solver {
     trail: Vec<Lit>,
     trail_lim: Vec<usize>,
     qhead: usize,
+    /// Length of the trail prefix unchanged since the last theory pass (the
+    /// [`TheoryCtx::stable`] low-water mark, lowered by every backtrack).
+    theory_stable: usize,
 
     ok: bool,
 }
@@ -143,6 +166,7 @@ impl Solver {
             trail: Vec::new(),
             trail_lim: Vec::new(),
             qhead: 0,
+            theory_stable: 0,
             ok: true,
         }
     }
@@ -545,11 +569,12 @@ impl Solver {
             let l = self.trail.pop().unwrap();
             let v = l.var() as usize;
             self.assign[v] = LBool::Undef;
-            self.polarity[v] = !l.sign(); // phase saving
+            self.polarity[v] = l.sign(); // phase saving
             self.reason[v] = REASON_NONE;
             self.heap_insert(v as Var);
         }
         self.qhead = target;
+        self.theory_stable = self.theory_stable.min(target);
         self.trail_lim.truncate(level as usize);
     }
 
@@ -608,6 +633,21 @@ impl Solver {
         for &l in &lits {
             self.ensure_var(l.var());
         }
+        // 1-UIP analysis needs a literal of the current level: a lemma that is
+        // already false at a lower level first backjumps there (z3 does the
+        // same for a theory conflict below the search level).
+        let top = lits
+            .iter()
+            .map(|l| self.level[l.var() as usize])
+            .max()
+            .unwrap_or(0);
+        if top < self.decision_level() {
+            self.cancel_until(top);
+        }
+        // Watch the two highest-level literals, so the clause keeps its watch
+        // invariant once the search backjumps.
+        let mut lits = lits;
+        lits.sort_by_key(|l| core::cmp::Reverse(self.level[l.var() as usize]));
         let cref = self.clauses.len();
         self.attach_clause(lits, true);
         Some(cref)
@@ -621,10 +661,12 @@ impl Solver {
     /// Every clause is a globally-valid theory lemma (the hook's soundness
     /// contract), so conflict analysis resolves through it soundly.
     fn theory_pass(&mut self, th: &mut dyn TheoryHook) -> TheoryPass {
-        let prop = {
-            let assign = &self.assign;
-            th.propagate(&|l| lit_value_from(assign, l))
-        };
+        let prop = th.propagate(&TheoryCtx {
+            trail: &self.trail,
+            stable: self.theory_stable,
+            assign: &self.assign,
+        });
+        self.theory_stable = self.trail.len();
         if let Some(c) = prop.conflict {
             let neg: Vec<Lit> = c.iter().map(|&l| !l).collect();
             if let Some(cref) = self.attach_conflict_clause(neg) {
@@ -654,6 +696,11 @@ impl Solver {
                         for &l in &clause {
                             self.ensure_var(l.var());
                         }
+                        // Watch the highest-level reason literal (index 1).
+                        let hi = (1..clause.len())
+                            .max_by_key(|&i| self.level[clause[i].var() as usize])
+                            .unwrap_or(1);
+                        clause.swap(1, hi);
                         let cref = self.clauses.len();
                         self.attach_clause(clause, true);
                         self.enqueue(p, cref as i32);
@@ -816,7 +863,8 @@ mod tests {
         b: Lit,
     }
     impl TheoryHook for ImplyHook {
-        fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp {
+        fn propagate(&mut self, ctx: &TheoryCtx<'_>) -> TheoryProp {
+            let val = |l| ctx.value(l);
             let mut implied = Vec::new();
             if val(self.a) == LBool::True && val(self.b) != LBool::True {
                 implied.push((self.b, alloc::vec![self.a]));
@@ -835,7 +883,8 @@ mod tests {
         b: Lit,
     }
     impl TheoryHook for ConflictHook {
-        fn propagate(&mut self, val: &dyn Fn(Lit) -> LBool) -> TheoryProp {
+        fn propagate(&mut self, ctx: &TheoryCtx<'_>) -> TheoryProp {
+            let val = |l| ctx.value(l);
             let conflict = if val(self.a) == LBool::True && val(self.b) == LBool::True {
                 Some(alloc::vec![self.a, self.b])
             } else {

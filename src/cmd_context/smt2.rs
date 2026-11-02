@@ -31210,6 +31210,13 @@ impl Context {
                 .is_none_or(|(idx, _)| idx == ctx.m.get_sort(j))
         };
         for &(a, b) in &array_eqs {
+            // Between two *plain* arrays (variables, uninterpreted applications)
+            // no read folds away, so congruence closure over the reads that do
+            // occur derives every needed instance (z3 relies on congruence the
+            // same way); the instances are only needed when a side's reads fold.
+            if self.is_plain_array(a) && self.is_plain_array(b) {
+                continue;
+            }
             let eq_ab = self.m.mk_eq(a, b);
             let ne_ab = self.m.mk_not(eq_ab);
             for &j in &indices {
@@ -31261,6 +31268,19 @@ impl Context {
             }
         }
         axioms
+    }
+
+    /// Is `arr` a *plain* array term — a variable or an uninterpreted
+    /// application, not a `store` / constant / map / lambda / `as-array` whose
+    /// reads the rewriter folds — so congruence alone relates its reads?
+    fn is_plain_array(&self, arr: AstId) -> bool {
+        self.m.app(arr).is_some_and(|a| {
+            self.m
+                .func_decl(a.decl)
+                .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+        }) && !self.maps.contains_key(&arr)
+            && !self.as_arrays.contains_key(&arr)
+            && !self.lambdas.contains_key(&arr)
     }
 
     /// The conjunction of all assertions (`true` if none).

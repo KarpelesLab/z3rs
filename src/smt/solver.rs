@@ -22,9 +22,16 @@
 //! arithmetic constraints. Entailment is decided convexly (a single equality per
 //! pair), complete for QF_UFLRA and sound for QF_UFLIA. A shared work budget
 //! bounds the (worst-case exponential) disequality split and branch-and-bound,
-//! yielding a sound `unknown` on exhaustion. Minimized explanations and online
-//! propagation come next. Non-arithmetic, non-equality atoms remain free
-//! Booleans.
+//! yielding a sound `unknown` on exhaustion. Non-arithmetic, non-equality
+//! atoms remain free Booleans.
+//!
+//! The search itself is online: a backtrackable congruence closure
+//! ([`crate::smt::euf_online`]) and the bounded simplex
+//! ([`crate::smt::arith_online`]) follow the SAT trail, detecting conflicts and
+//! propagating equalities on partial assignments (z3's `smt_context` with
+//! `theory_uf` / `theory_lra`). The final check then asks for case splits on new
+//! atoms — violated disequalities, fractional integers, and (for many interface
+//! terms) model-based theory combination — instead of searching internally.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -35,12 +42,15 @@ use crate::ast::bv::BvOp;
 use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
+use crate::sat::solver::{TheoryCtx, TheoryHook, TheoryProp};
 use crate::sat::tseitin::encode_tracking;
 use crate::smt::arith::{
-    Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible_core, feasible_with_diseqs,
-    model_with_diseqs_budgeted, project,
+    Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible_core, model_with_diseqs_budgeted,
+    project,
 };
+use crate::smt::arith_online::ArithOnline;
 use crate::smt::euf::{Egraph, ProofEgraph};
+use crate::smt::euf_online::IncEgraph;
 
 use alloc::collections::BTreeSet;
 
@@ -93,13 +103,13 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
             euf_roots.push(a);
             euf_roots.push(b);
             if m.is_arith_sort(m.get_sort(a)) {
-                arith_atoms.push(ArithAtom::eq(lit, a, b));
+                arith_atoms.push(ArithAtom::eq(m, lit, a, b));
             }
         } else if let Some(op) = m.arith_op(atom)
             && matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
         {
             let args = m.app_args(atom);
-            arith_atoms.push(ArithAtom::cmp(lit, op, args[0], args[1]));
+            arith_atoms.push(ArithAtom::cmp(m, lit, op, args[0], args[1]));
             // The compared terms are EUF terms too, so uninterpreted applications
             // among them (e.g. f(a) in f(a) > f(b)) get congruence.
             euf_roots.push(args[0]);
@@ -121,12 +131,32 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
     // rounds each face an expensive (blow-up-prone) theory check.
     let mut budget = BB_WORK_BUDGET;
     let mut euf_bases: Option<(ProofEgraph, Egraph)> = None;
+    // The online congruence closure: EUF conflicts and equality propagation
+    // during the search, on partial assignments (the final check below still
+    // decides arithmetic and theory combination on each full assignment).
+    let mut split_memo: SplitAtoms = BTreeMap::new();
+    let mut eq_pairs: BTreeSet<(AstId, AstId)> = euf_eq
+        .iter()
+        .map(|&(_, a, b)| (a.min(b), a.max(b)))
+        .collect();
+    let mut online = Online {
+        m,
+        eqs: Vec::new(),
+        euf: (!euf_eq.is_empty() || !pred_atoms.is_empty())
+            .then(|| IncEgraph::new(m, &euf_roots, &euf_eq, &pred_atoms)),
+        arith: (!arith_atoms.is_empty()).then(|| online_arith(m, &arith_atoms)),
+    };
     loop {
         rounds += 1;
         if rounds > DPLL_ROUND_LIMIT {
             return (SmtResult::Unknown, None);
         }
-        match sat.solve() {
+        let solved = if online.euf.is_none() && online.arith.is_none() {
+            sat.solve()
+        } else {
+            sat.solve_with_theory(&mut online)
+        };
+        match solved {
             SatResult::Unsat => return (SmtResult::Unsat, None),
             SatResult::Sat => {
                 // The Boolean assignment of every tracked atom.
@@ -182,6 +212,75 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         };
                         return (SmtResult::Sat, Some(model));
                     }
+                    // Case splits on new atoms: valid clauses, so the search
+                    // simply goes on with them.
+                    TheoryOutcome::Split(reqs) => {
+                        let mut new_eqs = false;
+                        let one = Rational::from_integer(Int::from(1));
+                        for req in reqs {
+                            match req {
+                                SplitReq::Diseq {
+                                    eq_lit,
+                                    d,
+                                    integral,
+                                } => {
+                                    let (lo, hi) = if integral {
+                                        let c = LinExpr::constant(one.clone());
+                                        (d.add(&c), d.neg().add(&c))
+                                    } else {
+                                        (d.clone(), d.neg())
+                                    };
+                                    let strict = !integral;
+                                    let mut mk = |e| {
+                                        split_atom(
+                                            m,
+                                            &mut sat,
+                                            &mut arith_atoms,
+                                            &mut online,
+                                            &mut split_memo,
+                                            strict,
+                                            e,
+                                        )
+                                    };
+                                    let (p, q) = (mk(lo), mk(hi));
+                                    sat.add_clause(&[eq_lit, p, q]);
+                                }
+                                SplitReq::Branch { x, k } => {
+                                    let e = LinExpr::var(x)
+                                        .sub(&LinExpr::constant(Rational::from_integer(k)));
+                                    split_atom(
+                                        m,
+                                        &mut sat,
+                                        &mut arith_atoms,
+                                        &mut online,
+                                        &mut split_memo,
+                                        false,
+                                        e,
+                                    );
+                                }
+                                SplitReq::Eq { a, b } => {
+                                    if !eq_pairs.insert((a.min(b), a.max(b))) {
+                                        continue;
+                                    }
+                                    let lit = Lit::pos(sat.mk_var());
+                                    euf_eq.push((lit, a, b));
+                                    let atom = ArithAtom::eq(m, lit, a, b);
+                                    let (_, t, f) = online_bounds(m, &atom);
+                                    online
+                                        .arith
+                                        .get_or_insert_with(|| ArithOnline::new(&[]))
+                                        .add_atom(lit, t.as_ref(), f.as_ref());
+                                    arith_atoms.push(atom);
+                                    new_eqs = true;
+                                }
+                            }
+                        }
+                        // The congruence closure watches the new equalities
+                        // from a fresh start (it re-asserts the trail).
+                        if new_eqs {
+                            online.euf = Some(IncEgraph::new(m, &euf_roots, &euf_eq, &pred_atoms));
+                        }
+                    }
                     // Undecidable here: neither confirm SAT nor soundly block.
                     TheoryOutcome::Unknown => return (SmtResult::Unknown, None),
                     // A strong conflict core. MANDATORY soundness net: re-verify the
@@ -228,41 +327,68 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                             })
                             .collect();
                         croots.extend(cpreds.iter().map(|&(t, _)| t));
-                        let euf_bad = {
-                            let mut g = Egraph::new(m, &croots);
-                            !g.is_consistent(m, &ceqs, &cdiseqs)
-                                || cpreds.iter().any(|&(t, v)| {
-                                    cpreds.iter().any(|&(u, w)| {
-                                        v && !w && g.class_of(m, t) == g.class_of(m, u)
-                                    })
-                                })
-                        };
-                        // Arith re-check: rebuild the linear system from only the core's
-                        // arith atoms (asserted polarity) and confirm it is genuinely
-                        // infeasible over the rationals (plus diseq splits).
-                        let arith_bad = {
+                        // The core's comparison atoms, in asserted polarity; their
+                        // sides join the congruence closure too.
+                        let mut ccmp: Vec<(&ArithAtom, bool)> = Vec::new();
+                        for atom in arith_atoms.iter().filter(|a| !a.is_eq) {
+                            if core_set.contains(&atom.lit) {
+                                ccmp.push((atom, true));
+                            } else if core_set.contains(&!atom.lit) {
+                                ccmp.push((atom, false));
+                            } else {
+                                continue;
+                            }
+                            croots.extend(atom.sides.iter().copied());
+                        }
+                        let mut g = Egraph::new(m, &croots);
+                        let euf_bad = !g.is_consistent(m, &ceqs, &cdiseqs)
+                            || cpreds.iter().any(|&(t, v)| {
+                                cpreds
+                                    .iter()
+                                    .any(|&(u, w)| v && !w && g.class_of(m, t) == g.class_of(m, u))
+                            });
+                        // Arith re-check: the linear system of only the core's atoms
+                        // (asserted polarity), plus the equalities congruence derives
+                        // from the core's equalities between arithmetic terms, must
+                        // be infeasible (over the integers for integer terms).
+                        let arith_bad = !euf_bad && {
                             let mut cons: Vec<Constraint> = Vec::new();
                             let mut diseqs: Vec<LinExpr> = Vec::new();
-                            for atom in &arith_atoms {
-                                let holds = if core_set.contains(&atom.lit) {
-                                    true
-                                } else if core_set.contains(&!atom.lit) {
-                                    false
-                                } else {
-                                    continue; // atom not in the core
-                                };
-                                let diff = ast_to_lin(m, atom.a).sub(&ast_to_lin(m, atom.b));
-                                if atom.is_eq {
-                                    if holds {
-                                        cons.push(Constraint::eq(diff));
-                                    } else {
-                                        diseqs.push(diff);
-                                    }
-                                } else {
-                                    cons.push(comparison_constraint(atom.op, holds, diff));
+                            for &(a, b) in &cdiseqs {
+                                if m.is_arith_sort(m.get_sort(a)) {
+                                    diseqs.push(ast_to_lin(m, a).sub(&ast_to_lin(m, b)));
                                 }
                             }
-                            !feasible_with_diseqs(&cons, &diseqs)
+                            for &(atom, holds) in &ccmp {
+                                cons.push(comparison_constraint(atom.op, holds, atom.diff.clone()));
+                            }
+                            let mut rep: BTreeMap<usize, AstId> = BTreeMap::new();
+                            for t in m.postorder_many(&croots) {
+                                if !m.is_arith_sort(m.get_sort(t)) {
+                                    continue;
+                                }
+                                match rep.get(&g.class_of(m, t)) {
+                                    Some(&r) => cons.push(Constraint::eq(
+                                        ast_to_lin(m, t).sub(&ast_to_lin(m, r)),
+                                    )),
+                                    None => {
+                                        rep.insert(g.class_of(m, t), t);
+                                    }
+                                }
+                            }
+                            let mut int_set = BTreeSet::new();
+                            for e in cons.iter().map(|c| &c.expr).chain(diseqs.iter()) {
+                                collect_int_vars(m, e, &mut int_set);
+                            }
+                            let sys = ArithSystem {
+                                con_lits: Vec::new(),
+                                diseq_lits: Vec::new(),
+                                cons,
+                                diseqs,
+                                int_set,
+                            };
+                            let mut verify_budget = CORE_VERIFY_BUDGET;
+                            matches!(arith_feasible(&sys, &mut verify_budget), Feas::Unsat)
                         };
                         if euf_bad || arith_bad {
                             // Verified inconsistent → learn the strong lemma ¬core.
@@ -281,6 +407,132 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
             }
         }
     }
+}
+
+/// The online theories of [`check_model`]'s search: congruence closure and
+/// the simplex, each following the SAT trail (z3's `smt_context` runs its
+/// theory solvers side by side the same way).
+struct Online<'a> {
+    m: &'a AstManager,
+    euf: Option<IncEgraph>,
+    arith: Option<ArithOnline>,
+    /// The congruence equalities passed to the arithmetic so far, compiled.
+    eqs: Vec<(usize, Constraint, Vec<Lit>)>,
+}
+
+impl TheoryHook for Online<'_> {
+    fn propagate(&mut self, ctx: &TheoryCtx<'_>) -> TheoryProp {
+        let mut out = TheoryProp {
+            implied: Vec::new(),
+            conflict: None,
+        };
+        if let Some(g) = self.euf.as_mut() {
+            out = g.propagate(ctx);
+            if out.conflict.is_some() {
+                return out;
+            }
+        }
+        if let Some(a) = self.arith.as_mut() {
+            // Mirror the congruence log (positions retracted there are retracted
+            // here, new entries compiled once).
+            let log = self.euf.as_ref().map_or(&[][..], |g| &g.eq_log[..]);
+            let mut same = 0;
+            while same < self.eqs.len()
+                && same < log.len()
+                && self.eqs[same].0 == log[same].0
+                && self.eqs[same].2 == log[same].3
+            {
+                same += 1;
+            }
+            self.eqs.truncate(same);
+            for (pos, u, v, why) in &log[same..] {
+                let c = Constraint::eq(ast_to_lin(self.m, *u).sub(&ast_to_lin(self.m, *v)));
+                self.eqs.push((*pos, c, why.clone()));
+            }
+            let p = a.propagate_with(ctx, &self.eqs);
+            if p.conflict.is_some() {
+                return p;
+            }
+            out.implied.extend(p.implied);
+        }
+        out
+    }
+}
+
+/// The online simplex over the arithmetic atoms: each atom's constraint when
+/// true and when false (an equality's negation, a disjunction, is left to the
+/// final check). Strict bounds over integral expressions are tightened.
+fn online_arith(m: &AstManager, atoms: &[ArithAtom]) -> ArithOnline {
+    let list: Vec<(Lit, Option<Constraint>, Option<Constraint>)> =
+        atoms.iter().map(|atom| online_bounds(m, atom)).collect();
+    ArithOnline::new(&list)
+}
+
+/// An atom's constraint when true and when false, for [`ArithOnline`]. Strict
+/// bounds over integral expressions are tightened (`e < 0` to `e + 1 ≤ 0`).
+fn online_bounds(
+    m: &AstManager,
+    atom: &ArithAtom,
+) -> (Lit, Option<Constraint>, Option<Constraint>) {
+    let tighten = |c: Constraint| -> Constraint {
+        let integral = c
+            .expr
+            .terms()
+            .all(|(v, a)| m.is_int_sort(m.get_sort(v)) && a.is_integer())
+            && c.expr.constant_part().is_integer();
+        if integral && c.rel == Rel::Lt {
+            let one = Rational::from_integer(Int::from(1));
+            Constraint::le(c.expr.add(&LinExpr::constant(one)))
+        } else {
+            c
+        }
+    };
+    let diff = atom.diff.clone();
+    if atom.is_eq {
+        (atom.lit, Some(Constraint::eq(diff)), None)
+    } else {
+        (
+            atom.lit,
+            Some(tighten(comparison_constraint(atom.op, true, diff.clone()))),
+            Some(tighten(comparison_constraint(atom.op, false, diff))),
+        )
+    }
+}
+
+/// The atoms [`check_model`] introduced for case splits, by `(op, diff)`.
+type SplitAtoms = BTreeMap<(bool, Vec<(AstId, Rational)>, Rational), Lit>;
+
+/// The literal of the split atom `diff ≤ 0` (`strict`: `diff < 0`), creating
+/// the atom — a fresh SAT variable, watched by the online simplex — on first
+/// use.
+fn split_atom(
+    m: &AstManager,
+    sat: &mut Solver,
+    arith_atoms: &mut Vec<ArithAtom>,
+    online: &mut Online<'_>,
+    memo: &mut SplitAtoms,
+    strict: bool,
+    diff: LinExpr,
+) -> Lit {
+    let key = (
+        strict,
+        diff.terms().map(|(v, a)| (v, a.clone())).collect(),
+        diff.constant_part().clone(),
+    );
+    if let Some(&l) = memo.get(&key) {
+        return l;
+    }
+    let lit = Lit::pos(sat.mk_var());
+    let op = if strict { ArithOp::Lt } else { ArithOp::Le };
+    let atom = ArithAtom::split(lit, op, diff);
+    let (_, t, f) = online_bounds(m, &atom);
+    online
+        .arith
+        .get_or_insert_with(|| ArithOnline::new(&[]))
+        .add_atom(lit, t.as_ref(), f.as_ref());
+    arith_atoms.push(atom);
+    memo.insert(key, lit);
+    lit
 }
 
 /// A satisfying assignment, able to evaluate terms to concrete [`Value`]s.
@@ -1259,32 +1511,46 @@ fn interface_terms(m: &AstManager, euf_roots: &[AstId]) -> Vec<AstId> {
         .collect()
 }
 
-/// An arithmetic theory atom: either a comparison or an equality.
+/// An arithmetic theory atom: either a comparison or an equality of `diff`
+/// (`a − b`) against `0`.
 struct ArithAtom {
     lit: Lit,
     op: ArithOp, // Le/Lt/Ge/Gt for comparisons, Eq is stored as `is_eq`
-    a: AstId,
-    b: AstId,
+    diff: LinExpr,
+    /// The compared terms (the leaves of `diff` for a split atom the solver
+    /// introduced, which has no term of its own).
+    sides: Vec<AstId>,
     is_eq: bool,
 }
 
 impl ArithAtom {
-    fn cmp(lit: Lit, op: ArithOp, a: AstId, b: AstId) -> ArithAtom {
+    fn cmp(m: &AstManager, lit: Lit, op: ArithOp, a: AstId, b: AstId) -> ArithAtom {
         ArithAtom {
             lit,
             op,
-            a,
-            b,
+            diff: ast_to_lin(m, a).sub(&ast_to_lin(m, b)),
+            sides: alloc::vec![a, b],
             is_eq: false,
         }
     }
-    fn eq(lit: Lit, a: AstId, b: AstId) -> ArithAtom {
+    fn eq(m: &AstManager, lit: Lit, a: AstId, b: AstId) -> ArithAtom {
         ArithAtom {
             lit,
             op: ArithOp::Le,
-            a,
-            b,
+            diff: ast_to_lin(m, a).sub(&ast_to_lin(m, b)),
+            sides: alloc::vec![a, b],
             is_eq: true,
+        }
+    }
+    /// The split atom `diff ⋈ 0` (`op` is `Le` or `Lt`).
+    fn split(lit: Lit, op: ArithOp, diff: LinExpr) -> ArithAtom {
+        let sides = diff.vars().collect();
+        ArithAtom {
+            lit,
+            op,
+            diff,
+            sides,
+            is_eq: false,
         }
     }
 }
@@ -1343,14 +1609,18 @@ struct ArithSystem {
     /// tracked — extensions appended in the Nelson–Oppen loop have no literal).
     /// Used to map a [`feasible_core`] index back to a conflict-core literal.
     con_lits: Vec<Lit>,
+    /// For each entry of `diseqs`, the asserted-true literal (the negated
+    /// equality atom).
+    diseq_lits: Vec<Lit>,
 }
 
 fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> ArithSystem {
     let mut cons: Vec<Constraint> = Vec::new();
     let mut diseqs: Vec<LinExpr> = Vec::new();
     let mut con_lits: Vec<Lit> = Vec::new();
+    let mut diseq_lits: Vec<Lit> = Vec::new();
     for atom in atoms {
-        let diff = ast_to_lin(m, atom.a).sub(&ast_to_lin(m, atom.b)); // a - b
+        let diff = atom.diff.clone(); // a - b
         let holds = sat.model_holds(atom.lit);
         if atom.is_eq {
             if holds {
@@ -1358,6 +1628,7 @@ fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Arit
                 con_lits.push(atom.lit); // asserted true
             } else {
                 diseqs.push(diff); // a ≠ b (disjunctive)
+                diseq_lits.push(!atom.lit);
             }
         } else {
             cons.push(comparison_constraint(atom.op, holds, diff));
@@ -1372,11 +1643,20 @@ fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Arit
     for d in &diseqs {
         collect_int_vars(m, d, &mut int_set);
     }
+    // Over the integers a strict bound is a non-strict one off by one, so the
+    // rational model of the system already respects it (`x > 0` is `x ≥ 1`).
+    for c in &mut cons {
+        if c.rel == Rel::Lt && integral_over(&c.expr, &int_set) {
+            let one = Rational::from_integer(Int::from(1));
+            *c = Constraint::le(c.expr.add(&LinExpr::constant(one)));
+        }
+    }
     ArithSystem {
         cons,
         diseqs,
         int_set,
         con_lits,
+        diseq_lits,
     }
 }
 
@@ -2195,6 +2475,93 @@ enum TheoryOutcome {
     Unsat,
     /// Inconclusive (the arithmetic search gave up).
     Unknown,
+    /// The assignment needs case splits on new arithmetic atoms first.
+    Split(Vec<SplitReq>),
+}
+
+/// A case split the arithmetic final check asks the search to decide.
+enum SplitReq {
+    /// The asserted disequality `d ≠ 0` (equality atom `eq_lit` false): add
+    /// `eq_lit ∨ d < 0 ∨ d > 0` (for integral `d`, `d ≤ −1 ∨ d ≥ 1`).
+    Diseq {
+        eq_lit: Lit,
+        d: LinExpr,
+        integral: bool,
+    },
+    /// The integer variable `x` is fractional: branch on the atom `x ≤ k`.
+    Branch { x: AstId, k: Int },
+    /// The model equates the arithmetic terms `a` and `b` in different
+    /// congruence classes: decide the new equality atom `a = b`.
+    Eq { a: AstId, b: AstId },
+}
+
+/// Work budget of the bounded integer search [`integer_model`] tries first.
+const INTEGER_PROBE_BUDGET: u64 = 50_000;
+
+/// A model of `sys` respecting its disequalities and integrality, or why
+/// there is none at hand: `Err(None)` when `sys` is infeasible, `Err(Some(_))`
+/// with the case splits a rational model calls for when the bounded integer
+/// search (gcd tests, Diophantine witnesses, branch-and-bound, disequality
+/// splits) is inconclusive — the search then decides the splits itself, as
+/// z3's `theory_lra` final check does.
+fn integer_model(sys: &ArithSystem) -> Result<Assignment, Option<Vec<SplitReq>>> {
+    let model = crate::smt::arith::model(&sys.cons).ok_or(None)?;
+    let splits = model_splits(sys, &model);
+    if splits.is_empty() {
+        return Ok(model);
+    }
+    // Disequality splits are finitely many; only integer branching can go on
+    // forever (parity, divisibility), which the integer search decides first.
+    if splits.iter().all(|s| matches!(s, SplitReq::Diseq { .. })) {
+        return Err(Some(splits));
+    }
+    let mut budget = INTEGER_PROBE_BUDGET;
+    match arith_feasible(sys, &mut budget) {
+        Feas::Sat(a) => Ok(a),
+        Feas::Unsat => Err(None),
+        Feas::Unknown => Err(Some(splits)),
+    }
+}
+
+/// Is `e` integer-valued whenever its variables (all in `ints`) are?
+fn integral_over(e: &LinExpr, ints: &BTreeSet<AstId>) -> bool {
+    e.terms().all(|(v, a)| ints.contains(&v) && a.is_integer()) && e.constant_part().is_integer()
+}
+
+/// Cap on the splits requested per final check.
+const MAX_SPLITS: usize = 32;
+
+/// The splits the rational `model` of `sys`'s constraints calls for: the
+/// disequalities it violates, then the integer variables it leaves fractional.
+fn model_splits(sys: &ArithSystem, model: &Assignment) -> Vec<SplitReq> {
+    let mut out = Vec::new();
+    for (d, &dl) in sys.diseqs.iter().zip(&sys.diseq_lits) {
+        if out.len() >= MAX_SPLITS {
+            return out;
+        }
+        if d.eval(model).is_zero() {
+            let integral = integral_over(d, &sys.int_set);
+            out.push(SplitReq::Diseq {
+                eq_lit: !dl,
+                d: d.clone(),
+                integral,
+            });
+        }
+    }
+    if !out.is_empty() {
+        return out;
+    }
+    for &x in &sys.int_set {
+        if let Some(v) = model.get(&x)
+            && !v.is_integer()
+        {
+            out.push(SplitReq::Branch { x, k: v.floor() });
+            if out.len() >= MAX_SPLITS {
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// The combined EUF + arithmetic theory check for one Boolean assignment.
@@ -2235,15 +2602,15 @@ fn theory_check(
     // the violated disequality's own literal (in asserted polarity). Anything that
     // needs arithmetic-implied equalities, feasibility, or the predicate clash is
     // left to the Nelson–Oppen loop below (which returns the always-sound `Unsat`).
+    let id_eqs: Vec<(usize, AstId, AstId)> = euf_eq
+        .iter()
+        .enumerate()
+        .filter(|&(_, &(lit, _, _))| sat.model_holds(lit))
+        .map(|(id, &(_, a, b))| (id, a, b))
+        .collect();
+    let mut pg = bases.0.clone();
+    pg.assert_eqs(m, &id_eqs);
     {
-        let id_eqs: Vec<(usize, AstId, AstId)> = euf_eq
-            .iter()
-            .enumerate()
-            .filter(|&(_, &(lit, _, _))| sat.model_holds(lit))
-            .map(|(id, &(_, a, b))| (id, a, b))
-            .collect();
-        let mut pg = bases.0.clone();
-        pg.assert_eqs(m, &id_eqs);
         for &(lit, a, b) in euf_eq {
             if !sat.model_holds(lit) && pg.class_of(m, a) == pg.class_of(m, b) {
                 // core: the equalities forcing a≈b (asserted true) + this diseq
@@ -2295,12 +2662,35 @@ fn theory_check(
         let core: Vec<Lit> = core_idx.iter().map(|&i| base.con_lits[i]).collect();
         return TheoryOutcome::Conflict(core);
     }
+    // Model-based splits (z3 `theory_lra::final_check`): a disequality the
+    // rational model violates, or an integer variable it gives a fractional
+    // value, becomes a case split on new bound atoms for the search to decide,
+    // instead of a search inside this check.
+    match integer_model(&base) {
+        Ok(_) => {}
+        Err(Some(splits)) => return TheoryOutcome::Split(splits),
+        Err(None) => {
+            let why: Vec<Vec<Lit>> = base.con_lits.iter().map(|&l| alloc::vec![l]).collect();
+            return match arith_conflict_core(&base, &why) {
+                Some(core) => TheoryOutcome::Conflict(core),
+                None => TheoryOutcome::Unsat,
+            };
+        }
+    }
 
     let interface = interface_terms(m, euf_roots);
+    if interface.len() > PAIRWISE_COMBINATION_LIMIT {
+        return model_based_combination(
+            m, &base, &interface, euf_eq, euf_roots, &eqs, &diseqs, &mut pg, bases,
+        );
+    }
 
     // Equalities shared across the theory boundary, grown to a fixpoint.
     let mut euf_extra: Vec<(AstId, AstId)> = Vec::new(); // arith → EUF
     let mut arith_extra: Vec<Constraint> = Vec::new(); // EUF → arith
+    // The asserted equalities explaining each `arith_extra` entry, while every
+    // one is explainable (no arithmetic-implied equality fed the congruence).
+    let mut extra_why: Option<Vec<Vec<Lit>>> = Some(Vec::new());
     // Each round adds at least one new equality (bounded by the interface pairs),
     // so this cap is only a backstop against surprises.
     let max_rounds = interface.len() * interface.len() + 4;
@@ -2314,10 +2704,20 @@ fn theory_check(
             diseqs: base.diseqs.clone(),
             int_set: base.int_set.clone(),
             con_lits: base.con_lits.clone(),
+            diseq_lits: base.diseq_lits.clone(),
         };
         sys.cons.extend(arith_extra.iter().cloned());
         let arith = arith_feasible(&sys, &mut *budget);
         if matches!(arith, Feas::Unsat) {
+            // Explain the infeasibility when every constraint has a literal
+            // explanation (the EUF-implied equalities through the proof forest).
+            if let Some(extra) = &extra_why {
+                let mut why: Vec<Vec<Lit>> = sys.con_lits.iter().map(|&l| alloc::vec![l]).collect();
+                why.extend(extra.iter().cloned());
+                if let Some(core) = arith_conflict_core(&sys, &why) {
+                    return TheoryOutcome::Conflict(core);
+                }
+            }
             return TheoryOutcome::Unsat;
         }
         // The arithmetic model is a witness of non-entailment: any two interface
@@ -2390,11 +2790,24 @@ fn theory_check(
                 };
                 if entailed && !same_class {
                     euf_extra.push((u, v)); // arith → EUF
+                    extra_why = None;
                     changed = true;
                 } else if same_class && !entailed {
                     // EUF → arith: add u − v = 0.
                     let diff = ast_to_lin(m, u).sub(&ast_to_lin(m, v));
                     arith_extra.push(Constraint::eq(diff));
+                    if let Some(w) = extra_why.as_mut() {
+                        if euf_extra.is_empty() {
+                            w.push(
+                                pg.explain(m, u, v)
+                                    .into_iter()
+                                    .map(|id| euf_eq[id].0)
+                                    .collect(),
+                            );
+                        } else {
+                            extra_why = None;
+                        }
+                    }
                     changed = true;
                 }
             }
@@ -2413,6 +2826,259 @@ fn theory_check(
         }
     }
     TheoryOutcome::Unknown // did not converge within the round budget
+}
+
+/// Above this many interface terms, theory combination is model-based rather
+/// than by pairwise entailment queries (quadratic in the interface).
+const PAIRWISE_COMBINATION_LIMIT: usize = 64;
+
+/// Model-based theory combination (z3 `theory_lra` + `smt_context`
+/// `assume_eqs`): the congruence classes are pushed into the arithmetic as
+/// equalities (explained by the proof forest), the arithmetic model is checked
+/// for violated disequalities and fractional integers (→ case splits), and the
+/// model is then repaired to respect congruence ([`separate_classes`]).
+#[allow(clippy::too_many_arguments)]
+fn model_based_combination(
+    m: &AstManager,
+    base: &ArithSystem,
+    interface: &[AstId],
+    euf_eq: &[(Lit, AstId, AstId)],
+    euf_roots: &[AstId],
+    eqs: &[(AstId, AstId)],
+    diseqs: &[(AstId, AstId)],
+    pg: &mut ProofEgraph,
+    bases: &(ProofEgraph, Egraph),
+) -> TheoryOutcome {
+    let mut g = bases.1.clone();
+    if !g.is_consistent(m, eqs, diseqs) {
+        return TheoryOutcome::Unsat;
+    }
+    let mut sys = ArithSystem {
+        cons: base.cons.clone(),
+        diseqs: base.diseqs.clone(),
+        int_set: base.int_set.clone(),
+        con_lits: base.con_lits.clone(),
+        diseq_lits: base.diseq_lits.clone(),
+    };
+    let mut why: Vec<Vec<Lit>> = sys.con_lits.iter().map(|&l| alloc::vec![l]).collect();
+    let mut rep: BTreeMap<usize, AstId> = BTreeMap::new();
+    for &u in interface {
+        match rep.get(&g.class_of(m, u)) {
+            Some(&r) => {
+                sys.cons
+                    .push(Constraint::eq(ast_to_lin(m, u).sub(&ast_to_lin(m, r))));
+                why.push(
+                    pg.explain(m, u, r)
+                        .into_iter()
+                        .map(|id| euf_eq[id].0)
+                        .collect(),
+                );
+            }
+            None => {
+                rep.insert(g.class_of(m, u), u);
+            }
+        }
+    }
+    match crate::smt::arith::model_or_core(&sys.cons) {
+        Ok(_) => {}
+        Err(core) => {
+            let mut out = BTreeSet::new();
+            for i in core {
+                out.extend(why[i].iter().copied());
+            }
+            return TheoryOutcome::Conflict(out.into_iter().collect());
+        }
+    }
+    let model = match integer_model(&sys) {
+        Ok(model) => model,
+        Err(Some(splits)) => return TheoryOutcome::Split(splits),
+        Err(None) => {
+            return match arith_conflict_core(&sys, &why) {
+                Some(core) => TheoryOutcome::Conflict(core),
+                None => TheoryOutcome::Unsat,
+            };
+        }
+    };
+    let model = spread_free_values(m, &sys, interface, &mut g, model);
+    let clashes = congruence_clashes(m, euf_roots, &mut g, &model);
+    if clashes.is_empty() {
+        return TheoryOutcome::Sat(model, g);
+    }
+    TheoryOutcome::Split(
+        clashes
+            .into_iter()
+            .take(MAX_SPLITS)
+            .map(|(a, b)| SplitReq::Eq { a, b })
+            .collect(),
+    )
+}
+
+/// Give the arithmetic leaves no constraint mentions — free but for
+/// congruence — pairwise distinct values (one per congruence class), so they
+/// cause no spurious congruence clashes (z3 moves free variables apart the
+/// same way before `assume_eqs`). Sound: nothing constrains them.
+fn spread_free_values(
+    m: &AstManager,
+    sys: &ArithSystem,
+    interface: &[AstId],
+    g: &mut Egraph,
+    mut model: Assignment,
+) -> Assignment {
+    let mut used: BTreeSet<AstId> = BTreeSet::new();
+    for e in sys.cons.iter().map(|c| &c.expr).chain(sys.diseqs.iter()) {
+        used.extend(e.vars());
+    }
+    let mut next = model
+        .values()
+        .map(|v| v.abs().ceil())
+        .max()
+        .unwrap_or_else(|| Int::from(0));
+    let mut by_class: BTreeMap<usize, Rational> = BTreeMap::new();
+    for &t in interface {
+        if !m.is_uninterp_const(t) || used.contains(&t) {
+            continue;
+        }
+        let v = by_class.entry(g.class_of(m, t)).or_insert_with(|| {
+            next = &next + &Int::from(1);
+            Rational::from_integer(next.clone())
+        });
+        model.insert(t, v.clone());
+    }
+    model
+}
+
+/// Pairs of arithmetic terms the `model` makes equal although they are in
+/// different congruence classes, where that matters: arguments at one position
+/// of two applications of one function whose arguments all agree (by value,
+/// or by class) while the applications are in different classes. Model-based
+/// theory combination case-splits on their equality (z3 `assume_eqs`).
+fn congruence_clashes(
+    m: &AstManager,
+    euf_roots: &[AstId],
+    g: &mut Egraph,
+    model: &Assignment,
+) -> Vec<(AstId, AstId)> {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Num(Rational),
+        Class(usize),
+    }
+    let mut groups: BTreeMap<(AstId, Vec<Key>), Vec<AstId>> = BTreeMap::new();
+    for t in m.postorder_many(euf_roots) {
+        let Some(a) = m.app(t) else { continue };
+        if a.args.is_empty()
+            || !(m.is_select(t)
+                || m.func_decl(a.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID))
+        {
+            continue;
+        }
+        let key: Vec<Key> = a
+            .args
+            .iter()
+            .map(|&x| {
+                if m.is_arith_sort(m.get_sort(x)) {
+                    Key::Num(ast_to_lin(m, x).eval(model))
+                } else {
+                    Key::Class(g.class_of(m, x))
+                }
+            })
+            .collect();
+        groups.entry((a.decl, key)).or_default().push(t);
+    }
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for apps in groups.values() {
+        let p = apps[0];
+        for &q in &apps[1..] {
+            if g.class_of(m, p) == g.class_of(m, q) {
+                continue;
+            }
+            let pair = m.app_args(p).iter().zip(m.app_args(q)).find(|&(&a, &b)| {
+                m.is_arith_sort(m.get_sort(a)) && g.class_of(m, a) != g.class_of(m, b)
+            });
+            if let Some((&a, &b)) = pair
+                && seen.insert((a.min(b), a.max(b)))
+            {
+                out.push((a, b));
+            }
+        }
+    }
+    out
+}
+
+/// Work budget for re-verifying one arithmetic conflict core.
+const CORE_VERIFY_BUDGET: u64 = 20_000;
+
+/// Cap on the disequalities [`arith_conflict_core`] tries to explain.
+const DISEQ_CORE_CANDIDATES: usize = 64;
+
+/// A conflict core for an infeasible arithmetic system, as the union of the
+/// literal explanations `why[i]` of the constraints it uses (plus disequality
+/// literals). Two shapes are explained, both by Farkas certificates (z3's
+/// `theory_lra` conflicts):
+///
+/// * the constraints alone are infeasible over the rationals, or
+/// * they entail `d = 0` for an asserted disequality `d ≠ 0` — both `d < 0` and
+///   `d > 0` are infeasible with them (over the integers `d ≤ −1` / `d ≥ 1`,
+///   when `d` is integral). Only disequalities the rational model violates
+///   are candidates (an entailed one is `0` in every model).
+///
+/// `None` when neither applies (integer-only infeasibility, a disjunction of
+/// disequalities); the caller then blocks the whole assignment.
+fn arith_conflict_core(sys: &ArithSystem, why: &[Vec<Lit>]) -> Option<Vec<Lit>> {
+    let n = sys.cons.len();
+    let lits_of = |idx: &[usize], out: &mut BTreeSet<Lit>| {
+        for &i in idx {
+            if i < n {
+                out.extend(why[i].iter().copied());
+            }
+        }
+    };
+    if let Some(core) = feasible_core(&sys.cons) {
+        let mut out = BTreeSet::new();
+        lits_of(&core, &mut out);
+        return Some(out.into_iter().collect());
+    }
+    let model = crate::smt::arith::model(&sys.cons)?;
+    let one = Rational::from_integer(Int::from(1));
+    for (d, &dl) in sys
+        .diseqs
+        .iter()
+        .zip(&sys.diseq_lits)
+        .filter(|(d, _)| d.eval(&model).is_zero())
+        .take(DISEQ_CORE_CANDIDATES)
+    {
+        let integral = d.vars().all(|v| sys.int_set.contains(&v))
+            && d.vars().all(|v| d.coeff_of(v).is_integer())
+            && d.constant_part().is_integer();
+        // `d < 0` and `−d < 0` (or `d + 1 ≤ 0` and `−d + 1 ≤ 0`).
+        let side = |e: LinExpr| {
+            if integral {
+                Constraint::le(e.add(&LinExpr::constant(one.clone())))
+            } else {
+                Constraint::lt(e)
+            }
+        };
+        let mut out = BTreeSet::new();
+        let mut both = true;
+        for e in [d.clone(), d.neg()] {
+            let mut cons = sys.cons.clone();
+            cons.push(side(e));
+            match feasible_core(&cons) {
+                Some(core) => lits_of(&core, &mut out),
+                None => {
+                    both = false;
+                    break;
+                }
+            }
+        }
+        if both {
+            out.insert(dl);
+            return Some(out.into_iter().collect());
+        }
+    }
+    None
 }
 
 /// The arithmetic model must respect congruence: two applications of one
@@ -2452,6 +3118,7 @@ fn separate_classes(
         diseqs: sys.diseqs.clone(),
         int_set: sys.int_set.clone(),
         con_lits: sys.con_lits.clone(),
+        diseq_lits: sys.diseq_lits.clone(),
     };
     let arith = |t: AstId| m.is_arith_sort(m.get_sort(t));
     for _ in 0..8 {
@@ -3168,6 +3835,40 @@ mod tests {
         let ne2 = m.mk_not(e2);
         let formula = m.mk_and(&[le1, e1, ne2]);
         assert_eq!(check(&m, formula), SmtResult::Sat);
+    }
+
+    /// `x ≤ y ∧ y ≤ x ∧ f(x) ≠ f(y)` among more interface terms than the
+    /// pairwise combination handles: model-based theory combination must case
+    /// split on `x = y` (and the disequality split must then refute `x ≠ y`).
+    /// Without the conflict, the same goal is sat.
+    #[test]
+    fn model_based_combination_splits() {
+        let mut m = AstManager::new();
+        let int = m.mk_int_sort();
+        let f = m.mk_func_decl(crate::util::symbol::Symbol::new("f"), &[int], int);
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let fx = m.mk_app(f, &[x]);
+        let fy = m.mk_app(f, &[y]);
+        let mut conj = alloc::vec![];
+        // Padding: f(z_i) = i over many fresh z_i (interface terms).
+        for i in 0..80 {
+            let z = m.mk_int_const(&alloc::format!("z{i}"));
+            let fz = m.mk_app(f, &[z]);
+            let k = m.mk_int(i);
+            conj.push(m.mk_eq(fz, k));
+        }
+        let le1 = m.mk_le(x, y);
+        let le2 = m.mk_le(y, x);
+        let eq = m.mk_eq(fx, fy);
+        let ne = m.mk_not(eq);
+        conj.push(le1);
+        conj.push(ne);
+        let sat_goal = m.mk_and(&conj);
+        assert_eq!(check(&m, sat_goal), SmtResult::Sat);
+        conj.push(le2);
+        let unsat_goal = m.mk_and(&conj);
+        assert_eq!(check(&m, unsat_goal), SmtResult::Unsat);
     }
 
     #[test]
