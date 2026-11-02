@@ -23894,6 +23894,15 @@ impl Context {
             return r;
         }
         let (mut res, mut model, mut goal) = self.decide_combined(combined);
+        // Many instances can swamp the nonlinear refuters; the instances at the
+        // small constants alone may already refute (sound: any instance set).
+        if res == SmtResult::Unknown
+            && !no_instances
+            && let Some(seeded) = self.numeral_seed_goal(base)
+            && self.decide_combined(seeded).0 == SmtResult::Unsat
+        {
+            return (SmtResult::Unsat, None);
+        }
         // Model-based quantifier instantiation (z3's `smt::model_checker`): a
         // `sat` over un-saturated universals is confirmed when every universal
         // holds in the candidate model; a counterexample instance refines it.
@@ -24255,6 +24264,53 @@ impl Context {
             ArithOp::Le => (None, Some(v)),
             _ => (None, Some(v.checked_sub(1)?)),
         }])
+    }
+
+    /// `base` conjoined with the instances of every arithmetic universal (at
+    /// most three binders) at the small constants `0`, `1`, `−1`, prepared as
+    /// [`Self::check_sat_core`] prepares its goal; `None` when no universal
+    /// qualifies.
+    fn numeral_seed_goal(&mut self, base: AstId) -> Option<AstId> {
+        let mut conj = alloc::vec![base];
+        for (vars, body) in self.universals.clone() {
+            if vars.is_empty()
+                || vars.len() > 3
+                || !vars
+                    .iter()
+                    .all(|&v| self.m.is_arith_sort(self.m.get_sort(v)))
+            {
+                continue;
+            }
+            let n = vars.len() as u32;
+            for idx in 0..3usize.pow(n) {
+                let mut rem = idx;
+                let subst: Vec<(AstId, AstId)> = vars
+                    .iter()
+                    .map(|&v| {
+                        let k = [0i64, 1, -1][rem % 3];
+                        rem /= 3;
+                        let is_int = self.m.is_int_sort(self.m.get_sort(v));
+                        (v, self.m.mk_numeral(Rational::from(k), is_int))
+                    })
+                    .collect();
+                let inst = substitute(&mut self.m, body, &subst);
+                conj.push(crate::rewriter::simplify(&mut self.m, inst));
+            }
+        }
+        if conj.len() == 1 {
+            return None;
+        }
+        let mut g = self.m.mk_and(&conj);
+        g = self.realdiv_product_cancel(g);
+        let mut cong = self.divmod_congruence_axioms(g);
+        cong.extend(self.realdiv_congruence_axioms(g));
+        cong.extend(self.mod_multiple_axioms(g));
+        cong.extend(self.trig_bound_axioms(g));
+        if !cong.is_empty() {
+            cong.push(g);
+            g = self.m.mk_and(&cong);
+        }
+        Some(g)
     }
 
     /// Universals over Bool/bit-vector/arithmetic binders with interpreted
@@ -42836,17 +42892,13 @@ mod tests {
     fn model_functions_print_as_tables() {
         // Disagreeing applications: z3's table with the most frequent result
         // as the `else` value.
-        let out = run(
-            "(declare-fun f (Int) Int)(declare-fun q (Int Int) Bool)\
+        let out = run("(declare-fun f (Int) Int)(declare-fun q (Int Int) Bool)\
              (assert (= (f 1) 7))(assert (= (f 2) 8))(assert (= (f 3) 7))\
-             (assert (q 1 2))(assert (not (q 2 1)))(check-sat)(get-model)",
-        )
+             (assert (q 1 2))(assert (not (q 2 1)))(check-sat)(get-model)")
         .unwrap();
         assert_eq!(out[0], "sat");
         assert!(
-            out[1].contains(
-                "  (define-fun f ((x!0 Int)) Int\n    (ite (= x!0 2) 8\n      7))\n"
-            ),
+            out[1].contains("  (define-fun f ((x!0 Int)) Int\n    (ite (= x!0 2) 8\n      7))\n"),
             "{}",
             out[1]
         );
