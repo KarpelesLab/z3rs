@@ -2627,6 +2627,15 @@ struct Context {
     /// (scoped like the assertions), which decide the declarations the
     /// printed model lists first.
     asserted_mentions: Vec<String>,
+    /// z3's combined solver switched to its incremental core (a push/pop, an
+    /// assertion after a `check-sat`, or assumptions): no `solve-eqs`
+    /// preprocessing, so no eliminated variables in the model.
+    inc_mode: bool,
+    /// A `check-sat` has run (later assertions switch to incremental mode).
+    check_sat_done: bool,
+    /// Constants a top-level `x = t` assertion defines (`solve-eqs`
+    /// candidates), in assertion order.
+    solved_vars: Vec<String>,
     /// Declared (uninterpreted) sort names in declaration order, for scoping.
     sort_order: Vec<String>,
     /// The model from the most recent satisfiable `check-sat`, if still current.
@@ -3835,6 +3844,9 @@ impl Context {
             decl_table: DeclTable::default(),
             decl_table_stack: Vec::new(),
             asserted_mentions: Vec::new(),
+            inc_mode: false,
+            check_sat_done: false,
+            solved_vars: Vec::new(),
             sort_order: Vec::new(),
             last_model: None,
             fresh_counter: 0,
@@ -4267,6 +4279,7 @@ impl Context {
                         table: self.decl_table_stack.len(),
                         mentions: self.asserted_mentions.len(),
                     });
+                    self.inc_mode = true;
                 }
                 self.last_model = None;
                 Ok(None)
@@ -4295,6 +4308,7 @@ impl Context {
                         self.decl_table.erase(&name);
                     }
                     self.asserted_mentions.truncate(mark.mentions);
+                    self.inc_mode = true;
                     for name in self.sort_order.drain(mark.sorts..) {
                         self.sorts.remove(&name);
                     }
@@ -4320,6 +4334,9 @@ impl Context {
                 self.decl_table.reset();
                 self.decl_table_stack.clear();
                 self.asserted_mentions.clear();
+                self.inc_mode = false;
+                self.check_sat_done = false;
+                self.solved_vars.clear();
                 for name in self.sort_order.drain(..) {
                     self.sorts.remove(&name);
                 }
@@ -4846,6 +4863,10 @@ impl Context {
             "assert" => {
                 if let Some(t) = list.get(1) {
                     self.note_mentions(t);
+                    self.note_solved_var(t);
+                }
+                if self.check_sat_done {
+                    self.inc_mode = true;
                 }
                 // A top-level quantifier gets real (sound) handling: `exists` is
                 // skolemized (its body asserted with fresh constants), `forall` is
@@ -5210,6 +5231,10 @@ impl Context {
                 {
                     self.complete_str_witness(md);
                 }
+                self.check_sat_done = true;
+                if !plain {
+                    self.inc_mode = true;
+                }
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -5229,6 +5254,8 @@ impl Context {
                     terms.push(id);
                 }
                 self.reason_unknown = None;
+                self.check_sat_done = true;
+                self.inc_mode = true;
                 // With objectives, z3 optimizes under the assumptions.
                 let (res, model) = if self.objectives.is_empty() {
                     self.check_with(&terms)
@@ -6128,19 +6155,59 @@ impl Context {
     /// Record the declared functions and `define-fun` names `t` mentions.
     fn note_mentions(&mut self, t: &SExpr) {
         let mut stack = alloc::vec![t];
-        let mut found: BTreeSet<&str> = BTreeSet::new();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let mut found: Vec<String> = Vec::new();
         while let Some(e) = stack.pop() {
             match e {
                 SExpr::Atom(a) => {
-                    if self.funcs.contains_key(a) || self.macros.contains_key(a) {
-                        found.insert(a);
+                    if (self.funcs.contains_key(a) || self.macros.contains_key(a)) && seen.insert(a)
+                    {
+                        found.push(a.clone());
                     }
                 }
-                SExpr::List(l) => stack.extend(l.iter()),
+                SExpr::List(l) => stack.extend(l.iter().rev()),
             }
         }
-        let found: Vec<String> = found.into_iter().map(str::to_string).collect();
         self.asserted_mentions.extend(found);
+    }
+
+    /// Record the constant a top-level `(= x t)` assertion (or conjunct)
+    /// defines, `t` not mentioning `x`: what z3's `solve-eqs` eliminates.
+    fn note_solved_var(&mut self, t: &SExpr) {
+        fn mentions(e: &SExpr, x: &str) -> bool {
+            match e {
+                SExpr::Atom(a) => a == x,
+                SExpr::List(l) => l.iter().any(|y| mentions(y, x)),
+            }
+        }
+        let SExpr::List(l) = t else {
+            return;
+        };
+        match l.first() {
+            Some(SExpr::Atom(h)) if h == "and" => {
+                for c in &l[1..] {
+                    self.note_solved_var(c);
+                }
+            }
+            Some(SExpr::Atom(h)) if h == "=" && l.len() == 3 => {
+                for (x, other) in [(&l[1], &l[2]), (&l[2], &l[1])] {
+                    if let SExpr::Atom(x) = x
+                        && self
+                            .funcs
+                            .get(x)
+                            .and_then(|&d| self.m.func_decl(d))
+                            .is_some_and(|f| f.domain.is_empty())
+                        && !mentions(other, x)
+                    {
+                        if !self.solved_vars.contains(x) {
+                            self.solved_vars.push(x.clone());
+                        }
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Enter one declaration of `name` into the replica of z3's declaration
@@ -34641,7 +34708,7 @@ impl Context {
         let fn_bodies: BTreeMap<AstId, String> =
             chosen.into_iter().map(|(d, r, _)| (d, r)).collect();
 
-        let decls = self.model_listing_order(decls, |d| &d.name);
+        let decls = self.model_listing_order(decls, |d| &d.name, |d| self.m.is_bool_sort(d.range));
         // z3 prints the model's constants before its functions.
         let (consts, funs): (Vec<Decl>, Vec<Decl>) =
             decls.into_iter().partition(|d| d.domain.is_empty());
@@ -34717,6 +34784,46 @@ impl Context {
         Ok(out)
     }
 
+    /// The declared functions the assertions mention, in order of first
+    /// occurrence (a macro's body expanded where the macro occurs).
+    fn asserted_order(&self) -> Vec<&str> {
+        fn walk<'a>(
+            ctx: &'a Context,
+            e: &'a SExpr,
+            seen: &mut BTreeSet<&'a str>,
+            out: &mut Vec<&'a str>,
+        ) {
+            match e {
+                SExpr::Atom(a) => {
+                    if let Some((_, body)) = ctx.macros.get(a.as_str()) {
+                        if seen.insert(a) {
+                            walk(ctx, body, seen, out);
+                        }
+                    } else if ctx.funcs.contains_key(a.as_str()) && seen.insert(a) {
+                        out.push(a);
+                    }
+                }
+                SExpr::List(l) => {
+                    for x in l {
+                        walk(ctx, x, seen, out);
+                    }
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        let mut out = Vec::new();
+        for n in &self.asserted_mentions {
+            if let Some((_, body)) = self.macros.get(n.as_str()) {
+                if seen.insert(n.as_str()) {
+                    walk(self, body, &mut seen, &mut out);
+                }
+            } else if seen.insert(n.as_str()) {
+                out.push(n.as_str());
+            }
+        }
+        out
+    }
+
     /// The declared names the assertions mention, closed under the bodies of
     /// the mentioned macros: the declarations z3's model interprets.
     fn asserted_names(&self) -> BTreeSet<&str> {
@@ -34749,11 +34856,33 @@ impl Context {
     /// approximated by those occurring in the current assertions, kept in
     /// declaration order — then the rest as `cmd_context::add_declared_functions`
     /// appends them, in the slot order of z3's declaration dictionary.
-    fn model_listing_order<T>(&self, decls: Vec<T>, name: impl Fn(&T) -> &String) -> Vec<T> {
+    fn model_listing_order<T>(
+        &self,
+        decls: Vec<T>,
+        name: impl Fn(&T) -> &String,
+        is_bool: impl Fn(&T) -> bool,
+    ) -> Vec<T> {
         let used = self.asserted_names();
         let (mut first, rest): (Vec<T>, Vec<T>) = decls
             .into_iter()
             .partition(|d| used.contains(name(d).as_str()));
+        // The solver's model registers the Boolean constants first, then the
+        // other terms in the order they were internalized (first occurrence).
+        let order = self.asserted_order();
+        let pos = |n: &str| order.iter().position(|m| *m == n).unwrap_or(usize::MAX);
+        // Outside incremental mode `solve-eqs` eliminates the defined
+        // constants; the model converter re-adds them last, most recent first.
+        let solved = |n: &str| {
+            if self.inc_mode {
+                None
+            } else {
+                self.solved_vars.iter().position(|m| m == n)
+            }
+        };
+        first.sort_by_key(|d| match solved(name(d)) {
+            Some(k) => (2, usize::MAX - k),
+            None => (usize::from(!is_bool(d)), pos(name(d))),
+        });
         let mut rest: Vec<Option<T>> = rest.into_iter().map(Some).collect();
         for n in self.decl_table.names() {
             if let Some(slot) = rest
