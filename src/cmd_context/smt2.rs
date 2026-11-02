@@ -31359,6 +31359,9 @@ impl Context {
         // by case-splitting the Bool index variables (`true`/`false`), which makes
         // every index constant and reduces to plain congruence reads.
         if self.has_bool_indexed_array(goal) {
+            if let Some(g) = self.eliminate_bool_indices(goal) {
+                return self.decide(g);
+            }
             return self.decide_bool_array(goal);
         }
         let (res, model) = check_model(&self.m, goal);
@@ -32427,14 +32430,14 @@ impl Context {
         Polynomial::var(v)
     }
 
-    /// Does `goal` contain a `select`/`store` over an array whose index sort is
-    /// `Bool`? (An unsupported corner needing boolean-value index reasoning.)
     /// Decide a goal with symbolic-Bool-indexed arrays by exhaustively splitting
-    /// the Bool index variables into `true`/`false`: each branch has only constant
-    /// indices (plain congruence). `sat` on any branch is `sat`; all `unsat` is
-    /// `unsat`; any undecided branch keeps a sound `unknown`.
+    /// the Bool index terms (constants or formulas such as `25 > i`) into
+    /// `true`/`false`: each branch replaces the index by its value and keeps
+    /// `index = value` as a constraint, so only constant indices remain (plain
+    /// congruence). `sat` on any branch is `sat`; all `unsat` is `unsat`; any
+    /// undecided branch keeps a sound `unknown`.
     fn decide_bool_array(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
-        let mut bvars: Vec<AstId> = Vec::new();
+        let mut idxs: Vec<AstId> = Vec::new();
         for t in self.m.postorder(goal) {
             if (self.m.is_select(t) || self.m.is_store(t))
                 && self
@@ -32443,38 +32446,31 @@ impl Context {
                     .is_some_and(|(i, _)| self.m.is_bool_sort(i))
             {
                 let idx = self.m.app_args(t)[1];
-                for u in self.m.postorder(idx) {
-                    if self.m.is_app(u)
-                        && self.m.app_args(u).is_empty()
-                        && self.m.is_bool_sort(self.m.get_sort(u))
-                        && !self.m.is_true(u)
-                        && !self.m.is_false(u)
-                        && !bvars.contains(&u)
-                    {
-                        bvars.push(u);
-                    }
+                if !self.m.is_true(idx) && !self.m.is_false(idx) && !idxs.contains(&idx) {
+                    idxs.push(idx);
                 }
             }
         }
-        if bvars.is_empty() || bvars.len() > 4 {
+        if idxs.is_empty() || idxs.len() > 4 {
             return (SmtResult::Unknown, None);
         }
-        let n = bvars.len();
+        let n = idxs.len();
         let mut any_unknown = false;
         for mask in 0..(1u32 << n) {
-            let subst: Vec<(AstId, AstId)> = bvars
-                .iter()
-                .enumerate()
-                .map(|(i, &v)| {
-                    let b = if (mask >> i) & 1 == 1 {
-                        self.m.mk_true()
-                    } else {
-                        self.m.mk_false()
-                    };
-                    (v, b)
-                })
-                .collect();
+            let mut subst: Vec<(AstId, AstId)> = Vec::new();
+            let mut pins: Vec<AstId> = Vec::new();
+            for (i, &c) in idxs.iter().enumerate() {
+                let (b, pin) = if (mask >> i) & 1 == 1 {
+                    (self.m.mk_true(), c)
+                } else {
+                    (self.m.mk_false(), self.m.mk_not(c))
+                };
+                subst.push((c, b));
+                pins.push(pin);
+            }
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            pins.push(g);
+            let g = self.m.mk_and(&pins);
             let g = crate::rewriter::simplify(&mut self.m, g);
             match self.decide(g) {
                 (SmtResult::Sat, m) => return (SmtResult::Sat, m),
@@ -32489,6 +32485,115 @@ impl Context {
         }
     }
 
+    /// Is `t` an array with a `Bool` index?
+    fn is_bool_indexed(&self, t: AstId) -> bool {
+        self.m
+            .array_sort_params(self.m.get_sort(t))
+            .is_some_and(|(i, _)| self.m.is_bool_sort(i))
+    }
+
+    /// `goal` with every read of a `Bool`-indexed array at a constant index:
+    /// `X[c]` is `ite(c, X[true], X[false])`, reads push through `store`,
+    /// `const` and `ite` arrays, and an equality of two such arrays is their
+    /// agreement at `true` and `false` (the whole index domain). Term `ite`s are
+    /// lifted. `None` when a symbolic-index `store` survives outside a read or
+    /// an equality (its value would be opaque), or for a large goal.
+    fn eliminate_bool_indices(&mut self, goal: AstId) -> Option<AstId> {
+        // A resource bound: the lifted `ite`s of a large goal can swamp the
+        // ground decision (the case split below is the cheaper fallback).
+        const MAX_NODES: usize = 2000;
+        if self.m.postorder(goal).len() > MAX_NODES {
+            return None;
+        }
+        let mut memo = BTreeMap::new();
+        let g = self.bool_index_rw(goal, &mut memo);
+        let left = self.m.postorder(g).iter().any(|&t| {
+            (self.m.is_select(t) || self.m.is_store(t))
+                && self.is_bool_indexed(self.m.app_args(t)[0])
+                && {
+                    let i = self.m.app_args(t)[1];
+                    !(self.m.is_true(i) || self.m.is_false(i))
+                }
+        });
+        if left {
+            return None;
+        }
+        let g = crate::rewriter::simplify(&mut self.m, g);
+        Some(self.lift_term_ites(g))
+    }
+
+    /// The rewrite of [`Self::eliminate_bool_indices`], bottom-up.
+    fn bool_index_rw(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let Some(app) = self.m.app(t).cloned() else {
+            return t;
+        };
+        let args: Vec<AstId> = app
+            .args
+            .iter()
+            .map(|&a| self.bool_index_rw(a, memo))
+            .collect();
+        let out = if self.m.is_select(t) && args.len() == 2 && self.is_bool_indexed(args[0]) {
+            self.bool_index_read(args[0], args[1], memo)
+        } else if self.m.is_eq(t) && args.len() == 2 && self.is_bool_indexed(args[0]) {
+            let tt = self.m.mk_true();
+            let ff = self.m.mk_false();
+            let a_t = self.bool_index_read(args[0], tt, memo);
+            let b_t = self.bool_index_read(args[1], tt, memo);
+            let a_f = self.bool_index_read(args[0], ff, memo);
+            let b_f = self.bool_index_read(args[1], ff, memo);
+            let e_t = self.m.mk_eq(a_t, b_t);
+            let e_f = self.m.mk_eq(a_f, b_f);
+            let both = self.m.mk_and(&[e_t, e_f]);
+            // The pointwise equalities may compare arrays again.
+            self.bool_index_rw(both, memo)
+        } else if args == app.args {
+            t
+        } else {
+            self.m.mk_app(app.decl, &args)
+        };
+        memo.insert(t, out);
+        out
+    }
+
+    /// The read `arr[i]` of a `Bool`-indexed array (`arr` already rewritten):
+    /// through `store`/`const`/`ite`, and split on a symbolic index.
+    fn bool_index_read(
+        &mut self,
+        arr: AstId,
+        i: AstId,
+        memo: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if self.m.is_store(arr) {
+            let sa = self.m.app_args(arr).to_vec(); // [array, index, value]
+            let hit = self.m.mk_eq(sa[1], i);
+            let rest = self.bool_index_read(sa[0], i, memo);
+            let r = self.m.mk_ite(hit, sa[2], rest);
+            return self.bool_index_rw(r, memo);
+        }
+        if self.m.is_const_array(arr) {
+            return self.m.app_args(arr)[0];
+        }
+        if self.m.is_ite(arr) {
+            let a = self.m.app_args(arr).to_vec();
+            let x = self.bool_index_read(a[1], i, memo);
+            let y = self.bool_index_read(a[2], i, memo);
+            return self.m.mk_ite(a[0], x, y);
+        }
+        if self.m.is_true(i) || self.m.is_false(i) {
+            return self.m.mk_select(arr, i);
+        }
+        let tt = self.m.mk_true();
+        let ff = self.m.mk_false();
+        let x = self.bool_index_read(arr, tt, memo);
+        let y = self.bool_index_read(arr, ff, memo);
+        self.m.mk_ite(i, x, y)
+    }
+
+    /// Does `goal` contain a `select`/`store` over an array whose index sort is
+    /// `Bool` with a symbolic index?
     fn has_bool_indexed_array(&self, goal: AstId) -> bool {
         self.m.postorder(goal).iter().any(|&t| {
             (self.m.is_select(t) || self.m.is_store(t))
