@@ -4856,6 +4856,13 @@ impl Context {
                         SExpr::List(alloc::vec![list[0].clone(), fill_bodyless_let(&list[1])]);
                     return self.command(&filled);
                 }
+                // Spell the alternate connectives canonically so the quantifier
+                // passes below (skolemization, prenexing) see their polarity.
+                if list.len() == 2
+                    && let Some(n) = self.canonical_connectives(&list[1])
+                {
+                    return self.command(&SExpr::List(alloc::vec![list[0].clone(), n]));
+                }
                 if let Some(n) = named_label(&list[1])
                     && let SExpr::List(parts) = &list[1]
                     && parts.len() >= 2
@@ -5034,6 +5041,19 @@ impl Context {
                 // ground assertion are skolemized rather than left as opaque
                 // sentinels (arithmetic ones are eliminated exactly instead).
                 let asserted = self.skolemize_nonarith(&asserted, true)?;
+                // Universals left in positive positions are pulled to the top
+                // (`P ∨ ∀x.φ` is `∀x. P ∨ φ`), so the assertion is a universal the
+                // instantiation engine handles rather than an opaque sentinel.
+                let mut extra = Vec::new();
+                let pren = prenex_positive(&asserted, true, &mut extra, &mut self.fresh_counter);
+                if !extra.is_empty() && list.len() == 2 && named_label(&list[1]).is_none() {
+                    let q = SExpr::List(alloc::vec![
+                        SExpr::Atom("forall".into()),
+                        SExpr::List(extra),
+                        pren
+                    ]);
+                    return self.command(&SExpr::List(alloc::vec![list[0].clone(), q]));
+                }
                 let t = self.term(&asserted)?;
                 let name = named_label(&list[1]);
                 if let Some(n) = &name {
@@ -28275,8 +28295,69 @@ impl Context {
             {
                 self.skolemize_body(e, &[], true)
             }
+            // A universal in negative position of a ground assertion is an
+            // existential: its Skolem constants are exact whatever the sorts.
+            "forall" if l.len() == 3 && !pos => self.skolemize_ground_forall(e),
             _ => Ok(e.clone()),
         }
+    }
+
+    /// `e` with z3's alternate connective spellings `implies`, `iff` and
+    /// `if_then_else`/`if` written `=>`, `=` and `ite` (as [`Self::apply`] reads
+    /// them, unless a user function of that name shadows it); `None` if none
+    /// occurs.
+    fn canonical_connectives(&self, e: &SExpr) -> Option<SExpr> {
+        fn walk(ctx: &Context, e: &SExpr, changed: &mut bool) -> SExpr {
+            let SExpr::List(l) = e else { return e.clone() };
+            let mut out: Vec<SExpr> = l.iter().map(|x| walk(ctx, x, changed)).collect();
+            if let Some(SExpr::Atom(h)) = out.first()
+                && !ctx.funcs.contains_key(h)
+            {
+                let canon = match h.as_str() {
+                    "implies" => Some("=>"),
+                    "iff" => Some("="),
+                    "if" | "if_then_else" if out.len() == 4 => Some("ite"),
+                    _ => None,
+                };
+                if let Some(c) = canon {
+                    out[0] = SExpr::Atom(c.to_string());
+                    *changed = true;
+                }
+            }
+            SExpr::List(out)
+        }
+        let mut changed = false;
+        let r = walk(self, e, &mut changed);
+        changed.then_some(r)
+    }
+
+    /// Skolemize a ground negative-position `∀xs. φ` (an `∃xs. ¬φ`): `φ` with
+    /// each binder replaced by a fresh constant, nested negative universals and
+    /// positive existentials included.
+    fn skolemize_ground_forall(&mut self, e: &SExpr) -> Result<SExpr, String> {
+        let SExpr::List(l) = e else {
+            return Ok(e.clone());
+        };
+        let mut subst: Vec<(String, SExpr)> = Vec::new();
+        for b in as_list(&l[1])? {
+            let pair = as_list(b)?;
+            let yname = Self::sym(&pair[0])?.to_string();
+            let ran = self.resolve_sort(&pair[1])?;
+            let fname = alloc::format!("!sk!{}", self.fresh_counter);
+            self.fresh_counter += 1;
+            let d = self.m.mk_func_decl(Symbol::new(&fname), &[], ran);
+            self.funcs.insert(fname.clone(), d);
+            subst.push((yname, SExpr::Atom(fname)));
+        }
+        let inner = subst_sexpr(&l[2], &subst);
+        // Drop an annotation wrapper around the body.
+        let inner = match &inner {
+            SExpr::List(x) if x.len() >= 2 && matches!(&x[0], SExpr::Atom(h) if h == "!") => {
+                x[1].clone()
+            }
+            _ => inner,
+        };
+        self.skolemize_nonarith(&inner, false)
     }
 
     fn skolemize_body(
