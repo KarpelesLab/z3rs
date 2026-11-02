@@ -24489,7 +24489,7 @@ impl Context {
                 Some(Value::Num(r, _)) => r.numerator().clone(),
                 _ => return None,
             };
-            return match self.opt_int_search(u, umax, v0, fixed) {
+            return match self.opt_int_search(u, umax, v0, fixed).0 {
                 OptResult::Unbounded => Some(true),
                 OptResult::Optimum(_) => Some(false),
                 OptResult::Unknown => None,
@@ -24595,15 +24595,19 @@ impl Context {
             _ => return unknown(),
         };
         match self.opt_int_search(obj, maximize, v0, fixed) {
-            OptResult::Optimum(v) => {
+            (OptResult::Optimum(v), best) => {
                 let iv = self.m.mk_numeral(Rational::from_integer(v.clone()), true);
                 let eq = self.m.mk_eq(obj, iv);
                 fixed.push(eq);
-                *model = self.check_with(fixed).1;
+                // The probe that attained the optimum already has its model (a
+                // fresh check of `obj = v` can be much harder than the bound).
+                if best.is_some() {
+                    *model = best;
+                }
                 (render_int(&v), false)
             }
-            OptResult::Unbounded => infinite(),
-            OptResult::Unknown => unknown(),
+            (OptResult::Unbounded, _) => infinite(),
+            (OptResult::Unknown, _) => unknown(),
         }
     }
 
@@ -25341,17 +25345,23 @@ impl Context {
 
     /// Binary-search the optimum of the integer objective `obj` (feasible value
     /// `v0`) subject to the base assertions plus `fixed`. Probes an outer bound
-    /// by doubling, then bisects; caps total solves.
+    /// by doubling, then bisects; caps total solves. Each feasible probe jumps
+    /// to the objective value its model attains. Also returns the model of the
+    /// probe attaining the optimum (`None` when that is `v0`'s).
     fn opt_int_search(
         &mut self,
         obj: AstId,
         maximize: bool,
         v0: Int,
         fixed: &[AstId],
-    ) -> OptResult {
+    ) -> (OptResult, Option<Model>) {
         let two = Int::from(2);
         let mut budget = 200i32;
-        let sat_at = |ctx: &mut Self, k: &Int, budget: &mut i32| -> Option<bool> {
+        // `Some(Some((v, model)))`: feasible, with the model's objective value
+        // `v` (at least as good as `k`; `k` itself when the model cannot say);
+        // `Some(None)`: infeasible; `None`: out of budget.
+        type Probe = Option<Option<(Int, Option<Model>)>>;
+        let sat_at = |ctx: &mut Self, k: &Int, budget: &mut i32| -> Probe {
             if *budget <= 0 {
                 return None;
             }
@@ -25359,25 +25369,50 @@ impl Context {
             let c = ctx.opt_bound(obj, maximize, k);
             let mut ex = fixed.to_vec();
             ex.push(c);
-            Some(ctx.check_with(&ex).0 == SmtResult::Sat)
+            Some(match ctx.check_with(&ex) {
+                (SmtResult::Sat, Some(mut model)) => match model.eval(&ctx.m, obj) {
+                    Value::Num(r, _)
+                        if r.is_integer()
+                            && (if maximize {
+                                *r.numerator() >= *k
+                            } else {
+                                *r.numerator() <= *k
+                            }) =>
+                    {
+                        Some((r.numerator().clone(), Some(model)))
+                    }
+                    _ => Some((k.clone(), None)),
+                },
+                (SmtResult::Sat, None) => Some((k.clone(), None)),
+                _ => None,
+            })
         };
-        // Doubling to find a bound infeasible in the optimizing direction.
+        // Doubling to find a bound infeasible in the optimizing direction; each
+        // feasible probe jumps to the value its model attains.
         let dir = |v: &Int, s: &Int, maximize: bool| if maximize { v.add(s) } else { v.sub(s) };
         let mut step = Int::from(1);
         let mut feasible = v0;
+        let mut best: Option<Model> = None;
         let infeasible;
         loop {
             let cand = dir(&feasible, &step, maximize);
             match sat_at(self, &cand, &mut budget) {
-                None => return OptResult::Unknown,
-                Some(true) => {
-                    feasible = cand;
+                None => return (OptResult::Unknown, None),
+                Some(Some((v, m))) => {
+                    // The step keeps pace with the model's jump, so a far
+                    // optimum is bracketed in few probes.
+                    let jump = v.sub(&feasible).abs();
+                    feasible = v;
+                    best = m;
                     step = step.mul(&two);
+                    if jump > step {
+                        step = jump;
+                    }
                     if step.bit_len() > 200 {
-                        return OptResult::Unbounded;
+                        return (OptResult::Unbounded, None);
                     }
                 }
-                Some(false) => {
+                Some(None) => {
                     infeasible = cand;
                     break;
                 }
@@ -25392,12 +25427,15 @@ impl Context {
             }
             let mid = lo.add(&hi).div_rem(&two).map(|(q, _)| q).unwrap();
             match sat_at(self, &mid, &mut budget) {
-                None => return OptResult::Unknown,
-                Some(true) => lo = mid,
-                Some(false) => hi = mid,
+                None => return (OptResult::Unknown, None),
+                Some(Some((v, m))) => {
+                    lo = v;
+                    best = m;
+                }
+                Some(None) => hi = mid,
             }
         }
-        OptResult::Optimum(lo)
+        (OptResult::Optimum(lo), best)
     }
 
     /// Optimize the **unsigned** value of a bit-vector objective by bisection

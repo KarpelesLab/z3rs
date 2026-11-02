@@ -1121,7 +1121,20 @@ fn propagate_euf_equalities(
 /// including compound terms like `(- y)`, not just leaf variables.
 fn interface_terms(m: &AstManager, euf_roots: &[AstId]) -> Vec<AstId> {
     let euf_universe: BTreeSet<AstId> = m.postorder_many(euf_roots).into_iter().collect();
-    euf_universe
+    // Only a term congruence can relate needs sharing: an application of a
+    // non-arithmetic function (an uninterpreted function, `ite`, `select`, …)
+    // with arguments, or an argument of one. Everything else EUF knows about
+    // arithmetic terms — the asserted equalities and congruence over `+`/`*` —
+    // the arithmetic theory already has.
+    let foreign = |t: AstId| m.is_app(t) && !m.app_args(t).is_empty() && m.arith_op(t).is_none();
+    let mut shared: BTreeSet<AstId> = BTreeSet::new();
+    for &t in &euf_universe {
+        if foreign(t) {
+            shared.insert(t);
+            shared.extend(m.app_args(t).iter().copied());
+        }
+    }
+    shared
         .into_iter()
         .filter(|&t| m.is_arith_sort(m.get_sort(t)))
         .collect()
