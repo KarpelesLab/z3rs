@@ -146,7 +146,11 @@ fn collect_sum(m: &mut AstManager, args: &[AstId], is_int: bool) -> Option<AstId
     }
     let zero = Rational::from_integer(puremp::Int::from(0));
     let one = Rational::from_integer(puremp::Int::from(1));
+    // z3's poly_rewriter puts the numeral first: `(+ 3 y)`.
     let mut parts: Vec<AstId> = Vec::new();
+    if constant != zero || coeffs.iter().all(|(_, c)| *c == zero) {
+        parts.push(m.mk_numeral(constant, is_int));
+    }
     for (t, c) in &coeffs {
         if *c == zero {
             continue; // cancelled
@@ -156,9 +160,6 @@ fn collect_sum(m: &mut AstManager, args: &[AstId], is_int: bool) -> Option<AstId
             let k = m.mk_numeral(c.clone(), is_int);
             parts.push(m.mk_mul(&[k, *t]));
         }
-    }
-    if constant != zero || parts.is_empty() {
-        parts.push(m.mk_numeral(constant, is_int));
     }
     Some(if parts.len() == 1 {
         parts[0]
@@ -217,13 +218,15 @@ mod tests {
     }
 
     #[test]
-    fn leaves_symbolic_arithmetic_alone() {
+    fn puts_the_numeral_first_in_symbolic_sums() {
         let mut m = AstManager::new();
         let x = m.mk_int_const("x");
         let one = m.mk_int(1);
-        // (+ x 1) has a non-numeral operand; unchanged.
+        // (+ x 1) has a non-numeral operand; z3 orders it (+ 1 x).
         let sum = m.mk_add(&[x, one]);
-        assert_eq!(simplify(&mut m, sum), sum);
+        let expect = m.mk_add(&[one, x]);
+        assert_eq!(simplify(&mut m, sum), expect);
+        assert_eq!(simplify(&mut m, expect), expect);
     }
 
     #[test]

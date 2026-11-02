@@ -4248,6 +4248,14 @@ impl Context {
                 }
                 let decimal = self.pp_decimal_precision();
                 let mut model = self.last_model.take().unwrap();
+                let completion = list.windows(2).any(|w| {
+                    matches!(&w[0], SExpr::Atom(k) if k == ":model_completion" || k == ":model-completion")
+                        && matches!(&w[1], SExpr::Atom(v) if v == "true")
+                });
+                if !completion && let Some(v) = self.eval_partial(&mut model, id) {
+                    self.last_model = Some(model);
+                    return Ok(Some(v));
+                }
                 let v = self
                     .eval_array_value(id)
                     .or_else(|| self.str_value(id).map(|cps| smt_string_literal(&cps)))
@@ -8151,6 +8159,88 @@ impl Context {
                 return None;
             }
         }
+    }
+
+    /// z3's `(eval t)` without model completion: a symbol the model does not
+    /// interpret — a declared constant/function, or an unspecified
+    /// `bvudiv0`-style division-by-zero function, absent from every assertion —
+    /// stays symbolic, the rest is replaced by its model value, and the result
+    /// is simplified (`(eval (+ x y))` with only `x` asserted is `(+ 3 y)`).
+    /// `None` when `t` mentions no such symbol, or has a node outside the
+    /// Bool/arithmetic/bit-vector sorts (the ordinary evaluation applies).
+    fn eval_partial(&mut self, model: &mut Model, t: AstId) -> Option<String> {
+        const DIV0: [&str; 5] = ["bvudiv0", "bvurem0", "bvsdiv0", "bvsrem0", "bvsmod0"];
+        let nodes = self.m.postorder(t);
+        let simple = |m: &AstManager, s: AstId| {
+            m.is_bool_sort(s) || m.is_arith_sort(s) || m.bv_sort_width(s).is_some()
+        };
+        if !nodes
+            .iter()
+            .all(|&n| !self.m.is_app(n) || simple(&self.m, self.m.get_sort(n)))
+        {
+            return None;
+        }
+        let mut in_model: BTreeSet<AstId> = BTreeSet::new();
+        let roots = self
+            .assertions
+            .iter()
+            .copied()
+            .chain(self.universals.iter().map(|(_, b)| *b))
+            .collect::<Vec<_>>();
+        for r in roots {
+            for n in self.m.postorder(r) {
+                if self.m.is_app(n) {
+                    in_model.insert(self.m.app_decl(n));
+                }
+            }
+        }
+        let free: BTreeSet<AstId> = nodes
+            .iter()
+            .filter(|&&n| {
+                if !self.m.is_app(n) {
+                    return false;
+                }
+                let d = self.m.app_decl(n);
+                if in_model.contains(&d) {
+                    return false;
+                }
+                self.funcs.values().any(|&f| f == d)
+                    || self
+                        .decl_name(d)
+                        .is_some_and(|s| DIV0.contains(&s.as_str()))
+            })
+            .copied()
+            .collect();
+        if free.is_empty() {
+            return None;
+        }
+        // Nodes with a free symbol below them stay structural; the others fold
+        // to their model value.
+        let mut symbolic: BTreeSet<AstId> = BTreeSet::new();
+        let mut out: BTreeMap<AstId, AstId> = BTreeMap::new();
+        for &n in &nodes {
+            if !self.m.is_app(n) {
+                return None;
+            }
+            let args = self.m.app_args(n).to_vec();
+            if free.contains(&n) || args.iter().any(|a| symbolic.contains(a)) {
+                symbolic.insert(n);
+                let new_args: Vec<AstId> = args.iter().map(|a| out[a]).collect();
+                let decl = self.m.app_decl(n);
+                out.insert(n, self.m.mk_app(decl, &new_args));
+                continue;
+            }
+            let v = match model.eval(&self.m, n) {
+                Value::Bool(true) => self.m.mk_true(),
+                Value::Bool(false) => self.m.mk_false(),
+                Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
+                Value::Bv(v, w) => self.m.mk_bv_numeral(v, w),
+                Value::Uninterp(..) => return None,
+            };
+            out.insert(n, v);
+        }
+        let s = crate::rewriter::simplify(&mut self.m, out[&t]);
+        Some(self.m.pp(s))
     }
 
     /// If `id` is a top-level conjunct of the assertions, it holds in every model
@@ -33064,12 +33154,13 @@ impl Context {
             .m
             .bv_sort_width(self.m.get_sort(x))
             .ok_or_else(|| alloc::format!("{head}: not a bit-vector"))?;
-        // One uninterpreted decl per (op, width); `mk_func_decl` is hash-consed, so
+        // One uninterpreted decl per (op, width) — z3's `bvudiv0` &c.; `mk_func_decl`
+        // is hash-consed on the name and sorts, so
         // equal dividends yield the same term and congruence holds automatically.
         let s = self.m.mk_bv_sort(w);
         let d = self
             .m
-            .mk_func_decl(Symbol::new(&alloc::format!("{head}0!{w}")), &[s], s);
+            .mk_func_decl(Symbol::new(&alloc::format!("{head}0")), &[s], s);
         let zero_case = self.m.mk_app(d, &[x]);
         // A literally-zero divisor is exactly the uninterpreted value.
         if self.m.bv_numeral_value(y).is_some_and(|v| v.is_zero()) {
