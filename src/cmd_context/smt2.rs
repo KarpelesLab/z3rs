@@ -22036,6 +22036,25 @@ impl Context {
         // a conflicting value. Only witness records constrained via `selᵢ(p) = v`.
         let mut directly_bound: BTreeSet<AstId> = BTreeSet::new();
         for &c in &top {
+            // A Boolean field asserted as an atom (`sel(x)` / `¬sel(x)`) pins it.
+            let (atom, val) = if self.m.is_not(c) {
+                (self.m.app_args(c)[0], false)
+            } else {
+                (c, true)
+            };
+            if self.m.is_app(atom)
+                && self.m.app_args(atom).len() == 1
+                && self
+                    .records
+                    .contains_key(&self.m.get_sort(self.m.app_args(atom)[0]))
+            {
+                let v = if val {
+                    self.m.mk_true()
+                } else {
+                    self.m.mk_false()
+                };
+                pin.entry(atom).or_insert(v);
+            }
             if self.m.is_eq(c) && self.m.app_args(c).len() == 2 {
                 let a = self.m.app_args(c);
                 for (s, v) in [(a[0], a[1]), (a[1], a[0])] {
@@ -22107,7 +22126,20 @@ impl Context {
         // report a spurious `sat`. A returned `sat` is a genuine witness; the
         // recursion terminates because `g` has no record variable left.
         match self.decide(g) {
-            (SmtResult::Sat, m) => Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()))),
+            (SmtResult::Sat, m) => {
+                let mut m = m.unwrap_or_else(|| Model::from_bv(BTreeMap::new()));
+                // The fields were substituted away: record their values.
+                for (t, cand) in cand_subst {
+                    let sels = self.records[&self.m.get_sort(t)].1.clone();
+                    let args = self.m.app_args(cand).to_vec();
+                    for (sd, arg) in sels.into_iter().zip(args) {
+                        let v = m.eval_value(&self.m, arg);
+                        let sel = self.m.mk_app(sd, &[t]);
+                        m.pin_value(sel, v);
+                    }
+                }
+                Some(m)
+            }
             _ => None,
         }
     }

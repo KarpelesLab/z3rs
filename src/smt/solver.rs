@@ -363,6 +363,23 @@ impl Model {
         self.defaults.get(&app.decl)
     }
 
+    /// Pin a term to a value (a Boolean, number or bit-vector; other values
+    /// are ignored).
+    pub fn pin_value(&mut self, t: AstId, v: Value) {
+        match v {
+            Value::Bool(b) => {
+                self.bools.insert(t, b);
+            }
+            Value::Num(r, _) => {
+                self.arith.insert(t, r);
+            }
+            Value::Bv(x, w) => {
+                self.bv.insert(t, (x, w));
+            }
+            Value::Uninterp(..) => {}
+        }
+    }
+
     /// Pin a Boolean constant (or atom) to a truth value.
     pub fn set_bool(&mut self, var: AstId, val: bool) {
         self.bools.insert(var, val);
