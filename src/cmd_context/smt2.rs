@@ -24464,13 +24464,15 @@ impl Context {
 
     /// [`Self::check_sat`] after the array-as-function reduction.
     fn check_sat_quant_defs(&mut self) -> (SmtResult, Option<Model>) {
-        let r = self.check_sat_rootobj();
-        // Undecided with quantifier abstractions in play: retry with their
-        // definitions. They are valid for the formulas the abstractions stand
-        // for, so a refutation holds; a `sat` needs a model where every universal
-        // (the definitions included) holds, which pins each exact abstraction to
-        // its formula's value.
-        if r.0 == SmtResult::Unknown && !self.in_quant_defs && !self.quant_defs.is_empty() {
+        // With quantifier abstractions in play, decide with their definitions
+        // first. They are valid for the formulas the abstractions stand for, so
+        // a refutation holds; a `sat` needs a model where every universal (the
+        // definitions included) holds, which pins each exact abstraction to its
+        // formula's value. Undecided, decide without them: the abstractions
+        // alone can be refuted, or irrelevant to a model. (Without the
+        // definitions an abstraction is a sentinel no model can confirm, so the
+        // other order mostly decided the goal twice.)
+        if !self.in_quant_defs && !self.quant_defs.is_empty() {
             let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
             roots.extend(self.assertions.iter().copied());
             if self
@@ -24500,7 +24502,7 @@ impl Context {
                 }
             }
         }
-        r
+        self.check_sat_rootobj()
     }
 
     /// [`Self::check_sat`] without the quantifier-definition retry.

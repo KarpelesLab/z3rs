@@ -142,6 +142,9 @@ impl Context {
                     let mut inst = crate::rewriter::simplify(&mut self.m, raw);
                     for _ in 0..3 {
                         let folded = self.dt_fold(inst);
+                        if folded == inst {
+                            break;
+                        }
                         let next = crate::rewriter::simplify(&mut self.m, folded);
                         if next == inst {
                             break;

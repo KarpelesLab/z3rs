@@ -410,6 +410,7 @@ impl SmtCore {
                 &mut budget,
                 bases,
                 hint.as_ref(),
+                self.euf.is_some(),
             );
             match tc {
                 // Both theories consistent under this assignment → SAT.
@@ -3010,6 +3011,7 @@ fn theory_check(
     budget: &mut u64,
     bases: &(ProofEgraph, Egraph),
     hint: Option<&Assignment>,
+    euf_online: bool,
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
     let mut eqs = Vec::new();
@@ -3035,9 +3037,15 @@ fn theory_check(
         .filter(|&(_, &(lit, _, _))| sat.model_holds(lit))
         .map(|(id, &(_, a, b))| (id, a, b))
         .collect();
-    let mut pg = bases.0.clone();
-    pg.assert_eqs(m, &id_eqs);
-    {
+    let mut pg = LazyProof {
+        base: &bases.0,
+        eqs: &id_eqs,
+        g: None,
+    };
+    // The online congruence closure followed the whole assignment without a
+    // conflict: no disequality or predicate clashes.
+    if !euf_online {
+        let pg = pg.get(m);
         for &(lit, a, b) in euf_eq {
             if !sat.model_holds(lit) && pg.class_of(m, a) == pg.class_of(m, b) {
                 // core: the equalities forcing a≈b (asserted true) + this diseq
@@ -3227,7 +3235,8 @@ fn theory_check(
                     if let Some(w) = extra_why.as_mut() {
                         if euf_extra.is_empty() {
                             w.push(
-                                pg.explain(m, u, v)
+                                pg.get(m)
+                                    .explain(m, u, v)
                                     .into_iter()
                                     .map(|id| euf_eq[id].0)
                                     .collect(),
@@ -3256,6 +3265,25 @@ fn theory_check(
     TheoryOutcome::Unknown // did not converge within the round budget
 }
 
+/// The proof-producing congruence closure of the asserted equalities
+/// `(id, a, b)` over `base`, built on first use.
+struct LazyProof<'a> {
+    base: &'a ProofEgraph,
+    eqs: &'a [(usize, AstId, AstId)],
+    g: Option<ProofEgraph>,
+}
+
+impl LazyProof<'_> {
+    /// The closure, built now if not yet.
+    fn get(&mut self, m: &AstManager) -> &mut ProofEgraph {
+        self.g.get_or_insert_with(|| {
+            let mut g = self.base.clone();
+            g.assert_eqs(m, self.eqs);
+            g
+        })
+    }
+}
+
 /// Above this many interface terms, theory combination is model-based rather
 /// than by pairwise entailment queries (quadratic in the interface).
 const PAIRWISE_COMBINATION_LIMIT: usize = 64;
@@ -3274,7 +3302,7 @@ fn model_based_combination(
     euf_roots: &[AstId],
     eqs: &[(AstId, AstId)],
     diseqs: &[(AstId, AstId)],
-    pg: &mut ProofEgraph,
+    pg: &mut LazyProof<'_>,
     bases: &(ProofEgraph, Egraph),
     hint: Option<&Assignment>,
 ) -> TheoryOutcome {
@@ -3289,25 +3317,35 @@ fn model_based_combination(
         con_lits: base.con_lits.clone(),
         diseq_lits: base.diseq_lits.clone(),
     };
-    let mut why: Vec<Vec<Lit>> = sys.con_lits.iter().map(|&l| alloc::vec![l]).collect();
+    // Each constraint's explanation: its literal, or the class equality `u = r`
+    // (explained by the proof forest only for a conflict core).
+    let mut class_eqs: Vec<(AstId, AstId)> = Vec::new();
     let mut rep: BTreeMap<usize, AstId> = BTreeMap::new();
     for &u in interface {
         match rep.get(&g.class_of(m, u)) {
             Some(&r) => {
                 sys.cons
                     .push(Constraint::eq(ast_to_lin(m, u).sub(&ast_to_lin(m, r))));
-                why.push(
-                    pg.explain(m, u, r)
-                        .into_iter()
-                        .map(|id| euf_eq[id].0)
-                        .collect(),
-                );
+                class_eqs.push((u, r));
             }
             None => {
                 rep.insert(g.class_of(m, u), u);
             }
         }
     }
+    let explain = |pg: &mut LazyProof<'_>| -> Vec<Vec<Lit>> {
+        let mut why: Vec<Vec<Lit>> = sys.con_lits.iter().map(|&l| alloc::vec![l]).collect();
+        for &(u, r) in &class_eqs {
+            let g = pg.get(m);
+            why.push(
+                g.explain(m, u, r)
+                    .into_iter()
+                    .map(|id| euf_eq[id].0)
+                    .collect(),
+            );
+        }
+        why
+    };
     let hint = hint.filter(|h| satisfies(&sys.cons, h));
     match hint.map_or_else(
         || crate::smt::arith::model_or_core(&sys.cons).map(|_| ()),
@@ -3315,6 +3353,7 @@ fn model_based_combination(
     ) {
         Ok(()) => {}
         Err(core) => {
+            let why = explain(pg);
             let mut out = BTreeSet::new();
             for i in core {
                 out.extend(why[i].iter().copied());
@@ -3326,6 +3365,7 @@ fn model_based_combination(
         Ok(model) => model,
         Err(Some(splits)) => return TheoryOutcome::Split(splits),
         Err(None) => {
+            let why = explain(pg);
             return match arith_conflict_core(&sys, &why) {
                 Some(core) => TheoryOutcome::Conflict(core),
                 None => TheoryOutcome::Unsat,
