@@ -3038,6 +3038,10 @@ struct Scope {
     /// z3's polymorphism-theory assertion head at the push (its trail restores
     /// it on pop).
     poly_qhead: usize,
+    /// The objectives at the push, each with its number of soft constraints
+    /// (0 for `maximize`/`minimize`): `pop` drops later ones and the softs
+    /// added to earlier groups (z3's `m_objectives_lim` and term trail).
+    objectives: Vec<usize>,
 }
 
 /// The parts of z3's solver state that decide how its model lists the
@@ -4934,6 +4938,14 @@ impl Context {
                         table: self.decl_table_stack.len(),
                         mentions: self.asserted_mentions.len(),
                         poly_qhead: self.z3_state.poly_qhead,
+                        objectives: self
+                            .objectives
+                            .iter()
+                            .map(|o| match o {
+                                Objective::Soft { items, .. } => items.len(),
+                                Objective::Term { .. } => 0,
+                            })
+                            .collect(),
                     });
                     self.inc_mode = true;
                 }
@@ -4967,6 +4979,13 @@ impl Context {
                     }
                     self.asserted_mentions.truncate(mark.mentions);
                     self.z3_state.poly_qhead = mark.poly_qhead;
+                    self.objectives.truncate(mark.objectives.len());
+                    for (o, &n) in self.objectives.iter_mut().zip(&mark.objectives) {
+                        if let Objective::Soft { items, .. } = o {
+                            items.truncate(n);
+                        }
+                    }
+                    self.objective_values.truncate(self.objectives.len());
                     self.inc_mode = true;
                     for name in self.sort_order.drain(mark.sorts..) {
                         self.sorts.remove(&name);
@@ -29111,7 +29130,27 @@ impl Context {
                             false,
                         )
                     }
-                    _ => unknown(),
+                    Some(_) => unknown(),
+                    None => match self.real_optimize_cubes(obj, maximize, fixed) {
+                        RealOpt::Attained(r) => {
+                            let rv = self.m.mk_numeral(r.clone(), false);
+                            let eq = self.m.mk_eq(obj, rv);
+                            fixed.push(eq);
+                            *model = self.check_with(fixed).1;
+                            (render_rational(&r), false)
+                        }
+                        RealOpt::Supremum(r, k) => {
+                            // Nothing attains it to commit for a later
+                            // objective (as the cube expansion's limit).
+                            self.opt_open_limit = true;
+                            (
+                                render_eps_bound(&render_real(&r), r.is_zero(), &k, maximize),
+                                false,
+                            )
+                        }
+                        RealOpt::Unbounded => infinite(),
+                        RealOpt::Unknown => unknown(),
+                    },
                 },
             };
         }
@@ -29947,8 +29986,16 @@ impl Context {
             let mut next = Vec::new();
             for c in &cubes {
                 for e in &d {
+                    // A cube with a literal and its negation is empty.
+                    if e.iter().any(|&(a, p)| c.contains(&(a, !p))) {
+                        continue;
+                    }
                     let mut m = c.clone();
-                    m.extend_from_slice(e);
+                    for &l in e {
+                        if !m.contains(&l) {
+                            m.push(l);
+                        }
+                    }
                     next.push(m);
                 }
             }
@@ -30315,10 +30362,24 @@ impl Context {
         // The constraint system: base assertions plus the objective-fix set.
         let mut conj = self.assertions.clone();
         conj.extend_from_slice(fixed);
+        self.real_optimize_in(&conj, obj, maximize, Some(fixed))
+    }
+
+    /// [`real_optimize`](Self::real_optimize) over the conjunction `conj`.
+    /// With `verify` (the extra constraints over the assertions that `conj`
+    /// stands for), an optimum the LP finds is checked by the solver; without
+    /// it the LP must be exact (linear constraints over real constants).
+    fn real_optimize_in(
+        &mut self,
+        conj: &[AstId],
+        obj: AstId,
+        maximize: bool,
+        verify: Option<&[AstId]>,
+    ) -> RealOpt {
         let combined = match conj.len() {
             0 => self.m.mk_true(),
             1 => conj[0],
-            _ => self.m.mk_and(&conj),
+            _ => self.m.mk_and(conj),
         };
         let lifted = self.lift(combined);
         let Some(cons) = linear_constraints(&self.m, lifted) else {
@@ -30338,9 +30399,15 @@ impl Context {
         let real = self.m.mk_real_sort();
         let z = self.fresh_const(real);
         let mut budget: u64 = 200_000;
+        let fixed = match verify {
+            Some(f) => f,
+            None if exact => &[][..],
+            None => return RealOpt::Unknown,
+        };
         match arith_optimize(&cons, &obj_lin, z, maximize, &mut budget) {
             OptOutcome::Unbounded | OptOutcome::Bound(_) if !exact => RealOpt::Unknown,
             OptOutcome::Unbounded => RealOpt::Unbounded,
+            OptOutcome::Attained(r) if verify.is_none() => RealOpt::Attained(r),
             OptOutcome::Attained(r) => {
                 // Verify: `obj` reaches r, and cannot pass it.
                 let rv = self.m.mk_numeral(r.clone(), false);
@@ -30371,7 +30438,7 @@ impl Context {
                 };
                 let mut ex = fixed.to_vec();
                 ex.push(reach);
-                if self.check_with(&ex).0 != SmtResult::Unsat {
+                if verify.is_some() && self.check_with(&ex).0 != SmtResult::Unsat {
                     return RealOpt::Unknown;
                 }
                 // z3 reports the bound as `r ∓ k·ε`, the optimum with every
@@ -30417,6 +30484,246 @@ impl Context {
             }
             OptOutcome::Exhausted => RealOpt::Unknown,
         }
+    }
+
+    /// Optimize the real objective `obj` over Boolean structure the cube
+    /// expansion of [`nra_optimize`](Self::nra_optimize) cannot afford (soft
+    /// constraints, many disjunctions), as z3's optimizer climbs over SMT
+    /// models: each model of the assertions plus `fixed` (and the bound
+    /// demanding a better value) gives a conjunction of the arithmetic
+    /// literals it makes true that implies the assertions under its Boolean
+    /// values (an implicant); the objective is optimized exactly over that
+    /// cube, and the next model must improve on it. The best cube optimum is
+    /// the optimum once no model improves. `Unknown` outside linear real
+    /// arithmetic over the cubes or past the round budget.
+    fn real_optimize_cubes(&mut self, obj: AstId, maximize: bool, fixed: &[AstId]) -> RealOpt {
+        const ROUNDS: usize = 64;
+        let mut guard: Vec<AstId> = fixed.to_vec();
+        let mut best: Option<RealOpt> = None;
+        for _ in 0..ROUNDS {
+            let (res, model) = self.check_with(&guard);
+            let mut model = match (res, model) {
+                (SmtResult::Unsat, _) => return best.unwrap_or(RealOpt::Unknown),
+                (SmtResult::Sat, Some(m)) => m,
+                _ => return RealOpt::Unknown,
+            };
+            let mut cube = Vec::new();
+            let roots: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
+            for f in roots {
+                // A formula over no real constant leaves them free (its
+                // integer and Boolean constants keep the model's values).
+                let real = |ctx: &Self, t: AstId| {
+                    let srt = ctx.m.get_sort(t);
+                    ctx.m.is_uninterp_const(t)
+                        && ctx.m.is_arith_sort(srt)
+                        && !ctx.m.is_int_sort(srt)
+                };
+                if !self.m.postorder(f).into_iter().any(|t| real(self, t)) {
+                    continue;
+                }
+                if self.opt_implicant(f, true, &mut model, &mut cube).is_none() {
+                    return RealOpt::Unknown;
+                }
+            }
+            // Only the literals over real constants bear on the objective:
+            // the rest (Booleans, integer pins such as a soft group's
+            // committed cost) share no constant with them and the model
+            // satisfies them. A literal mixing both is outside the fragment.
+            let mut real_cube = Vec::new();
+            for c in cube {
+                let consts: Vec<AstId> = self
+                    .m
+                    .postorder(c)
+                    .into_iter()
+                    .filter(|&t| self.m.is_uninterp_const(t))
+                    .collect();
+                let real = |ctx: &Self, t: AstId| {
+                    let srt = ctx.m.get_sort(t);
+                    ctx.m.is_arith_sort(srt) && !ctx.m.is_int_sort(srt)
+                };
+                if consts.iter().all(|&t| real(self, t)) {
+                    real_cube.push(c);
+                } else if consts.iter().any(|&t| real(self, t)) {
+                    return RealOpt::Unknown;
+                }
+            }
+            if self
+                .m
+                .postorder(obj)
+                .into_iter()
+                .any(|t| self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t)))
+            {
+                return RealOpt::Unknown;
+            }
+            // The cube's optimum, exactly by its LP.
+            let r = self.real_optimize_in(&real_cube, obj, maximize, None);
+            let (v, attained) = match r {
+                RealOpt::Attained(ref v) => (v.clone(), true),
+                RealOpt::Supremum(ref v, _) => (v.clone(), false),
+                RealOpt::Unbounded => return RealOpt::Unbounded,
+                RealOpt::Unknown => return RealOpt::Unknown,
+            };
+            let better = match &best {
+                None => true,
+                Some(RealOpt::Attained(b)) => {
+                    if maximize {
+                        v > *b
+                    } else {
+                        v < *b
+                    }
+                }
+                Some(RealOpt::Supremum(b, _)) => {
+                    (if maximize { v > *b } else { v < *b }) || (v == *b && attained)
+                }
+                _ => false,
+            };
+            if better {
+                best = Some(r);
+            }
+            // The next model must beat an attained value, or at least reach
+            // an open one (another cube may attain it).
+            let rv = self.m.mk_numeral(v, false);
+            let bound = match (maximize, attained) {
+                (true, true) => self.m.mk_gt(obj, rv),
+                (true, false) => self.m.mk_ge(obj, rv),
+                (false, true) => self.m.mk_lt(obj, rv),
+                (false, false) => self.m.mk_le(obj, rv),
+            };
+            guard.push(bound);
+        }
+        RealOpt::Unknown
+    }
+
+    /// Push onto `out` arithmetic literals and Boolean constant literals,
+    /// true in `model`, that together imply `f` (when `pos`) or `¬f`: one
+    /// true disjunct of a disjunction, every conjunct of a conjunction, and
+    /// each arithmetic atom with its term-level `ite`s resolved to the
+    /// branch the model selects (their conditions added too). `None` on a
+    /// connective or atom outside that fragment, or when `model` does not
+    /// give `f` the value `pos`.
+    fn opt_implicant(
+        &mut self,
+        f: AstId,
+        pos: bool,
+        model: &mut Model,
+        out: &mut Vec<AstId>,
+    ) -> Option<()> {
+        let holds = |ctx: &Self, model: &mut Model, t: AstId| match model.eval_value(&ctx.m, t) {
+            Value::Bool(b) => Some(b),
+            _ => None,
+        };
+        if holds(self, model, f)? != pos {
+            return None;
+        }
+        if self.m.is_true(f) || self.m.is_false(f) {
+            return Some(());
+        }
+        if self.m.is_not(f) {
+            let a = self.m.app_args(f)[0];
+            return self.opt_implicant(a, !pos, model, out);
+        }
+        let args = self.m.app_args(f).to_vec();
+        let conj = (self.m.is_and(f) && pos) || (self.m.is_or(f) && !pos);
+        let disj = (self.m.is_or(f) && pos) || (self.m.is_and(f) && !pos);
+        if conj {
+            for a in args {
+                self.opt_implicant(a, pos, model, out)?;
+            }
+            return Some(());
+        }
+        if disj {
+            let a = args
+                .iter()
+                .copied()
+                .find(|&a| holds(self, model, a) == Some(pos))?;
+            return self.opt_implicant(a, pos, model, out);
+        }
+        if self.m.is_implies(f) {
+            // a ⇒ b is ¬a ∨ b.
+            let (a, b) = (args[0], args[1]);
+            if pos {
+                return if holds(self, model, a)? {
+                    self.opt_implicant(b, true, model, out)
+                } else {
+                    self.opt_implicant(a, false, model, out)
+                };
+            }
+            self.opt_implicant(a, true, model, out)?;
+            return self.opt_implicant(b, false, model, out);
+        }
+        let is_bool = |ctx: &Self, t: AstId| ctx.m.is_bool_sort(ctx.m.get_sort(t));
+        if self.m.is_ite(f) && is_bool(self, f) {
+            let c = holds(self, model, args[0])?;
+            self.opt_implicant(args[0], c, model, out)?;
+            return self.opt_implicant(if c { args[1] } else { args[2] }, pos, model, out);
+        }
+        if self.m.is_eq(f) && args.len() == 2 && is_bool(self, args[0]) {
+            // An equivalence: both sides at their values.
+            for a in args {
+                let v = holds(self, model, a)?;
+                self.opt_implicant(a, v, model, out)?;
+            }
+            return Some(());
+        }
+        if self.m.is_uninterp_const(f) {
+            out.push(if pos { f } else { self.m.mk_not(f) });
+            return Some(());
+        }
+        let arith_atom =
+            (self.m.is_eq(f) && args.len() == 2 && self.m.is_arith_sort(self.m.get_sort(args[0])))
+                || matches!(
+                    self.m.arith_op(f),
+                    Some(
+                        crate::ast::ArithOp::Le
+                            | crate::ast::ArithOp::Ge
+                            | crate::ast::ArithOp::Lt
+                            | crate::ast::ArithOp::Gt
+                    )
+                );
+        if !arith_atom {
+            return None;
+        }
+        // Resolve the term-level `ite`s, innermost first.
+        let mut atom = f;
+        for _ in 0..256 {
+            let Some(ite) = self
+                .m
+                .postorder(atom)
+                .into_iter()
+                .find(|&t| self.m.is_ite(t) && !is_bool(self, t))
+            else {
+                break;
+            };
+            let a = self.m.app_args(ite).to_vec();
+            let c = holds(self, model, a[0])?;
+            self.opt_implicant(a[0], c, model, out)?;
+            let branch = if c { a[1] } else { a[2] };
+            atom = crate::rewriter::substitute(&mut self.m, atom, &[(ite, branch)]);
+        }
+        if pos {
+            out.push(atom);
+            return Some(());
+        }
+        // A false atom as the comparison that holds instead (a disequality
+        // as the strict side the model takes).
+        use crate::ast::ArithOp;
+        let a = self.m.app_args(atom).to_vec();
+        let lit = match self.m.arith_op(atom) {
+            Some(ArithOp::Le) => self.m.mk_gt(a[0], a[1]),
+            Some(ArithOp::Lt) => self.m.mk_ge(a[0], a[1]),
+            Some(ArithOp::Ge) => self.m.mk_lt(a[0], a[1]),
+            Some(ArithOp::Gt) => self.m.mk_le(a[0], a[1]),
+            _ => {
+                let lt = self.m.mk_lt(a[0], a[1]);
+                if holds(self, model, lt)? {
+                    lt
+                } else {
+                    self.m.mk_gt(a[0], a[1])
+                }
+            }
+        };
+        out.push(lit);
+        Some(())
     }
 
     /// `cons` and `obj` with the variables z3's `solve-eqs` eliminates
@@ -50673,6 +50980,71 @@ mod tests {
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "sat");
         assert!(out[2].contains("(n 0)") || out[2].contains("(n 1)") || out[2].contains("(n 2)"));
+    }
+
+    #[test]
+    fn objectives_are_scoped_by_push_and_pop() {
+        let src = "
+            (declare-const x Real)
+            (declare-const a Bool)
+            (declare-const b Bool)
+            (assert (<= x 3.0))
+            (assert (not (and a b)))
+            (assert-soft a :weight 2 :id g)
+            (push)
+            (maximize x)
+            (assert-soft b :weight 3 :id g)
+            (check-sat)
+            (get-objectives)
+            (pop)
+            (minimize (- x))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(src).unwrap();
+        assert_eq!(out[1], "(objectives\n (g 2)\n (x 3)\n)");
+        assert_eq!(out[3], "(objectives\n (g 0)\n ((- x) (- 3))\n)");
+    }
+
+    #[test]
+    fn real_objective_after_soft_constraints() {
+        // The committed soft cost leaves a Boolean structure the cube
+        // expansion cannot afford; the model-guided cube search optimizes x.
+        let src = "
+            (declare-const x Real)
+            (declare-const a Bool)
+            (declare-const b Bool)
+            (assert (<= x 3.0))
+            (assert (not (and a b)))
+            (assert-soft a :weight 2 :id g)
+            (assert-soft b :weight 3 :id g)
+            (assert-soft (< x 1.0) :weight 1 :id h)
+            (assert-soft (or a (< x 2.0)) :weight 1 :id h)
+            (maximize x)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(src).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(
+            out[1],
+            "(objectives\n (g 2)\n (h 0)\n (x (+ 1.0 (* (- 1.0) epsilon)))\n)"
+        );
+        // At an equal bound the strict constraint wins: the supremum 5 of
+        // y is open (2x ≤ y + 2 and 2y < 3 + 2x).
+        let strict = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (assert (<= y 5.0))
+            (assert (< (+ (* (- 2.0) x) (* 2.0 y)) 3.0))
+            (assert (>= (+ (* (- 2.0) x) y) (- 2.0)))
+            (assert (or (< y 6.0) (> x 9.0)))
+            (maximize y)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(strict).unwrap();
+        assert_eq!(out[1], "(objectives\n (y (+ 5.0 (* (- 1.0) epsilon)))\n)");
     }
 
     #[test]

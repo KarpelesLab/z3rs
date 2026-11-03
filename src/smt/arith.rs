@@ -735,12 +735,13 @@ pub fn optimize(
         let bound = &i.expr.constant.neg() / &cz;
         if cz > zero() {
             upper = Some(match upper {
-                Some((h, hs)) if h < bound || (h == bound && !hs) => (h, hs),
+                // At an equal value the strict bound is the tighter one.
+                Some((h, hs)) if h < bound || (h == bound && hs) => (h, hs),
                 _ => (bound, i.strict),
             });
         } else {
             lower = Some(match lower {
-                Some((l, ls)) if l > bound || (l == bound && !ls) => (l, ls),
+                Some((l, ls)) if l > bound || (l == bound && ls) => (l, ls),
                 _ => (bound, i.strict),
             });
         }
