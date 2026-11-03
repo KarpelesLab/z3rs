@@ -3540,8 +3540,25 @@ fn integer_model(
     if splits.is_empty() {
         return Ok(model);
     }
+    // An all-integer equality without integer solutions (z3's `gcd_test`,
+    // run by `int_solver` before any branch): no branching can refute it.
+    if sys.cons.iter().any(|c| {
+        c.rel == Rel::Eq
+            && c.expr.vars().all(|v| sys.int_set.contains(&v))
+            && c.expr.integer_equality_infeasible()
+    }) {
+        return Err(None);
+    }
     // Disequality splits are finitely many; only integer branching can go on
     // forever (parity, divisibility), which the integer search decides first.
+    // Left to the search, a branch first tries z3's patching: the model's
+    // integers rounded, the other variables re-solved around them.
+    if !probe
+        && splits.iter().any(|s| matches!(s, SplitReq::Branch { .. }))
+        && let Some(patched) = patched_integer_model(sys, &model)
+    {
+        return Ok(patched);
+    }
     if !probe || splits.iter().all(|s| matches!(s, SplitReq::Diseq { .. })) {
         return Err(Some(splits));
     }
@@ -3551,6 +3568,51 @@ fn integer_model(
         Feas::Unsat => Err(None),
         Feas::Unknown => Err(Some(splits)),
     }
+}
+
+/// z3's patching of integer columns (`int_solver::patch_int_columns`), in a
+/// simple form: every integer variable fixed to its value in `model` rounded
+/// down (then up), the remaining variables solved again over the rationals.
+/// The resulting model of `sys` when every integer is integral there and no
+/// disequality is violated; `None` otherwise.
+fn patched_integer_model(sys: &ArithSystem, model: &Assignment) -> Option<Assignment> {
+    let zero = Rational::from_integer(Int::from(0));
+    for up in [false, true] {
+        let fixed: Assignment = sys
+            .int_set
+            .iter()
+            .map(|&x| {
+                let v = model.get(&x).unwrap_or(&zero);
+                let k = if up { v.ceil() } else { v.floor() };
+                (x, Rational::from_integer(k))
+            })
+            .collect();
+        let cons: Vec<Constraint> = sys
+            .cons
+            .iter()
+            .map(|c| {
+                let mut e = LinExpr::constant(c.expr.constant_part().clone());
+                for (v, a) in c.expr.terms() {
+                    match fixed.get(&v) {
+                        Some(k) => e.add_scaled(&LinExpr::constant(k.clone()), a),
+                        None => e.add_scaled(&LinExpr::var(v), a),
+                    }
+                }
+                Constraint {
+                    expr: e,
+                    rel: c.rel,
+                }
+            })
+            .collect();
+        let Some(mut a) = crate::smt::arith::model(&cons) else {
+            continue;
+        };
+        a.extend(fixed);
+        if satisfies(&sys.cons, &a) && model_splits(sys, &a).is_empty() {
+            return Some(a);
+        }
+    }
+    None
 }
 
 /// Does the assignment `a` (absent variables zero) satisfy every constraint?
