@@ -21730,16 +21730,21 @@ impl Context {
     }
 
     /// Bit-blast `fp.roundToIntegral` on a symbolic operand (port of z3's
-    /// `mk_round_to_integral`). The rounding mode is a constant, so its many
-    /// per-mode branches collapse at build time. `None` for unsupported bits.
+    /// `mk_round_to_integral`). A constant rounding mode collapses the
+    /// per-mode branches at build time; a symbolic one selects among them by
+    /// its 3-bit encoding where they differ (the rounding decisions), sharing
+    /// the rest of the circuit. `None` for unsupported bits.
     fn fp_r2i_bv(&mut self, rm: AstId, x: AstId) -> Option<AstId> {
         let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
         if eb < 2 || sb < 3 || eb > sb {
             return None;
         }
-        let Some(rm_c) = self.rm_code(rm) else {
-            return self.fp_rm_cases(rm, |ctx, mode| ctx.fp_r2i_bv(mode, x));
+        // `Ok(code)` for a constant mode, `Err(bits)` for a symbolic one.
+        let mode = match self.rm_code(rm) {
+            Some(c) => Ok(c),
+            None => Err(self.rm_bits(rm)?),
         };
+        let rm_c = mode.unwrap_or(u32::MAX);
         let (rte, rta, rtp, rtn, rtz) = (rm_c == 0, rm_c == 1, rm_c == 2, rm_c == 3, rm_c == 4);
         let w = eb + sb;
         let bvx = self.fp_to_bv(x)?;
@@ -21807,7 +21812,20 @@ impl Context {
             // rtz path uses xzero below; this branch only reached for rte/rta.
             xone
         };
-        let v4 = if rtp {
+        let v4 = if let Err(rm3) = mode {
+            // The five modes' values, selected by the mode.
+            let below = self.m.mk_or(&[tie, c423]);
+            let v_rte = self.m.mk_ite(below, xzero, xone);
+            let v_rta = self.m.mk_ite(c423, xzero, xone);
+            let v_rtp = self.m.mk_ite(x_neg, nzero, pone);
+            let v_rtn = self.m.mk_ite(x_neg, none, pzero);
+            let mut acc = xzero; // RTZ
+            for (k, v) in [(3, v_rtn), (2, v_rtp), (1, v_rta), (0, v_rte)] {
+                let is = self.fp_rm_is(rm3, k);
+                acc = self.m.mk_ite(is, v, acc);
+            }
+            acc
+        } else if rtp {
             self.m.mk_ite(x_neg, nzero, pone)
         } else if rtn {
             self.m.mk_ite(x_neg, none, pzero)
@@ -21841,7 +21859,32 @@ impl Context {
         let one_s = self.m.mk_bv(1, sb);
         let div_p1 = self.m.mk_bvadd(divp, one_s);
         let zero1 = self.m.mk_bv(0, 1);
-        let res_sig = if rte || rta {
+        let res_sig = if let Err(rm3) = mode {
+            // Whether to round the integer part up, per mode.
+            let tie_z = self.m.mk_bv(0, sb - 1);
+            let tie_pat = self.m.mk_bv_concat(one1, tie_z); // sb
+            let tie2 = self.m.mk_eq(remp, tie_pat);
+            let div_last = self.m.mk_bv_extract(0, 0, divp);
+            let dl1 = self.m.mk_eq(div_last, one1);
+            let gt_half = self.m.mk_bvule(tie_pat, remp);
+            let is_rta = self.fp_rm_is(rm3, 1);
+            let t = self.m.mk_true();
+            let tie_up = self.m.mk_ite(is_rta, t, dl1);
+            let up_near = self.m.mk_ite(tie2, tie_up, gt_half);
+            let rem_z = self.m.mk_bv(0, sb);
+            let rem_eq0 = self.m.mk_eq(remp, rem_z);
+            let rem_nz = self.m.mk_not(rem_eq0);
+            let pos = self.m.mk_eq(res_sgn, zero1);
+            let up_rtp = self.m.mk_and(&[rem_nz, pos]);
+            let negc = self.m.mk_eq(res_sgn, one1);
+            let up_rtn = self.m.mk_and(&[rem_nz, negc]);
+            let mut up = self.m.mk_false(); // RTZ: truncate
+            for (k, u) in [(3, up_rtn), (2, up_rtp), (1, up_near), (0, up_near)] {
+                let is = self.fp_rm_is(rm3, k);
+                up = self.m.mk_ite(is, u, up);
+            }
+            self.m.mk_ite(up, div_p1, divp)
+        } else if rte || rta {
             // half-way pattern 100..0.
             let tie_z = self.m.mk_bv(0, sb - 1);
             let tie_pat = self.m.mk_bv_concat(one1, tie_z); // sb
