@@ -32114,7 +32114,8 @@ impl Context {
                     // instantiation finds them. Its domain is not exhausted.
                     let had_ground = by_sort.get(&s).is_some_and(|e| !e.is_empty());
                     by_sort.entry(s).or_default().extend(seeds);
-                    if !had_ground {
+                    // The rounding modes are all seeded: their domain is.
+                    if !had_ground && Some(s) != self.rm_sort {
                         seeded_sorts.insert(s);
                     }
                 } else if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
@@ -32664,9 +32665,12 @@ impl Context {
             .copied()
             .filter(|&v| {
                 let s = self.m.get_sort(v);
+                // A rounding-mode binder ranges over its five constants, all
+                // enumerated.
                 !(self.m.is_bool_sort(s)
                     || self.m.is_arith_sort(s)
-                    || self.declared_sorts.contains(&s))
+                    || self.declared_sorts.contains(&s)
+                    || Some(s) == self.rm_sort)
             })
             .collect();
         if binders.is_empty() {
@@ -36332,6 +36336,14 @@ impl Context {
         let goal = if self.fp_sorts.is_empty() {
             goal
         } else {
+            // Congruence of FP reads and applications on their images.
+            let mut fpb = self.fp_image_congruence(goal);
+            let goal = if fpb.is_empty() {
+                goal
+            } else {
+                fpb.push(goal);
+                self.m.mk_and(&fpb)
+            };
             let mut memo = BTreeMap::new();
             self.blast_fp_equalities(goal, &mut memo)
         };
@@ -38753,6 +38765,12 @@ impl Context {
                     }
                     if let Some(extra) = side.get(&t) {
                         stack.extend(extra.iter().copied());
+                    }
+                    // The image of an FP term stands for the term, whose
+                    // arguments (an array read's index, a function's
+                    // arguments) are its symbols too.
+                    if let Some(&f) = fp_link.get(&t) {
+                        stack.push(f);
                     }
                     // An array read is a term of its own: the axioms that give
                     // it meaning (a read of a constant array or a `store`) may
@@ -44189,6 +44207,55 @@ mod tests {
         let out = run(script).unwrap();
         assert_eq!(out[0], "sat");
         assert!(!out[1].contains("!val!"), "{}", out[1]);
+    }
+
+    #[test]
+    fn float_reads_and_applications_are_congruent_on_their_bits() {
+        // (select a 0) and (select a i) at i = 0 are one float: NaN, so
+        // nothing is below it.
+        let script = "
+            (declare-const a (Array Int (_ FloatingPoint 3 4)))
+            (declare-const f (_ FloatingPoint 3 4))
+            (declare-const i Int)
+            (assert (fp.isNaN (select a 0)))
+            (assert (fp.lt f (select a i)))
+            (assert (= i 0))
+            (check-sat)
+            (reset)
+            (declare-fun h (Int) (_ FloatingPoint 3 4))
+            (declare-const f (_ FloatingPoint 3 4))
+            (declare-const i Int)
+            (assert (fp.isNaN (h 0)))
+            (assert (fp.lt f (h i)))
+            (assert (= i 0))
+            (check-sat)
+            (reset)
+            (declare-const a (Array Int (_ FloatingPoint 3 4)))
+            (declare-const b (Array Int (_ FloatingPoint 3 4)))
+            (declare-const g (_ FloatingPoint 3 4))
+            (declare-const j Int)
+            (assert (= a (store b j g)))
+            (assert (= (store b j (_ -zero 3 4)) b))
+            (assert (= b a))
+            (assert (fp.isNaN g))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert!(out.iter().all(|r| r != "sat"), "{out:?}");
+    }
+
+    #[test]
+    fn universals_over_rounding_modes_are_exhausted() {
+        let script = "
+            (declare-const c RoundingMode)
+            (assert (exists ((x RoundingMode)) (forall ((y RoundingMode)) (or (= x c) (= y RTZ)))))
+            (assert (= c RNE))
+            (check-sat)
+            (reset)
+            (assert (forall ((y RoundingMode)) (or (= y RNE) (= y RNA) (= y RTP) (= y RTN) (= y RTZ))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
     }
 
     #[test]

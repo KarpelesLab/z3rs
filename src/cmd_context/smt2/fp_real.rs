@@ -242,6 +242,127 @@ impl Context {
         Some(ax)
     }
 
+    /// Congruence of the floating-point array reads and function
+    /// applications of `goal` on their bit-vector images (Ackermann's
+    /// reduction): the image of such a term is a free bit-vector, so for
+    /// two reads `(select A i)`, `(select B j)` (two applications of one
+    /// function) with equal arrays and indices (arguments) the images must
+    /// denote the same float — `b₁ = b₂ ∨ both NaN`. The array axioms'
+    /// read-over-write instances reach the images through the lowered
+    /// equalities; this supplies what congruence gives the terms. The terms
+    /// are those of `goal` and those whose images the parse-time lowering
+    /// left in it.
+    pub(super) fn fp_image_congruence(&mut self, goal: AstId) -> Vec<AstId> {
+        const MAX_TERMS: usize = 48;
+        if self.fp_sorts.is_empty() {
+            return Vec::new();
+        }
+        // The declared functions (the datatype members have their own axioms).
+        let members = self.datatype_member_decls();
+        let user: alloc::collections::BTreeSet<AstId> = self
+            .funcs
+            .values()
+            .copied()
+            .filter(|d| !members.contains(d))
+            .collect();
+        let present = self.m.postorder(goal);
+        let present_set: alloc::collections::BTreeSet<AstId> = present.iter().copied().collect();
+        let mut cands: Vec<AstId> = present;
+        for (&t, &b) in &self.fp_bv {
+            if present_set.contains(&b) && !present_set.contains(&t) {
+                cands.push(t);
+            }
+        }
+        // Per (function, or `select` per sort): the terms.
+        let mut groups: alloc::collections::BTreeMap<(AstId, bool), Vec<AstId>> =
+            alloc::collections::BTreeMap::new();
+        let mut seen = alloc::collections::BTreeSet::new();
+        for t in cands {
+            if !seen.insert(t) {
+                continue;
+            }
+            let s = self.m.get_sort(t);
+            if self.fp_format_of(s).is_none() {
+                continue;
+            }
+            let Some(a) = self.m.app(t) else { continue };
+            if self.m.is_select(t) {
+                groups.entry((s, true)).or_default().push(t);
+            } else if !a.args.is_empty() && user.contains(&a.decl) {
+                groups.entry((a.decl, false)).or_default().push(t);
+            }
+        }
+        let mut ax = Vec::new();
+        for (_, terms) in groups {
+            if terms.len() < 2 || terms.len() > MAX_TERMS {
+                continue;
+            }
+            for x in 0..terms.len() {
+                for y in x + 1..terms.len() {
+                    let (t1, t2) = (terms[x], terms[y]);
+                    let a1 = self.m.app_args(t1).to_vec();
+                    let a2 = self.m.app_args(t2).to_vec();
+                    if a1.len() != a2.len() {
+                        continue;
+                    }
+                    let mut hyp = Vec::new();
+                    let mut ok = true;
+                    for (&u, &v) in a1.iter().zip(&a2) {
+                        if u == v {
+                            continue;
+                        }
+                        match self.fp_value_eq(u, v) {
+                            Some(e) => hyp.push(e),
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    let Some(concl) = (ok).then(|| self.fp_value_eq(t1, t2)).flatten() else {
+                        continue;
+                    };
+                    ax.push(match hyp.len() {
+                        0 => concl,
+                        1 => self.m.mk_implies(hyp[0], concl),
+                        _ => {
+                            let h = self.m.mk_and(&hyp);
+                            self.m.mk_implies(h, concl)
+                        }
+                    });
+                }
+            }
+        }
+        ax
+    }
+
+    /// `u = v` with a floating-point pair compared on their images (equal
+    /// bits or both NaN); `None` for a float without an image.
+    fn fp_value_eq(&mut self, u: AstId, v: AstId) -> Option<AstId> {
+        let s = self.m.get_sort(u);
+        let Some((eb, sb)) = self.fp_format_of(s) else {
+            return Some(self.m.mk_eq(u, v));
+        };
+        let b1 = self.fp_to_bv(u)?;
+        let b2 = self.fp_to_bv(v)?;
+        let w = eb + sb;
+        let nan = |me: &mut Self, b: AstId| {
+            let e = me.m.mk_bv_extract(w - 2, sb - 1, b);
+            let ones = me.m.mk_bv_numeral(super::pow2(eb) - Int::from(1), eb);
+            let eo = me.m.mk_eq(e, ones);
+            let sg = me.m.mk_bv_extract(sb - 2, 0, b);
+            let z = me.m.mk_bv(0, sb - 1);
+            let sz = me.m.mk_eq(sg, z);
+            let snz = me.m.mk_not(sz);
+            me.m.mk_and(&[eo, snz])
+        };
+        let same = self.m.mk_eq(b1, b2);
+        let n1 = nan(self, b1);
+        let n2 = nan(self, b2);
+        let both = self.m.mk_and(&[n1, n2]);
+        Some(self.m.mk_or(&[same, both]))
+    }
+
     /// The rounding constraints of every `to_fp` of a symbolic real whose
     /// image occurs in `goal` (see [`Self::fp_round_real_axioms`]).
     pub(super) fn fp_round_real_goal_axioms(&mut self, goal: AstId) -> Vec<AstId> {
