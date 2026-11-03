@@ -12,7 +12,7 @@
 //! detecting unsatisfiability but not complete for `Int` (a real solution need
 //! not be integral).
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use puremp::{Int, Rational};
@@ -264,6 +264,85 @@ pub fn model_with_diseqs_budgeted(
     diseqs: &[LinExpr],
     budget: &mut u64,
 ) -> SolveOutcome {
+    match model_with_diseqs_split(constraints, diseqs, budget) {
+        SolveOutcome::Exhausted => {
+            let mut own = CONVEX_DISEQ_BUDGET;
+            model_with_diseqs_convex(constraints, diseqs, &mut own)
+        }
+        r => r,
+    }
+}
+
+/// The simplex work [`model_with_diseqs_convex`] may spend when the
+/// disequality case split ran out of budget.
+const CONVEX_DISEQ_BUDGET: u64 = 200_000;
+
+/// [`model_with_diseqs_budgeted`] by convexity, in at most `2n + 1` solves for
+/// `n` disequalities: over the rationals the polyhedron of `constraints`
+/// minus finitely many hyperplanes is empty only when the polyhedron is empty
+/// or lies inside one of them (a convex set is never a finite union of
+/// lower-dimensional slices). A point is moved off each hyperplane it lies on
+/// toward a witness off it: on the segment, every disequality already met
+/// vanishes at most once, so one of a few blend factors keeps them all.
+fn model_with_diseqs_convex(
+    constraints: &[Constraint],
+    diseqs: &[LinExpr],
+    budget: &mut u64,
+) -> SolveOutcome {
+    let mut point = match model_budgeted(constraints, budget) {
+        SolveOutcome::Sat(m) => m,
+        other => return other,
+    };
+    for (i, d) in diseqs.iter().enumerate() {
+        if !d.eval(&point).is_zero() {
+            continue;
+        }
+        // A point of the polyhedron off `d = 0`, on either side.
+        let mut lt = constraints.to_vec();
+        lt.push(Constraint::lt(d.clone()));
+        let w = match model_budgeted(&lt, budget) {
+            SolveOutcome::Sat(w) => w,
+            SolveOutcome::Exhausted => return SolveOutcome::Exhausted,
+            SolveOutcome::Unsat => {
+                let mut gt = constraints.to_vec();
+                gt.push(Constraint::lt(d.neg()));
+                match model_budgeted(&gt, budget) {
+                    SolveOutcome::Sat(w) => w,
+                    other => return other,
+                }
+            }
+        };
+        let vars: BTreeSet<AstId> = point.keys().chain(w.keys()).copied().collect();
+        let at = |a: &Assignment, x: AstId| a.get(&x).cloned().unwrap_or_else(zero);
+        let mut moved = None;
+        for k in 1..=(i as i64 + 2) {
+            let t = Rational::new(Int::from(1), Int::from(k));
+            let blend: Assignment = vars
+                .iter()
+                .map(|&x| {
+                    let (a, b) = (at(&point, x), at(&w, x));
+                    (x, a.add(&b.sub(&a).mul(&t)))
+                })
+                .collect();
+            if diseqs[..=i].iter().all(|e| !e.eval(&blend).is_zero()) {
+                moved = Some(blend);
+                break;
+            }
+        }
+        match moved {
+            Some(b) => point = b,
+            None => return SolveOutcome::Exhausted,
+        }
+    }
+    SolveOutcome::Sat(point)
+}
+
+/// [`model_with_diseqs_budgeted`]'s model-guided case split.
+fn model_with_diseqs_split(
+    constraints: &[Constraint],
+    diseqs: &[LinExpr],
+    budget: &mut u64,
+) -> SolveOutcome {
     // Model-guided disequality splitting. Instead of eagerly case-splitting every
     // disequality (`< 0` vs `> 0`, 2^n leaves), first solve the constraints
     // *ignoring* the disequalities, then case-split only on a disequality the
@@ -291,11 +370,11 @@ pub fn model_with_diseqs_budgeted(
     };
     let mut lt = constraints.to_vec();
     lt.push(Constraint::lt(d.clone()));
-    match model_with_diseqs_budgeted(&lt, diseqs, budget) {
+    match model_with_diseqs_split(&lt, diseqs, budget) {
         SolveOutcome::Unsat => {
             let mut gt = constraints.to_vec();
             gt.push(Constraint::lt(d.neg())); // -d < 0  ⟺  d > 0
-            model_with_diseqs_budgeted(&gt, diseqs, budget)
+            model_with_diseqs_split(&gt, diseqs, budget)
         }
         other => other, // Sat or Exhausted short-circuits
     }
