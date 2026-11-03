@@ -1004,6 +1004,7 @@ mod seq_bounded;
 mod seq_nth;
 mod simplify_th;
 use simplify_th::PreTerm;
+mod str_int;
 mod str_uf;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
@@ -15239,6 +15240,7 @@ impl Context {
                 }
             }
         }
+        ax.extend(self.str_int_axioms(&present, &mut extra_lits));
         if self.str_lits.is_empty() {
             return ax;
         }
@@ -17812,6 +17814,21 @@ impl Context {
                     alpha.push(c as u32);
                 }
             }
+        }
+        // A digit when a `str.to_int` reads a string: its non-negative values
+        // need one.
+        if !alpha.iter().any(|c| (0x30..=0x39).contains(c))
+            && self.m.postorder(goal).iter().any(|&t| {
+                self.m.is_app(t)
+                    && matches!(
+                        self.str_op_decls
+                            .get(&self.m.app_decl(t))
+                            .map(String::as_str),
+                        Some("str.to_int" | "str.to-int")
+                    )
+            })
+        {
+            alpha.push(0x31);
         }
         // Per-variable candidate strings. A variable pinned to an exact length by
         // `str.len v = k` gets exactly-length-`k` candidates (so length-fixed word
@@ -45509,6 +45526,42 @@ mod tests {
         assert_eq!(out[1], "((a \"abab\"))");
         assert_eq!(out[2], "sat");
         assert!(out[3].starts_with("((b \"x"), "{out:?}");
+    }
+
+    #[test]
+    fn to_int_and_from_int_digit_facts() {
+        // `str.to_int` is at least -1; `str.from_int` is a digit string (or
+        // empty), so it never starts with "b" nor contains "a"; a positive
+        // `str.to_int` is witnessed by a digit string.
+        let script = "
+            (declare-const t String)
+            (declare-const j Int)
+            (assert (< (str.to_int t) (- 1)))
+            (check-sat)
+            (reset)
+            (declare-const t String)
+            (declare-const j Int)
+            (assert (= (str.from_int j) (str.++ \"ba\" t)))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (assert (str.contains (str.from_int i) \"a\"))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (declare-const t String)
+            (assert (or (= t \"a\") (= t \"ba\")))
+            (assert (= (str.from_int i) t))
+            (check-sat)
+            (reset)
+            (declare-const t String)
+            (assert (< 0 (str.to_int t)))
+            (check-sat)
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["unsat", "unsat", "unsat", "unsat", "sat"]
+        );
     }
 
     #[test]
