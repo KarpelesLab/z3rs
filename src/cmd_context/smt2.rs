@@ -5009,10 +5009,7 @@ impl Context {
                 if self.mentions_seq_terms(s) {
                     return Ok(Some(self.render_seq_term(s)));
                 }
-                // FP literals are fresh constants internally; print z3's spelling.
-                let fp_of = &self.fp_of;
-                let lit = |t: AstId| fp_of.get(&t).map(|&(b, eb, sb)| render_fp(b, eb, sb));
-                Ok(Some(self.m.pp_with(s, &lit)))
+                Ok(Some(self.simplify_pp(s)))
             }
             "apply" => {
                 // (apply tactic) — apply a goal-transforming tactic and print the
@@ -7042,6 +7039,28 @@ impl Context {
         }
         out.push(')');
         Some(out)
+    }
+
+    /// A `simplify` result in z3's spelling: FP and string literals (fresh
+    /// constants internally) as literals, symbolic string operations
+    /// (markers) by their operation name.
+    fn simplify_pp(&self, t: AstId) -> String {
+        let custom = |u: AstId| -> Option<String> {
+            if let Some(&(b, eb, sb)) = self.fp_of.get(&u) {
+                return Some(render_fp(b, eb, sb));
+            }
+            if let Some(cps) = self.str_value(u) {
+                return Some(smt_string_literal(&cps));
+            }
+            let a = self.m.app(u)?;
+            let op = self.str_op_decls.get(&a.decl)?;
+            if a.args.is_empty() {
+                return None;
+            }
+            let args: Vec<String> = a.args.iter().map(|&x| self.simplify_pp(x)).collect();
+            Some(alloc::format!("({op} {})", args.join(" ")))
+        };
+        self.m.pp_with(t, &custom)
     }
 
     /// The `:pp.decimal-precision` digit count when `:pp.decimal` is on.
@@ -44256,6 +44275,19 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "sat"]);
+    }
+
+    #[test]
+    fn simplify_prints_string_literals_and_operations() {
+        let script = "
+            (declare-const a String)
+            (simplify (str.++ a \"x\"))
+            (simplify (= (str.len a) (str.len \"abc\")))
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["(str.++ a \"x\")", "(= (str.len a) 3)"]
+        );
     }
 
     #[test]
