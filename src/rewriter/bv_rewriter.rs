@@ -20,7 +20,6 @@ use puremp::Int;
 use crate::ast::bv::BvOp;
 use crate::ast::manager::AstManager;
 use crate::ast::{AstId, DeclKind};
-use crate::util::symbol::Symbol;
 
 /// `2^w`.
 fn pow2(w: u32) -> Int {
@@ -58,7 +57,7 @@ fn bvop_of_kind(kind: DeclKind) -> Option<BvOp> {
 /// `args`. Returns `None` if `decl` is not a bit-vector op this rewriter
 /// handles, or the operands are not concrete enough to fold.
 pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Option<AstId> {
-    let bvfid = m.get_family_id(Symbol::new("bv"))?;
+    let bvfid = m.get_family_id_named("bv")?;
     let d = m.func_decl(decl).expect("app decl");
     if d.info.family_id != bvfid {
         return None;

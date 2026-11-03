@@ -27,12 +27,48 @@ pub fn encode(m: &AstManager, root: AstId, s: &mut Solver) -> Lit {
 /// `(<= x y)`) to the SAT literal representing it. The SMT layer uses this to
 /// connect the Boolean skeleton back to theory reasoning.
 pub fn encode_tracking(m: &AstManager, root: AstId, s: &mut Solver) -> (Lit, BTreeMap<AstId, Lit>) {
+    let mut st = TseitinState::default();
+    let (top, _) = encode_more(m, root, s, &mut st);
+    (top, st.atoms)
+}
+
+/// The state an incremental encoding keeps between formulas (see
+/// [`encode_more`]): the literal of every encoded subformula and opaque atom.
+#[derive(Default)]
+pub struct TseitinState {
+    cache: BTreeMap<AstId, Lit>,
+    true_lit: Option<Lit>,
+    /// Opaque atoms → their literal (propositional vars and theory atoms).
+    pub atoms: BTreeMap<AstId, Lit>,
+}
+
+impl TseitinState {
+    /// Every encoded subformula and atom with its literal.
+    pub fn lits(&self) -> impl Iterator<Item = (AstId, Lit)> + '_ {
+        self.cache
+            .iter()
+            .chain(self.atoms.iter())
+            .map(|(&t, &l)| (t, l))
+    }
+}
+
+/// Encode one more formula `root` into `s`, sharing the literals of the
+/// subformulas and atoms `st` already encoded (z3's `internalize` of a
+/// formula asserted later). Returns `root`'s literal and the atoms seen for
+/// the first time, in [`AstId`] order.
+pub fn encode_more(
+    m: &AstManager,
+    root: AstId,
+    s: &mut Solver,
+    st: &mut TseitinState,
+) -> (Lit, Vec<(AstId, Lit)>) {
     let mut enc = Tseitin {
         m,
         s,
-        cache: BTreeMap::new(),
-        true_lit: None,
-        atoms: BTreeMap::new(),
+        cache: core::mem::take(&mut st.cache),
+        true_lit: st.true_lit,
+        atoms: core::mem::take(&mut st.atoms),
+        fresh_atoms: Vec::new(),
     };
     // Encode inner connectives first, in the order the recursion reaches them
     // (constant stack on deep formulas; same variable numbering).
@@ -40,7 +76,16 @@ pub fn encode_tracking(m: &AstManager, root: AstId, s: &mut Solver) -> (Lit, BTr
         enc.encode(t);
     }
     let top = enc.encode(root);
-    (top, enc.atoms)
+    let mut fresh: Vec<(AstId, Lit)> = enc
+        .fresh_atoms
+        .iter()
+        .map(|&a| (a, enc.atoms[&a]))
+        .collect();
+    fresh.sort_by_key(|&(a, _)| a);
+    st.cache = enc.cache;
+    st.true_lit = enc.true_lit;
+    st.atoms = enc.atoms;
+    (top, fresh)
 }
 
 /// Whether [`Tseitin::encode`] encodes `e` from its arguments (a connective)
@@ -73,6 +118,8 @@ struct Tseitin<'a> {
     true_lit: Option<Lit>,
     /// Opaque atoms → their literal (propositional vars and theory atoms).
     atoms: BTreeMap<AstId, Lit>,
+    /// The atoms this encoding created.
+    fresh_atoms: Vec<AstId>,
 }
 
 impl Tseitin<'_> {
@@ -144,6 +191,7 @@ impl Tseitin<'_> {
             // Opaque Boolean atom (a propositional variable / theory atom).
             let l = self.fresh();
             self.atoms.insert(e, l);
+            self.fresh_atoms.push(e);
             l
         }
     }

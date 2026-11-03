@@ -11,17 +11,25 @@
 //! (`unsat`) or no new instance (E-matching is complete only up to its
 //! triggers, so that is no `sat`).
 //!
-//! Here each round decides the ground goal with the instances so far, takes
-//! the relevant terms and their congruence classes from its model, and adds
-//! every instance the triggers match among them. Instances are consequences
-//! of the universals, so an `unsat` round is a refutation.
+//! Here each round takes the relevant terms and their congruence classes
+//! from a model of the ground goal with the instances so far, and adds every
+//! instance the triggers match among them. Instances are consequences of the
+//! universals, so an `unsat` round is a refutation. Within the fragment of
+//! Booleans, arithmetic and uninterpreted functions the rounds run inside one
+//! persistent search ([`crate::smt::SmtCore`], see
+//! `Context::online_ematch_refute`): each final check's model drives a
+//! round, whose instances are preprocessed and internalized on the fly and the
+//! search resumes with what it learnt. Elsewhere each round decides the goal
+//! afresh.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use super::Context;
+use super::{Context, LiftCtx};
 use crate::ast::AstId;
+use crate::ast::arith::ArithOp;
 use crate::rewriter::substitute;
+use crate::smt::SmtCore;
 use crate::smt::{Model, SmtResult, Value};
 
 /// The most bindings one trigger set may produce in one round.
@@ -57,28 +65,327 @@ fn union(parent: &mut BTreeMap<AstId, AstId>, a: AstId, b: AstId) -> bool {
     true
 }
 
+/// The memo of [`Context::online_preprocess`] across formulas.
+struct OnlinePre {
+    /// The finite function tables: rewritten terms, and each replaced
+    /// constant-argument application with its constant.
+    table_memo: BTreeMap<AstId, AstId>,
+    table: BTreeMap<AstId, AstId>,
+    /// The functions tabled.
+    table_decls: BTreeSet<AstId>,
+    /// The term-`ite` lifting.
+    lift: LiftCtx,
+}
+
+/// The instantiation state shared by the rounds of one refutation.
+#[derive(Default)]
+struct Rounds {
+    /// The instances so far, in creation order.
+    instances: Vec<AstId>,
+    seen: BTreeSet<AstId>,
+    /// Every binding instantiated so far, as (universal, binder terms):
+    /// like z3's fingerprints, a binding is new only modulo the classes.
+    done: Vec<(usize, Vec<AstId>)>,
+}
+
 impl Context {
+    /// The user functions and the quantifier abstractions: a relevant
+    /// abstraction `P(t)` triggers its definitions `∀xs. P(t) ⇒ φ` and
+    /// `¬P(t) ⇒ ¬φ[sk(t)]`, as z3 instantiates a nested quantifier whose
+    /// atom holds and skolemizes one whose atom fails.
+    fn ematch_user_decls(&self) -> BTreeSet<AstId> {
+        let mut user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        user_decls.extend(self.quant_pred_decls.iter().copied());
+        user_decls
+    }
+
+    /// One E-matching round over `model`: the instances of the universals
+    /// (with their trigger sets `trigs`) at the bindings the relevant terms
+    /// of the assertions and the instances so far match, new modulo the
+    /// model's congruence classes. They join `st.instances`; returns how many.
+    /// `known` holds the truth values the search assigned to formulas,
+    /// read before the model's evaluation.
+    fn ematch_round(
+        &mut self,
+        universals: &[(Vec<AstId>, AstId)],
+        trigs: &[Vec<Vec<AstId>>],
+        user_decls: &BTreeSet<AstId>,
+        model: &mut Model,
+        known: BTreeMap<AstId, bool>,
+        st: &mut Rounds,
+    ) -> usize {
+        let mut roots = self.assertions.clone();
+        roots.extend(st.instances.iter().copied());
+        let mut memo = known;
+        let terms = self.relevant_terms(&roots, model, &mut memo);
+        let by_decl = self.relevant_classes(&terms, model, user_decls, &mut memo);
+        let before = st.instances.len();
+        let mut fingerprints: BTreeSet<(usize, Vec<AstId>)> = st
+            .done
+            .iter()
+            .map(|(ui, ts)| (*ui, ts.iter().map(|&t| self.class_rep(t)).collect()))
+            .collect();
+        for (ui, (vars, body)) in universals.iter().enumerate() {
+            let vs: BTreeSet<AstId> = vars.iter().copied().collect();
+            for set in &trigs[ui] {
+                for binding in self.search_ematch_set(set, &vs, &by_decl) {
+                    // New only modulo the classes (z3's fingerprints);
+                    // instantiated with the matched terms.
+                    let terms: Vec<AstId> = vars.iter().map(|v| binding[v]).collect();
+                    let key: Vec<AstId> = terms.iter().map(|&t| self.class_rep(t)).collect();
+                    if !fingerprints.insert((ui, key)) {
+                        continue;
+                    }
+                    st.done.push((ui, terms.clone()));
+                    let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(terms).collect();
+                    let raw = substitute(&mut self.m, *body, &subst);
+                    let mut inst = crate::rewriter::simplify(&mut self.m, raw);
+                    for _ in 0..3 {
+                        let folded = self.dt_fold(inst);
+                        let next = crate::rewriter::simplify(&mut self.m, folded);
+                        if next == inst {
+                            break;
+                        }
+                        inst = next;
+                    }
+                    if self.m.is_true(inst) || !st.seen.insert(inst) {
+                        continue;
+                    }
+                    st.instances.push(inst);
+                }
+            }
+        }
+        st.instances.len() - before
+    }
+
+    /// Relevancy-guided E-matching inside one persistent search (z3's
+    /// `smt::context` with its quantifier manager): the ground goal is
+    /// internalized once into an [`SmtCore`], and each final check's model
+    /// drives an E-matching round whose instances are internalized into the
+    /// same search, which resumes with every clause it learnt (a round no
+    /// longer re-decides the goal from scratch). Each formula goes through the
+    /// per-term preprocessing of [`Self::decide_combined`] incrementally: the
+    /// finite function tables and the term-`ite` lifting keep their memo
+    /// across instances, so a term shared by two instances is preprocessed
+    /// once. `None` outside the fragment this preprocessing covers (Booleans,
+    /// linear arithmetic and uninterpreted functions over uninterpreted sorts,
+    /// where [`Self::decide_combined`] adds nothing else); else whether the
+    /// universals were refuted.
+    fn online_ematch_refute(
+        &mut self,
+        universals: &[(Vec<AstId>, AstId)],
+        trigs: &[Vec<Vec<AstId>>],
+        user_decls: &BTreeSet<AstId>,
+    ) -> Option<Option<SmtResult>> {
+        const MAX_ROUNDS: usize = 60;
+        const MAX_INSTANCES: usize = 20_000;
+        // Each round reads the relevant terms of every instance so far: past
+        // this many instances read in total the search gives up (`unknown`).
+        const MAX_WORK: usize = 600_000;
+        let base = self.conjunction();
+        let mut roots = alloc::vec![base];
+        roots.extend(universals.iter().map(|&(_, b)| b));
+        if !self.online_fragment(&roots) {
+            return None;
+        }
+        let members = self.datatype_member_decls();
+        let table_decls: BTreeSet<AstId> = self
+            .funcs
+            .values()
+            .copied()
+            .filter(|d| !members.contains(d))
+            .collect();
+        let mut pre = OnlinePre {
+            table_memo: BTreeMap::new(),
+            table: BTreeMap::new(),
+            lift: LiftCtx {
+                defs: Vec::new(),
+                cache: BTreeMap::new(),
+                dm: BTreeMap::new(),
+                toint: BTreeMap::new(),
+                rdiv: BTreeMap::new(),
+                zero_divs: Vec::new(),
+                zero_rdivs: Vec::new(),
+                sqrt: BTreeMap::new(),
+                lin_facts: Vec::new(),
+            },
+            table_decls,
+        };
+        let mut core = SmtCore::new();
+        core.eager_equalities();
+        let goal = self.online_preprocess(base, &mut pre);
+        let goal = self.with_axioms(goal);
+        core.assert(&self.m, goal);
+        let mut st = Rounds::default();
+        // Decide `false` first, as z3 does: an atom left open by the search
+        // then keeps what it guards irrelevant.
+        use core::sync::atomic::Ordering::Relaxed;
+        let saved_phase = crate::sat::solver::DECIDE_FALSE_FIRST.swap(true, Relaxed);
+        let mut verdict = None;
+        let mut work = 0;
+        for _ in 0..MAX_ROUNDS {
+            let (res, model) = core.check(&self.m);
+            match res {
+                SmtResult::Unsat => {
+                    verdict = Some(SmtResult::Unsat);
+                    break;
+                }
+                SmtResult::Unknown => break,
+                SmtResult::Sat => {}
+            }
+            let Some(mut model) = model else { break };
+            // The applications replaced by their table entries take those values.
+            for (&app, &v) in &pre.table {
+                match model.eval_value(&self.m, v) {
+                    Value::Uninterp(..) => model.pin_equal(&self.m, app, v),
+                    val => model.pin_value(app, val),
+                }
+            }
+            let before = st.instances.len();
+            // The search's truth values, also for the original form of each
+            // preprocessed formula.
+            let mut known = core.assigned();
+            for (&t, &tabled) in &pre.table_memo {
+                let lifted = pre.lift.cache.get(&tabled).copied().unwrap_or(tabled);
+                if t != lifted
+                    && let Some(&v) = known.get(&lifted)
+                {
+                    known.insert(t, v);
+                }
+            }
+            if self.ematch_round(universals, trigs, user_decls, &mut model, known, &mut st) == 0 {
+                break;
+            }
+            for i in before..st.instances.len() {
+                let inst = st.instances[i];
+                let p = self.online_preprocess(inst, &mut pre);
+                core.assert(&self.m, p);
+            }
+            work += st.instances.len();
+            if st.instances.len() > MAX_INSTANCES || work > MAX_WORK {
+                break;
+            }
+        }
+        crate::sat::solver::DECIDE_FALSE_FIRST.store(saved_phase, Relaxed);
+        Some(verdict)
+    }
+
+    /// The formula `f` ready for the search: the finite function tables and
+    /// the term-`ite` lifting of [`Self::decide_combined`], with the memo of
+    /// both kept in `pre` across formulas, and the lifting's new definitions.
+    fn online_preprocess(&mut self, f: AstId, pre: &mut OnlinePre) -> AstId {
+        let mut table: BTreeMap<AstId, AstId> = core::mem::take(&mut pre.table);
+        let decls = core::mem::take(&mut pre.table_decls);
+        let tabled = self.table_rw(f, &decls, &mut pre.table_memo, &mut table);
+        pre.table = table;
+        pre.table_decls = decls;
+        let mark = pre.lift.defs.len();
+        // Inner terms first (constant stack on deep goals).
+        for t in self.m.postorder_ltr(tabled, |_| true) {
+            self.lift_terms(t, &mut pre.lift);
+        }
+        let lifted = self.lift_terms(tabled, &mut pre.lift);
+        if pre.lift.defs.len() == mark {
+            lifted
+        } else {
+            let mut parts = pre.lift.defs[mark..].to_vec();
+            parts.push(lifted);
+            self.m.mk_and(&parts)
+        }
+    }
+
+    /// Are the `roots` within the fragment [`Self::online_ematch_refute`]
+    /// preprocesses: Boolean connectives, arithmetic over `Int` and `Real`
+    /// (products of variables opaque), equalities, and uninterpreted functions and constants over
+    /// `Bool`, the arithmetic sorts and plain uninterpreted sorts?
+    fn online_fragment(&self, roots: &[AstId]) -> bool {
+        let mut decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        decls.extend(self.quant_pred_decls.iter().copied());
+        self.m
+            .postorder_many(roots)
+            .into_iter()
+            .all(|t| self.online_term(t, &decls))
+    }
+
+    /// Is the term `t` itself (not its arguments) in the fragment of
+    /// [`Self::online_fragment`], `decls` being the user functions and the
+    /// quantifier abstractions?
+    fn online_term(&self, t: AstId, decls: &BTreeSet<AstId>) -> bool {
+        let m = &self.m;
+        let Some(app) = m.app(t) else {
+            return false;
+        };
+        let s = m.get_sort(t);
+        if !(m.is_bool_sort(s) || m.is_arith_sort(s) || self.is_plain_uninterp_sort(s))
+            || self.str_symbolic.contains(&t)
+            || self.quant_atoms.contains(&t)
+        {
+            return false;
+        }
+        if m.is_true(t)
+            || m.is_false(t)
+            || m.is_and(t)
+            || m.is_or(t)
+            || m.is_not(t)
+            || m.is_implies(t)
+            || m.is_xor(t)
+            || m.is_ite(t)
+            || m.is_eq(t)
+        {
+            return true;
+        }
+        match m.arith_op(t) {
+            // A nonlinear product is an opaque term to the search (an
+            // abstraction: its refutations stand).
+            Some(
+                ArithOp::Num
+                | ArithOp::Le
+                | ArithOp::Ge
+                | ArithOp::Lt
+                | ArithOp::Gt
+                | ArithOp::Add
+                | ArithOp::Sub
+                | ArithOp::Uminus
+                | ArithOp::Mul,
+            ) => return true,
+            Some(_) => return false,
+            None => {}
+        }
+        if app.args.is_empty() {
+            return m.is_uninterp_const(t);
+        }
+        // The user functions, quantifier abstractions and their skolems.
+        decls.contains(&app.decl)
+            || self
+                .decl_name(app.decl)
+                .is_some_and(|n| n.starts_with("!sk!"))
+    }
+
     /// Refute the universals by relevancy-guided E-matching rounds (see the
     /// module documentation). `Some(Unsat)` on a refutation; `None` when the
     /// matching reaches a fixpoint, the ground decision is not definite, or
     /// the round / instance budget runs out.
     pub(super) fn relevant_ematch_refute(&mut self) -> Option<SmtResult> {
-        const MAX_ROUNDS: usize = 40;
-        const MAX_INSTANCES: usize = 6000;
-        // Each round decides the whole goal afresh, so the rounds together
-        // cost about the sum of the goals' sizes: past this many nodes the
-        // search gives up (a sound `unknown`) rather than run unboundedly.
-        const MAX_WORK: usize = 100_000;
         if self.universals.is_empty() || !self.fp_deferred_decls.is_empty() {
             return None;
         }
+        // An undecided goal over quantifier abstractions is retried with
+        // their definitions (`check_sat_quant_defs`): the matching waits for
+        // those, which it needs to instantiate the nested quantifiers.
+        if !self.in_quant_defs && !self.quant_defs.is_empty() {
+            let mut roots: Vec<AstId> = self.universals.iter().map(|&(_, b)| b).collect();
+            roots.extend(self.assertions.iter().copied());
+            if self
+                .m
+                .postorder_many(&roots)
+                .iter()
+                .any(|&t| self.is_quant_atom(t))
+            {
+                return None;
+            }
+        }
         let universals = self.universals.clone();
-        // The user functions and the quantifier abstractions: a relevant
-        // abstraction `P(t)` triggers its definitions `∀xs. P(t) ⇒ φ` and
-        // `¬P(t) ⇒ ¬φ[sk(t)]`, as z3 instantiates a nested quantifier whose
-        // atom holds and skolemizes one whose atom fails.
-        let mut user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
-        user_decls.extend(self.quant_pred_decls.iter().copied());
+        let user_decls = self.ematch_user_decls();
         let trigs: Vec<Vec<Vec<AstId>>> = universals
             .iter()
             .map(|(vars, body)| self.search_triggers(vars, *body, &user_decls))
@@ -88,20 +395,39 @@ impl Context {
         }
         let saved_class = core::mem::take(&mut self.ematch_class);
         let saved_members = core::mem::take(&mut self.ematch_members);
+        let verdict = match self.online_ematch_refute(&universals, &trigs, &user_decls) {
+            Some(v) => v,
+            None => self.ematch_rounds_afresh(&universals, &trigs, &user_decls),
+        };
+        self.ematch_class = saved_class;
+        self.ematch_members = saved_members;
+        verdict
+    }
+
+    /// The E-matching rounds outside [`Self::online_ematch_refute`]'s
+    /// fragment: each round decides the ground goal with the instances so far
+    /// afresh with [`Self::decide_combined`].
+    fn ematch_rounds_afresh(
+        &mut self,
+        universals: &[(Vec<AstId>, AstId)],
+        trigs: &[Vec<Vec<AstId>>],
+        user_decls: &BTreeSet<AstId>,
+    ) -> Option<SmtResult> {
+        const MAX_ROUNDS: usize = 40;
+        const MAX_INSTANCES: usize = 6000;
+        // Each round decides the whole goal afresh, so the rounds together
+        // cost about the sum of the goals' sizes: past this many nodes the
+        // search gives up (a sound `unknown`) rather than run unboundedly.
+        const MAX_WORK: usize = 100_000;
         let base = self.conjunction();
-        let mut instances: Vec<AstId> = Vec::new();
-        let mut seen: BTreeSet<AstId> = BTreeSet::new();
-        // Every binding instantiated so far, as (universal, binder terms):
-        // like z3's fingerprints, a binding is new only modulo the classes.
-        let mut done: Vec<(usize, Vec<AstId>)> = Vec::new();
-        let mut verdict = None;
+        let mut st = Rounds::default();
         let mut work = 0;
         for _ in 0..MAX_ROUNDS {
-            let goal = if instances.is_empty() {
+            let goal = if st.instances.is_empty() {
                 base
             } else {
                 let mut conj = alloc::vec![base];
-                conj.extend(instances.iter().copied());
+                conj.extend(st.instances.iter().copied());
                 self.m.mk_and(&conj)
             };
             work += self.m.postorder(goal).len();
@@ -115,60 +441,25 @@ impl Context {
             let (res, model, _) = self.decide_combined(goal);
             crate::sat::solver::DECIDE_FALSE_FIRST.store(saved_phase, Relaxed);
             match res {
-                SmtResult::Unsat => {
-                    verdict = Some(SmtResult::Unsat);
-                    break;
-                }
+                SmtResult::Unsat => return Some(SmtResult::Unsat),
                 SmtResult::Unknown => break,
                 SmtResult::Sat => {}
             }
             let Some(mut model) = model else { break };
-            let mut roots = self.assertions.clone();
-            roots.extend(instances.iter().copied());
-            let terms = self.relevant_terms(&roots, &mut model);
-            let by_decl = self.relevant_classes(&terms, &mut model, &user_decls);
-            let before = instances.len();
-            let mut fingerprints: BTreeSet<(usize, Vec<AstId>)> = done
-                .iter()
-                .map(|(ui, ts)| (*ui, ts.iter().map(|&t| self.class_rep(t)).collect()))
-                .collect();
-            for (ui, (vars, body)) in universals.iter().enumerate() {
-                let vs: BTreeSet<AstId> = vars.iter().copied().collect();
-                for set in &trigs[ui] {
-                    for binding in self.search_ematch_set(set, &vs, &by_decl) {
-                        // New only modulo the classes (z3's fingerprints);
-                        // instantiated with the matched terms.
-                        let terms: Vec<AstId> = vars.iter().map(|v| binding[v]).collect();
-                        let key: Vec<AstId> = terms.iter().map(|&t| self.class_rep(t)).collect();
-                        if !fingerprints.insert((ui, key)) {
-                            continue;
-                        }
-                        done.push((ui, terms.clone()));
-                        let subst: Vec<(AstId, AstId)> = vars.iter().copied().zip(terms).collect();
-                        let raw = substitute(&mut self.m, *body, &subst);
-                        let mut inst = crate::rewriter::simplify(&mut self.m, raw);
-                        for _ in 0..3 {
-                            let folded = self.dt_fold(inst);
-                            let next = crate::rewriter::simplify(&mut self.m, folded);
-                            if next == inst {
-                                break;
-                            }
-                            inst = next;
-                        }
-                        if self.m.is_true(inst) || !seen.insert(inst) {
-                            continue;
-                        }
-                        instances.push(inst);
-                    }
-                }
-            }
-            if instances.len() == before || instances.len() > MAX_INSTANCES {
+            if self.ematch_round(
+                universals,
+                trigs,
+                user_decls,
+                &mut model,
+                BTreeMap::new(),
+                &mut st,
+            ) == 0
+                || st.instances.len() > MAX_INSTANCES
+            {
                 break;
             }
         }
-        self.ematch_class = saved_class;
-        self.ematch_members = saved_members;
-        verdict
+        None
     }
 
     /// The representative of `t`'s E-matching class: its oldest (smallest)
@@ -220,10 +511,14 @@ impl Context {
     }
 
     /// The terms relevant in `model` from the asserted `roots` (z3's relevancy
-    /// propagation, see the module documentation), in discovery order.
-    /// Quantifiers are not entered.
-    fn relevant_terms(&self, roots: &[AstId], model: &mut Model) -> Vec<AstId> {
-        let mut memo: BTreeMap<AstId, bool> = BTreeMap::new();
+    /// propagation, see the module documentation), in discovery order, with
+    /// the truth values found in `memo`. Quantifiers are not entered.
+    fn relevant_terms(
+        &self,
+        roots: &[AstId],
+        model: &mut Model,
+        memo: &mut BTreeMap<AstId, bool>,
+    ) -> Vec<AstId> {
         let mut seen: BTreeSet<AstId> = BTreeSet::new();
         let mut out = Vec::new();
         let mut stack: Vec<AstId> = roots.iter().rev().copied().collect();
@@ -245,19 +540,19 @@ impl Context {
                     .find(|&a| ctx.relevancy_value(a, model, memo) == want)
             };
             let next: Vec<AstId> = if m.is_ite(t) {
-                let c = self.relevancy_value(args[0], model, &mut memo);
+                let c = self.relevancy_value(args[0], model, memo);
                 alloc::vec![args[0], if c { args[1] } else { args[2] }]
             } else if boolean && (m.is_and(t) || m.is_or(t)) {
-                let v = self.relevancy_value(t, model, &mut memo);
+                let v = self.relevancy_value(t, model, memo);
                 // A true disjunction / false conjunction needs one witness.
                 if v == m.is_or(t) {
-                    pick(v, self, model, &mut memo).into_iter().collect()
+                    pick(v, self, model, memo).into_iter().collect()
                 } else {
                     args
                 }
             } else if boolean && m.is_implies(t) {
-                if self.relevancy_value(t, model, &mut memo) {
-                    if !self.relevancy_value(args[0], model, &mut memo) {
+                if self.relevancy_value(t, model, memo) {
+                    if !self.relevancy_value(args[0], model, memo) {
                         alloc::vec![args[0]]
                     } else {
                         alloc::vec![args[1]]
@@ -274,17 +569,18 @@ impl Context {
     }
 
     /// Install as the E-matching classes the congruence closure of the
-    /// equalities between the relevant `terms` that hold in `model`, and
+    /// equalities between the relevant `terms` that hold in `model` (or by
+    /// `memo`), and
     /// return the relevant user-function applications by declaration.
     fn relevant_classes(
         &mut self,
         terms: &[AstId],
         model: &mut Model,
         user_decls: &BTreeSet<AstId>,
+        memo: &mut BTreeMap<AstId, bool>,
     ) -> BTreeMap<AstId, BTreeSet<AstId>> {
         let mut parent: BTreeMap<AstId, AstId> = BTreeMap::new();
         let mut by_decl: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
-        let mut memo: BTreeMap<AstId, bool> = BTreeMap::new();
         for &t in terms {
             let Some(app) = self.m.app(t) else { continue };
             if user_decls.contains(&app.decl) {
@@ -294,8 +590,7 @@ impl Context {
                 continue;
             }
             let (a, b) = (app.args[0], app.args[1]);
-            if self.m.is_bool_sort(self.m.get_sort(a)) || !self.relevancy_value(t, model, &mut memo)
-            {
+            if self.m.is_bool_sort(self.m.get_sort(a)) || !self.relevancy_value(t, model, memo) {
                 continue;
             }
             union(&mut parent, a, b);

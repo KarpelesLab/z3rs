@@ -67,6 +67,18 @@ impl ArithOnline {
         self.bounds[v] = Some((bt, bf));
     }
 
+    /// The simplex's current assignment (a model of the asserted bounds after
+    /// a pass that reported no conflict, unless that pass ran out of budget).
+    pub fn model(&self) -> crate::smt::arith::Assignment {
+        self.lra.model()
+    }
+
+    /// Retract the whole trail (it is asserted again by the next pass), as
+    /// when the equalities passed with it are derived afresh.
+    pub fn retract_all(&mut self) {
+        self.rollback(0);
+    }
+
     /// Retract every asserted trail position `≥ pos`.
     fn rollback(&mut self, pos: usize) {
         while let Some(&(p, ntags)) = self.marks.last() {

@@ -42,7 +42,7 @@ impl AstManager {
 
     /// The registered array family id, if arrays have been used yet.
     fn array_fid_opt(&self) -> Option<FamilyId> {
-        self.get_family_id(Symbol::new("array"))
+        self.get_family_id_named("array")
     }
 
     /// The array sort `(Array index elem)`.

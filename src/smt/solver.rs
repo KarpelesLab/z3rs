@@ -43,7 +43,7 @@ use crate::ast::manager::AstManager;
 use crate::sat::literal::Lit;
 use crate::sat::solver::{SatResult, Solver};
 use crate::sat::solver::{TheoryCtx, TheoryHook, TheoryProp};
-use crate::sat::tseitin::encode_tracking;
+use crate::sat::tseitin::{TseitinState, encode_more};
 use crate::smt::arith::{
     Assignment, Constraint, LinExpr, Rel, SolveOutcome, feasible_core, model_with_diseqs_budgeted,
     project,
@@ -80,95 +80,306 @@ pub fn check(m: &AstManager, formula: AstId) -> SmtResult {
 /// satisfiable (`None` when unsat). The model can evaluate terms via
 /// [`Model::eval`], backing `(get-value …)` / `(get-model)`.
 pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>) {
-    let mut sat = Solver::new();
-    let (top, atoms) = encode_tracking(m, formula, &mut sat);
-    sat.add_clause(&[top]);
+    let mut core = SmtCore::new();
+    core.assert(m, formula);
+    core.check(m)
+}
 
+/// A persistent DPLL(T) search over a growing set of ground formulas (z3's
+/// `smt::context` between `assert_expr` calls): [`SmtCore::assert`]
+/// internalizes one more formula into the same SAT solver and theories, and
+/// [`SmtCore::check`] resumes the search, keeping every clause learnt so far.
+/// [`check_model`] is one `assert` and one `check`.
+pub struct SmtCore {
+    sat: Solver,
+    enc: TseitinState,
     // Classify theory atoms. *Every* equality feeds the EUF congruence closure,
     // so uninterpreted functions get congruence regardless of their range sort
     // (an equality `(f x) = (f y)` between Int-sorted applications still yields a
     // congruence conflict when `x = y`). Arithmetic-sorted equalities and the
     // comparisons additionally feed the LRA/LIA theory.
-    let mut euf_eq: Vec<(Lit, AstId, AstId)> = Vec::new();
-    let mut euf_roots: Vec<AstId> = Vec::new();
-    let mut arith_atoms: Vec<ArithAtom> = Vec::new();
+    euf_eq: Vec<(Lit, AstId, AstId)>,
+    euf_roots: Vec<AstId>,
+    arith_atoms: Vec<ArithAtom>,
     // Boolean-sorted uninterpreted applications (predicates): congruent instances
     // must share a truth value, so they need the congruence closure too.
-    let mut pred_atoms: Vec<(Lit, AstId)> = Vec::new();
-    for (&atom, &lit) in &atoms {
-        if m.is_eq(atom) {
-            let args = m.app_args(atom);
-            let (a, b) = (args[0], args[1]);
-            euf_eq.push((lit, a, b));
-            euf_roots.push(a);
-            euf_roots.push(b);
-            if m.is_arith_sort(m.get_sort(a)) {
-                arith_atoms.push(ArithAtom::eq(m, lit, a, b));
-            }
-        } else if let Some(op) = m.arith_op(atom)
-            && matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
-        {
-            let args = m.app_args(atom);
-            arith_atoms.push(ArithAtom::cmp(m, lit, op, args[0], args[1]));
-            // The compared terms are EUF terms too, so uninterpreted applications
-            // among them (e.g. f(a) in f(a) > f(b)) get congruence.
-            euf_roots.push(args[0]);
-            euf_roots.push(args[1]);
-        } else if m.is_app(atom) && !m.app_args(atom).is_empty() {
-            // A predicate application p(…): a congruence term whose truth is `lit`.
-            pred_atoms.push((lit, atom));
-            euf_roots.push(atom);
+    pred_atoms: Vec<(Lit, AstId)>,
+    /// The interned e-graphs of the final check, built once per term universe.
+    euf_bases: Option<(ProofEgraph, Egraph)>,
+    split_memo: SplitAtoms,
+    eq_pairs: BTreeSet<(AstId, AstId)>,
+    /// The online congruence closure (rebuilt when the atoms grow) and simplex.
+    euf: Option<IncEgraph>,
+    euf_stale: bool,
+    arith: Option<ArithOnline>,
+    /// The arithmetic atoms the online simplex does not watch yet.
+    arith_new: usize,
+    /// The congruence equalities passed to the arithmetic so far, compiled.
+    eqs: Vec<(usize, Constraint, Vec<Lit>)>,
+    /// Axiomatize each arithmetic equality atom when it is internalized
+    /// (see [`SmtCore::eager_equalities`]).
+    eager_eqs: bool,
+}
+
+impl Default for SmtCore {
+    fn default() -> SmtCore {
+        SmtCore::new()
+    }
+}
+
+impl SmtCore {
+    /// An empty search (no formula asserted: satisfiable).
+    pub fn new() -> SmtCore {
+        SmtCore {
+            sat: Solver::new(),
+            enc: TseitinState::default(),
+            euf_eq: Vec::new(),
+            euf_roots: Vec::new(),
+            arith_atoms: Vec::new(),
+            pred_atoms: Vec::new(),
+            euf_bases: None,
+            split_memo: BTreeMap::new(),
+            eq_pairs: BTreeSet::new(),
+            euf: None,
+            euf_stale: false,
+            arith: None,
+            arith_new: 0,
+            eqs: Vec::new(),
+            eager_eqs: false,
         }
     }
 
-    let has_theory = !euf_eq.is_empty() || !arith_atoms.is_empty() || !pred_atoms.is_empty();
-    // The offline lazy loop enumerates theory-atom assignments via blocking
-    // clauses; that is worst-case exponential, so cap the number of rounds and
-    // return a sound `unknown` on exhaustion (rather than looping indefinitely).
-    let mut rounds: u32 = 0;
-    // A single work budget shared across *all* theory checks in this decision, so
-    // the whole call terminates in bounded time even when many blocking-clause
-    // rounds each face an expensive (blow-up-prone) theory check.
-    let mut budget = BB_WORK_BUDGET;
-    let mut euf_bases: Option<(ProofEgraph, Egraph)> = None;
-    // The online congruence closure: EUF conflicts and equality propagation
-    // during the search, on partial assignments (the final check below still
-    // decides arithmetic and theory combination on each full assignment).
-    let mut split_memo: SplitAtoms = BTreeMap::new();
-    let mut eq_pairs: BTreeSet<(AstId, AstId)> = euf_eq
-        .iter()
-        .map(|&(_, a, b)| (a.min(b), a.max(b)))
-        .collect();
-    let mut online = Online {
-        m,
-        eqs: Vec::new(),
-        euf: (!euf_eq.is_empty() || !pred_atoms.is_empty())
-            .then(|| IncEgraph::new(m, &euf_roots, &euf_eq, &pred_atoms)),
-        arith: (!arith_atoms.is_empty()).then(|| online_arith(m, &arith_atoms)),
-    };
-    loop {
-        rounds += 1;
-        if rounds > DPLL_ROUND_LIMIT {
-            return (SmtResult::Unknown, None);
-        }
-        let solved = if online.euf.is_none() && online.arith.is_none() {
-            sat.solve()
+    /// Axiomatize every arithmetic equality atom `a = b` as it is
+    /// internalized, by the clause `a = b ∨ a < b ∨ a > b` (`a − b ≤ −1 ∨
+    /// a − b ≥ 1` over the integers), as z3's arithmetic theories internalize
+    /// an equality, instead of splitting each disequality the final check's
+    /// model violates in a round of its own.
+    pub fn eager_equalities(&mut self) {
+        self.eager_eqs = true;
+    }
+
+    /// The clause `lit ∨ d < 0 ∨ d > 0` for the arithmetic equality atom
+    /// `lit ⇔ d = 0` (strict over the integers: `d ≤ −1 ∨ d ≥ 1`).
+    fn equality_axiom(&mut self, m: &AstManager, lit: Lit, d: &LinExpr) {
+        let integral = d
+            .terms()
+            .all(|(v, a)| m.is_int_sort(m.get_sort(v)) && a.is_integer())
+            && d.constant_part().is_integer();
+        let one = LinExpr::constant(Rational::from_integer(Int::from(1)));
+        let (lo, hi) = if integral {
+            (d.add(&one), d.neg().add(&one))
         } else {
-            sat.solve_with_theory(&mut online)
+            (d.clone(), d.neg())
         };
-        match solved {
-            SatResult::Unsat => return (SmtResult::Unsat, None),
-            SatResult::Sat => {
-                // The Boolean assignment of every tracked atom.
-                let bools: BTreeMap<AstId, bool> = atoms
-                    .iter()
-                    .map(|(&a, &l)| (a, sat.model_holds(l)))
-                    .collect();
-                if !has_theory {
+        let mut mk = |e| {
+            split_atom(
+                m,
+                &mut self.sat,
+                &mut self.arith_atoms,
+                &mut self.arith,
+                &mut self.split_memo,
+                !integral,
+                e,
+            )
+        };
+        let (p, q) = (mk(lo), mk(hi));
+        self.sat.add_clause(&[lit, p, q]);
+    }
+
+    /// Assert the ground formula `formula`: its Boolean skeleton joins the
+    /// SAT solver (sharing the subformulas already encoded) and its new
+    /// atoms the theories.
+    pub fn assert(&mut self, m: &AstManager, formula: AstId) {
+        let (top, fresh) = encode_more(m, formula, &mut self.sat, &mut self.enc);
+        self.sat.add_clause(&[top]);
+        let mut euf_grew = false;
+        for (atom, lit) in fresh {
+            if m.is_eq(atom) {
+                let args = m.app_args(atom);
+                let (a, b) = (args[0], args[1]);
+                self.euf_eq.push((lit, a, b));
+                self.euf_roots.push(a);
+                self.euf_roots.push(b);
+                self.eq_pairs.insert((a.min(b), a.max(b)));
+                if m.is_arith_sort(m.get_sort(a)) {
+                    let atom = ArithAtom::eq(m, lit, a, b);
+                    let d = atom.diff.clone();
+                    self.arith_atoms.push(atom);
+                    if self.eager_eqs {
+                        self.equality_axiom(m, lit, &d);
+                    }
+                }
+                euf_grew = true;
+            } else if let Some(op) = m.arith_op(atom)
+                && matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
+            {
+                let args = m.app_args(atom);
+                self.arith_atoms
+                    .push(ArithAtom::cmp(m, lit, op, args[0], args[1]));
+                // The compared terms are EUF terms too, so uninterpreted applications
+                // among them (e.g. f(a) in f(a) > f(b)) get congruence.
+                self.euf_roots.push(args[0]);
+                self.euf_roots.push(args[1]);
+                euf_grew = true;
+            } else if m.is_app(atom) && !m.app_args(atom).is_empty() {
+                // A predicate application p(…): a congruence term whose truth is `lit`.
+                self.pred_atoms.push((lit, atom));
+                self.euf_roots.push(atom);
+                euf_grew = true;
+            }
+        }
+        if euf_grew {
+            self.euf_bases = None;
+            self.euf_stale = true;
+        }
+    }
+
+    /// Bring the online theories up to the atoms asserted so far.
+    fn sync_online(&mut self, m: &AstManager) {
+        if self.euf_stale && (!self.euf_eq.is_empty() || !self.pred_atoms.is_empty()) {
+            // The congruence closure watches the new atoms from a fresh start
+            // (it re-asserts the trail, and logs its equalities afresh).
+            self.eqs.clear();
+            if let Some(a) = self.arith.as_mut() {
+                a.retract_all();
+            }
+            self.euf = Some(IncEgraph::new(
+                m,
+                &self.euf_roots,
+                &self.euf_eq,
+                &self.pred_atoms,
+            ));
+        }
+        self.euf_stale = false;
+        if self.arith_new < self.arith_atoms.len() {
+            let fresh = &self.arith_atoms[self.arith_new..];
+            match self.arith.as_mut() {
+                None => self.arith = Some(online_arith(m, fresh)),
+                Some(a) => {
+                    for atom in fresh {
+                        let (_, t, f) = online_bounds(m, atom);
+                        a.add_atom(atom.lit, t.as_ref(), f.as_ref());
+                    }
+                }
+            }
+            self.arith_new = self.arith_atoms.len();
+        }
+    }
+
+    /// The truth value, in the assignment of the last `sat` check, of every
+    /// formula internalized so far (each subformula and atom).
+    pub fn assigned(&self) -> BTreeMap<AstId, bool> {
+        self.enc
+            .lits()
+            .map(|(t, l)| (t, self.sat.model_holds(l)))
+            .collect()
+    }
+
+    /// Decide the formulas asserted so far, resuming the search with the
+    /// clauses learnt by earlier calls.
+    pub fn check(&mut self, m: &AstManager) -> (SmtResult, Option<Model>) {
+        self.sync_online(m);
+        let has_theory =
+            !self.euf_eq.is_empty() || !self.arith_atoms.is_empty() || !self.pred_atoms.is_empty();
+        // The offline lazy loop enumerates theory-atom assignments via blocking
+        // clauses; that is worst-case exponential, so cap the number of rounds and
+        // return a sound `unknown` on exhaustion (rather than looping indefinitely).
+        let mut rounds: u32 = 0;
+        // A single work budget shared across *all* theory checks in this decision, so
+        // the whole call terminates in bounded time even when many blocking-clause
+        // rounds each face an expensive (blow-up-prone) theory check.
+        let mut budget = BB_WORK_BUDGET;
+        loop {
+            rounds += 1;
+            if rounds > DPLL_ROUND_LIMIT {
+                return (SmtResult::Unknown, None);
+            }
+            let solved = if self.euf.is_none() && self.arith.is_none() {
+                self.sat.solve()
+            } else {
+                // The online congruence closure: EUF conflicts and equality
+                // propagation during the search, on partial assignments (the
+                // final check below still decides arithmetic and theory
+                // combination on each full assignment).
+                let mut online = Online {
+                    m,
+                    eqs: core::mem::take(&mut self.eqs),
+                    euf: self.euf.take(),
+                    arith: self.arith.take(),
+                };
+                let r = self.sat.solve_with_theory(&mut online);
+                self.eqs = online.eqs;
+                self.euf = online.euf;
+                self.arith = online.arith;
+                r
+            };
+            if solved == SatResult::Unsat {
+                return (SmtResult::Unsat, None);
+            }
+            let sat = &mut self.sat;
+            let euf_eq = &mut self.euf_eq;
+            let euf_roots = &self.euf_roots;
+            let arith_atoms = &mut self.arith_atoms;
+            let pred_atoms = &self.pred_atoms;
+            // The Boolean assignment of every tracked atom.
+            let bools: BTreeMap<AstId, bool> = self
+                .enc
+                .atoms
+                .iter()
+                .map(|(&a, &l)| (a, sat.model_holds(l)))
+                .collect();
+            if !has_theory {
+                let model = Model {
+                    bools,
+                    arith: BTreeMap::new(),
+                    euf: Egraph::new(m, &[]),
+                    bv: BTreeMap::new(),
+                    alg: BTreeMap::new(),
+                    defaults: BTreeMap::new(),
+                    cong_depth: 0,
+                    zero_div: Default::default(),
+                    zero_div_ready: false,
+                };
+                return (SmtResult::Sat, Some(model));
+            }
+            // In the eager mode, the online simplex's assignment is the first
+            // candidate arithmetic model (z3's final check starts from it).
+            let hint = if self.eager_eqs {
+                self.arith.as_ref().map(ArithOnline::model)
+            } else {
+                None
+            };
+            // The interned e-graphs are rebuilt by cloning, not re-interning
+            // every subterm each round.
+            let bases = self
+                .euf_bases
+                .get_or_insert_with(|| (ProofEgraph::new(m, euf_roots), Egraph::new(m, euf_roots)));
+            let tc = theory_check(
+                m,
+                euf_eq,
+                euf_roots,
+                arith_atoms,
+                pred_atoms,
+                sat,
+                &mut budget,
+                bases,
+                hint.as_ref(),
+            );
+            match tc {
+                // Both theories consistent under this assignment → SAT.
+                TheoryOutcome::Sat(arith, euf) => {
+                    // Online-propagation increment (offline hook): derive EUF
+                    // equality atoms that the asserted equalities theory-entail
+                    // but that are not themselves asserted, and inject each as a
+                    // verified, globally-valid lemma clause so future solves
+                    // prune. Verdict-neutral — every injected clause is entailed
+                    // by the asserted equalities and independently re-verified
+                    // before injection (unverified candidates are dropped).
+                    propagate_euf_equalities(m, euf_eq, euf_roots, sat);
                     let model = Model {
                         bools,
-                        arith: BTreeMap::new(),
-                        euf: Egraph::new(m, &[]),
+                        arith,
+                        euf,
                         bv: BTreeMap::new(),
                         alg: BTreeMap::new(),
                         defaults: BTreeMap::new(),
@@ -178,143 +389,112 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                     };
                     return (SmtResult::Sat, Some(model));
                 }
-                // The interned e-graphs are rebuilt by cloning, not re-interning
-                // every subterm each round.
-                let bases = euf_bases.get_or_insert_with(|| {
-                    (ProofEgraph::new(m, &euf_roots), Egraph::new(m, &euf_roots))
-                });
-                match theory_check(
-                    m,
-                    &euf_eq,
-                    &euf_roots,
-                    &arith_atoms,
-                    &pred_atoms,
-                    &sat,
-                    &mut budget,
-                    bases,
-                ) {
-                    // Both theories consistent under this assignment → SAT.
-                    TheoryOutcome::Sat(arith, euf) => {
-                        // Online-propagation increment (offline hook): derive EUF
-                        // equality atoms that the asserted equalities theory-entail
-                        // but that are not themselves asserted, and inject each as a
-                        // verified, globally-valid lemma clause so future solves
-                        // prune. Verdict-neutral — every injected clause is entailed
-                        // by the asserted equalities and independently re-verified
-                        // before injection (unverified candidates are dropped).
-                        propagate_euf_equalities(m, &euf_eq, &euf_roots, &mut sat);
-                        let model = Model {
-                            bools,
-                            arith,
-                            euf,
-                            bv: BTreeMap::new(),
-                            alg: BTreeMap::new(),
-                            defaults: BTreeMap::new(),
-                            cong_depth: 0,
-                            zero_div: Default::default(),
-                            zero_div_ready: false,
-                        };
-                        return (SmtResult::Sat, Some(model));
-                    }
-                    // Case splits on new atoms: valid clauses, so the search
-                    // simply goes on with them.
-                    TheoryOutcome::Split(reqs) => {
-                        let mut new_eqs = false;
-                        let one = Rational::from_integer(Int::from(1));
-                        for req in reqs {
-                            match req {
-                                SplitReq::Diseq {
-                                    eq_lit,
-                                    d,
-                                    integral,
-                                } => {
-                                    let (lo, hi) = if integral {
-                                        let c = LinExpr::constant(one.clone());
-                                        (d.add(&c), d.neg().add(&c))
-                                    } else {
-                                        (d.clone(), d.neg())
-                                    };
-                                    let strict = !integral;
-                                    let mut mk = |e| {
-                                        split_atom(
-                                            m,
-                                            &mut sat,
-                                            &mut arith_atoms,
-                                            &mut online,
-                                            &mut split_memo,
-                                            strict,
-                                            e,
-                                        )
-                                    };
-                                    let (p, q) = (mk(lo), mk(hi));
-                                    sat.add_clause(&[eq_lit, p, q]);
-                                }
-                                SplitReq::Branch { x, k } => {
-                                    let e = LinExpr::var(x)
-                                        .sub(&LinExpr::constant(Rational::from_integer(k)));
+                // Case splits on new atoms: valid clauses, so the search
+                // simply goes on with them.
+                TheoryOutcome::Split(reqs) => {
+                    let mut new_eqs = false;
+                    let mut axioms: Vec<(Lit, LinExpr)> = Vec::new();
+                    let one = Rational::from_integer(Int::from(1));
+                    for req in reqs {
+                        match req {
+                            SplitReq::Diseq {
+                                eq_lit,
+                                d,
+                                integral,
+                            } => {
+                                let (lo, hi) = if integral {
+                                    let c = LinExpr::constant(one.clone());
+                                    (d.add(&c), d.neg().add(&c))
+                                } else {
+                                    (d.clone(), d.neg())
+                                };
+                                let strict = !integral;
+                                let mut mk = |e| {
                                     split_atom(
                                         m,
-                                        &mut sat,
-                                        &mut arith_atoms,
-                                        &mut online,
-                                        &mut split_memo,
-                                        false,
+                                        sat,
+                                        arith_atoms,
+                                        &mut self.arith,
+                                        &mut self.split_memo,
+                                        strict,
                                         e,
-                                    );
+                                    )
+                                };
+                                let (p, q) = (mk(lo), mk(hi));
+                                sat.add_clause(&[eq_lit, p, q]);
+                            }
+                            SplitReq::Branch { x, k } => {
+                                let e = LinExpr::var(x)
+                                    .sub(&LinExpr::constant(Rational::from_integer(k)));
+                                split_atom(
+                                    m,
+                                    sat,
+                                    arith_atoms,
+                                    &mut self.arith,
+                                    &mut self.split_memo,
+                                    false,
+                                    e,
+                                );
+                            }
+                            SplitReq::Eq { a, b } => {
+                                if !self.eq_pairs.insert((a.min(b), a.max(b))) {
+                                    continue;
                                 }
-                                SplitReq::Eq { a, b } => {
-                                    if !eq_pairs.insert((a.min(b), a.max(b))) {
-                                        continue;
-                                    }
-                                    let lit = Lit::pos(sat.mk_var());
-                                    euf_eq.push((lit, a, b));
-                                    let atom = ArithAtom::eq(m, lit, a, b);
-                                    let (_, t, f) = online_bounds(m, &atom);
-                                    online
-                                        .arith
-                                        .get_or_insert_with(|| ArithOnline::new(&[]))
-                                        .add_atom(lit, t.as_ref(), f.as_ref());
-                                    arith_atoms.push(atom);
-                                    new_eqs = true;
+                                let lit = Lit::pos(sat.mk_var());
+                                euf_eq.push((lit, a, b));
+                                let atom = ArithAtom::eq(m, lit, a, b);
+                                if self.eager_eqs {
+                                    // z3's `assume_eq`: try the equality first,
+                                    // which the model already satisfies.
+                                    sat.set_phase(lit.var(), true);
+                                    axioms.push((lit, atom.diff.clone()));
                                 }
+                                let (_, t, f) = online_bounds(m, &atom);
+                                self.arith
+                                    .get_or_insert_with(|| ArithOnline::new(&[]))
+                                    .add_atom(lit, t.as_ref(), f.as_ref());
+                                arith_atoms.push(atom);
+                                new_eqs = true;
                             }
                         }
-                        // The congruence closure watches the new equalities
-                        // from a fresh start (it re-asserts the trail).
-                        if new_eqs {
-                            online.euf = Some(IncEgraph::new(m, &euf_roots, &euf_eq, &pred_atoms));
+                    }
+                    self.arith_new = arith_atoms.len();
+                    // The congruence closure watches the new equalities
+                    // from a fresh start (it re-asserts the trail).
+                    if new_eqs {
+                        self.eqs.clear();
+                        if let Some(a) = self.arith.as_mut() {
+                            a.retract_all();
                         }
+                        self.euf = Some(IncEgraph::new(m, euf_roots, euf_eq, pred_atoms));
                     }
-                    // Undecidable here: neither confirm SAT nor soundly block.
-                    TheoryOutcome::Unknown => return (SmtResult::Unknown, None),
-                    // A strong conflict core. MANDATORY soundness net: re-verify the
-                    // core is *genuinely* inconsistent — restricted to only the atoms
-                    // it names — before learning `¬core`. If verification fails (an
-                    // explanation bug produced a bogus/incomplete core) we DISCARD it
-                    // and fall back to the full-assignment block, so a buggy
-                    // explanation can only ever weaken a lemma, never cause a wrong
-                    // `unsat`.
-                    TheoryOutcome::Conflict(core) => {
-                        if core_is_inconsistent(
-                            m,
-                            &core,
-                            &euf_roots,
-                            &euf_eq,
-                            &arith_atoms,
-                            &pred_atoms,
-                        ) {
-                            // Verified inconsistent → learn the strong lemma ¬core.
-                            let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
-                            sat.add_clause(&clause);
-                        } else {
-                            // Core not verified by either theory: fall back to full block.
-                            add_full_block(&mut sat, &euf_eq, &arith_atoms, &pred_atoms);
-                        }
+                    for (lit, d) in axioms {
+                        self.equality_axiom(m, lit, &d);
                     }
-                    // Definitively inconsistent → block this assignment and retry.
-                    TheoryOutcome::Unsat => {
-                        add_full_block(&mut sat, &euf_eq, &arith_atoms, &pred_atoms);
+                    self.arith_new = self.arith_atoms.len();
+                }
+                // Undecidable here: neither confirm SAT nor soundly block.
+                TheoryOutcome::Unknown => return (SmtResult::Unknown, None),
+                // A strong conflict core. MANDATORY soundness net: re-verify the
+                // core is *genuinely* inconsistent — restricted to only the atoms
+                // it names — before learning `¬core`. If verification fails (an
+                // explanation bug produced a bogus/incomplete core) we DISCARD it
+                // and fall back to the full-assignment block, so a buggy
+                // explanation can only ever weaken a lemma, never cause a wrong
+                // `unsat`.
+                TheoryOutcome::Conflict(core) => {
+                    if core_is_inconsistent(m, &core, euf_roots, euf_eq, arith_atoms, pred_atoms) {
+                        // Verified inconsistent → learn the strong lemma ¬core.
+                        let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
+                        sat.add_clause(&clause);
+                    } else {
+                        // Core not verified by either theory: fall back to full block.
+                        add_full_block(sat, euf_eq, arith_atoms, pred_atoms);
                     }
+                }
+                // Definitively inconsistent → block this assignment and retry.
+                TheoryOutcome::Unsat => {
+                    add_full_block(sat, euf_eq, arith_atoms, pred_atoms);
                 }
             }
         }
@@ -419,7 +599,7 @@ fn split_atom(
     m: &AstManager,
     sat: &mut Solver,
     arith_atoms: &mut Vec<ArithAtom>,
-    online: &mut Online<'_>,
+    arith: &mut Option<ArithOnline>,
     memo: &mut SplitAtoms,
     strict: bool,
     diff: LinExpr,
@@ -436,8 +616,7 @@ fn split_atom(
     let op = if strict { ArithOp::Lt } else { ArithOp::Le };
     let atom = ArithAtom::split(lit, op, diff);
     let (_, t, f) = online_bounds(m, &atom);
-    online
-        .arith
+    arith
         .get_or_insert_with(|| ArithOnline::new(&[]))
         .add_atom(lit, t.as_ref(), f.as_ref());
     arith_atoms.push(atom);
@@ -1394,16 +1573,25 @@ impl Model {
                 .filter(|&(&u, _)| u != t && m.app(u).is_some_and(|a| a.decl == decl))
                 .map(|(&u, &v)| (u, v))
                 .collect();
-            for (u, v) in candidates {
+            // Comparing Boolean arguments evaluates them, which can come back
+            // here through a nested application (`q(q(true, a), c)` asks for
+            // `q(true, a)`): bounded like [`Self::congruent_assigned`].
+            const MAX_DEPTH: usize = 4;
+            if candidates.is_empty() || self.cong_depth >= MAX_DEPTH {
+                return false;
+            }
+            self.cong_depth += 1;
+            let found = candidates.into_iter().find(|&(u, _)| {
                 let uargs = m.app_args(u).to_vec();
-                if uargs.len() == args.len()
+                uargs.len() == args.len()
                     && args
                         .iter()
                         .zip(&uargs)
                         .all(|(&x, &y)| self.values_eq(m, x, y))
-                {
-                    return v;
-                }
+            });
+            self.cong_depth -= 1;
+            if let Some((_, v)) = found {
+                return v;
             }
         }
         false // an untracked atom we cannot resolve; default to false
@@ -2652,8 +2840,14 @@ const INTEGER_PROBE_BUDGET: u64 = 50_000;
 /// search (gcd tests, Diophantine witnesses, branch-and-bound, disequality
 /// splits) is inconclusive — the search then decides the splits itself, as
 /// z3's `theory_lra` final check does.
-fn integer_model(sys: &ArithSystem) -> Result<Assignment, Option<Vec<SplitReq>>> {
-    let model = crate::smt::arith::model(&sys.cons).ok_or(None)?;
+fn integer_model(
+    sys: &ArithSystem,
+    hint: Option<&Assignment>,
+) -> Result<Assignment, Option<Vec<SplitReq>>> {
+    let model = match hint.filter(|h| satisfies(&sys.cons, h)) {
+        Some(h) => h.clone(),
+        None => crate::smt::arith::model(&sys.cons).ok_or(None)?,
+    };
     let splits = model_splits(sys, &model);
     if splits.is_empty() {
         return Ok(model);
@@ -2669,6 +2863,18 @@ fn integer_model(sys: &ArithSystem) -> Result<Assignment, Option<Vec<SplitReq>>>
         Feas::Unsat => Err(None),
         Feas::Unknown => Err(Some(splits)),
     }
+}
+
+/// Does the assignment `a` (absent variables zero) satisfy every constraint?
+fn satisfies(cons: &[Constraint], a: &Assignment) -> bool {
+    cons.iter().all(|c| {
+        let v = c.expr.eval(a);
+        match c.rel {
+            Rel::Le => !v.is_positive(),
+            Rel::Lt => v.is_negative(),
+            Rel::Eq => v.is_zero(),
+        }
+    })
 }
 
 /// Is `e` integer-valued whenever its variables (all in `ints`) are?
@@ -2731,6 +2937,7 @@ fn theory_check(
     sat: &Solver,
     budget: &mut u64,
     bases: &(ProofEgraph, Egraph),
+    hint: Option<&Assignment>,
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
     let mut eqs = Vec::new();
@@ -2806,7 +3013,12 @@ fn theory_check(
     // splits return `None` and fall through to the Nelson–Oppen loop below, which
     // still returns the always-sound `Unsat`. Always re-verified by the soundness
     // net in `check_model` before being trusted.
-    if let Some(core_idx) = feasible_core(&base.cons) {
+    // A candidate model that satisfies the asserted constraints (the online
+    // simplex's) proves them feasible.
+    let hint = hint.filter(|h| satisfies(&base.cons, h));
+    if hint.is_none()
+        && let Some(core_idx) = feasible_core(&base.cons)
+    {
         let core: Vec<Lit> = core_idx.iter().map(|&i| base.con_lits[i]).collect();
         return TheoryOutcome::Conflict(core);
     }
@@ -2814,7 +3026,7 @@ fn theory_check(
     // rational model violates, or an integer variable it gives a fractional
     // value, becomes a case split on new bound atoms for the search to decide,
     // instead of a search inside this check.
-    match integer_model(&base) {
+    match integer_model(&base, hint) {
         Ok(_) => {}
         Err(Some(splits)) => return TheoryOutcome::Split(splits),
         Err(None) => {
@@ -2829,7 +3041,7 @@ fn theory_check(
     let interface = interface_terms(m, euf_roots);
     if interface.len() > PAIRWISE_COMBINATION_LIMIT {
         return model_based_combination(
-            m, &base, &interface, euf_eq, euf_roots, &eqs, &diseqs, &mut pg, bases,
+            m, &base, &interface, euf_eq, euf_roots, &eqs, &diseqs, &mut pg, bases, hint,
         );
     }
 
@@ -2898,15 +3110,11 @@ fn theory_check(
         }
         // Predicate congruence: two congruent predicate applications (same class)
         // must have the same truth value; a clash is a conflict.
-        for i in 0..pred_atoms.len() {
-            for j in (i + 1)..pred_atoms.len() {
-                let (li, ti) = pred_atoms[i];
-                let (lj, tj) = pred_atoms[j];
-                if g.class_of(m, ti) == g.class_of(m, tj)
-                    && sat.model_holds(li) != sat.model_holds(lj)
-                {
-                    return TheoryOutcome::Unsat;
-                }
+        let mut class_value: BTreeMap<usize, bool> = BTreeMap::new();
+        for &(l, t) in pred_atoms {
+            let v = sat.model_holds(l);
+            if *class_value.entry(g.class_of(m, t)).or_insert(v) != v {
+                return TheoryOutcome::Unsat;
             }
         }
 
@@ -2996,6 +3204,7 @@ fn model_based_combination(
     diseqs: &[(AstId, AstId)],
     pg: &mut ProofEgraph,
     bases: &(ProofEgraph, Egraph),
+    hint: Option<&Assignment>,
 ) -> TheoryOutcome {
     let mut g = bases.1.clone();
     if !g.is_consistent(m, eqs, diseqs) {
@@ -3027,8 +3236,12 @@ fn model_based_combination(
             }
         }
     }
-    match crate::smt::arith::model_or_core(&sys.cons) {
-        Ok(_) => {}
+    let hint = hint.filter(|h| satisfies(&sys.cons, h));
+    match hint.map_or_else(
+        || crate::smt::arith::model_or_core(&sys.cons).map(|_| ()),
+        |_| Ok(()),
+    ) {
+        Ok(()) => {}
         Err(core) => {
             let mut out = BTreeSet::new();
             for i in core {
@@ -3037,7 +3250,7 @@ fn model_based_combination(
             return TheoryOutcome::Conflict(out.into_iter().collect());
         }
     }
-    let model = match integer_model(&sys) {
+    let model = match integer_model(&sys, hint) {
         Ok(model) => model,
         Err(Some(splits)) => return TheoryOutcome::Split(splits),
         Err(None) => {
@@ -3244,18 +3457,14 @@ fn separate_classes(
     budget: &mut u64,
 ) -> Option<Assignment> {
     let mut apps: Vec<AstId> = Vec::new();
-    let mut seen = BTreeSet::new();
-    for &r in euf_roots {
-        for t in m.postorder(r) {
-            if let Some(a) = m.app(t)
-                && !a.args.is_empty()
-                && (m.is_select(t)
-                    || m.func_decl(a.decl)
-                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID))
-                && seen.insert(t)
-            {
-                apps.push(t);
-            }
+    for t in m.postorder_many(euf_roots) {
+        if let Some(a) = m.app(t)
+            && !a.args.is_empty()
+            && (m.is_select(t)
+                || m.func_decl(a.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID))
+        {
+            apps.push(t);
         }
     }
     if apps.len() < 2 {
@@ -3269,31 +3478,47 @@ fn separate_classes(
         diseq_lits: sys.diseq_lits.clone(),
     };
     let arith = |t: AstId| m.is_arith_sort(m.get_sort(t));
+    /// A term's value for the comparison: its number (arithmetic) or class.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Key {
+        Num(Rational),
+        Class(usize),
+    }
     for _ in 0..8 {
-        let mut clash = Vec::new();
-        for i in 0..apps.len() {
-            for j in (i + 1)..apps.len() {
-                let (p, q) = (apps[i], apps[j]);
-                if m.app_decl(p) != m.app_decl(q) {
-                    continue;
-                }
-                let (pa, qa) = (m.app_args(p), m.app_args(q));
-                let same = |g: &mut Egraph, a: AstId, b: AstId| {
-                    if arith(a) {
-                        ast_to_lin(m, a).eval(&assign) == ast_to_lin(m, b).eval(&assign)
-                    } else {
-                        g.class_of(m, a) == g.class_of(m, b)
-                    }
-                };
-                if !pa.iter().zip(qa).all(|(&a, &b)| same(g, a, b)) || same(g, p, q) {
-                    continue;
-                }
-                let sep = pa
-                    .iter()
-                    .zip(qa)
-                    .find(|&(&a, &b)| arith(a) && g.class_of(m, a) != g.class_of(m, b))?;
-                clash.push(ast_to_lin(m, *sep.0).sub(&ast_to_lin(m, *sep.1)));
+        let key = |g: &mut Egraph, t: AstId| {
+            if arith(t) {
+                Key::Num(ast_to_lin(m, t).eval(&assign))
+            } else {
+                Key::Class(g.class_of(m, t))
             }
+        };
+        // The pairs of applications of one function whose arguments agree,
+        // in index order (grouped by their arguments' keys, not compared
+        // pairwise).
+        let mut groups: BTreeMap<(AstId, Vec<Key>), Vec<usize>> = BTreeMap::new();
+        for (i, &p) in apps.iter().enumerate() {
+            let args: Vec<Key> = m.app_args(p).iter().map(|&a| key(g, a)).collect();
+            groups.entry((m.app_decl(p), args)).or_default().push(i);
+        }
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for idx in groups.values() {
+            for (k, &i) in idx.iter().enumerate() {
+                pairs.extend(idx[k + 1..].iter().map(|&j| (i, j)));
+            }
+        }
+        pairs.sort_unstable();
+        let mut clash = Vec::new();
+        for (i, j) in pairs {
+            let (p, q) = (apps[i], apps[j]);
+            if key(g, p) == key(g, q) {
+                continue;
+            }
+            let (pa, qa) = (m.app_args(p), m.app_args(q));
+            let sep = pa
+                .iter()
+                .zip(qa)
+                .find(|&(&a, &b)| arith(a) && g.class_of(m, a) != g.class_of(m, b))?;
+            clash.push(ast_to_lin(m, *sep.0).sub(&ast_to_lin(m, *sep.1)));
         }
         if clash.is_empty() {
             return Some(assign);

@@ -66,6 +66,16 @@ impl AstManager {
         fid
     }
 
+    /// The id of the already-registered family named `name`, if any: like
+    /// [`Self::get_family_id`] without interning `name` (the theory queries
+    /// ask for their family on every call).
+    pub fn get_family_id_named(&self, name: &str) -> Option<FamilyId> {
+        self.families
+            .iter()
+            .position(|s| s.as_str() == Some(name))
+            .map(|i| i as FamilyId)
+    }
+
     /// The id of an already-registered family, if any.
     pub fn get_family_id(&self, name: Symbol) -> Option<FamilyId> {
         self.families

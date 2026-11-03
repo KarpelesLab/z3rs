@@ -308,7 +308,7 @@ impl AstManager {
 
     /// The registered arithmetic family id, if arithmetic has been used yet.
     fn arith_fid_opt(&self) -> Option<FamilyId> {
-        self.get_family_id(Symbol::new("arith"))
+        self.get_family_id_named("arith")
     }
 
     /// If `id` is an arithmetic numeral (`OP_NUM`), its value.

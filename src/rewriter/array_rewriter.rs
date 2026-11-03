@@ -14,7 +14,6 @@
 use crate::ast::array::ArrayOp;
 use crate::ast::manager::AstManager;
 use crate::ast::{AstId, DeclKind};
-use crate::util::symbol::Symbol;
 
 /// Map an array func-decl kind back to its [`ArrayOp`].
 fn arrayop_of_kind(kind: DeclKind) -> Option<ArrayOp> {
@@ -44,7 +43,7 @@ fn provably_distinct(m: &AstManager, i: AstId, j: AstId) -> bool {
 /// Returns `None` if `decl` is not an array op this rewriter handles, or the
 /// operands are not concrete enough to fold.
 pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Option<AstId> {
-    let afid = m.get_family_id(Symbol::new("array"))?;
+    let afid = m.get_family_id_named("array")?;
     let d = m.func_decl(decl).expect("app decl");
     if d.info.family_id != afid {
         return None;

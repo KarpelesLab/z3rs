@@ -201,6 +201,12 @@ impl Solver {
         v
     }
 
+    /// Decide `v` as `value` first (until phase saving overrides it).
+    pub fn set_phase(&mut self, v: Var, value: bool) {
+        self.ensure_var(v);
+        self.polarity[v as usize] = !value;
+    }
+
     fn ensure_var(&mut self, v: Var) {
         while (self.assign.len() as Var) <= v {
             self.mk_var();
@@ -698,6 +704,10 @@ impl Solver {
                     clause.extend(r.iter().map(|&l| !l));
                     if clause.len() == 1 {
                         if self.enqueue(p, REASON_NONE) {
+                            // A valid literal (empty reason): a level-0 fact to
+                            // conflict analysis, which drops it from learnt
+                            // clauses instead of looking for its antecedent.
+                            self.level[p.var() as usize] = 0;
                             progress = true;
                         }
                     } else {

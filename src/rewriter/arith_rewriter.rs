@@ -13,13 +13,12 @@ use puremp::Rational;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
 use crate::ast::{AstId, DeclKind};
-use crate::util::symbol::Symbol;
 
 /// Try to fold an arithmetic application `decl(args)` with all-numeral operands.
 /// Returns `None` if `decl` is not arithmetic, an operand is not a numeral, or
 /// the op is not one this rewriter evaluates.
 pub(crate) fn try_fold(m: &mut AstManager, decl: AstId, args: &[AstId]) -> Option<AstId> {
-    let afid = m.get_family_id(Symbol::new("arith"))?;
+    let afid = m.get_family_id_named("arith")?;
     let d = m.func_decl(decl).expect("app decl");
     if d.info.family_id != afid {
         return None;
@@ -117,7 +116,7 @@ fn addend(m: &AstManager, a: AstId) -> (Option<AstId>, Rational) {
         let kind = m
             .func_decl(app.decl)
             .map(|d| (d.info.family_id, d.info.decl_kind));
-        let afid = m.get_family_id(Symbol::new("arith"));
+        let afid = m.get_family_id_named("arith");
         if let (Some(fid), Some(afid)) = (kind, afid)
             && fid.0 == afid
         {

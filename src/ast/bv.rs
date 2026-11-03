@@ -377,7 +377,7 @@ impl AstManager {
 
     /// The width of a bit-vector sort (or `None` if `sort_id` is not one).
     pub fn bv_sort_width(&self, sort_id: AstId) -> Option<u32> {
-        let bvfid = self.get_family_id(Symbol::new("bv"))?;
+        let bvfid = self.get_family_id_named("bv")?;
         let s = self.sort(sort_id)?;
         if s.info.family_id == bvfid && s.info.decl_kind == BvSortKind::BitVec as DeclKind {
             s.info.parameters.first()?.get_int().map(|w| w as u32)
@@ -388,7 +388,7 @@ impl AstManager {
 
     /// The value of a bit-vector numeral `id` (in `[0, 2^width)`), if it is one.
     pub fn bv_numeral_value(&self, id: AstId) -> Option<Int> {
-        let bvfid = self.get_family_id(Symbol::new("bv"))?;
+        let bvfid = self.get_family_id_named("bv")?;
         let a = self.app(id)?;
         if !a.args.is_empty() {
             return None;
@@ -407,7 +407,7 @@ impl AstManager {
 
     /// If `id` applies a bit-vector-family declaration, its op kind.
     pub fn bv_op(&self, id: AstId) -> Option<BvOp> {
-        let bvfid = self.get_family_id(Symbol::new("bv"))?;
+        let bvfid = self.get_family_id_named("bv")?;
         let a = self.app(id)?;
         let d = self.func_decl(a.decl)?;
         if d.info.family_id != bvfid {
