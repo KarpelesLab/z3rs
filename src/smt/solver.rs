@@ -411,6 +411,7 @@ impl SmtCore {
                     enum_ctors: BTreeMap::new(),
                     fn_defaults_ready: false,
                     euf_nums_ready: false,
+                    array_values: None,
                 };
                 return (SmtResult::Sat, Some(model));
             }
@@ -463,6 +464,7 @@ impl SmtCore {
                         enum_ctors: BTreeMap::new(),
                         fn_defaults_ready: false,
                         euf_nums_ready: false,
+                        array_values: None,
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -880,6 +882,10 @@ pub struct Model {
     /// Whether the e-graph's unvalued arithmetic applications have been
     /// given values (see [`Model::complete_euf_nums`]).
     euf_nums_ready: bool,
+    /// The front end's interpretations of the array constants (constant →
+    /// ground `store`/`const` value term), once computed: `Some(None)` when
+    /// they could not be built (see [`Model::set_array_values`]).
+    array_values: Option<Option<BTreeMap<AstId, AstId>>>,
 }
 
 /// Which of z3's division-by-zero functions: `div0` (integer `div`), `mod0`
@@ -954,6 +960,7 @@ impl Model {
             enum_ctors: BTreeMap::new(),
             fn_defaults_ready: false,
             euf_nums_ready: false,
+            array_values: None,
         }
     }
 
@@ -1025,6 +1032,39 @@ impl Model {
         };
         self.euf.is_consistent(m, &[(t, target)], &[]);
         self.euf.class_of(m, t)
+    }
+
+    /// The interpretations of the array constants, once computed: `None`
+    /// before [`Model::set_array_values`], `Some(None)` when there are none.
+    pub fn array_values(&self) -> Option<Option<&BTreeMap<AstId, AstId>>> {
+        self.array_values.as_ref().map(Option::as_ref)
+    }
+
+    /// Record the interpretations of the array constants (constant → ground
+    /// value term), or that they could not be built (`None`).
+    pub fn set_array_values(&mut self, values: Option<BTreeMap<AstId, AstId>>) {
+        self.array_values = Some(values);
+    }
+
+    /// Does the model hold a value for `t` itself (an assigned atom, number
+    /// or bit-vector, or, of another sort, an e-graph term), rather than one
+    /// evaluation would make up?
+    pub fn knows(&self, m: &AstManager, t: AstId) -> bool {
+        let s = m.get_sort(t);
+        if m.is_bool_sort(s) {
+            self.bools.contains_key(&t)
+        } else if m.is_arith_sort(s) {
+            self.arith.contains_key(&t) || self.alg.contains_key(&t)
+        } else if m.bv_sort_width(s).is_some() {
+            self.bv.contains_key(&t)
+        } else {
+            self.euf.contains(t)
+        }
+    }
+
+    /// Every term of the model's e-graph, children before parents.
+    pub fn euf_terms(&self) -> &[AstId] {
+        self.euf.terms()
     }
 
     /// Whether the division-by-zero interpretations have been computed.

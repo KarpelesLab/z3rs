@@ -963,6 +963,7 @@ fn render_int(v: &Int) -> String {
 use super::decl_table::DeclTable;
 
 mod array_cal;
+mod array_model;
 mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
@@ -5283,6 +5284,11 @@ impl Context {
                 let mut model = self.last_model.take().unwrap();
                 self.prepare_model(&mut model);
                 let id = self.str_ground(&mut model, id);
+                if let Some(v) = self.array_model_value_of(&mut model, id) {
+                    let v = self.array_model_render(&mut model, v);
+                    self.last_model = Some(model);
+                    return Ok(Some(v));
+                }
                 let completion = list.windows(2).any(|w| {
                     matches!(&w[0], SExpr::Atom(k) if k == ":model_completion" || k == ":model-completion")
                         && matches!(&w[1], SExpr::Atom(v) if v == "true")
@@ -40185,7 +40191,10 @@ impl Context {
                 Err(e) => Err(e),
             };
             let v = match id {
-                Ok(id) => self.model_term_render(&mut model, id),
+                Ok(id) => match self.array_model_value_of(&mut model, id) {
+                    Some(v) => self.array_model_render(&mut model, v),
+                    None => self.model_term_render(&mut model, id),
+                },
                 Err((d, dom, ran)) => {
                     let body = self
                         .const_fn_interp(d, &mut model)
@@ -40341,6 +40350,7 @@ impl Context {
                 .map(|l| alloc::format!("\n{l}"))
                 .collect::<String>()
         };
+        let array_values = self.array_model_values(&mut model);
         let mut zero_div_head = Some(zero_div(
             self,
             &model,
@@ -40356,10 +40366,20 @@ impl Context {
                 out.push_str(&h);
             }
             if decl.domain.is_empty() {
-                if self.m.is_array_sort(decl.range) {
-                    continue; // array interpretations not yet emitted (invalid)
-                }
                 let c = self.m.mk_const(decl.d);
+                if self.m.is_array_sort(decl.range) {
+                    // An array constant: its interpretation, when the arrays'
+                    // interpretations satisfy the assertions.
+                    if let Some(&v) = array_values.as_ref().and_then(|vs| vs.get(&c)) {
+                        let v = self.array_model_render(&mut model, v);
+                        let sort_name = self.sort_display(decl.range);
+                        out.push_str(&alloc::format!(
+                            "\n  (define-fun {} () {sort_name}\n    {v})",
+                            smt2_symbol(&decl.name)
+                        ));
+                    }
+                    continue;
+                }
                 // A string/index constant the witness search assigned renders as
                 // its witness value (as `get-value` does).
                 let c = self
@@ -41658,7 +41678,7 @@ impl Context {
                     continue;
                 }
             }
-            if self.model_value_str(model, sub) != "true" {
+            if self.model_value_str(model, sub) != "true" && !self.array_model_holds(model, sub) {
                 return false;
             }
         }
@@ -41989,7 +42009,7 @@ impl Context {
                 continue;
             }
             if self.m.postorder(t).iter().any(|&x| self.m.is_quantifier(x))
-                || self.model_value_str(model, t) != "true"
+                || (self.model_value_str(model, t) != "true" && !self.array_model_holds(model, t))
             {
                 return None;
             }
@@ -45900,6 +45920,44 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn array_constants_are_in_the_model() {
+        // `c` is defined by its equality, `a` read at 1, `b` free: each is a
+        // `store` chain over a constant array, and `get-value`/`eval` agree.
+        let out = run(
+            "(declare-const a (Array Int Int))(declare-const b (Array Int Int))\
+             (declare-const c (Array Int Int))\
+             (assert (= (select a 1) 7))(assert (= c (store a 3 4)))\
+             (check-sat)(get-model)(get-value ((select c 3) (store c 1 2)))(eval (select a 9))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(
+            out[1]
+                .contains("(define-fun a () (Array Int Int)\n    ((as const (Array Int Int)) 7))"),
+            "{}",
+            out[1]
+        );
+        assert!(
+            out[1]
+                .contains("(define-fun b () (Array Int Int)\n    ((as const (Array Int Int)) 0))"),
+            "{}",
+            out[1]
+        );
+        assert!(
+            out[1].contains(
+                "(define-fun c () (Array Int Int)\n    (store ((as const (Array Int Int)) 7) 3 4))"
+            ),
+            "{}",
+            out[1]
+        );
+        assert_eq!(
+            out[2],
+            "(((select c 3) 4)\n ((store c 1 2) (store (store ((as const (Array Int Int)) 7) 3 4) 1 2)))"
+        );
+        assert_eq!(out[3], "7");
     }
 
     #[test]
