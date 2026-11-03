@@ -878,6 +878,7 @@ mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
+mod seq_nth;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -10522,7 +10523,7 @@ impl Context {
             }
             set
         };
-        let mut ax = Vec::new();
+        let mut ax = self.seq_nth_u_axioms(goal);
         // Literals synthesised by axioms below (e.g. the prefix/suffix a variable
         // is pinned to) that must join the literal-distinctness set even though
         // they are absent from the original goal.
@@ -16503,7 +16504,7 @@ impl Context {
                     .into_iter()
                     .filter(|t| self.seq_of.contains_key(t))
                     .collect();
-                let mut conj: Vec<AstId> = Vec::new();
+                let mut conj: Vec<AstId> = self.seq_nth_u_axioms(g2);
                 for i in 0..seqs.len() {
                     for j in i + 1..seqs.len() {
                         let (a, b) = (self.seq_of[&seqs[i]].clone(), self.seq_of[&seqs[j]].clone());
@@ -22859,6 +22860,12 @@ impl Context {
                     let c = self.m.mk_const(d);
                     self.seq_nth_oob.insert((args[0], i), c);
                     return Ok(c);
+                }
+                // A concrete sequence at a symbolic index: by cases.
+                if let Some(l) = self.seq_of.get(&args[0]).cloned()
+                    && let Some(t) = self.seq_nth_cases(args[0], &l, args[1])
+                {
+                    return Ok(t);
                 }
                 // Symbolic `seq.nth s i`: reuse one congruent marker per (s, i).
                 if let Some(&c) = self.seq_nth_sym.get(&(args[0], args[1])) {
@@ -35877,6 +35884,14 @@ impl Context {
     /// [`Self::decide_inner_core`] after the `bv2int`-only bit-vectors are
     /// eliminated.
     fn decide_inner_core_bv2int_free(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
+        // Out-of-range sequence reads agree on equal sequences and indices.
+        let mut nth_u = self.seq_nth_u_axioms(goal);
+        let goal = if nth_u.is_empty() {
+            goal
+        } else {
+            nth_u.push(goal);
+            self.m.mk_and(&nth_u)
+        };
         let goal = self.lift_arith_ites(goal);
         // Fold ground algebraic (in)equalities — e.g. `(0.375^¼)² = (0.375²)^¼`
         // (both √0.375, so `true`) — to `true`/`false` via exact algebraic
@@ -43440,6 +43455,44 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn seq_nth_at_a_symbolic_index() {
+        // By cases on the index; out of range the reads agree on equal
+        // sequences and indices (z3's `seq.nth_u`).
+        let script = "
+            (declare-const i Int)
+            (assert (= (seq.nth (seq.++ (seq.unit 4) (seq.unit 5)) i) 5))
+            (assert (<= 0 i 1))
+            (check-sat)
+            (eval i)
+            (reset)
+            (declare-const i Int)
+            (assert (= (seq.nth (seq.unit 5) i) 1))
+            (assert (= (seq.nth (seq.unit 5) 3) 2))
+            (assert (= i 3))
+            (check-sat)
+            (reset)
+            (declare-const a (Seq Int))
+            (declare-const b (Seq Int))
+            (declare-const i Int)
+            (declare-const j Int)
+            (assert (<= (seq.len a) 1))
+            (assert (<= (seq.len b) 2))
+            (assert (or (distinct a b) (= (seq.nth b 0) 1)))
+            (assert (= (seq.nth a (+ i 1)) 1))
+            (assert (< (seq.nth a j) 1))
+            (assert (= a b))
+            (assert (= i (- 1)))
+            (assert (= j 0))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "1");
+        assert_eq!(out[2], "unsat");
+        assert_ne!(out[3], "sat");
     }
 
     #[test]
