@@ -131,7 +131,7 @@ pub struct Solver {
 
     clauses: Vec<Vec<Lit>>,
     /// `watches[l.index()]` = clauses watching literal `~l` (MiniSat convention).
-    watches: Vec<Vec<usize>>,
+    watches: Vec<Vec<Watch>>,
     /// Per-clause: is it a learnt clause (deletable), its activity, and whether
     /// it has been lazily deleted (skipped in propagation, freed).
     learnt: Vec<bool>,
@@ -170,6 +170,14 @@ pub struct Solver {
     chrono_levels: u32,
 
     ok: bool,
+}
+
+/// A watch-list entry: the clause, and a literal of it whose truth shows the
+/// clause satisfied without reading it (MiniSat's blocker).
+#[derive(Clone, Copy)]
+struct Watch {
+    cref: usize,
+    blocker: Lit,
 }
 
 /// What attaching a pending clause did (see [`Solver::attach_pending`]).
@@ -385,12 +393,13 @@ impl Solver {
     fn attach_clause(&mut self, ps: Vec<Lit>, learnt: bool) {
         let cref = self.clauses.len();
         let (w0, w1) = ((!ps[0]).index() as usize, (!ps[1]).index() as usize);
+        let (b0, b1) = (ps[1], ps[0]);
         self.clauses.push(ps);
         self.learnt.push(learnt);
         self.cla_activity.push(0.0);
         self.deleted.push(false);
-        self.watches[w0].push(cref);
-        self.watches[w1].push(cref);
+        self.watches[w0].push(Watch { cref, blocker: b0 });
+        self.watches[w1].push(Watch { cref, blocker: b1 });
         if learnt {
             self.n_learnt += 1;
             self.bump_clause(cref);
@@ -541,9 +550,13 @@ impl Solver {
             let false_lit = !p;
             let mut i = 0;
             'next_clause: while i < ws.len() {
-                let cref = ws[i];
+                let Watch { cref, blocker } = ws[i];
                 if self.deleted[cref] {
                     ws.swap_remove(i); // drop stale watch of a deleted clause
+                    continue;
+                }
+                if self.lit_value(blocker) == LBool::True {
+                    i += 1; // clause satisfied by its blocker; keep watching
                     continue;
                 }
                 // Ensure the false watched literal is at position 1.
@@ -552,6 +565,7 @@ impl Solver {
                 }
                 let first = self.clauses[cref][0]; // the other watched literal
                 if self.lit_value(first) == LBool::True {
+                    ws[i].blocker = first;
                     i += 1; // clause already satisfied; keep watching
                     continue;
                 }
@@ -561,7 +575,10 @@ impl Solver {
                     let lk = self.clauses[cref][k];
                     if self.lit_value(lk) != LBool::False {
                         self.clauses[cref].swap(1, k);
-                        self.watches[(!self.clauses[cref][1]).index() as usize].push(cref);
+                        self.watches[(!self.clauses[cref][1]).index() as usize].push(Watch {
+                            cref,
+                            blocker: first,
+                        });
                         ws.swap_remove(i); // stop watching under p
                         continue 'next_clause;
                     }
@@ -703,12 +720,13 @@ impl Solver {
         if k >= 2 {
             // Watch the literal at `k` instead of the one at 1.
             let old = (!self.clauses[cref][1]).index() as usize;
-            if let Some(i) = self.watches[old].iter().position(|&w| w == cref) {
+            if let Some(i) = self.watches[old].iter().position(|w| w.cref == cref) {
                 self.watches[old].swap_remove(i);
             }
             self.clauses[cref].swap(1, k);
             let new = (!self.clauses[cref][1]).index() as usize;
-            self.watches[new].push(cref);
+            let blocker = self.clauses[cref][0];
+            self.watches[new].push(Watch { cref, blocker });
         }
         if k != 0 {
             self.clauses[cref].swap(0, 1);
