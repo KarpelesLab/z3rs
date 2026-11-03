@@ -874,6 +874,7 @@ fn render_int(v: &Int) -> String {
 }
 use super::decl_table::DeclTable;
 
+mod array_cal;
 mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
@@ -24573,11 +24574,23 @@ impl Context {
             if let Some(r) = self.check_sat_regex_vars() {
                 return r;
             }
+            // Map/store/const arrays by their element reduction.
+            if !self.maps.is_empty()
+                && let Some(r) = self.check_sat_array_cal()
+            {
+                return r;
+            }
         }
         let r = self.check_sat_split();
         if r.0 == SmtResult::Unknown
             && let Some(r2) = self.check_sat_components()
             && r2.0 != SmtResult::Unknown
+        {
+            return r2;
+        }
+        // Map/store/const arrays by their element reduction.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_array_cal()
         {
             return r2;
         }
@@ -44165,6 +44178,24 @@ mod tests {
              (assert (= (str.len b) 9))(check-sat)")
         .unwrap();
         assert_eq!(out, alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn map_arrays_decided_by_their_elements() {
+        let sat = "(declare-const x (Array Int Bool))(declare-const y (Array Int Bool))\
+             (declare-const a (Array Int Int))(declare-const b (Array Int Int))\
+             (declare-const c (Array Int Int))(declare-const i Int)(declare-const j Int)\
+             (assert (distinct i 0))\
+             (assert (= a ((_ map (+ (Int Int) Int)) ((_ map (ite (Bool Int Int) Int)) y c c) \
+                 (store b 1 0))))\
+             (assert (= ((_ map (+ (Int Int) Int)) (store b j 2) (store a i 2)) c))\
+             (assert (= y ((_ map and) ((_ map (<= (Int Int) Bool)) a b) \
+                 ((_ map (<= (Int Int) Bool)) c c))))(check-sat)";
+        assert_eq!(run(sat).unwrap(), alloc::vec!["sat"]);
+        // not x and x agree nowhere.
+        let unsat = "(declare-const x (Array Int Bool))\
+             (assert (= ((_ map not) x) x))(check-sat)";
+        assert_eq!(run(unsat).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
