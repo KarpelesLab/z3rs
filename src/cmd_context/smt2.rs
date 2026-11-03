@@ -3369,6 +3369,9 @@ struct Context {
     reglan_sort: Option<AstId>,
     /// Regex terms whose structure is fully constant, for `str.in_re` folding.
     regex_of: BTreeMap<AstId, Regex>,
+    /// Per regex term: whether its language is provably empty, and provably
+    /// universal (each an automaton exploration, so computed once).
+    regex_lang: BTreeMap<AstId, (bool, bool)>,
     /// `(str.to_re t)` regex terms over a non-literal string `t`, mapped to `t`,
     /// so `(str.in_re s (str.to_re t))` lowers to `s = t` as z3's seq rewriter does.
     regex_to_re_arg: BTreeMap<AstId, AstId>,
@@ -4553,6 +4556,7 @@ impl Context {
             str_marker_cache: BTreeMap::new(),
             reglan_sort: None,
             regex_of: BTreeMap::new(),
+            regex_lang: BTreeMap::new(),
             regex_to_re_arg: BTreeMap::new(),
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
@@ -19943,6 +19947,15 @@ impl Context {
                     if matches!(r, Regex::All) {
                         return Ok(self.m.mk_true());
                     }
+                    // If s is a literal and r a constant regex, match directly.
+                    if let Some(s) = self.str_value(raw[0]) {
+                        let hit = r.matches(&s);
+                        return Ok(if hit {
+                            self.m.mk_true()
+                        } else {
+                            self.m.mk_false()
+                        });
+                    }
                     // `(re.* inner)` matches Σ* when `inner` accepts every single
                     // character of the alphabet: any string is then a
                     // concatenation of length-1 `inner`-words, so membership holds
@@ -19952,22 +19965,25 @@ impl Context {
                     {
                         return Ok(self.m.mk_true());
                     }
-                    if r.is_empty_lang() {
+                    // An empty language, or a universal one (its complement is
+                    // empty, decided on the derivative automaton): membership
+                    // fails, or holds, for every `s`.
+                    let (empty, universal) = match self.regex_lang.get(&raw[1]) {
+                        Some(&known) => known,
+                        None => {
+                            let empty = r.is_empty_lang();
+                            let universal = !empty
+                                && Regex::Comp(Box::new(r.clone())).language_is_empty()
+                                    == Some(true);
+                            self.regex_lang.insert(raw[1], (empty, universal));
+                            (empty, universal)
+                        }
+                    };
+                    if empty {
                         return Ok(self.m.mk_false());
                     }
-                    // A universal language (its complement is empty, decided on
-                    // the derivative automaton): membership holds for every `s`.
-                    if Regex::Comp(Box::new(r.clone())).language_is_empty() == Some(true) {
+                    if universal {
                         return Ok(self.m.mk_true());
-                    }
-                    // If s is a literal and r a constant regex, match directly.
-                    if let Some(s) = self.str_value(raw[0]) {
-                        let hit = r.matches(&s);
-                        return Ok(if hit {
-                            self.m.mk_true()
-                        } else {
-                            self.m.mk_false()
-                        });
                     }
                 }
                 // (str.in_re s (str.to_re t)) ≡ s = t (seq_rewriter::mk_str_in_regexp).
