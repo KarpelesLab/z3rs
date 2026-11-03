@@ -18,6 +18,7 @@
 
 use alloc::vec::Vec;
 
+use crate::math::factor::normalize;
 use crate::math::polynomial::{Polynomial, Var};
 
 /// `Res_v(p, q)`: the resultant of `p` and `q` with respect to variable `v`, a
@@ -36,6 +37,17 @@ pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Option<Polynomial> {
     if n == 0 {
         return Some(q.coeff_of_var(v, 0).pow(m as u32));
     }
+    // The subresultant PRS is far cheaper than the determinant.
+    if let Some(r) = resultant_prs(p, q, v) {
+        return Some(r);
+    }
+    sylvester_resultant(p, q, v)
+}
+
+/// `Res_v(p, q)` as the Sylvester determinant (both of positive degree).
+fn sylvester_resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Option<Polynomial> {
+    let m = p.degree_of(v) as usize;
+    let n = q.degree_of(v) as usize;
     // Sylvester matrix: (m+n)×(m+n). Coefficients highest-degree first.
     let p_co: Vec<Polynomial> = (0..=m).rev().map(|i| p.coeff_of_var(v, i as u32)).collect();
     let q_co: Vec<Polynomial> = (0..=n).rev().map(|j| q.coeff_of_var(v, j as u32)).collect();
@@ -111,7 +123,7 @@ pub fn principal_subresultant_coeffs(
     }
     // For i = 0..=n: sᵢ = det of the submatrix using
     //   rows  = P-rows 0..(n-i-1) and Q-rows 0..(m-i-1)   [(m+n-2i) rows],
-    //   cols  = 0..(size-2i-2) and column (size-1-i)      [the v^i column].
+    //   cols  = 0..(m+n-2i-1)                              [leading minor].
     // i=0 recovers the full Sylvester determinant = Res.
     let mut out = Vec::with_capacity(n + 1);
     for i in 0..=n {
@@ -127,17 +139,198 @@ pub fn principal_subresultant_coeffs(
         for r in 0..(m - i) {
             rows.push(n + r);
         }
-        let mut cols: Vec<usize> = Vec::with_capacity(dim);
-        for c in 0..(dim - 1) {
-            cols.push(c);
-        }
-        cols.push(size - 1 - i);
+        // The rows are the Sylvester rows shifted by `v^i`, so the `v^i`
+        // coefficient of the `i`-th subresultant sits in column `dim - 1`:
+        // the principal coefficient is the leading `dim × dim` minor.
+        let cols: Vec<usize> = (0..dim).collect();
         let sub: Vec<Vec<Polynomial>> = rows
             .iter()
             .map(|&ri| cols.iter().map(|&ci| syl[ri][ci].clone()).collect())
             .collect();
         out.push(determinant(&sub)?);
     }
+    Some(out)
+}
+
+/// The leading coefficient of `p` in `x`.
+fn lc(p: &Polynomial, x: Var) -> Polynomial {
+    p.coeff_of_var(x, p.degree_of(x))
+}
+
+/// The monomial `x^j` as a polynomial.
+fn xpow(x: Var, j: u32) -> Polynomial {
+    use crate::math::polynomial::Monomial;
+    Polynomial::from_terms(alloc::vec![(1.into(), Monomial::from_powers(&[(x, j)]))])
+}
+
+/// The exact pseudo-remainder `lc(q)^(deg p − deg q + 1) · p mod q` in `x`
+/// (z3's `exact_pseudo_remainder`; requires `deg p ≥ deg q`).
+fn exact_prem(p: &Polynomial, q: &Polynomial, x: Var) -> Polynomial {
+    let db = q.degree_of(x);
+    if db == 0 {
+        return Polynomial::zero();
+    }
+    let da = p.degree_of(x);
+    let lb = lc(q, x);
+    let rb = q.sub(&lb.mul(&xpow(x, db)));
+    let mut r = p.clone();
+    let mut d = 0;
+    loop {
+        let dr = r.degree_of(x);
+        if r.is_zero() || db > dr {
+            let exact = (da + 1).saturating_sub(db);
+            if d < exact {
+                r = lb.pow(exact - d).mul(&r);
+            }
+            return r;
+        }
+        // Cancel x^dr: r ← lb·(r − lr·x^dr) − lr·x^(dr−db)·rb.
+        let lr = r.coeff_of_var(x, dr);
+        let red = r.sub(&lr.mul(&xpow(x, dr)));
+        r = lb.mul(&red).sub(&lr.mul(&xpow(x, dr - db)).mul(&rb));
+        d += 1;
+    }
+}
+
+/// `S_e` from `S_{d−1}` by the "dichotomous Lazard" optimization (z3's
+/// `Se_Lazard`).
+fn se_lazard(d: u32, lc_s_d: &Polynomial, s_d_1: &Polynomial, x: Var) -> Option<Polynomial> {
+    let mut n = d - s_d_1.degree_of(x) - 1;
+    if n == 0 {
+        return Some(s_d_1.clone());
+    }
+    let xx = lc(s_d_1, x);
+    let y = lc_s_d;
+    let mut a = 1u32 << (31 - n.leading_zeros());
+    let mut c = xx.clone();
+    n -= a;
+    while a != 1 {
+        a /= 2;
+        c = c.mul(&c).div_exact(y)?;
+        if n >= a {
+            c = c.mul(&xx).div_exact(y)?;
+            n -= a;
+        }
+    }
+    c.mul(s_d_1).div_exact(y)
+}
+
+/// `S_{e−1}` (z3's `optimized_S_e_1`, Ducos' optimization).
+fn optimized_s_e_1(
+    d: u32,
+    e: u32,
+    a: &Polynomial,
+    s_d_1: &Polynomial,
+    s_e: &Polynomial,
+    s: &Polynomial,
+    x: Var,
+) -> Option<Polynomial> {
+    let c_d_1 = lc(s_d_1, x);
+    let se = lc(s_e, x);
+    let mut h: Vec<Polynomial> = (0..e).map(|j| se.mul(&xpow(x, j))).collect();
+    h.push(se.mul(&xpow(x, e)).sub(s_e));
+    let xp = xpow(x, 1);
+    for j in e + 1..d {
+        let xh = xp.mul(&h[j as usize - 1]);
+        let xhe = xh.coeff_of_var(x, e);
+        let t = xhe.mul(s_d_1).div_exact(&c_d_1)?;
+        h.push(xh.sub(&t));
+    }
+    let mut dd = Polynomial::zero();
+    for (j, hj) in h.iter().enumerate().take(d as usize) {
+        dd = dd.add(&a.coeff_of_var(x, j as u32).mul(hj));
+    }
+    let dd = dd.div_exact(&lc(a, x))?;
+    let xh = xp.mul(&h[d as usize - 1]);
+    let xhe = xh.coeff_of_var(x, e).mul(s_d_1);
+    let r = c_d_1.mul(&xh.add(&dd)).sub(&xhe).div_exact(s)?;
+    Some(if (d - e + 1) % 2 == 1 { r.neg() } else { r })
+}
+
+/// The resultant `S₀` of `p` and `q` (both of positive degree in `x`) by
+/// the subresultant PRS of [`psc_chain`], up to a nonzero constant factor
+/// (the inputs are scaled to primitive integer coefficients, which keeps the
+/// arithmetic integral). `None` if an exact division fails.
+fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Polynomial> {
+    let (p, q) = (&normalize(p), &normalize(q));
+    let (p, q) = if p.degree_of(x) >= q.degree_of(x) {
+        (p, q)
+    } else {
+        (q, p)
+    };
+    let mut s = lc(q, x).pow(p.degree_of(x) - q.degree_of(x));
+    let mut a = q.clone();
+    let mut b = exact_prem(p, &q.neg(), x);
+    loop {
+        if b.is_zero() {
+            return Some(Polynomial::zero());
+        }
+        let d = a.degree_of(x);
+        let e = b.degree_of(x);
+        let c = if d - e > 1 {
+            se_lazard(d, &s, &b, x)?
+        } else {
+            b.clone()
+        };
+        if e == 0 {
+            return Some(c);
+        }
+        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x)?;
+        s = lc(&c, x);
+        a = c;
+    }
+}
+
+/// The nonzero principal subresultant coefficients of `p` and `q` in `x`,
+/// lowest index first, below the top one (z3's `psc_chain`, the optimized
+/// subresultant algorithm of Ducos): `[0]` when they all vanish (`p` and `q`
+/// share their whole gcd structure), each up to a nonzero constant factor.
+/// `None` if an exact division fails.
+/// Both polynomials must contain `x`.
+pub fn psc_chain(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Vec<Polynomial>> {
+    let (p, q) = (&normalize(p), &normalize(q));
+    let (p, q) = if p.degree_of(x) >= q.degree_of(x) {
+        (p, q)
+    } else {
+        (q, p)
+    };
+    let mut out = Vec::new();
+    let deg_p = p.degree_of(x);
+    let deg_q = q.degree_of(x);
+    let mut s = lc(q, x).pow(deg_p - deg_q);
+    let mut a = q.clone();
+    let mut b = exact_prem(p, &q.neg(), x);
+    loop {
+        let d = a.degree_of(x);
+        let e = b.degree_of(x);
+        if b.is_zero() {
+            break;
+        }
+        let ps = b.coeff_of_var(x, d - 1);
+        if !ps.is_zero() {
+            out.push(ps);
+        }
+        let c = if d - e > 1 {
+            let c = se_lazard(d, &s, &b, x)?;
+            let ps = c.coeff_of_var(x, e);
+            if !ps.is_zero() {
+                out.push(ps);
+            }
+            c
+        } else {
+            b.clone()
+        };
+        if e == 0 {
+            break;
+        }
+        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x)?;
+        s = lc(&c, x);
+        a = c;
+    }
+    if out.is_empty() {
+        out.push(Polynomial::zero());
+    }
+    out.reverse();
     Some(out)
 }
 
@@ -289,6 +482,74 @@ mod tests {
             (r(-4), mono(&[(2, 1)])),
         ]);
         assert!(disc == expect || disc == expect.neg(), "got {disc:?}");
+    }
+
+    /// `psc_chain` agrees with the determinant definition: the same nonzero
+    /// principal subresultant coefficients (below the top), up to a nonzero
+    /// rational factor.
+    #[test]
+    fn psc_chain_matches_determinants() {
+        let mut seed = 7u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..300 {
+            let mk = |next: &mut dyn FnMut(u64) -> u64| {
+                let mut terms = Vec::new();
+                for _ in 0..1 + next(5) {
+                    let c = next(7) as i64 - 3;
+                    let mut pw = Vec::new();
+                    for v in 0..3u32 {
+                        let e = next(if v == 0 { 4 } else { 3 }) as u32;
+                        pw.push((v, e));
+                    }
+                    terms.push((r(c), mono(&pw)));
+                }
+                Polynomial::from_terms(terms)
+            };
+            let p = mk(&mut next);
+            let q = mk(&mut next);
+            if p.degree_of(0) == 0 || q.degree_of(0) == 0 {
+                continue;
+            }
+            let fast = psc_chain(&p, &q, 0).expect("exact");
+            let r1 = resultant_prs(&p, &q, 0).expect("exact");
+            let r2 = sylvester_resultant(&p, &q, 0).expect("exact");
+            if r2.is_zero() {
+                assert!(r1.is_zero());
+            } else {
+                let k = r2.terms()[0].0.div(&r1.terms()[0].0);
+                assert_eq!(r1.scale(&k), r2, "{r1:?} {r2:?}");
+            }
+            let (hp, hq) = if p.degree_of(0) >= q.degree_of(0) {
+                (&p, &q)
+            } else {
+                (&q, &p)
+            };
+            let slow = principal_subresultant_coeffs(hp, hq, 0).expect("exact");
+            let n = hq.degree_of(0) as usize;
+            let mut nz: Vec<Polynomial> =
+                slow[..n].iter().filter(|s| !s.is_zero()).cloned().collect();
+            if nz.is_empty() {
+                nz.push(Polynomial::zero());
+            }
+            assert_eq!(
+                fast.len(),
+                nz.len(),
+                "{p:?} {q:?}\nFAST {fast:?}\nSLOW {slow:?}"
+            );
+            for (f, s) in fast.iter().zip(&nz) {
+                if s.is_zero() {
+                    assert!(f.is_zero());
+                    continue;
+                }
+                let k = s.terms()[0].0.div(&f.terms()[0].0);
+                assert_eq!(f.scale(&k), *s, "{p:?} {q:?}");
+            }
+        }
     }
 
     // Subresultant chain, coprime pair: s0 = Res ≠ 0.

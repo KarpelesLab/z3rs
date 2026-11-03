@@ -11,7 +11,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use puremp::Rational;
+use puremp::{Int, Rational};
 
 fn zero() -> Rational {
     Rational::from_integer(0.into())
@@ -213,14 +213,19 @@ impl UPoly {
     /// Monic GCD via the Euclidean algorithm (the zero polynomial's GCD with `p`
     /// is the monic form of `p`).
     pub fn gcd(&self, other: &UPoly) -> UPoly {
-        let mut a = self.clone();
-        let mut b = other.clone();
-        while !b.is_zero() {
-            let r = a.rem(&b);
-            a = b;
-            b = r;
+        if self.is_zero() || other.is_zero() || self.degree() == 0 || other.degree() == 0 {
+            let mut a = self.clone();
+            let mut b = other.clone();
+            while !b.is_zero() {
+                let r = a.rem(&b);
+                a = b;
+                b = r;
+            }
+            return a.monic();
         }
-        a.monic()
+        // Over the integers by the subresultant PRS (no rational arithmetic).
+        let g = gcd_int(&int_coeffs(self), &int_coeffs(other));
+        UPoly::from_coeffs(g.into_iter().map(Rational::from_integer).collect()).monic()
     }
 
     /// The monic associate `p / lead(p)` (the zero polynomial is unchanged).
@@ -340,6 +345,248 @@ pub fn isolate_roots(p: &UPoly) -> Vec<(Rational, Rational)> {
     out
 }
 
+/// Exact rational roots and isolating intervals of the other real roots.
+pub type RootIsolation = (Vec<Rational>, Vec<(Rational, Rational)>);
+
+/// Integer coefficients proportional to `p`'s by a positive factor.
+pub fn int_coeffs(p: &UPoly) -> Vec<Int> {
+    let mut l = Int::from(1);
+    for c in &p.coeffs {
+        let d = c.denominator();
+        let g = l.gcd(d);
+        l = l.mul(d).div_exact(&g);
+    }
+    let lr = Rational::from_integer(l);
+    p.coeffs
+        .iter()
+        .map(|c| c.mul(&lr).numerator().clone())
+        .collect()
+}
+
+/// The GCD of the integer coefficients (0 for none).
+fn int_content(a: &[Int]) -> Int {
+    let mut g = Int::from(0);
+    for c in a {
+        g = g.gcd(c);
+        if g.is_one() {
+            break;
+        }
+    }
+    g
+}
+
+/// `a` divided by its content.
+fn int_pp(a: &[Int]) -> Vec<Int> {
+    let c = int_content(a);
+    if c.is_zero() || c.is_one() {
+        return a.to_vec();
+    }
+    a.iter().map(|x| x.div_exact(&c)).collect()
+}
+
+/// The pseudo-remainder `lc(b)^(deg a − deg b + 1) · a mod b` of dense
+/// integer polynomials (ascending, no trailing zeros, `deg a ≥ deg b`).
+fn int_prem(a: &[Int], b: &[Int]) -> Vec<Int> {
+    let db = b.len() - 1;
+    let lb = &b[db];
+    let mut r = a.to_vec();
+    let mut steps = a.len() - b.len() + 1;
+    while r.len() > db && !r.is_empty() {
+        let dr = r.len() - 1;
+        let lr = r[dr].clone();
+        for c in r.iter_mut() {
+            *c = c.mul(lb);
+        }
+        let shift = dr - db;
+        for (i, bc) in b.iter().enumerate() {
+            let t = r[shift + i].sub(&lr.mul(bc));
+            r[shift + i] = t;
+        }
+        steps -= 1;
+        while r.last().is_some_and(|c| c.is_zero()) {
+            r.pop();
+        }
+    }
+    if steps > 0 {
+        let f = lb.pow(steps as u64);
+        for c in r.iter_mut() {
+            *c = c.mul(&f);
+        }
+    }
+    r
+}
+
+/// The GCD (up to a constant) of nonconstant integer polynomials, by the
+/// subresultant PRS (Knuth, TAOCP 4.6.1, Algorithm C).
+fn gcd_int(a: &[Int], b: &[Int]) -> Vec<Int> {
+    let (a, b) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    let d = int_content(a).gcd(&int_content(b));
+    let mut u = int_pp(a);
+    let mut v = int_pp(b);
+    let mut g = Int::from(1);
+    let mut h = Int::from(1);
+    loop {
+        let delta = (u.len() - v.len()) as u64;
+        let r = int_prem(&u, &v);
+        if r.is_empty() {
+            break;
+        }
+        if r.len() == 1 {
+            return alloc::vec![d];
+        }
+        u = v;
+        let div = g.mul(&h.pow(delta));
+        v = r.iter().map(|c| c.div_exact(&div)).collect();
+        g = u.last().expect("nonzero").clone();
+        // h ← g^δ / h^(δ−1)
+        h = if delta == 0 {
+            h
+        } else {
+            g.pow(delta).div_exact(&h.pow(delta - 1))
+        };
+    }
+    int_pp(&v).into_iter().map(|c| c.mul(&d)).collect()
+}
+
+/// Sign variations of a coefficient sequence (zeros skipped).
+fn sign_variations(cs: &[Int]) -> usize {
+    let mut last = 0;
+    let mut n = 0;
+    for c in cs {
+        let s = c.signum();
+        if s == 0 {
+            continue;
+        }
+        if last != 0 && s != last {
+            n += 1;
+        }
+        last = s;
+    }
+    n
+}
+
+/// `q(x) ↦ q(x + 1)` in place (ascending coefficients).
+fn taylor_shift_1(a: &mut [Int]) {
+    let n = a.len();
+    for i in 0..n.saturating_sub(1) {
+        for j in (i..n - 1).rev() {
+            let t = a[j].add(&a[j + 1]);
+            a[j] = t;
+        }
+    }
+}
+
+/// Descartes' bound on the roots of `q` in `(0, 1)`: the sign variations of
+/// `(x + 1)ⁿ q(1 / (x + 1))`.
+fn descartes_01(q: &[Int]) -> usize {
+    let mut r: Vec<Int> = q.iter().rev().cloned().collect();
+    taylor_shift_1(&mut r);
+    sign_variations(&r)
+}
+
+/// The real roots of the squarefree `p`, by Descartes' rule of signs with
+/// bisection (the Vincent–Collins–Akritas method z3's `upolynomial` uses), in
+/// exact integer arithmetic: the rational roots met at bisection points (and
+/// zero) exactly, and an isolating open interval for each other root, whose
+/// endpoints are roots of `p` only when listed among the exact ones. `None`
+/// past the iteration guard.
+pub fn isolate_roots_vca(p: &UPoly) -> Option<RootIsolation> {
+    let mut exact = Vec::new();
+    let mut ivs = Vec::new();
+    if p.degree() == 0 {
+        return Some((exact, ivs));
+    }
+    let mut cs = int_coeffs(p);
+    if cs[0].is_zero() {
+        exact.push(zero());
+        cs.remove(0);
+    }
+    // 2^k bounds every root's magnitude strictly (Cauchy).
+    let lead = cs.last().expect("nonconstant").abs();
+    let mut maxc = Int::from(0);
+    for c in &cs[..cs.len() - 1] {
+        let a = c.abs();
+        if a > maxc {
+            maxc = a;
+        }
+    }
+    let bound = maxc.div_floor(&lead).add(&Int::from(2));
+    let k = bound.bit_len() as u64;
+    for negative in [false, true] {
+        if cs.len() <= 1 {
+            break;
+        }
+        // q(x) = P(±2^k x): its roots in (0, 1) are P's in (0, ±2^k).
+        let q: Vec<Int> = cs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let c = c.mul_2k(k * i as u64);
+                if negative && i % 2 == 1 { c.neg() } else { c }
+            })
+            .collect();
+        // Nodes: (q, c, j) for the interval (c / 2^j, (c + 1) / 2^j) · 2^k.
+        let mut stack: Vec<(Vec<Int>, Int, u64)> = alloc::vec![(q, Int::from(0), 0)];
+        let mut guard = 0usize;
+        let to_rat = |c: &Int, j: u64| -> Rational {
+            let v = if j >= k {
+                Rational::new(c.clone(), Int::from(1).mul_2k(j - k))
+            } else {
+                Rational::from_integer(c.mul_2k(k - j))
+            };
+            if negative { v.neg() } else { v }
+        };
+        while let Some((q, c, j)) = stack.pop() {
+            guard += 1;
+            if guard > 100_000 || j > 4000 {
+                return None;
+            }
+            if q.len() <= 1 {
+                continue;
+            }
+            let v = descartes_01(&q);
+            if v == 0 {
+                continue;
+            }
+            if v == 1 {
+                let lo = to_rat(&c, j);
+                let hi = to_rat(&c.add(&Int::from(1)), j);
+                ivs.push(if negative { (hi, lo) } else { (lo, hi) });
+                continue;
+            }
+            // Halves: q1(x) = 2^n q(x/2) on (0, 1/2), q2(x) = q1(x + 1).
+            let n = q.len() - 1;
+            let mut q1: Vec<Int> = q
+                .iter()
+                .enumerate()
+                .map(|(i, a)| a.mul_2k((n - i) as u64))
+                .collect();
+            let mut q2 = q1.clone();
+            taylor_shift_1(&mut q2);
+            let c2 = c.mul_2k(1);
+            if q2[0].is_zero() {
+                // The midpoint is a root: record it, divide it out of both.
+                exact.push(to_rat(&c2.add(&Int::from(1)), j + 1));
+                q2.remove(0);
+                // q1 = (x − 1)·s: s_{i−1} = −(a_i... ) by synthetic division.
+                let mut s = alloc::vec![Int::from(0); n];
+                let mut carry = Int::from(0);
+                for i in (1..=n).rev() {
+                    carry = carry.add(&q1[i]);
+                    s[i - 1] = carry.clone();
+                }
+                debug_assert!(carry.add(&q1[0]).is_zero());
+                q1 = s;
+            }
+            stack.push((q2, c2.add(&Int::from(1)), j + 1));
+            stack.push((q1, c2, j + 1));
+        }
+    }
+    exact.sort();
+    ivs.sort_by(|a, b| a.0.cmp(&b.0));
+    Some((exact, ivs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +597,89 @@ mod tests {
     // c₀ + c₁x + … from integer coeffs.
     fn p(cs: &[i64]) -> UPoly {
         UPoly::from_coeffs(cs.iter().map(|&c| r(c)).collect())
+    }
+
+    /// The integer subresultant GCD equals the monic rational Euclidean one.
+    #[test]
+    fn int_gcd_matches_euclid() {
+        let mut seed = 3u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let rnd = |next: &mut dyn FnMut(u64) -> u64| {
+            let deg = next(5) as usize;
+            UPoly::from_coeffs((0..=deg).map(|_| r(next(9) as i64 - 4)).collect())
+        };
+        for _ in 0..300 {
+            let c = rnd(&mut next);
+            let a = rnd(&mut next).mul(&c);
+            let b = rnd(&mut next).mul(&c);
+            let fast = a.gcd(&b);
+            let mut x = a.clone();
+            let mut y = b.clone();
+            while !y.is_zero() {
+                let t = x.rem(&y);
+                x = y;
+                y = t;
+            }
+            assert_eq!(fast, x.monic(), "{a:?} {b:?}");
+        }
+    }
+
+    /// The Descartes isolation agrees with the Sturm counts: every interval
+    /// holds exactly one root and has non-root endpoints after dividing the
+    /// exact roots out, and the totals match.
+    #[test]
+    fn vca_matches_sturm() {
+        let mut seed = 11u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..400 {
+            let deg = 1 + next(8) as usize;
+            let mut cs: Vec<Rational> = (0..=deg).map(|_| r(next(11) as i64 - 5)).collect();
+            if next(3) == 0 {
+                cs[0] = r(0);
+            }
+            let mut poly = UPoly::from_coeffs(cs);
+            // Rational roots: multiply by (2x − 1)(x + 3) sometimes.
+            if next(2) == 0 {
+                poly = poly.mul(&p(&[-1, 2])).mul(&p(&[3, 1]));
+            }
+            if poly.degree() == 0 {
+                continue;
+            }
+            let sf = poly.squarefree();
+            let (exact, ivs) = isolate_roots_vca(&sf).expect("terminates");
+            let chain = sturm_chain(&sf);
+            let m = sf.root_bound();
+            let total = root_count(&chain, &m.neg(), &m);
+            assert_eq!(total as usize, exact.len() + ivs.len(), "{sf:?}");
+            for e in &exact {
+                assert_eq!(sf.sign_at(e), 0);
+            }
+            let mut def = sf.clone();
+            for e in &exact {
+                def = def.div_exact(&UPoly::from_coeffs(vec![e.neg(), one()]));
+            }
+            for (lo, hi) in &ivs {
+                assert!(lo < hi);
+                assert_ne!(def.sign_at(lo), 0, "{sf:?} {lo:?}");
+                assert_ne!(def.sign_at(hi), 0);
+                let at_hi = i64::from(sf.sign_at(hi) == 0);
+                assert_eq!(
+                    root_count(&chain, lo, hi) - at_hi,
+                    1,
+                    "{sf:?} ({lo:?}, {hi:?})"
+                );
+            }
+        }
     }
 
     #[test]

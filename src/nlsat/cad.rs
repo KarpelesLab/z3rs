@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use puremp::Rational;
 
 use crate::math::polynomial::{Polynomial, Var};
-use crate::math::resultant::{principal_subresultant_coeffs, resultant};
+use crate::math::resultant::psc_chain;
 use crate::math::upoly::UPoly;
 use crate::nlsat::icp::Rel;
 use crate::nlsat::realclosure::{Alg, poly_to_upoly, sign_at_point, upoly_to_poly};
@@ -324,7 +324,7 @@ pub(crate) fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>>
             if gd.degree_of(var) >= 1 {
                 // Decline (→ `unknown`) if the subresultant determinant hits an
                 // inexact Bareiss division rather than returning a wrong factor.
-                proj.extend(principal_subresultant_coeffs(g, &gd, var)?);
+                proj.extend(subresultant_coeffs(g, &gd, var)?);
             }
             // (If `g` is linear in `var`, `g'` is a nonzero constant in `var`; the
             // pair has no repeated root and the leading coefficient above suffices.)
@@ -335,12 +335,27 @@ pub(crate) fn project(polys: &[Polynomial], var: Var) -> Option<Vec<Polynomial>>
         for j in (i + 1)..reducta_lists.len() {
             for g in &reducta_lists[i] {
                 for h in &reducta_lists[j] {
-                    proj.extend(principal_subresultant_coeffs(g, h, var)?);
+                    proj.extend(subresultant_coeffs(g, h, var)?);
                 }
             }
         }
     }
     Some(clean(proj))
+}
+
+/// Every principal subresultant coefficient of `g` and `h` in `var` (both of
+/// positive degree), the top one `lc(h)^(deg g − deg h)` included (for
+/// `deg g ≥ deg h`); zero ones may be omitted.
+fn subresultant_coeffs(g: &Polynomial, h: &Polynomial, var: Var) -> Option<Vec<Polynomial>> {
+    let (g, h) = if g.degree_of(var) >= h.degree_of(var) {
+        (g, h)
+    } else {
+        (h, g)
+    };
+    let mut out = psc_chain(g, h, var)?;
+    let top = h.coeff_of_var(var, h.degree_of(var));
+    out.push(top.pow(g.degree_of(var) - h.degree_of(var)));
+    Some(out)
 }
 
 /// The chain of *reducta* of `f` in `var`: `f`, then `f` with its leading
@@ -527,18 +542,13 @@ pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<A
     if f.degree_of(var) == 0 {
         return Some(Vec::new()); // no root boundaries from a var-free polynomial
     }
-    // Eliminate each sample coordinate (rationals by substitution).
-    let mut g = f.clone();
-    for (i, coord) in sample.iter().enumerate() {
-        match coord {
-            Alg::Rational(r) => {
-                g = crate::nlsat::elim::subst_var(&g, i as Var, &Polynomial::constant(r.clone()));
-            }
-            Alg::Irrational { poly, .. } => {
-                g = resultant(&g, &upoly_to_poly(poly, i as Var), i as Var)?;
-            }
-        }
+    // Eliminate each sample coordinate (rationals by substitution, the
+    // irrational ones occurring by resultants).
+    let f = &crate::nlsat::realclosure::subst_rationals(f, sample);
+    if f.degree_of(var) == 0 {
+        return Some(Vec::new());
     }
+    let g = crate::nlsat::realclosure::eliminate_irrationals(f.clone(), sample)?;
     // `g` is now univariate in `var`.
     let u = poly_to_upoly(&g, var);
     if u.is_zero() {
@@ -565,8 +575,28 @@ pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<A
         return None;
     }
     let candidates = Alg::roots_of(&u);
+    if f.vars().iter().all(|&v| v == var) {
+        // Pure substitution: `u` is `f` along the fiber, its roots are exact.
+        return Some(candidates);
+    }
     let mut out = Vec::new();
     for beta in candidates {
+        // Every root of `f` along the fiber is a root of `u`, and the
+        // isolating interval of `beta` holds no other root of `u`: a strict
+        // sign change of `f` across it proves `beta` a root.
+        if let Alg::Irrational { lo, hi, .. } = &beta {
+            let at = |x: &Rational| {
+                let mut point = sample.to_vec();
+                point.push(Alg::Rational(x.clone()));
+                crate::nlsat::realclosure::strict_sign_at_point(f, &point, 24)
+            };
+            if let (Some(a), Some(b)) = (at(lo), at(hi))
+                && a != b
+            {
+                out.push(beta);
+                continue;
+            }
+        }
         let mut point = sample.to_vec();
         point.push(beta.clone());
         if sign_at_point(f, &point)? == 0 {

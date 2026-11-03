@@ -22,7 +22,6 @@ use crate::math::interval::Interval;
 use crate::math::polynomial::{Polynomial, Var};
 use crate::math::resultant::resultant;
 use crate::math::upoly::{self, UPoly};
-use crate::nlsat::elim::subst_var;
 use crate::nlsat::icp::eval_interval;
 
 fn two() -> Rational {
@@ -65,19 +64,63 @@ fn eliminate_to_univariate(p: &Polynomial, point: &[Alg]) -> Option<UPoly> {
     let n = point.len();
     let z = n as Var; // fresh variable index, above all coordinates
     // f = z - p
-    let mut f = Polynomial::var(z).sub(p);
-    for (i, coord) in point.iter().enumerate() {
-        match coord {
-            Alg::Rational(r) => {
-                f = subst_var(&f, i as Var, &Polynomial::constant(r.clone()));
+    let f = Polynomial::var(z).sub(&subst_rationals(p, point));
+    let f = eliminate_irrationals(f, point)?;
+    Some(poly_to_upoly(&f, z))
+}
+
+/// `p` with every rational coordinate of `point` substituted (one pass).
+pub(crate) fn subst_rationals(p: &Polynomial, point: &[Alg]) -> Polynomial {
+    use crate::math::polynomial::Monomial;
+    if !p
+        .vars()
+        .iter()
+        .any(|&v| matches!(point.get(v as usize), Some(Alg::Rational(_))))
+    {
+        return p.clone();
+    }
+    let terms = p
+        .terms()
+        .iter()
+        .map(|(c, m)| {
+            let mut c = c.clone();
+            let mut rest: Vec<(Var, u32)> = Vec::new();
+            for v in m.vars() {
+                let e = m.degree_of(v);
+                match point.get(v as usize) {
+                    Some(Alg::Rational(r)) => c = c.mul(&r.pow(e as i32)),
+                    _ => rest.push((v, e)),
+                }
             }
-            Alg::Irrational { poly, .. } => {
-                let qi = upoly_to_poly(poly, i as Var);
-                f = resultant(&f, &qi, i as Var)?; // inexact Bareiss ⇒ decline
+            (c, Monomial::from_powers(&rest))
+        })
+        .collect();
+    Polynomial::from_terms(terms)
+}
+
+/// Eliminate, by resultants with their defining polynomials, the irrational
+/// coordinates of `point` that occur in `f` (lowest defining degree first,
+/// as z3's `var_degree_lt`); `None` on an inexact division.
+pub(crate) fn eliminate_irrationals(mut f: Polynomial, point: &[Alg]) -> Option<Polynomial> {
+    let mut vs: Vec<(usize, Var)> = f
+        .vars()
+        .into_iter()
+        .filter_map(|v| match point.get(v as usize) {
+            Some(Alg::Irrational { poly, .. }) => Some((poly.degree(), v)),
+            _ => None,
+        })
+        .collect();
+    vs.sort();
+    for (_, v) in vs {
+        if let Some(Alg::Irrational { poly, .. }) = point.get(v as usize) {
+            let qi = crate::math::factor::normalize(&upoly_to_poly(poly, v));
+            f = crate::math::factor::normalize(&resultant(&f, &qi, v)?);
+            if f.is_zero() {
+                break;
             }
         }
     }
-    Some(poly_to_upoly(&f, z))
+    Some(f)
 }
 
 /// A rational `L > 0` such that every **nonzero** root `ρ` of `r` has `|ρ| ≥ L`
@@ -149,14 +192,56 @@ fn boxes_of(point: &[Alg]) -> Vec<Interval> {
         .collect()
 }
 
+/// The sign of `p` at `point` when interval evaluation (refining the
+/// irrational coordinates up to `rounds` times) shows it nonzero; `None` when
+/// that does not settle it (the value may be zero).
+pub(crate) fn strict_sign_at_point(p: &Polynomial, point: &[Alg], rounds: usize) -> Option<i32> {
+    let p = &subst_rationals(p, point);
+    if let Some(c) = p.as_constant() {
+        return (!c.is_zero()).then(|| c.signum());
+    }
+    let refinable: Vec<usize> = p
+        .vars()
+        .iter()
+        .map(|&v| v as usize)
+        .filter(|&i| matches!(point.get(i), Some(Alg::Irrational { .. })))
+        .collect();
+    let mut pt = point.to_vec();
+    for _ in 0..rounds {
+        let val = eval_interval(p, &boxes_of(&pt));
+        if let Some(s) = strict_interval_sign(&val) {
+            return Some(s);
+        }
+        for &i in &refinable {
+            pt[i].refine();
+        }
+    }
+    None
+}
+
 /// The exact sign of a multivariate polynomial `p` at a sample point whose
 /// coordinates are algebraic numbers (`point[i]` is the value of variable `i`).
 /// Interval arithmetic decides the easy cases; a resultant certification decides
 /// a suspected zero exactly. Sound and terminating (CAD spec §3.3).
 pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> Option<i32> {
-    // Indices whose coordinate is irrational (refinable).
-    let refinable: Vec<usize> = (0..point.len())
-        .filter(|&i| matches!(point[i], Alg::Irrational { .. }))
+    // Rational coordinates first (z3's `eval_sign_at`): what is left depends
+    // on irrational coordinates only, and a single one is decided exactly by
+    // its defining polynomial.
+    let p = &subst_rationals(p, point);
+    if let Some(c) = p.as_constant() {
+        return Some(c.signum());
+    }
+    let vars = p.vars();
+    if let [v] = vars[..]
+        && let Some(a) = point.get(v as usize)
+    {
+        return Some(a.sign_of(&poly_to_upoly(p, v)));
+    }
+    // Indices whose coordinate is irrational (refinable) and occurs in `p`.
+    let refinable: Vec<usize> = vars
+        .iter()
+        .map(|&v| v as usize)
+        .filter(|&i| matches!(point.get(i), Some(Alg::Irrational { .. })))
         .collect();
     let mut pt = point.to_vec();
 
@@ -208,6 +293,33 @@ fn exact_rational_sign(p: &Polynomial, point: &[Alg]) -> i32 {
     p.eval(&assign).signum()
 }
 
+/// Bounds `(l, u)` on `q` over `[a, b]` by interval Horner evaluation
+/// (they tighten to the value as the interval shrinks).
+fn interval_horner(q: &UPoly, a: &Rational, b: &Rational) -> (Rational, Rational) {
+    let cs = q.coeffs();
+    let mut l = cs
+        .last()
+        .cloned()
+        .unwrap_or_else(|| Rational::from_integer(0.into()));
+    let mut u = l.clone();
+    for c in cs.iter().rev().skip(1) {
+        let ps = [l.mul(a), l.mul(b), u.mul(a), u.mul(b)];
+        let mut lo = ps[0].clone();
+        let mut hi = ps[0].clone();
+        for p in &ps[1..] {
+            if *p < lo {
+                lo = p.clone();
+            }
+            if *p > hi {
+                hi = p.clone();
+            }
+        }
+        l = lo.add(c);
+        u = hi.add(c);
+    }
+    (l, u)
+}
+
 /// A real algebraic number.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Alg {
@@ -232,12 +344,60 @@ impl Alg {
     /// Isolate all real roots of `p` as algebraic numbers, ascending. A root that
     /// happens to be rational is returned as [`Alg::Rational`].
     pub fn roots_of(p: &UPoly) -> Vec<Alg> {
-        let sf = p.squarefree();
-        let intervals = upoly::isolate_roots(&sf);
-        let mut out = Vec::new();
-        for (lo, hi) in intervals {
-            out.push(Alg::from_isolation(sf.clone(), lo, hi));
+        if p.degree() == 0 {
+            return Vec::new();
         }
+        // Factoring is skipped for large degrees, where it costs more than
+        // it saves (z3 bounds its factorization effort too).
+        if p.degree() <= 2 || p.degree() > 16 {
+            return Self::roots_of_sqf(p.squarefree());
+        }
+        // Each root gets its irreducible factor as defining polynomial (z3's
+        // `isolate_roots` factors first): the smallest polynomials for every
+        // later resultant and sign test.
+        let fs = puremp::Poly::new(p.coeffs().to_vec()).factor();
+        let mut out = Vec::new();
+        for (f, _) in fs {
+            let u = UPoly::from_coeffs(f.coeffs().to_vec());
+            if u.degree() >= 1 {
+                out.extend(Self::roots_of_sqf(u));
+            }
+        }
+        out.sort_by(|a, b| a.compare(b));
+        out
+    }
+
+    /// The real roots of the squarefree `sf`, ascending.
+    fn roots_of_sqf(sf: UPoly) -> Vec<Alg> {
+        let Some((exact, intervals)) = upoly::isolate_roots_vca(&sf) else {
+            let mut out = Vec::new();
+            for (lo, hi) in upoly::isolate_roots(&sf) {
+                out.push(Alg::from_isolation(sf.clone(), lo, hi));
+            }
+            return out;
+        };
+        // The rational roots divided out, no interval endpoint is a root of
+        // the defining polynomial.
+        let mut def = sf;
+        for r in &exact {
+            def = def.div_exact(&UPoly::from_coeffs(alloc::vec![
+                r.neg(),
+                Rational::from_integer(1.into())
+            ]));
+        }
+        let mut out: Vec<Alg> = exact.into_iter().map(Alg::Rational).collect();
+        for (lo, hi) in intervals {
+            out.push(Alg::from_isolation(def.clone(), lo, hi));
+        }
+        // Sorted by lower endpoint: an exact root is never inside an interval
+        // and precedes an interval starting at it.
+        out.sort_by(|a, b| {
+            let key = |x: &Alg| match x {
+                Alg::Rational(r) => (r.clone(), 0),
+                Alg::Irrational { lo, .. } => (lo.clone(), 1),
+            };
+            key(a).cmp(&key(b))
+        });
         out
     }
 
@@ -303,16 +463,19 @@ impl Alg {
                         return 0;
                     }
                 }
-                // (b) q(self) ≠ 0: refine until q is sign-constant on the
-                // isolating interval, then read its sign at an endpoint.
+                // (b) q(self) ≠ 0: refine until the interval evaluation of q
+                // over the isolating interval excludes zero (equal endpoint
+                // signs alone would not exclude an even number of roots).
                 let mut a = lo.clone();
                 let mut b = hi.clone();
                 let ps = poly.clone();
-                for _ in 0..256 {
-                    let qa = q.sign_at(&a);
-                    let qb = q.sign_at(&b);
-                    if qa != 0 && qa == qb {
-                        return qa; // constant sign on [a,b] ⇒ that is q(self)'s sign
+                loop {
+                    let (l, u) = interval_horner(q, &a, &b);
+                    if l.is_positive() {
+                        return 1;
+                    }
+                    if u.is_negative() {
+                        return -1;
                     }
                     // Bisect keeping the root of `poly`.
                     let mid = a.add(&b).div(&two());
@@ -327,9 +490,6 @@ impl Alg {
                         b = mid;
                     }
                 }
-                // Fallback (should not happen for well-separated roots): use the
-                // interval midpoint's sign as a best effort.
-                q.sign_at(&a.add(&b).div(&two()))
             }
         }
     }
@@ -473,6 +633,20 @@ mod tests {
         assert_eq!(sqrt2.sign_of(&p(&[-2, 1])), -1); // √2 - 2 < 0
         // x^2 - 3 at √2 = 2 - 3 = -1 < 0.
         assert_eq!(sqrt2.sign_of(&p(&[-3, 0, 1])), -1);
+    }
+
+    /// Two roots of `q` inside √2's isolating interval, one on each side of
+    /// √2: `q` has the same sign at both endpoints but is negative at √2.
+    #[test]
+    fn sign_with_two_roots_in_the_interval() {
+        let sqrt2 = Alg::Irrational {
+            poly: p(&[-2, 0, 1]),
+            lo: r(1),
+            hi: r(2),
+        };
+        // (x − 1.40)(x − 1.42) = x² − 2.82x + 1.988, scaled by 2500.
+        let q = p(&[4970, -7050, 2500]);
+        assert_eq!(sqrt2.sign_of(&q), -1);
     }
 
     // Locating a rational relative to √2: 1 < √2 < 2, and x^2-2's root value.

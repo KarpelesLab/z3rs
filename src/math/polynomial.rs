@@ -84,16 +84,30 @@ impl Monomial {
         self.powers.iter().map(|&(v, _)| v)
     }
 
-    /// Multiply two monomials (adds exponents).
+    /// Multiply two monomials (adds exponents; a merge of the sorted powers).
     pub fn mul(&self, other: &Monomial) -> Monomial {
-        let mut powers = self.powers.clone();
-        for &(v, e) in &other.powers {
-            match powers.iter().position(|(pv, _)| *pv == v) {
-                Some(i) => powers[i].1 += e,
-                None => powers.push((v, e)),
+        let (a, b) = (&self.powers, &other.powers);
+        let mut powers = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0, 0);
+        while i < a.len() && j < b.len() {
+            match a[i].0.cmp(&b[j].0) {
+                Ordering::Less => {
+                    powers.push(a[i]);
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    powers.push(b[j]);
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    powers.push((a[i].0, a[i].1 + b[j].1));
+                    i += 1;
+                    j += 1;
+                }
             }
         }
-        powers.sort_by_key(|&(v, _)| v);
+        powers.extend_from_slice(&a[i..]);
+        powers.extend_from_slice(&b[j..]);
         Monomial { powers }
     }
 
@@ -175,29 +189,69 @@ impl Polynomial {
     /// Build from arbitrary `(coeff, monomial)` terms, combining like monomials
     /// and dropping zeros — the canonicalising constructor.
     pub fn from_terms(terms: Vec<(Rational, Monomial)>) -> Polynomial {
-        let mut p = Polynomial { terms: Vec::new() };
-        for (c, m) in terms {
-            p.add_term(c, m);
-        }
+        let mut p = Polynomial { terms };
         p.canonicalize();
         p
     }
 
-    fn add_term(&mut self, c: Rational, m: Monomial) {
-        if c.is_zero() {
-            return;
-        }
-        match self.terms.iter_mut().find(|(_, tm)| *tm == m) {
-            Some(slot) => {
-                slot.0 = slot.0.add(&c);
+    /// Sort the terms (leading, largest monomial first), combine like
+    /// monomials and drop zero coefficients.
+    fn canonicalize(&mut self) {
+        let mut ts = core::mem::take(&mut self.terms);
+        ts.sort_by(|(_, a), (_, b)| b.grlex_cmp(a));
+        let mut out: Vec<(Rational, Monomial)> = Vec::with_capacity(ts.len());
+        for (c, m) in ts {
+            if let Some(last) = out.last_mut()
+                && last.1 == m
+            {
+                last.0 = last.0.add(&c);
+                continue;
             }
-            None => self.terms.push((c, m)),
+            if let Some(last) = out.last()
+                && last.0.is_zero()
+            {
+                out.pop();
+            }
+            out.push((c, m));
         }
+        if out.last().is_some_and(|(c, _)| c.is_zero()) {
+            out.pop();
+        }
+        self.terms = out;
     }
 
-    fn canonicalize(&mut self) {
-        self.terms.retain(|(c, _)| !c.is_zero());
-        self.terms.sort_by(|(_, a), (_, b)| b.grlex_cmp(a)); // leading (largest) first
+    /// The sum of two canonical term lists, by merging (`neg_b`: subtract).
+    fn merge(a: &[(Rational, Monomial)], b: &[(Rational, Monomial)], neg_b: bool) -> Polynomial {
+        let mut terms = Vec::with_capacity(a.len() + b.len());
+        let (mut i, mut j) = (0, 0);
+        let nb = |c: &Rational| if neg_b { c.neg() } else { c.clone() };
+        while i < a.len() && j < b.len() {
+            match a[i].1.grlex_cmp(&b[j].1) {
+                Ordering::Greater => {
+                    terms.push(a[i].clone());
+                    i += 1;
+                }
+                Ordering::Less => {
+                    terms.push((nb(&b[j].0), b[j].1.clone()));
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    let c = if neg_b {
+                        a[i].0.sub(&b[j].0)
+                    } else {
+                        a[i].0.add(&b[j].0)
+                    };
+                    if !c.is_zero() {
+                        terms.push((c, a[i].1.clone()));
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        terms.extend_from_slice(&a[i..]);
+        terms.extend(b[j..].iter().map(|(c, m)| (nb(c), m.clone())));
+        Polynomial { terms }
     }
 
     /// Is this the zero polynomial?
@@ -313,52 +367,110 @@ impl Polynomial {
 
     /// Add two polynomials.
     pub fn add(&self, other: &Polynomial) -> Polynomial {
-        let mut p = self.clone();
-        for (c, m) in &other.terms {
-            p.add_term(c.clone(), m.clone());
-        }
-        p.canonicalize();
-        p
+        Polynomial::merge(&self.terms, &other.terms, false)
     }
 
     /// Subtract `other` from `self`.
     pub fn sub(&self, other: &Polynomial) -> Polynomial {
-        self.add(&other.neg())
+        Polynomial::merge(&self.terms, &other.terms, true)
     }
 
     /// Multiply two polynomials (full distribution).
     pub fn mul(&self, other: &Polynomial) -> Polynomial {
-        let mut p = Polynomial { terms: Vec::new() };
+        let mut terms = Vec::with_capacity(self.terms.len() * other.terms.len());
         for (ca, ma) in &self.terms {
             for (cb, mb) in &other.terms {
-                p.add_term(ca.mul(cb), ma.mul(mb));
+                terms.push((ca.mul(cb), ma.mul(mb)));
             }
         }
+        let mut p = Polynomial { terms };
         p.canonicalize();
         p
     }
 
     /// Exact quotient `self / divisor` when `divisor` divides `self` exactly
-    /// (multivariate long division by leading terms in graded-lex order; used by
-    /// the fraction-free Bareiss determinant). Returns `None` if a leading-term
-    /// division is not possible — i.e. the division is not exact — so callers can
-    /// decline rather than crash (the Bareiss exactness invariant can be broken by
-    /// a degenerate/pivoted matrix).
+    /// (multivariate long division by leading terms; used by the fraction-free
+    /// Bareiss determinant and the subresultant chain). Returns `None` when the
+    /// division is not exact, so callers can decline rather than crash.
+    ///
+    /// The division runs in graded-lex order on dense exponent vectors (a true
+    /// monomial order, unlike the canonical storage order), so an exact
+    /// division never fails spuriously.
     pub fn div_exact(&self, divisor: &Polynomial) -> Option<Polynomial> {
         debug_assert!(!divisor.is_zero());
-        let (dc, dm) = divisor.terms[0].clone(); // graded-lex leading term
-        let mut rem = self.clone();
-        let mut quot = Polynomial::zero();
-        while let Some((rc, rm)) = rem.terms.first().cloned() {
-            let qm = rm.checked_div(&dm)?; // not divisible ⇒ inexact ⇒ decline
-            let qc = rc.div(&dc);
-            let qterm = Polynomial {
-                terms: vec![(qc, qm)],
-            };
-            quot = quot.add(&qterm);
-            rem = rem.sub(&divisor.mul(&qterm));
+        if self.is_zero() {
+            return Some(Polynomial::zero());
         }
-        Some(quot)
+        let n = self
+            .terms
+            .iter()
+            .chain(&divisor.terms)
+            .flat_map(|(_, m)| m.vars())
+            .max()
+            .map_or(0, |v| v as usize + 1);
+        let dense = |m: &Monomial| -> (u32, Vec<u32>) {
+            let mut e = vec![0u32; n];
+            for &(v, k) in &m.powers {
+                e[v as usize] = k;
+            }
+            (m.total_degree(), e)
+        };
+        let sparse = |e: &[u32]| -> Monomial {
+            Monomial {
+                powers: e
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &k)| k > 0)
+                    .map(|(v, &k)| (v as Var, k))
+                    .collect(),
+            }
+        };
+        let div: Vec<(Rational, (u32, Vec<u32>))> = divisor
+            .terms
+            .iter()
+            .map(|(c, m)| (c.clone(), dense(m)))
+            .collect();
+        let (dc, dm) = div
+            .iter()
+            .max_by(|a, b| a.1.cmp(&b.1))
+            .cloned()
+            .expect("nonzero divisor");
+        let mut rem: alloc::collections::BTreeMap<(u32, Vec<u32>), Rational> = self
+            .terms
+            .iter()
+            .map(|(c, m)| (dense(m), c.clone()))
+            .collect();
+        let mut quot: Vec<(Rational, Monomial)> = Vec::new();
+        while let Some((rm, rc)) = rem.pop_last() {
+            if rm.0 < dm.0 || rm.1.iter().zip(&dm.1).any(|(a, b)| a < b) {
+                return None;
+            }
+            let qe: Vec<u32> = rm.1.iter().zip(&dm.1).map(|(a, b)| a - b).collect();
+            let qc = rc.div(&dc);
+            for (c, (td, e)) in &div {
+                let key: (u32, Vec<u32>) = (
+                    td + rm.0 - dm.0,
+                    e.iter().zip(&qe).map(|(a, b)| a + b).collect(),
+                );
+                if key == rm {
+                    continue; // cancelled exactly
+                }
+                let t = qc.mul(c);
+                match rem.get_mut(&key) {
+                    Some(v) => {
+                        *v = v.sub(&t);
+                        if v.is_zero() {
+                            rem.remove(&key);
+                        }
+                    }
+                    None => {
+                        rem.insert(key, t.neg());
+                    }
+                }
+            }
+            quot.push((qc, sparse(&qe)));
+        }
+        Some(Polynomial::from_terms(quot))
     }
 
     /// Remainder of multivariate division by `divisors` (graded-lex leading
