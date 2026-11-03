@@ -855,6 +855,16 @@ fn render_fp_real(bits: u64, eb: u32, sb: u32) -> Option<String> {
 }
 
 /// Render an integer as an SMT-LIB term (`n` or `(- n)`).
+/// The model of a bit-blasted goal: its bit-vector values and the values of
+/// its Boolean constants, both read off the one SAT assignment.
+fn bv_bool_model((bv, bools): (BTreeMap<AstId, (Int, u32)>, BTreeMap<AstId, bool>)) -> Model {
+    let mut model = Model::from_bv(bv);
+    for (t, b) in bools {
+        model.set_bool(t, b);
+    }
+    model
+}
+
 fn render_int(v: &Int) -> String {
     if *v < Int::from(0) {
         alloc::format!("(- {})", v.abs())
@@ -864,6 +874,7 @@ fn render_int(v: &Int) -> String {
 }
 use super::decl_table::DeclTable;
 
+mod elim_uncnstr;
 mod ematch_search;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
@@ -1649,7 +1660,7 @@ fn run_into(script: &str, out: &mut Vec<String>) -> Result<(), String> {
             continue;
         }
         out.extend(unknown_attribute_warnings(&form));
-        match ctx.command(&form) {
+        match ctx.top_command(&form) {
             Ok(Some(resp)) => out.push(resp),
             // A state-changing command that produced no output prints `success`
             // when `:print-success` is on (SMT-LIB compliance mode).
@@ -2210,7 +2221,7 @@ impl Session {
         let forms = parse(script)?;
         let mut out = Vec::new();
         for form in forms {
-            if let Some(resp) = self.ctx.command(&form)? {
+            if let Some(resp) = self.ctx.top_command(&form)? {
                 out.push(resp);
             }
             if self.ctx.exited {
@@ -3334,6 +3345,15 @@ struct Context {
     /// `(check-sat-assuming (a …))`, as `(printed-text, term)` — the candidates
     /// an assumption-based `(get-unsat-core)` reports.
     last_assumptions: Vec<(String, AstId)>,
+    /// The asserted formulas as written, with the scope depth they were
+    /// asserted at: the goal z3's tactics see (see `elim_uncnstr`).
+    raw_asserts: Vec<(usize, SExpr)>,
+    /// The next index z3's `mk_fresh_const` gives an `elim-uncnstr` constant
+    /// (`k!n`; the manager's counter, reset with it by `(reset)`).
+    uncnstr_fresh: u32,
+    /// After a `check-sat-using` whose model `elim-uncnstr`'s converter
+    /// rebuilt: the model's constants in the order z3 lists them.
+    uncnstr_model_order: Option<Vec<AstId>>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -4339,6 +4359,9 @@ impl Context {
             seqop_ops: BTreeMap::new(),
             witness_base: None,
             last_assumptions: Vec::new(),
+            raw_asserts: Vec::new(),
+            uncnstr_fresh: 0,
+            uncnstr_model_order: None,
         }
     }
 
@@ -4530,6 +4553,21 @@ impl Context {
     }
 
     /// Interpret a top-level command, returning any textual response.
+    /// Run a command of the script: [`Context::command`], remembering an
+    /// accepted assertion as written (`raw_asserts`).
+    fn top_command(&mut self, form: &SExpr) -> Result<Option<String>, String> {
+        let r = self.command(form);
+        if r.is_ok()
+            && let SExpr::List(l) = form
+            && l.len() == 2
+            && matches!(&l[0], SExpr::Atom(a) if a == "assert")
+        {
+            self.raw_asserts
+                .push((self.scope_stack.len(), l[1].clone()));
+        }
+        r
+    }
+
     fn command(&mut self, form: &SExpr) -> Result<Option<String>, String> {
         self.as_const_seen = 0;
         let list = match form {
@@ -4706,10 +4744,14 @@ impl Context {
                         self.sorts.remove(&name);
                     }
                 }
+                let depth = self.scope_stack.len();
+                self.raw_asserts.retain(|(d, _)| *d <= depth);
                 self.last_model = None;
                 Ok(None)
             }
             "reset" => {
+                self.raw_asserts.clear();
+                self.uncnstr_fresh = 0;
                 self.assertions.clear();
                 self.assert_names.clear();
                 self.named_terms.clear();
@@ -4746,6 +4788,7 @@ impl Context {
                 self.z3_state.inc_ctx = false;
                 self.z3_state.inc_poly = false;
                 self.z3_state.poly_qhead = 0;
+                self.raw_asserts.clear();
                 self.assertions.clear();
                 self.assert_names.clear();
                 self.named_terms.clear();
@@ -4947,6 +4990,11 @@ impl Context {
                 // propagate-values); combinators (then / and-then / par-then / …)
                 // are traversed for their leaves. Trivially-true assertions are
                 // dropped and a false one collapses the goal.
+                if let Some(t) = list.get(1)
+                    && let Some(out) = self.apply_elim_uncnstr(t)
+                {
+                    return Ok(Some(out));
+                }
                 let use_nnf = list
                     .get(1)
                     .map(|t| Self::tactic_mentions(t, "nnf"))
@@ -35866,10 +35914,8 @@ impl Context {
                 replaced = subst;
             }
             if self.bv_goal_is_pure(g) {
-                if replaced.is_empty() {
-                    let (res, bv) = check_bv_model(&self.m, g);
-                    return (res, bv.map(Model::from_bv));
-                }
+                // The goal's Boolean constants take their values from the same
+                // SAT assignment as the bit-vectors.
                 let (res, val) = check_bv_model_with_bools(&self.m, g);
                 return (
                     res,
@@ -37831,8 +37877,8 @@ impl Context {
                 _ => self.m.mk_and(&cs),
             };
             let (r, m) = if self.bv_goal_is_pure(g) {
-                let (r, bv) = check_bv_model(&self.m, g);
-                (r, bv.map(Model::from_bv))
+                let (r, val) = check_bv_model_with_bools(&self.m, g);
+                (r, val.map(bv_bool_model))
             } else if self.is_bv_goal(g) {
                 return None;
             } else {
@@ -47234,5 +47280,50 @@ mod tests {
     #[test]
     fn parse_error_is_reported() {
         assert!(run("(declare-const a").is_err());
+    }
+
+    #[test]
+    fn bit_blasted_goal_models_its_booleans() {
+        // A ground bit-vector conjunct sends the goal to the bit-blaster, whose
+        // assignment also gives the Boolean constants their values.
+        let script = "
+            (declare-const p Bool)
+            (declare-const a Real)
+            (assert (= #x0 (bvadd #x8 #x8)))
+            (assert p)
+            (check-sat)
+            (get-value (p))
+            (assert (<= a 0.0))
+            (check-sat)
+            (get-value (p))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out, alloc::vec!["sat", "((p true))", "sat", "((p true))"]);
+    }
+
+    #[test]
+    fn elim_uncnstr_goal_is_printed_as_parsed() {
+        let script = "
+            (declare-const x (_ BitVec 4))
+            (declare-const y (_ BitVec 4))
+            (declare-const z (_ BitVec 4))
+            (assert (= (bvadd x y) (bvadd y z z)))
+            (assert (= z #x3))
+            (assert (= y #x5))
+            (apply elim-uncnstr)
+            (apply elim-uncnstr)
+            (reset)
+            (assert (forall ((b (_ BitVec 8))) (exists ((a (_ BitVec 8))) (= a b))))
+            (apply (then elim-uncnstr simplify))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(
+            out,
+            alloc::vec![
+                "(goals\n(goal\n  k!1\n  k!2\n  k!3\n  :precision precise :depth 1)\n)",
+                "(goals\n(goal\n  k!5\n  k!6\n  k!7\n  :precision precise :depth 1)\n)",
+                "(goals\n(goal\n  :precision precise :depth 1)\n)",
+            ]
+        );
     }
 }

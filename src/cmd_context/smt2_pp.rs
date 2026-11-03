@@ -151,11 +151,20 @@ struct Info {
     depth: u32,
 }
 
+/// A quantifier node's binder (the node's single argument is its body):
+/// `forall` / `exists` / `lambda` and the bound `(name, sort)` pairs, both
+/// already rendered.
+pub struct PpBinder {
+    pub header: String,
+    pub vars: Vec<(String, String)>,
+}
+
 struct Printer<'a> {
     nodes: &'a [PpNode],
     root: usize,
-    shared: BTreeSet<usize>,
+    shared: &'a BTreeSet<usize>,
     assoc: &'a dyn Fn(&str) -> bool,
+    binders: &'a BTreeMap<usize, PpBinder>,
     alias: BTreeMap<usize, (String, u32)>,
     alias_defs: Vec<(Fmt, u32, String)>,
     next_alias: u32,
@@ -174,6 +183,11 @@ impl Printer<'_> {
                     depth: 1,
                 },
             ));
+            return;
+        }
+        if let Some(b) = self.binders.get(&n) {
+            let (f, info) = self.quantifier(b, self.nodes[n].args[0]);
+            self.store(n, f, info, out);
             return;
         }
         let node = &self.nodes[n];
@@ -227,6 +241,40 @@ impl Printer<'_> {
             indent(len + 2, Fmt::Compose(vec![s(" "), first, rest, s(")")]))
         };
         let f = group(Fmt::Compose(vec![heading, body]));
+        self.store(n, f, info, out);
+    }
+
+    /// `process_quantifier`: the body printed in a scope of its own (fresh
+    /// aliases, `let`-wrapped), after the binder's declarations (`mk_seq3`).
+    fn quantifier(&self, b: &PpBinder, body: usize) -> (Fmt, Info) {
+        let (f_body, b_info, num_lets) =
+            let_doc(self.nodes, body, self.shared, self.assoc, self.binders);
+        let decls: Vec<Fmt> = b
+            .vars
+            .iter()
+            .map(|(v, srt)| seq1(vec![s(srt)], v))
+            .collect();
+        let ind = b.header.chars().count() + 2;
+        let first = group(indent(ind, Fmt::Compose(vec![s(" "), seq5(decls)])));
+        let rest = indent(SMALL_INDENT, seq(vec![f_body]));
+        let f = group(Fmt::Compose(vec![
+            s("("),
+            s(&b.header),
+            first,
+            rest,
+            s(")"),
+        ]));
+        let info = Info {
+            lvl: 0,
+            weight: b_info.weight + 2 * b.vars.len() as u32 + 8 * num_lets,
+            depth: b_info.depth + 1,
+        };
+        (f, info)
+    }
+
+    /// `store_result`: push `f`, or an alias for it when it is too deep, or
+    /// shared and heavy.
+    fn store(&mut self, n: usize, f: Fmt, info: Info, out: &mut Vec<(Fmt, Info)>) {
         if n != self.root
             && (info.depth >= MAX_DEPTH
                 || (info.weight >= MIN_ALIAS_SIZE && self.shared.contains(&n)))
@@ -272,20 +320,54 @@ fn shared_nodes(nodes: &[PpNode], root: usize) -> BTreeSet<usize> {
 /// 80-column layout, with `(let ((a!1 …)) …)` aliases. `assoc` tells which
 /// operators are associative (their nested applications print flattened).
 pub fn pp_term(nodes: &[PpNode], root: usize, assoc: &dyn Fn(&str) -> bool) -> String {
+    pp_term_with(nodes, root, assoc, &BTreeMap::new(), 0)
+}
+
+/// [`pp_term`] with quantifier nodes (`binders`), laid out at indentation
+/// `ind` as `ast_smt2_pp(…, indent)` does: the first line starts at the
+/// current column, the following ones are indented.
+pub fn pp_term_with(
+    nodes: &[PpNode],
+    root: usize,
+    assoc: &dyn Fn(&str) -> bool,
+    binders: &BTreeMap<usize, PpBinder>,
+    ind: usize,
+) -> String {
+    let shared = shared_nodes(nodes, root);
+    let (doc, _, _) = let_doc(nodes, root, &shared, assoc, binders);
+    layout(&indent(ind, doc))
+}
+
+/// The document of node `root` in an alias scope of its own, wrapped in the
+/// `let`s of the aliases it introduced (`pp_let`), with its summary and the
+/// number of aliases.
+fn let_doc(
+    nodes: &[PpNode],
+    root: usize,
+    shared: &BTreeSet<usize>,
+    assoc: &dyn Fn(&str) -> bool,
+    binders: &BTreeMap<usize, PpBinder>,
+) -> (Fmt, Info, u32) {
     let mut p = Printer {
         nodes,
         root,
-        shared: shared_nodes(nodes, root),
+        shared,
         assoc,
+        binders,
         alias: BTreeMap::new(),
         alias_defs: Vec::new(),
         next_alias: 1,
     };
     let mut out = Vec::new();
     p.visit(root, None, &mut out);
-    let body = out.pop().map(|(f, _)| f).unwrap_or_else(|| s(""));
+    let leaf = Info {
+        lvl: 0,
+        weight: 1,
+        depth: 1,
+    };
+    let (body, info) = out.pop().unwrap_or_else(|| (s(""), leaf));
     if p.alias_defs.is_empty() {
-        return layout(&body);
+        return (body, info, 0);
     }
     // `pp_let`: one `let` per alias level, innermost level first.
     let max_lvl = p.alias_defs.iter().map(|d| d.1).max().unwrap_or(0);
@@ -315,7 +397,7 @@ pub fn pp_term(nodes: &[PpNode], root: usize, assoc: &dyn Fn(&str) -> bool) -> S
     for _ in 0..num_op {
         buf.push(s(")"));
     }
-    layout(&Fmt::Compose(buf))
+    (Fmt::Compose(buf), info, p.alias_defs.len() as u32)
 }
 
 /// A function interpretation as z3's `model_smt2_pp` (`pp_funs`) prints it in
