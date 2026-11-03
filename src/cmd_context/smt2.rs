@@ -6737,38 +6737,11 @@ impl Context {
     }
 
     /// Record the constant a top-level `(= x t)` assertion (or conjunct)
-    /// defines, `t` not mentioning `x`: what z3's `solve-eqs` eliminates.
+    /// defines, `t` not mentioning `x`: what z3's `solve-eqs` eliminates
+    /// (also when `t` has a binder: its `solve_eqs_non_ground` is on).
     fn note_solved_var(&mut self, t: &SExpr) {
         fn mentions(e: &SExpr, x: &str) -> bool {
             sexpr_any(e, |y| matches!(y, SExpr::Atom(a) if a == x))
-        }
-        // `solve-eqs` keeps definitions with quantifiers or lambdas (a binder,
-        // or a function macro passed as a value; an application's head symbol
-        // is not a value).
-        fn binds(ctx: &Context, e: &SExpr) -> bool {
-            let mut stack = alloc::vec![e];
-            while let Some(e) = stack.pop() {
-                match e {
-                    SExpr::Atom(a) => {
-                        if ctx.macros.get(a).is_some_and(|(ps, _)| !ps.is_empty()) {
-                            return true;
-                        }
-                    }
-                    SExpr::List(l) => {
-                        if matches!(l.first(), Some(SExpr::Atom(h)) if h == "lambda" || h == "forall" || h == "exists")
-                        {
-                            return true;
-                        }
-                        let args = if matches!(l.first(), Some(SExpr::Atom(_))) {
-                            &l[1..]
-                        } else {
-                            &l[..]
-                        };
-                        stack.extend(args.iter().rev());
-                    }
-                }
-            }
-            false
         }
         // The top-level conjuncts, left to right (an explicit stack: a
         // conjunction may nest arbitrarily deep).
@@ -6790,7 +6763,6 @@ impl Context {
                                 .and_then(|&d| self.m.func_decl(d))
                                 .is_some_and(|f| f.domain.is_empty())
                             && !mentions(other, x)
-                            && !binds(self, other)
                         {
                             if !self.solved_vars.contains(x) {
                                 self.solved_vars.push(x.clone());
@@ -42724,6 +42696,33 @@ mod tests {
         );
         assert!(
             out[1].contains("(define-fun b () Bool\n    false)"),
+            "{}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn get_model_lists_non_ground_solved_constant_last() {
+        // z3's `solve-eqs` (with `solve_eqs_non_ground` on) eliminates `all`
+        // although its definition passes a function macro as a value, so the
+        // model converter lists it after the solver's constants.
+        let script = "
+            (declare-const elements (Seq Int))
+            (declare-const k Int)
+            (declare-const all (Seq Int))
+            (define-fun inc ((x Int)) Int (+ x 1))
+            (assert (= all (seq.map inc elements)))
+            (assert (= (seq.len elements) 3))
+            (assert (= k (seq.nth all 2)))
+            (assert (> k 5))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        let pos = |n: &str| out[1].find(&alloc::format!("(define-fun {n} ")).unwrap();
+        assert!(
+            pos("elements") < pos("k") && pos("k") < pos("all"),
             "{}",
             out[1]
         );
