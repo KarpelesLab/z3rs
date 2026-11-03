@@ -537,34 +537,7 @@ fn eval_poly_alg(
     Some(sum)
 }
 
-/// A puremp [`Algebraic`](puremp::Algebraic) as an nlsat
-/// [`Alg`](crate::nlsat::realclosure::Alg): its squarefree defining polynomial
-/// and an isolating interval refined until neither end is a root.
-fn algebraic_to_alg(a: &puremp::Algebraic) -> Option<crate::nlsat::realclosure::Alg> {
-    use crate::nlsat::realclosure::Alg;
-    if a.is_rational() {
-        return Some(Alg::Rational(a.interval().0.clone()));
-    }
-    let mut a = a.clone();
-    let poly = a.defining_polynomial().clone();
-    for _ in 0..256 {
-        let (lo, hi) = a.interval();
-        let (sl, sh) = (poly.eval(lo).signum(), poly.eval(hi).signum());
-        if sl != 0 && sh != 0 && sl != sh {
-            return Some(Alg::Irrational {
-                poly: crate::math::upoly::UPoly::from_coeffs(poly.coeffs().to_vec()),
-                lo: lo.clone(),
-                hi: hi.clone(),
-            });
-        }
-        let w = hi.sub(lo).div(&Rational::from_integer(Int::from(2)));
-        a.refine_below(&w);
-        if a.is_rational() {
-            return Some(Alg::Rational(a.interval().0.clone()));
-        }
-    }
-    None
-}
+use crate::smt::solver::algebraic_to_alg;
 
 /// A real algebraic number as z3 prints an objective value: a rational via
 /// [`render_rational`], an irrational as its `(root-obj <minimal poly> <i>)`.
@@ -42165,6 +42138,15 @@ impl Context {
                 if !value_sort {
                     return ZeroDivStatus::Unsupported;
                 }
+                // An irrational value: a close rational in its place (the
+                // interpretations found are checked exactly below).
+                if let Some(mut a) = model.alg_value(&self.m, t).filter(|a| !a.is_rational()) {
+                    a.refine_below(&Rational::new(Int::from(1), Int::from(1u64 << 48)));
+                    let (lo, hi) = a.interval();
+                    let mid = lo.add(hi).div(&Rational::from_integer(Int::from(2)));
+                    new.insert(t, self.m.mk_numeral(mid, false));
+                    continue;
+                }
                 let Some(v) = self.eval_value_term(model, t) else {
                     return ZeroDivStatus::Unsupported;
                 };
@@ -42220,7 +42202,16 @@ impl Context {
                     rebuilt
                 }
                 // A ground term folds to its value, so the re-decision is
-                // over the unknowns alone.
+                // over the unknowns alone. A ground atom over irrational
+                // values folds to its exact truth (the rationals standing for
+                // them only approximate it).
+                _ if self.m.is_bool_sort(sort) && model.has_irrational() => {
+                    match model.alg_holds(&self.m, t) {
+                        Some(true) => self.m.mk_true(),
+                        Some(false) => self.m.mk_false(),
+                        None => return ZeroDivStatus::Unsupported,
+                    }
+                }
                 _ => {
                     let mut scratch = Model::from_bv(BTreeMap::new());
                     match self.eval_value_term(&mut scratch, rebuilt) {
@@ -42261,6 +42252,13 @@ impl Context {
         };
         let mut tables: [Vec<(Rational, Rational)>; 3] = Default::default();
         for &(k, d, u) in &unknowns {
+            // A table takes rational dividends only: eval reads a division
+            // of an irrational value by zero as 0.
+            if sub.alg_value(&self.m, d).is_some_and(|a| !a.is_rational())
+                || sub.alg_value(&self.m, u).is_some_and(|a| !a.is_rational())
+            {
+                return ZeroDivStatus::Inconsistent;
+            }
             let (Value::Num(dv, _), Value::Num(uv, _)) =
                 (sub.eval_value(&self.m, d), sub.eval_value(&self.m, u))
             else {
@@ -42307,6 +42305,9 @@ impl Context {
         // holds under them (a division by a term over the unknowns can still
         // divide by zero, outside the functions built here).
         let holds = |ctx: &Self, model: &mut Model, a: AstId| {
+            if model.has_irrational() {
+                return model.alg_holds(&ctx.m, a) == Some(true);
+            }
             matches!(model.eval_value(&ctx.m, a), Value::Bool(true))
         };
         let checked: Vec<AstId> = self
@@ -42389,14 +42390,30 @@ impl Context {
     /// Whether `md` reads back as a model: its division-by-zero functions
     /// can be built from its values, or every assertion holds as
     /// `get-model`/`eval` evaluate it anyway (exactly, over its irrational
-    /// values: [`Model::alg_holds`]).
+    /// values: [`Model::alg_holds`]). An assertion dividing by no term `md`
+    /// makes zero holds as the search decided it. Over irrational values, the
+    /// functions must actually be built (an unsupported construction leaves
+    /// each division by zero read as 0).
     fn zero_div_model_readable(&mut self, md: &mut Model) -> bool {
-        !matches!(self.ensure_zero_div_tables(md), ZeroDivStatus::Inconsistent)
-            || self
-                .assertions
-                .clone()
-                .into_iter()
-                .all(|a| md.alg_holds(&self.m, a) == Some(true))
+        match self.ensure_zero_div_tables(md) {
+            ZeroDivStatus::Done | ZeroDivStatus::NoDivisions => return true,
+            ZeroDivStatus::Unsupported if !md.has_irrational() => return true,
+            ZeroDivStatus::Unsupported | ZeroDivStatus::Inconsistent => {}
+        }
+        for a in self.assertions.clone() {
+            let divides_by_zero = self.m.postorder(a).into_iter().any(|t| {
+                matches!(
+                    self.m.arith_op(t),
+                    Some(ArithOp::Idiv | ArithOp::Mod | ArithOp::Div)
+                ) && md
+                    .alg_sign(&self.m, self.m.app_args(t)[1])
+                    .is_none_or(|s| s == 0)
+            });
+            if divides_by_zero && md.alg_holds(&self.m, a) != Some(true) {
+                return false;
+            }
+        }
+        true
     }
 
     /// The `get-model` listing of `model`'s division-by-zero function `kind`

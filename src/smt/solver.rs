@@ -1003,6 +1003,268 @@ pub enum Value {
     Bv(Int, u32),
 }
 
+/// The largest product of the degrees of the irrational leaves of two terms
+/// that [`Model::alg_holds`] compares by exact algebraic arithmetic (whose
+/// characteristic polynomials grow as that product).
+const ALG_EXACT_MAX_DEGREE: usize = 32;
+
+/// The work [`Model::alg_holds`] spends on the exact sign of one polynomial
+/// comparison (see [`crate::nlsat::realclosure::sign_at_point_fueled`]).
+const ALG_SIGN_FUEL: u64 = 200_000;
+
+/// `a` with an isolating interval whose lower end is not a root of its
+/// defining polynomial. puremp's sums and products keep a non-minimal
+/// polynomial (`√3 + √3` is a root of `x³ − 12x`) and its intervals are
+/// `(lo, hi]`: a spurious root at the excluded `lo` (`(0, 16]` there) becomes
+/// the included `hi` once the value is negated or scaled by a negative
+/// rational, which then reads as that root (`−2√3` as `0`). Refining moves
+/// `lo` off every spurious root.
+fn isolated(mut a: puremp::Algebraic) -> puremp::Algebraic {
+    for _ in 0..256 {
+        if a.is_rational() || !a.defining_polynomial().eval(a.interval().0).is_zero() {
+            break;
+        }
+        a.refine();
+    }
+    a
+}
+
+/// The exact value of the arithmetic term `t` under `md`, as
+/// [`Model::alg_holds`] reads it (see there).
+fn alg_num(md: &mut Model, m: &AstManager, t: AstId) -> Option<puremp::Algebraic> {
+    alg_num_raw(md, m, t).map(isolated)
+}
+
+/// [`alg_num`] before [`isolated`].
+fn alg_num_raw(md: &mut Model, m: &AstManager, t: AstId) -> Option<puremp::Algebraic> {
+    use puremp::Algebraic;
+    if let Some(a) = md.alg.get(&t) {
+        return Some(a.clone());
+    }
+    if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
+        return match md.eval_value(m, t) {
+            Value::Num(r, _) => Some(Algebraic::from_rational(r)),
+            _ => None,
+        };
+    }
+    let args = m.app_args(t).to_vec();
+    let op = m.arith_op(t)?;
+    if op == ArithOp::Div && args.len() == 2 {
+        let d = alg_num(md, m, args[1])?;
+        if d.signum() == 0 {
+            // A division by zero reads as `eval` prints it.
+            return match md.eval_value(m, t) {
+                Value::Num(r, _) => Some(Algebraic::from_rational(r)),
+                _ => None,
+            };
+        }
+        return Some(alg_num(md, m, args[0])?.div(&d));
+    }
+    let mut vals = Vec::with_capacity(args.len());
+    for a in args {
+        vals.push(alg_num(md, m, a)?);
+    }
+    let mut it = vals.into_iter();
+    let first = it.next()?;
+    Some(match op {
+        ArithOp::Add => it.fold(first, |acc, v| acc.add(&v)),
+        ArithOp::Mul => it.fold(first, |acc, v| acc.mul(&v)),
+        ArithOp::Sub => {
+            let rest: Vec<Algebraic> = it.collect();
+            if rest.is_empty() {
+                first.neg()
+            } else {
+                rest.iter().fold(first, |acc, v| acc.sub(v))
+            }
+        }
+        ArithOp::Uminus => first.neg(),
+        ArithOp::ToReal => first,
+        _ => return None,
+    })
+}
+
+/// A puremp [`Algebraic`](puremp::Algebraic) as an nlsat
+/// [`Alg`](crate::nlsat::realclosure::Alg): its squarefree defining polynomial
+/// and an isolating interval refined until neither end is a root.
+pub fn algebraic_to_alg(a: &puremp::Algebraic) -> Option<crate::nlsat::realclosure::Alg> {
+    use crate::nlsat::realclosure::Alg;
+    if a.is_rational() {
+        return Some(Alg::Rational(a.interval().0.clone()));
+    }
+    let mut a = a.clone();
+    let poly = a.defining_polynomial().clone();
+    for _ in 0..256 {
+        let (lo, hi) = a.interval();
+        let (sl, sh) = (poly.eval(lo).signum(), poly.eval(hi).signum());
+        if sl != 0 && sh != 0 && sl != sh {
+            return Some(Alg::Irrational {
+                poly: crate::math::upoly::UPoly::from_coeffs(poly.coeffs().to_vec()),
+                lo: lo.clone(),
+                hi: hi.clone(),
+            });
+        }
+        let w = hi.sub(lo).div(&Rational::from_integer(Int::from(2)));
+        a.refine_below(&w);
+        if a.is_rational() {
+            return Some(Alg::Rational(a.interval().0.clone()));
+        }
+    }
+    None
+}
+
+/// `t` as a polynomial over the irrational leaves of `md` (variable `i` the
+/// value `leaves[i]`, appended as met), its other parts read as
+/// [`Model::alg_holds`] reads them. A division by an irrational value is a
+/// leaf of its own, its exact value computed when the degrees involved stay
+/// below [`ALG_EXACT_MAX_DEGREE`]. `None` past `+ - * /`.
+fn alg_poly(
+    md: &mut Model,
+    m: &AstManager,
+    t: AstId,
+    leaves: &mut Vec<(AstId, puremp::Algebraic)>,
+) -> Option<crate::math::polynomial::Polynomial> {
+    use crate::math::polynomial::Polynomial;
+    let mut leaf = |t: AstId, v: puremp::Algebraic| {
+        let i = leaves.iter().position(|(l, _)| *l == t).unwrap_or_else(|| {
+            leaves.push((t, v));
+            leaves.len() - 1
+        });
+        Polynomial::var(i as u32)
+    };
+    if let Some(a) = md.alg.get(&t) {
+        return Some(leaf(t, a.clone()));
+    }
+    let rational = |md: &mut Model, t: AstId| match md.eval_value(m, t) {
+        Value::Num(r, _) => Some(r),
+        _ => None,
+    };
+    if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
+        return Some(Polynomial::constant(rational(md, t)?));
+    }
+    let args = m.app_args(t).to_vec();
+    let op = m.arith_op(t)?;
+    if op == ArithOp::Div {
+        let [x, d] = args[..] else { return None };
+        if m.postorder(d).iter().any(|v| md.alg.contains_key(v)) {
+            if alg_degree_product(md, m, t) > ALG_EXACT_MAX_DEGREE {
+                return None;
+            }
+            let v = alg_num(md, m, t)?;
+            if v.is_rational() {
+                return Some(Polynomial::constant(v.interval().0.clone()));
+            }
+            return Some(leaf(t, v));
+        }
+        let dv = rational(md, d)?;
+        if dv.is_zero() {
+            // A division by zero reads as `eval` prints it.
+            return Some(Polynomial::constant(rational(md, t)?));
+        }
+        return Some(alg_poly(md, m, x, leaves)?.scale(&dv.recip()));
+    }
+    let mut ps = Vec::with_capacity(args.len());
+    for a in args {
+        ps.push(alg_poly(md, m, a, leaves)?);
+    }
+    let mut it = ps.into_iter();
+    let first = it.next()?;
+    Some(match op {
+        ArithOp::Add => it.fold(first, |acc, q| acc.add(&q)),
+        ArithOp::Mul => it.fold(first, |acc, q| acc.mul(&q)),
+        ArithOp::Sub => {
+            let rest: Vec<Polynomial> = it.collect();
+            if rest.is_empty() {
+                first.neg()
+            } else {
+                rest.iter().fold(first, |acc, q| acc.sub(q))
+            }
+        }
+        ArithOp::Uminus => first.neg(),
+        ArithOp::ToReal => first,
+        _ => return None,
+    })
+}
+
+/// A closed interval enclosing the value of the arithmetic term `t` under
+/// `md`, each irrational leaf refined below width `eps` (in place: the model
+/// keeps the value, with a narrower interval). Terms are read as
+/// [`Model::alg_holds`] reads them; `None` beyond `+ - * /` or when a
+/// divisor's enclosure still meets zero.
+fn alg_enclosure(
+    md: &mut Model,
+    m: &AstManager,
+    t: AstId,
+    eps: &Rational,
+) -> Option<(Rational, Rational)> {
+    if let Some(a) = md.alg.get_mut(&t) {
+        a.refine_below(eps);
+        let (lo, hi) = a.interval();
+        return Some((lo.clone(), hi.clone()));
+    }
+    if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
+        return match md.eval_value(m, t) {
+            Value::Num(r, _) => Some((r.clone(), r)),
+            _ => None,
+        };
+    }
+    let args = m.app_args(t).to_vec();
+    let op = m.arith_op(t)?;
+    let mut vals = Vec::with_capacity(args.len());
+    for &a in &args {
+        vals.push(alg_enclosure(md, m, a, eps)?);
+    }
+    let mul = |(a, b): &(Rational, Rational), (c, d): &(Rational, Rational)| {
+        let ps = [a.mul(c), a.mul(d), b.mul(c), b.mul(d)];
+        let lo = ps.iter().min().cloned().unwrap_or_default();
+        let hi = ps.iter().max().cloned().unwrap_or_default();
+        (lo, hi)
+    };
+    let neg = |(a, b): &(Rational, Rational)| (b.neg(), a.neg());
+    let add = |(a, b): &(Rational, Rational), (c, d): &(Rational, Rational)| (a.add(c), b.add(d));
+    let mut it = vals.into_iter();
+    let first = it.next()?;
+    Some(match op {
+        ArithOp::Add => it.fold(first, |acc, v| add(&acc, &v)),
+        ArithOp::Mul => it.fold(first, |acc, v| mul(&acc, &v)),
+        ArithOp::Sub => {
+            let rest: Vec<_> = it.collect();
+            if rest.is_empty() {
+                neg(&first)
+            } else {
+                rest.iter().fold(first, |acc, v| add(&acc, &neg(v)))
+            }
+        }
+        ArithOp::Uminus => neg(&first),
+        ArithOp::ToReal => first,
+        ArithOp::Div => {
+            let (c, d) = it.next()?;
+            // A divisor whose enclosure meets zero (a finer refinement, or
+            // an exact zero, is left to the caller).
+            if !c.is_positive() && !d.is_negative() {
+                return None;
+            }
+            mul(&first, &(d.recip(), c.recip()))
+        }
+        _ => return None,
+    })
+}
+
+/// A bound on the degree of the polynomial exact algebraic arithmetic reaches
+/// on `t`: puremp's sums and products multiply their operands' degrees (the
+/// characteristic polynomial is not reduced to the minimal one), so it is the
+/// product of the degrees of every occurrence of an irrational leaf.
+fn alg_degree_product(md: &Model, m: &AstManager, t: AstId) -> usize {
+    if let Some(a) = md.alg.get(&t) {
+        return a.defining_polynomial().degree().unwrap_or(1).max(1);
+    }
+    if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
+        return 1;
+    }
+    m.app_args(t).iter().fold(1usize, |acc, &a| {
+        acc.saturating_mul(alg_degree_product(md, m, a))
+    })
+}
+
 impl Model {
     /// A bit-vector-only model: the concrete value of each blasted term.
     pub fn from_bv(bv: BTreeMap<AstId, (Int, u32)>) -> Model {
@@ -1250,6 +1512,9 @@ impl Model {
             return None;
         }
         fn go(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
+            go_raw(md, m, t).map(isolated)
+        }
+        fn go_raw(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
             if let Some(a) = md.alg.get(&t) {
                 return Some(a.clone());
             }
@@ -1304,64 +1569,13 @@ impl Model {
     /// depends on irrational leaves (see [`Model::set_alg`]), reading every
     /// arithmetic term as `get-model`/`eval` print it: by exact algebraic
     /// arithmetic, a division by zero as the model's `/0`-style value
-    /// ([`Model::eval_value`]). Subterms over no irrational leaf are read by
+    /// ([`Model::eval_value`]). Arithmetic subterms over no irrational leaf,
+    /// and atoms other than arithmetic comparisons, are read by
     /// [`Model::eval_value`]. `None` when some arithmetic subterm over an
     /// irrational leaf is beyond `+ - * /` and comparisons.
     pub fn alg_holds(&mut self, m: &AstManager, t: AstId) -> Option<bool> {
         use crate::ast::arith::ArithOp;
-        use puremp::Algebraic;
         let over_alg = |md: &Model, t: AstId| m.postorder(t).iter().any(|v| md.alg.contains_key(v));
-        fn num(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
-            if let Some(a) = md.alg.get(&t) {
-                return Some(a.clone());
-            }
-            if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
-                return match md.eval_value(m, t) {
-                    Value::Num(r, _) => Some(Algebraic::from_rational(r)),
-                    _ => None,
-                };
-            }
-            let args = m.app_args(t).to_vec();
-            let op = m.arith_op(t)?;
-            if op == ArithOp::Div && args.len() == 2 {
-                let d = num(md, m, args[1])?;
-                if d.signum() == 0 {
-                    // A division by zero reads as `eval` prints it.
-                    return match md.eval_value(m, t) {
-                        Value::Num(r, _) => Some(Algebraic::from_rational(r)),
-                        _ => None,
-                    };
-                }
-                return Some(num(md, m, args[0])?.div(&d));
-            }
-            let mut vals = Vec::with_capacity(args.len());
-            for a in args {
-                vals.push(num(md, m, a)?);
-            }
-            let mut it = vals.into_iter();
-            let first = it.next()?;
-            Some(match op {
-                ArithOp::Add => it.fold(first, |acc, v| acc.add(&v)),
-                ArithOp::Mul => it.fold(first, |acc, v| acc.mul(&v)),
-                ArithOp::Sub => {
-                    let rest: Vec<Algebraic> = it.collect();
-                    if rest.is_empty() {
-                        first.neg()
-                    } else {
-                        rest.iter().fold(first, |acc, v| acc.sub(v))
-                    }
-                }
-                ArithOp::Uminus => first.neg(),
-                ArithOp::ToReal => first,
-                _ => return None,
-            })
-        }
-        if !over_alg(self, t) {
-            return match self.eval_value(m, t) {
-                Value::Bool(b) => Some(b),
-                _ => None,
-            };
-        }
         let args = m.app_args(t).to_vec();
         if m.is_not(t) {
             return self.alg_holds(m, args[0]).map(|b| !b);
@@ -1387,31 +1601,117 @@ impl Model {
         }
         let arith_args = !args.is_empty() && args.iter().all(|&a| m.is_arith_sort(m.get_sort(a)));
         if arith_args && (m.is_eq(t) || m.is_distinct(t)) {
-            let mut vals = Vec::with_capacity(args.len());
-            for &a in &args {
-                vals.push(num(self, m, a)?);
+            let n = args.len();
+            if m.is_eq(t) {
+                for w in args.windows(2) {
+                    if self.alg_cmp(m, w[0], w[1])? != 0 {
+                        return Some(false);
+                    }
+                }
+                return Some(true);
             }
-            let eq = |a: &Algebraic, b: &Algebraic| a.sub(b).signum() == 0;
-            return Some(if m.is_eq(t) {
-                vals.windows(2).all(|w| eq(&w[0], &w[1]))
-            } else {
-                (0..vals.len()).all(|i| (i + 1..vals.len()).all(|j| !eq(&vals[i], &vals[j])))
-            });
+            for i in 0..n {
+                for j in i + 1..n {
+                    if self.alg_cmp(m, args[i], args[j])? == 0 {
+                        return Some(false);
+                    }
+                }
+            }
+            return Some(true);
         }
         if m.is_eq(t) && args.len() == 2 && m.is_bool_sort(m.get_sort(args[0])) {
             return Some(self.alg_holds(m, args[0])? == self.alg_holds(m, args[1])?);
         }
-        let op = m.arith_op(t)?;
-        if !matches!(op, ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt) || args.len() != 2 {
+        let op = m.arith_op(t);
+        let Some(op @ (ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt)) = op else {
+            // Any other atom: as `eval` reads it, when no irrational leaf
+            // is involved.
+            if over_alg(self, t) {
+                return None;
+            }
+            return match self.eval_value(m, t) {
+                Value::Bool(b) => Some(b),
+                _ => None,
+            };
+        };
+        if args.len() != 2 {
             return None;
         }
-        let s = num(self, m, args[0])?.sub(&num(self, m, args[1])?).signum();
+        let s = self.alg_cmp(m, args[0], args[1])?;
         Some(match op {
             ArithOp::Le => s <= 0,
             ArithOp::Ge => s >= 0,
             ArithOp::Lt => s < 0,
             _ => s > 0,
         })
+    }
+
+    /// The sign of `a − b` for arithmetic terms `a`, `b` read as
+    /// [`Model::alg_holds`] reads them (see [`Model::alg_sign`]).
+    fn alg_cmp(&mut self, m: &AstManager, a: AstId, b: AstId) -> Option<i32> {
+        self.alg_sign_diff(m, a, Some(b))
+    }
+
+    /// The sign of the arithmetic term `t` read as [`Model::alg_holds`] reads
+    /// it: by enclosures refined until they exclude zero, else (a zero, or a
+    /// value closer to it than the refinement) exactly, by nlsat's sign of a
+    /// polynomial at an algebraic point or by algebraic arithmetic when the
+    /// degrees involved keep it cheap. `None` when undecided.
+    pub fn alg_sign(&mut self, m: &AstManager, t: AstId) -> Option<i32> {
+        self.alg_sign_diff(m, t, None)
+    }
+
+    /// The sign of `a − b` (of `a` when `b` is `None`); see [`Model::alg_sign`].
+    fn alg_sign_diff(&mut self, m: &AstManager, a: AstId, b: Option<AstId>) -> Option<i32> {
+        let zero = Rational::from_integer(Int::from(0));
+        let mut eps = Rational::new(Int::from(1), Int::from(1024));
+        let step = Rational::new(Int::from(1), Int::from(1 << 16));
+        for _ in 0..4 {
+            let ea = alg_enclosure(self, m, a, &eps);
+            let eb = match b {
+                Some(b) => alg_enclosure(self, m, b, &eps),
+                None => Some((zero.clone(), zero.clone())),
+            };
+            if let (Some((alo, ahi)), Some((blo, bhi))) = (ea, eb) {
+                if ahi < blo {
+                    return Some(-1);
+                }
+                if alo > bhi {
+                    return Some(1);
+                }
+                if alo == ahi && blo == bhi && alo == blo {
+                    return Some(0);
+                }
+            }
+            eps = eps.mul(&step);
+        }
+        // A polynomial difference: nlsat's exact sign at the point.
+        let mut leaves = Vec::new();
+        let pa = alg_poly(self, m, a, &mut leaves);
+        let pb = match b {
+            Some(b) => alg_poly(self, m, b, &mut leaves),
+            None => Some(crate::math::polynomial::Polynomial::constant(zero.clone())),
+        };
+        if let (Some(pa), Some(pb)) = (pa, pb) {
+            let point: Option<Vec<_>> = leaves.iter().map(|(_, v)| algebraic_to_alg(v)).collect();
+            if let Some(point) = point {
+                let fuel = crate::math::fuel::Fuel::new(ALG_SIGN_FUEL);
+                return crate::nlsat::realclosure::sign_at_point_fueled(
+                    &pa.sub(&pb),
+                    &point,
+                    &fuel,
+                );
+            }
+        }
+        let db = b.map_or(1, |b| alg_degree_product(self, m, b));
+        if alg_degree_product(self, m, a).saturating_mul(db) > ALG_EXACT_MAX_DEGREE {
+            return None;
+        }
+        let vb = match b {
+            Some(b) => alg_num(self, m, b)?,
+            None => puremp::Algebraic::from_rational(zero),
+        };
+        Some(alg_num(self, m, a)?.sub(&vb).signum())
     }
 
     /// Pin an arithmetic leaf variable to a concrete value. Used when a witness
