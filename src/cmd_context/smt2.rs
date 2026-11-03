@@ -24463,7 +24463,8 @@ impl Context {
         }
         let (res, model) = self.check_sat();
         self.assertions.truncate(n);
-        if res == SmtResult::Sat { model } else { None }
+        let mut model = model.filter(|_| res == SmtResult::Sat)?;
+        self.zero_div_model_readable(&mut model).then_some(model)
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
@@ -39874,6 +39875,23 @@ impl Context {
             })
             .collect();
         if roots.is_empty() {
+            // An eliminated constant defined by a division (by zero) takes its
+            // definition's value under the (function-less) completed model.
+            for &(c, t) in defs.iter().rev() {
+                if !self
+                    .m
+                    .postorder(t)
+                    .into_iter()
+                    .any(|u| self.m.is_app(u) && kind_of(self, u).is_some())
+                {
+                    continue;
+                }
+                match model.eval_value(&self.m, t) {
+                    Value::Num(r, _) => model.set_arith(c, r),
+                    Value::Bool(b) => model.set_bool(c, b),
+                    _ => {}
+                }
+            }
             return ZeroDivStatus::NoDivisions;
         }
         // Rebuild the assertions bottom-up: constants to their values, each
@@ -40074,7 +40092,10 @@ impl Context {
     /// [`Self::check_sat`] deciding first without the division-by-zero
     /// consistency constraints (they cost nonlinear goals dearly): a `sat`
     /// stands when its model admits z3's `div0`/`mod0`/`/0` functions;
-    /// otherwise the check is redone with the constraints.
+    /// otherwise the check is redone with the constraints. An irrational
+    /// model of that check admitting no such functions (they cannot take
+    /// irrational dividends) is kept only when the assertions hold under it as
+    /// `get-model`/`eval` read it (else the answer is `unknown`).
     fn check_sat_zero_div_lazy(&mut self) -> (SmtResult, Option<Model>) {
         self.zero_div_axioms = false;
         let r = self.check_sat();
@@ -40086,9 +40107,46 @@ impl Context {
                 }
                 ZeroDivStatus::Unsupported | ZeroDivStatus::Inconsistent => {}
             }
-            return self.check_sat();
+            let r = self.check_sat();
+            if let (SmtResult::Sat, Some(mut md)) = r {
+                if md.has_irrational()
+                    && self.divides_by_zero(&mut md)
+                    && !self.zero_div_model_readable(&mut md)
+                {
+                    return (SmtResult::Unknown, None);
+                }
+                return (SmtResult::Sat, Some(md));
+            }
+            return r;
         }
         r
+    }
+
+    /// Whether some assertion divides by a term `md` makes zero.
+    fn divides_by_zero(&mut self, md: &mut Model) -> bool {
+        let order = self.m.postorder_many(&self.assertions);
+        order.into_iter().any(|t| {
+            matches!(
+                self.m.arith_op(t),
+                Some(ArithOp::Idiv | ArithOp::Mod | ArithOp::Div)
+            ) && {
+                let b = self.m.app_args(t)[1];
+                md.alg_value(&self.m, b).is_none()
+                    && matches!(md.eval_value(&self.m, b), Value::Num(v, _) if v.is_zero())
+            }
+        })
+    }
+
+    /// Whether `md` reads back as a model: its division-by-zero functions
+    /// can be built from its values, or every assertion holds as
+    /// `get-model`/`eval` evaluate it anyway.
+    fn zero_div_model_readable(&mut self, md: &mut Model) -> bool {
+        !matches!(self.ensure_zero_div_tables(md), ZeroDivStatus::Inconsistent)
+            || self
+                .assertions
+                .clone()
+                .into_iter()
+                .all(|a| matches!(md.eval_value(&self.m, a), Value::Bool(true)))
     }
 
     /// The `get-model` listing of `model`'s division-by-zero function `kind`

@@ -1100,6 +1100,11 @@ impl Model {
         self.bools.insert(var, val);
     }
 
+    /// Does the model give some arithmetic leaf an irrational value?
+    pub fn has_irrational(&self) -> bool {
+        !self.alg.is_empty()
+    }
+
     /// Pin an arithmetic leaf variable to a real algebraic value (a rational
     /// one goes to the ordinary assignment).
     pub fn set_alg(&mut self, var: AstId, val: puremp::Algebraic) {
@@ -1761,6 +1766,12 @@ impl Model {
         }
         if let Some(Value::Num(r, _)) = self.default_of(m, t) {
             return Some(r.clone());
+        }
+        // A constant the assignment leaves free reads as 0, as in the linear
+        // evaluator, so that a comparison over it still folds the divisions
+        // by zero beside it (an irrational value is read by `alg_value`).
+        if m.is_uninterp_const(t) && !self.alg.contains_key(&t) {
+            return Some(Rational::from_integer(Int::from(0)));
         }
         let op = m.arith_op(t)?;
         let args = m.app_args(t).to_vec();
