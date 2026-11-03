@@ -5123,7 +5123,7 @@ impl Context {
                 }
                 let decimal = self.pp_decimal_precision();
                 let mut model = self.last_model.take().unwrap();
-                self.ensure_zero_div_tables(&mut model);
+                self.prepare_model(&mut model);
                 let id = self.str_ground(&mut model, id);
                 let completion = list.windows(2).any(|w| {
                     matches!(&w[0], SExpr::Atom(k) if k == ":model_completion" || k == ":model-completion")
@@ -7112,15 +7112,21 @@ impl Context {
             // An unconstrained mode: z3's model completion picks RTZ.
             return Some("roundTowardZero".to_string());
         }
+        let c = self.enum_ctor_value(model, id)?;
+        let name = self.m.func_decl(self.m.app_decl(c))?.name.as_str()?;
+        Some(name.to_string())
+    }
+
+    /// If `id` has an enum sort, the constructor it equals under `model`.
+    fn enum_ctor_value(&self, model: &mut Model, id: AstId) -> Option<AstId> {
         let ctors = self.enums.get(&self.m.get_sort(id))?;
-        for &c in ctors {
-            if model.terms_equal(&self.m, id, c) {
-                let decl = self.m.app_decl(c);
-                let name = self.m.func_decl(decl)?.name.as_str()?;
-                return Some(name.to_string());
-            }
-        }
-        None
+        let Value::Uninterp(_, class) = model.eval_value(&self.m, id) else {
+            return None;
+        };
+        ctors
+            .iter()
+            .copied()
+            .find(|&c| matches!(model.eval_value(&self.m, c), Value::Uninterp(_, k) if k == class))
     }
 
     /// Axioms for general (multi-constructor, non-recursive) datatypes in `goal`.
@@ -39054,8 +39060,7 @@ impl Context {
         }
         // Then evaluate against the model (disjoint immutable borrow of `m`).
         let mut model = self.last_model.take().unwrap();
-        self.ensure_zero_div_tables(&mut model);
-        let decimal = self.pp_decimal_precision();
+        self.prepare_model(&mut model);
         let mut out = String::from("(");
         for (i, (text, id)) in terms.iter().enumerate() {
             // z3 puts each `(term value)` pair on its own line.
@@ -39067,15 +39072,7 @@ impl Context {
                 Err(e) => Err(e),
             };
             let v = match id {
-                Ok(id) if self.is_seq_value_term(id) => self.model_term_render(&mut model, id),
-                Ok(id) => self
-                    .str_value(id)
-                    .map(|cps| smt_string_literal(&cps))
-                    .or_else(|| self.str_model_value(&mut model, id))
-                    .or_else(|| self.enum_value_name(&mut model, id))
-                    .or_else(|| self.fp_model_value(&mut model, id))
-                    .or_else(|| alg_model_value(&self.m, &mut model, id, decimal))
-                    .unwrap_or_else(|| model.value_string(&self.m, id)),
+                Ok(id) => self.model_term_render(&mut model, id),
                 Err((d, dom, ran)) => {
                     let body = self
                         .const_fn_interp(d, &mut model)
@@ -39131,7 +39128,7 @@ impl Context {
             })
             .collect();
         let mut model = self.last_model.take().unwrap();
-        self.ensure_zero_div_tables(&mut model);
+        self.prepare_model(&mut model);
 
         // Build constant interpretations for every n-ary (non-array-range)
         // function, then *jointly* validate: a single function may validate in
@@ -39293,6 +39290,91 @@ impl Context {
         out.push_str("\n)");
         self.last_model = Some(model);
         Ok(out)
+    }
+
+    /// Complete `model` before values are read from it: register the
+    /// enumeration sorts' constructors (so an unconstrained enumeration term
+    /// evaluates to a constructor, never an abstract value) and compute the
+    /// division-by-zero functions (see [`Self::ensure_zero_div_tables`]).
+    fn prepare_model(&mut self, model: &mut Model) {
+        for (&sort, ctors) in &self.enums {
+            model.set_enum_ctors(sort, ctors.clone());
+        }
+        self.ensure_zero_div_tables(model);
+        self.ensure_fn_defaults(model);
+    }
+
+    /// The declared n-ary functions `get-model` interprets (not datatype
+    /// members, not array-valued), as `(name, declaration)` in declaration
+    /// order.
+    fn model_fn_decls(&self) -> Vec<(String, AstId)> {
+        let dt_members = self.datatype_member_decls();
+        let mut seen = BTreeSet::new();
+        self.decl_order
+            .iter()
+            .filter(|name| seen.insert((*name).clone()))
+            .filter_map(|name| {
+                let d = self.funcs[name];
+                let fd = self.m.func_decl(d)?;
+                (!dt_members.contains(&d)
+                    && !fd.domain.is_empty()
+                    && !self.m.is_array_sort(fd.range))
+                .then(|| (name.clone(), d))
+            })
+            .collect()
+    }
+
+    /// Give each declared n-ary function without one the default value of the
+    /// interpretation `get-model` prints for it (its table's `else`, or its
+    /// validated constant), so that an application no assigned term covers
+    /// evaluates as z3's completed model does: `(h 2)` is `h`'s `else` value,
+    /// not an arbitrary one. Once per model.
+    fn ensure_fn_defaults(&mut self, model: &mut Model) {
+        if model.fn_defaults_ready() {
+            return;
+        }
+        model.mark_fn_defaults_ready();
+        let fdecls: Vec<(String, AstId)> = self
+            .model_fn_decls()
+            .into_iter()
+            .filter(|(_, d)| !model.has_default(*d))
+            .collect();
+        if fdecls.is_empty() {
+            return;
+        }
+        let csub = self.model_const_subst(model);
+        let defaults: Vec<(AstId, AstId)> = match self.fn_tables(&fdecls, model, &csub) {
+            Some(tables) => tables.into_iter().map(|(d, t)| (d, t.els)).collect(),
+            None => {
+                let mut chosen: Vec<(AstId, Option<AstId>)> = Vec::new();
+                for &(_, d) in &fdecls {
+                    if let Some((_, term)) = self.fn_const_interp(d, model, &csub) {
+                        chosen.push((d, term));
+                    }
+                }
+                while !chosen.is_empty() && !self.joint_model_valid(&chosen, model, &csub) {
+                    chosen.pop();
+                }
+                // A constant not renderable as a value term (a record, …) is
+                // the value its applications agree on: the first one's.
+                for (d, t) in chosen.iter_mut() {
+                    if t.is_none() {
+                        *t = self
+                            .ground_apps_in_order(&BTreeSet::from([*d]))
+                            .first()
+                            .copied();
+                    }
+                }
+                chosen
+                    .into_iter()
+                    .filter_map(|(d, t)| Some((d, t?)))
+                    .collect()
+            }
+        };
+        for (d, v) in defaults {
+            let v = model.eval_value(&self.m, v);
+            model.set_default(d, v);
+        }
     }
 
     /// Compute `model`'s interpretations of z3's division-by-zero functions
@@ -40125,10 +40207,11 @@ impl Context {
 
     /// Render a term's model value through the same value stack the constant and
     /// `get-value` paths use (string / enum / floating-point / generic).
-    fn model_value_str(&self, model: &mut Model, id: AstId) -> String {
+    fn model_value_str(&mut self, model: &mut Model, id: AstId) -> String {
         self.str_value(id)
             .map(|cps| smt_string_literal(&cps))
             .or_else(|| self.str_model_value(model, id))
+            .or_else(|| self.dt_model_value(model, id))
             .or_else(|| self.enum_value_name(model, id))
             .or_else(|| self.fp_model_value(model, id))
             .unwrap_or_else(|| model.value_string(&self.m, id))
@@ -40161,7 +40244,7 @@ impl Context {
         {
             return Some(self.m.mk_bv_numeral(v, w));
         }
-        None
+        self.enum_ctor_value(model, t)
     }
 
     /// Rewrite `root`, replacing 0-ary constants listed in `csub` by their model
@@ -40328,6 +40411,11 @@ impl Context {
         } else if let Some(w) = self.m.bv_sort_width(range) {
             let z = self.m.mk_bv_numeral(Int::from(0), w);
             alloc::vec![(z, render_bv_field(0, w))]
+        } else if let Some(&c) = self.enums.get(&range).and_then(|cs| cs.first())
+            && let Some(name) = self.decl_name(self.m.app_decl(c))
+        {
+            // An enumeration: its first constructor.
+            alloc::vec![(c, name)]
         } else {
             Vec::new()
         }
@@ -40518,8 +40606,46 @@ impl Context {
         model: &mut Model,
         csub: &BTreeMap<AstId, AstId>,
     ) -> Option<BTreeMap<AstId, String>> {
+        let tables = self.fn_tables(fdecls, model, csub)?;
+        let mut out = BTreeMap::new();
+        for (name, d) in fdecls {
+            let fd = self.m.func_decl(*d)?.clone();
+            let tab = &tables[d];
+            let params: Vec<String> = fd.domain.iter().map(|&s| self.sort_display(s)).collect();
+            let entries: Vec<(Vec<String>, String)> = tab
+                .entries
+                .iter()
+                .map(|(k, r)| {
+                    (
+                        k.iter().map(|&x| self.model_value_str(model, x)).collect(),
+                        self.model_value_str(model, *r),
+                    )
+                })
+                .collect();
+            let els = self.model_value_str(model, tab.els);
+            let range = self.sort_display(fd.range);
+            out.insert(
+                *d,
+                super::smt2_pp::pp_func_interp(&smt2_symbol(name), &params, &range, &entries, &els),
+            );
+        }
+        Some(out)
+    }
+
+    /// The jointly checked tables of [`Self::fn_table_interps`], by
+    /// declaration.
+    fn fn_tables(
+        &mut self,
+        fdecls: &[(String, AstId)],
+        model: &mut Model,
+        csub: &BTreeMap<AstId, AstId>,
+    ) -> Option<BTreeMap<AstId, FnTable>> {
+        let enums = &self.enums;
         let supported = |m: &AstManager, s: AstId| {
-            m.is_bool_sort(s) || m.is_arith_sort(s) || m.bv_sort_width(s).is_some()
+            m.is_bool_sort(s)
+                || m.is_arith_sort(s)
+                || m.bv_sort_width(s).is_some()
+                || enums.contains_key(&s)
         };
         for (_, d) in fdecls {
             let fd = self.m.func_decl(*d)?;
@@ -40596,29 +40722,7 @@ impl Context {
                 }
             }
         }
-        let mut out = BTreeMap::new();
-        for (name, d) in fdecls {
-            let fd = self.m.func_decl(*d)?.clone();
-            let tab = &tables[d];
-            let params: Vec<String> = fd.domain.iter().map(|&s| self.sort_display(s)).collect();
-            let entries: Vec<(Vec<String>, String)> = tab
-                .entries
-                .iter()
-                .map(|(k, r)| {
-                    (
-                        k.iter().map(|&x| self.model_value_str(model, x)).collect(),
-                        self.model_value_str(model, *r),
-                    )
-                })
-                .collect();
-            let els = self.model_value_str(model, tab.els);
-            let range = self.sort_display(fd.range);
-            out.insert(
-                *d,
-                super::smt2_pp::pp_func_interp(&smt2_symbol(name), &params, &range, &entries, &els),
-            );
-        }
-        Some(out)
+        Some(tables)
     }
 
     /// `((_ repeat k) x)` — concatenate `x` with itself `k` times.
@@ -45987,6 +46091,47 @@ mod tests {
             "{script}(assert (forall ((u A)) (p u)))(assert (not (p a4)))(check-sat)"
         );
         assert_eq!(run(&unsat).unwrap(), ["unsat"]);
+    }
+
+    #[test]
+    fn unconstrained_datatype_terms_take_constructor_values() {
+        // `x` and `(f e0 true)` occur in no assertion: their values are
+        // constructors (never `E!val!k`), and an application no assigned term
+        // covers takes the `else` value of the function's printed table.
+        let out = run(
+            "(set-option :produce-models true)(declare-datatypes () ((E e0 e1 e2)))\
+             (declare-fun f (E Bool) E)(declare-const x E)(declare-const b Bool)\
+             (assert (= (f e1 b) e2))(check-sat)(get-value (x (f e1 b) (f e0 true)))(get-model)",
+        )
+        .unwrap();
+        assert_eq!(
+            out[1], "((x e0)\n ((f e1 b) e2)\n ((f e0 true) e2))",
+            "{out:?}"
+        );
+        assert!(
+            out[2].contains("(define-fun f ((x!0 E) (x!1 Bool)) E\n    e2)"),
+            "{out:?}"
+        );
+        // Records and recursive datatypes render as constructor terms too, and
+        // a record-valued function is the value its applications agree on.
+        let out = run(
+            "(set-option :produce-models true)(declare-datatypes () ((E e0 e1)))\
+             (declare-datatypes () ((P (mk (fst Int) (snd E)))))\
+             (declare-datatypes () ((L nil (cons (hd E) (tl L)))))\
+             (declare-const r P)(declare-const l L)(declare-fun g (Int) P)\
+             (assert (= (fst (g 2)) 7))(check-sat)(get-value (r l (g 1) (fst (g 1))))",
+        )
+        .unwrap();
+        assert_eq!(
+            out[1],
+            "((r (mk 0 e0))\n (l nil)\n ((g 1) (mk 7 e0))\n ((fst (g 1)) 7))"
+        );
+        // An integer function's untracked application is its table's `else`.
+        let out = run("(set-option :produce-models true)(declare-fun h (Int) Int)\
+             (assert (= (h 1) 5))(assert (= (h 3) 5))(assert (= (h 4) 6))(check-sat)\
+             (get-value ((h 2)))")
+        .unwrap();
+        assert_eq!(out[1], "(((h 2) 5))");
     }
 
     #[test]

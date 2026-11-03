@@ -185,6 +185,21 @@ impl Egraph {
         self.ids.contains_key(&t)
     }
 
+    /// A term of the class `class` (an index [`Self::class_of`] returned,
+    /// even if the class has been merged since).
+    pub fn member(&self, class: usize) -> AstId {
+        self.terms[class]
+    }
+
+    /// Is the interned term `t` alone in its class?
+    pub fn is_singleton(&self, t: AstId) -> bool {
+        let Some(&i) = self.ids.get(&t) else {
+            return true;
+        };
+        let r = self.root(i);
+        (0..self.terms.len()).all(|j| j == i || self.root(j) != r)
+    }
+
     /// Are the `equalities` (with congruence) consistent with the
     /// `disequalities`? Returns `true` if satisfiable.
     pub fn is_consistent(

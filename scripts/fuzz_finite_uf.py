@@ -6,7 +6,8 @@ enumeration, Bool and Int results), applied at constant and symbolic
 arguments and nested, plus enumeration-sorted constants, equalities and
 integer constraints. These are decided through finite value tables; the
 z3rs `get-value` of the constants and some applications is checked against
-the assertions by z3. A DISAGREE or BADMODEL is a soundness bug.
+the assertions by z3 (and must name a constructor: an `E!val!k`
+abstract value for the datatype sort is a BADMODEL). A DISAGREE or BADMODEL is a soundness bug.
 
 Usage: scripts/fuzz_finite_uf.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
@@ -56,6 +57,8 @@ def run(c,p):
     try: return subprocess.run([c,p],capture_output=True,text=True,timeout=20).stdout.strip()
     except subprocess.TimeoutExpired: return "timeout"
 def check_model(src,vals,p):
+    # E is a datatype: every value must be a constructor, never `E!val!k`.
+    if "!val!" in vals: return False
     pins=re.findall(r"\(((?:\([^()]*\))|\w+) (true|false|e\d|\(- \d+\)|-?\d+)\)",vals)
     if not pins: return True
     body=src.split("(check-sat)")[0]

@@ -385,6 +385,8 @@ impl SmtCore {
                     cong_depth: 0,
                     zero_div: Default::default(),
                     zero_div_ready: false,
+                    enum_ctors: BTreeMap::new(),
+                    fn_defaults_ready: false,
                 };
                 return (SmtResult::Sat, Some(model));
             }
@@ -433,6 +435,8 @@ impl SmtCore {
                         cong_depth: 0,
                         zero_div: Default::default(),
                         zero_div_ready: false,
+                        enum_ctors: BTreeMap::new(),
+                        fn_defaults_ready: false,
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -840,6 +844,13 @@ pub struct Model {
     zero_div: [Option<ZeroDivInterp>; 3],
     /// Whether `zero_div` has been computed (see [`Model::set_zero_div`]).
     zero_div_ready: bool,
+    /// The constructors of each enumeration sort (see
+    /// [`Model::set_enum_ctors`]): a term of such a sort always evaluates to
+    /// one of them.
+    enum_ctors: BTreeMap<AstId, Vec<AstId>>,
+    /// Whether the front end has completed the functions' default values
+    /// (see [`Model::mark_fn_defaults_ready`]).
+    fn_defaults_ready: bool,
 }
 
 /// Which of z3's division-by-zero functions: `div0` (integer `div`), `mod0`
@@ -911,6 +922,8 @@ impl Model {
             cong_depth: 0,
             zero_div: Default::default(),
             zero_div_ready: false,
+            enum_ctors: BTreeMap::new(),
+            fn_defaults_ready: false,
         }
     }
 
@@ -922,7 +935,66 @@ impl Model {
         self.arith.extend(other.arith);
         self.alg.extend(other.alg);
         self.defaults.extend(other.defaults);
+        self.enum_ctors.extend(other.enum_ctors);
         self.euf.absorb(m, other.euf);
+    }
+
+    /// Register the constructors of the enumeration sort `sort`. A term of
+    /// that sort the model leaves unconstrained (no constructor in its class)
+    /// is completed, when first evaluated, to its function's default value or
+    /// else the first constructor — z3's model completion — so that values
+    /// read from the model are always constructors.
+    pub fn set_enum_ctors(&mut self, sort: AstId, ctors: Vec<AstId>) {
+        if !ctors.is_empty() {
+            self.enum_ctors.insert(sort, ctors);
+        }
+    }
+
+    /// The congruence class of the uninterpreted-sort term `t`, completing
+    /// enumeration-sorted terms to a constructor (see [`Self::set_enum_ctors`]).
+    /// A term new to the e-graph has its arguments completed first, so that
+    /// congruence with the assigned applications is decided on their final
+    /// classes.
+    fn uninterp_class(&mut self, m: &AstManager, t: AstId) -> usize {
+        if self.enum_ctors.is_empty() && self.defaults.is_empty() {
+            return self.euf.class_of(m, t);
+        }
+        let new = !self.euf.contains(t);
+        if new && let Some(app) = m.app(t) {
+            for a in app.args.clone() {
+                let s = m.get_sort(a);
+                if !(m.is_bool_sort(s) || m.is_arith_sort(s) || m.bv_sort_width(s).is_some()) {
+                    self.uninterp_class(m, a);
+                }
+            }
+        }
+        let class = self.euf.class_of(m, t);
+        // An application no assigned term covers takes its function's
+        // default value.
+        if new
+            && let Some(&Value::Uninterp(_, d)) = self.default_of(m, t)
+            && self.euf.is_singleton(t)
+        {
+            let rep = self.euf.member(d);
+            self.euf.is_consistent(m, &[(t, rep)], &[]);
+            return self.euf.class_of(m, t);
+        }
+        let Some(ctors) = self.enum_ctors.get(&m.get_sort(t)).cloned() else {
+            return class;
+        };
+        let classes: Vec<usize> = ctors.iter().map(|&k| self.euf.class_of(m, k)).collect();
+        if classes.contains(&class) {
+            return class;
+        }
+        let target = match self.default_of(m, t) {
+            Some(&Value::Uninterp(_, d)) => classes
+                .iter()
+                .position(|&c| c == d)
+                .map_or(ctors[0], |i| ctors[i]),
+            _ => ctors[0],
+        };
+        self.euf.is_consistent(m, &[(t, target)], &[]);
+        self.euf.class_of(m, t)
     }
 
     /// Whether the division-by-zero interpretations have been computed.
@@ -967,6 +1039,22 @@ impl Model {
     /// assigned application covers.
     pub fn set_default(&mut self, decl: AstId, v: Value) {
         self.defaults.insert(decl, v);
+    }
+
+    /// Does the uninterpreted function `decl` have a default value?
+    pub fn has_default(&self, decl: AstId) -> bool {
+        self.defaults.contains_key(&decl)
+    }
+
+    /// Whether the functions' default values have been completed.
+    pub fn fn_defaults_ready(&self) -> bool {
+        self.fn_defaults_ready
+    }
+
+    /// Record that the functions' default values have been completed (once
+    /// per model: later completions keep them).
+    pub fn mark_fn_defaults_ready(&mut self) {
+        self.fn_defaults_ready = true;
     }
 
     /// The default value of `t`'s function, when `t` is an application of one
@@ -1085,7 +1173,7 @@ impl Model {
         } else if m.is_arith_sort(s) {
             Value::Num(ast_to_lin(m, t).eval(&self.arith), m.is_int_sort(s))
         } else {
-            let class = self.euf.class_of(m, t);
+            let class = self.uninterp_class(m, t);
             Value::Uninterp(s, class)
         }
     }
@@ -1187,16 +1275,27 @@ impl Model {
             // An application with a Boolean argument the e-graph never saw
             // (`f(g(x))` for Boolean `g(x)`): Booleans are no e-graph classes,
             // so find an interned application with the same argument values.
+            // The same holds for arithmetic and bit-vector arguments, whose
+            // equal values need not share a class. The application joins the
+            // class it found, so that terms over it agree with it.
             if !self.euf.contains(t)
                 && let Some(app) = m.app(t)
-                && app.args.iter().any(|&a| m.is_bool_sort(m.get_sort(a)))
+                && app.args.iter().any(|&a| {
+                    let s = m.get_sort(a);
+                    m.is_bool_sort(s)
+                        || (!self.enum_ctors.is_empty()
+                            && (m.is_arith_sort(s) || m.bv_sort_width(s).is_some()))
+                })
             {
                 let decl = app.decl;
                 if let Some(k) = self.congruent_assigned(m, t, |s| s.euf.apps_of(decl)) {
-                    return Value::Uninterp(s, self.euf.class_of(m, k));
+                    if self.enum_ctors.is_empty() {
+                        return Value::Uninterp(s, self.euf.class_of(m, k));
+                    }
+                    self.euf.is_consistent(m, &[(t, k)], &[]);
                 }
             }
-            Value::Uninterp(s, self.euf.class_of(m, t))
+            Value::Uninterp(s, self.uninterp_class(m, t))
         }
     }
 
