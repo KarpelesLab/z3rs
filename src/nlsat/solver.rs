@@ -31,8 +31,12 @@
 //! Root literals of linear and quadratic polynomials become sign conditions
 //! (`mk_linear_root`, `mk_quadratic_root`'s Thom encoding).
 //!
-//! Not ported: core simplification by equalities and core minimization,
-//! restarts and reordering during search, and lazy-mode clause skipping.
+//! Before projection the conflict core is normalized and simplified with its
+//! equations and those of lower stages (`simplify`, z3's
+//! `simplify_conflicts`).
+//!
+//! Not ported: core minimization, restarts and reordering during search, and
+//! lazy-mode clause skipping.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -46,6 +50,7 @@ use crate::nlsat::cad::roots_at;
 use crate::nlsat::realclosure::{Alg, sign_at_point};
 
 mod levelwise;
+mod simplify;
 
 /// The kind of an arithmetic atom: `p = 0`, `p < 0`, `p > 0`, or a comparison
 /// of the atom's variable with the `i`-th real root of `p` (`x = root_i(p)`, …).
@@ -213,7 +218,13 @@ enum Trail {
     Infeasible(ISet),
     NewStage,
     NewLevel,
+    /// The previous equation recorded for the current stage.
+    UpdtEq(Option<usize>),
 }
+
+/// An inequality atom's factors with parity (`true`: even multiplicity) and
+/// the sign of the remaining constant.
+type AtomFactors = (Vec<(Polynomial, bool)>, i32);
 
 /// The solver aborted: an inexact primitive or an exhausted budget.
 #[derive(Debug)]
@@ -731,6 +742,14 @@ struct Solver {
     psc_cache: BTreeMap<(Var, Polynomial, Polynomial), Vec<Polynomial>>,
     /// Factorizations (`math::factor::factors`), memoized.
     factor_cache: BTreeMap<Polynomial, Vec<Polynomial>>,
+    /// The Boolean variable of each atom.
+    atom_bool: Vec<u32>,
+    /// Each atom's factors with parity and constant sign (`atom_factors`).
+    atom_factor_cache: Vec<Option<AtomFactors>>,
+    /// Lower-stage factors dropped by core normalization, to project.
+    lower_stage_polys: Vec<Polynomial>,
+    /// The equation recorded for each stage (`m_var2eq`), by atom.
+    var2eq: Vec<Option<usize>>,
 }
 
 impl Solver {
@@ -770,6 +789,10 @@ impl Solver {
             sign_cache: BTreeMap::new(),
             psc_cache: BTreeMap::new(),
             factor_cache: BTreeMap::new(),
+            atom_bool: Vec::new(),
+            atom_factor_cache: Vec::new(),
+            lower_stage_polys: Vec::new(),
+            var2eq: alloc::vec![None; num_vars],
         }
     }
 
@@ -822,6 +845,7 @@ impl Solver {
                 .unwrap_or_else(|_| p.degree_of(x))
         };
         self.atoms.push(Atom { kind, p, x, i, deg });
+        self.atom_bool.push(b);
         self.bool2atom[b as usize] = Some(self.atoms.len() - 1);
         self.atom_index.insert(key, b);
         b
@@ -1171,6 +1195,7 @@ impl Solver {
         self.levels[b] = self.scope_lvl;
         self.justs[b] = j;
         self.trail.push(Trail::BAssign(l.var()));
+        self.updt_eq(l);
     }
 
     fn new_level(&mut self) {
@@ -1210,6 +1235,13 @@ impl Solver {
                 None => {}
             },
             Trail::NewLevel => self.scope_lvl -= 1,
+            Trail::UpdtEq(old) => {
+                if let Some(x) = self.xk
+                    && x < self.var2eq.len()
+                {
+                    self.var2eq[x] = old;
+                }
+            }
         }
         true
     }
@@ -1764,11 +1796,32 @@ impl Solver {
     }
 
     fn explain_main(&mut self, core: &[Lit]) -> Result<(), ExplainErr> {
-        let mut ps: Vec<Polynomial> = Vec::new();
-        for &l in core {
-            let a = self.atom(l.var()).cloned().expect("arith literal");
-            ps.push(a.p);
+        // Core normalization and simplification (z3's `process2` with
+        // `simplify_conflicts`).
+        let Some(max) = core.iter().filter_map(|&l| self.lit_max_var(l)).max() else {
+            return Ok(());
+        };
+        let mut c = core.to_vec();
+        self.lower_stage_polys.clear();
+        self.normalize_core(&mut c, max)?;
+        self.simplify_core(&mut c, max)?;
+        if c.is_empty() {
+            return Ok(());
         }
+        let mut ps: Vec<Polynomial> = Vec::new();
+        for &l in &c {
+            let Some(ai) = self.bool2atom[l.var() as usize] else {
+                continue;
+            };
+            if self.atoms[ai].kind.is_root() {
+                ps.push(self.atoms[ai].p.clone());
+            } else {
+                for (f, _) in self.atom_factors(ai)?.0 {
+                    ps.push(f);
+                }
+            }
+        }
+        ps.extend(core::mem::take(&mut self.lower_stage_polys));
         let max_x = ps.iter().filter_map(max_var).max();
         let Some(max_x) = max_x else {
             return Ok(());
