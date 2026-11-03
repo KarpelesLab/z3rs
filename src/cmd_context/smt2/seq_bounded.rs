@@ -123,7 +123,7 @@ impl Context {
     /// variables `vars`: `sat` (a confirmed model) at the first combination
     /// that has one, `unsat` when none has, `None` when one is undecided.
     #[allow(clippy::type_complexity)]
-    fn seq_bounded_search(
+    pub(super) fn seq_bounded_search(
         &mut self,
         roots: &[AstId],
         universals: &[(Vec<AstId>, AstId)],
@@ -197,6 +197,7 @@ impl Context {
                         continue;
                     };
                     if let Some(res) = self.seq_bounded_confirm(&pins) {
+                        self.seq_bounded_pins_found = pins;
                         return Some(res);
                     }
                     undecided = true;

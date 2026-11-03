@@ -996,6 +996,7 @@ mod lra_conj;
 mod re_len;
 mod re_sym;
 mod seq_bounded;
+mod seq_lengths;
 mod seq_nth;
 mod simplify_th;
 use simplify_th::PreTerm;
@@ -3321,6 +3322,9 @@ struct Context {
     /// string-witness search, so `get-value`/`get-model` report a concrete string
     /// (e.g. `"aaa"`) rather than an uninterpreted placeholder.
     str_witness: Vec<(AstId, AstId)>,
+    /// The pins of the last model [`Context::seq_bounded_search`] confirmed:
+    /// each sequence variable's concrete value (and the other constants').
+    seq_bounded_pins_found: Vec<(AstId, AstId)>,
     /// The `v = literal` bindings the last `inline_str_bindings` substituted.
     str_inlined: Vec<(AstId, AstId)>,
     /// Length links for symbolic string predicates: `(pred_app, longer, shorter)`
@@ -4522,6 +4526,7 @@ impl Context {
             sqrt_roots: BTreeMap::new(),
             sqrt_defs: BTreeSet::new(),
             str_witness: Vec::new(),
+            seq_bounded_pins_found: Vec::new(),
             str_inlined: Vec::new(),
             str_pred_len: Vec::new(),
             str_len_ub: Vec::new(),
@@ -13933,6 +13938,55 @@ impl Context {
             let len_avail = self.m.mk_eq(sublen, avail);
             ax.push(self.m.mk_implies(c2, len_avail));
         }
+        // The sequence analog (z3's `seq_axioms::add_extract_axiom` lengths):
+        // `len(extract s i n) = 0` when `i < 0 ∨ n ≤ 0 ∨ i ≥ len s`, else
+        // `min(n, len s − i)`; `seq.at s i` is `extract s i 1`. Refutes
+        // `[0,0]·a = extract a (len a) k` (a length-0 window).
+        let seq_subs: Vec<(AstId, AstId, AstId, AstId)> = present
+            .iter()
+            .filter_map(|&t| {
+                if !self.m.is_app(t) {
+                    return None;
+                }
+                let a = self.m.app_args(t);
+                match self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str) {
+                    Some("seq.extract") if a.len() == 3 => Some((t, a[0], a[1], a[2])),
+                    Some("seq.at") if a.len() == 2 => Some((t, a[0], a[1], one)),
+                    _ => None,
+                }
+            })
+            .collect();
+        for (app, x, i, n) in seq_subs {
+            let (Ok(lx), Ok(sublen)) =
+                (self.seq_op("seq.len", &[x]), self.seq_op("seq.len", &[app]))
+            else {
+                continue;
+            };
+            let zero = self.m.mk_int(0);
+            let empty = self.seq_empty_of(self.m.get_sort(app));
+            let is_empty = self.m.mk_eq(app, empty);
+            let len_zero = self.m.mk_eq(sublen, zero);
+            ax.push(self.m.mk_eq(len_zero, is_empty));
+            ax.push(self.m.mk_ge(sublen, zero));
+            ax.push(self.m.mk_ge(lx, zero));
+            let i_neg = self.m.mk_lt(i, zero);
+            let n_nonpos = self.m.mk_le(n, zero);
+            let oob = self.m.mk_ge(i, lx);
+            let out = self.m.mk_or(&[i_neg, n_nonpos, oob]);
+            ax.push(self.m.mk_implies(out, len_zero));
+            let i_ok = self.m.mk_ge(i, zero);
+            let n_pos = self.m.mk_gt(n, zero);
+            let inb = self.m.mk_lt(i, lx);
+            let avail = self.m.mk_sub(&[lx, i]);
+            let enough = self.m.mk_ge(avail, n);
+            let c1 = self.m.mk_and(&[i_ok, n_pos, inb, enough]);
+            let len_n = self.m.mk_eq(sublen, n);
+            ax.push(self.m.mk_implies(c1, len_n));
+            let short = self.m.mk_lt(avail, n);
+            let c2 = self.m.mk_and(&[i_ok, n_pos, inb, short]);
+            let len_avail = self.m.mk_eq(sublen, avail);
+            ax.push(self.m.mk_implies(c2, len_avail));
+        }
         // `str.to_code x`: a valid code (≥ 0) requires a single character, so
         // `str.to_code x ≥ 0 ⇒ len x = 1`. Refutes `str.to_code x = 97 ∧ len x = 2`.
         // `str.indexof x t i`: a found index (≥ 0) leaves room for the needle, so
@@ -17486,9 +17540,31 @@ impl Context {
             return (res, Some(m2));
         }
         // Refuted, or still open: no string/sequence values confirm the
-        // `sat` of the abstraction.
+        // `sat` of the abstraction. The sequences' length abstraction may
+        // still decide the goal.
         if refuted || self.str_model_incomplete(extra) {
-            return (SmtResult::Unknown, None);
+            let n = self.assertions.len();
+            self.assertions.extend_from_slice(extra);
+            let r = self.check_sat_seq_lengths();
+            self.assertions.truncate(n);
+            return match r {
+                Some((SmtResult::Sat, Some(mut m))) => {
+                    // The confirmed sequence values are the witness.
+                    let pins = core::mem::take(&mut self.seq_bounded_pins_found);
+                    self.str_witness = pins
+                        .into_iter()
+                        .filter(|&(v, _)| self.seq_elem_sort(self.m.get_sort(v)).is_some())
+                        .collect();
+                    self.complete_str_witness(&mut m);
+                    if self.str_model_refuted(&mut m, extra) || self.str_model_incomplete(extra) {
+                        (SmtResult::Unknown, None)
+                    } else {
+                        (SmtResult::Sat, Some(m))
+                    }
+                }
+                Some((SmtResult::Unsat, _)) => (SmtResult::Unsat, None),
+                _ => (SmtResult::Unknown, None),
+            };
         }
         (res, Some(md))
     }
@@ -24973,6 +25049,12 @@ impl Context {
         // Sequences of bounded length by their elements.
         if r.0 == SmtResult::Unknown
             && let Some(r2) = self.check_sat_seq_bounded()
+        {
+            return r2;
+        }
+        // Sequences of unbounded length through their length abstraction.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_seq_lengths()
         {
             return r2;
         }
