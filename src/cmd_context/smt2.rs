@@ -1461,11 +1461,14 @@ struct LiftCtx {
     toint: BTreeMap<AstId, AstId>,
     /// Memo of `(/ a b)` terms (symbolic divisor) → their quotient constant.
     rdiv: BTreeMap<AstId, AstId>,
-    /// Dividends occurring in ≥2 distinct `div`/`mod` terms — the only case where
-    /// two zero-divisor results can coincide, so only these get `div0`/`mod0`
-    /// consistency axioms (a lone zero-divisor term is genuinely free, and
-    /// emitting the axiom for every term needlessly bloats div/mod-heavy goals).
-    coincident_dividends: BTreeSet<AstId>,
+    /// The `div`/`mod` pieces whose divisor may be zero, as `(dividend,
+    /// divisor, quotient, remainder)`: division by zero is z3's `div0`/`mod0`
+    /// *function* of the dividend, so two such pieces agree whenever their
+    /// divisors are both zero and their dividends are equal.
+    zero_divs: Vec<(AstId, AstId, AstId, AstId)>,
+    /// The real divisions whose divisor may be zero, as `(dividend, divisor,
+    /// quotient)` (z3's `/0` function, likewise).
+    zero_rdivs: Vec<(AstId, AstId, AstId)>,
     /// Memo of `(^ b 1/2)` bases → their square-root constant.
     sqrt: BTreeMap<AstId, AstId>,
     /// The goal's top-level linear conjuncts (for entailed side conditions).
@@ -1705,6 +1708,20 @@ fn supported_logic(s: &str) -> bool {
         || has_fpa
         || has_datatype
         || has_finite_sets
+}
+
+/// The outcome of [`Context::ensure_zero_div_tables`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroDivStatus {
+    /// The model's division-by-zero functions are built (or were already).
+    Done,
+    /// No assertion divides by a possibly-zero term.
+    NoDivisions,
+    /// The assertions are outside what the construction handles.
+    Unsupported,
+    /// No such functions exist: the model's constants violate an assertion
+    /// whatever the divisions by zero are.
+    Inconsistent,
 }
 
 /// [`Context::term`] nesting depth past which deep application chains are
@@ -2942,6 +2959,12 @@ struct Context {
     scopes: BoundScopes,
     /// Nesting depth of [`Self::term`] calls in progress.
     term_depth: usize,
+    /// Whether term lifting constrains divisions by zero to agree at equal
+    /// dividends (z3's `div0`/`mod0`/`/0` are functions). On by default; a
+    /// plain `check-sat` first decides without these constraints and keeps
+    /// the result only when its model admits such functions (see
+    /// [`Self::check_sat_zero_div_lazy`]).
+    zero_div_axioms: bool,
     /// Terms already built for s-expression nodes (keyed by node address) of a
     /// deep application chain being built bottom-up (see [`Self::term`]);
     /// empty outside such a build.
@@ -4196,6 +4219,7 @@ impl Context {
             scope_stack: Vec::new(),
             scopes: BoundScopes::default(),
             term_depth: 0,
+            zero_div_axioms: true,
             term_memo: BTreeMap::new(),
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
@@ -5025,6 +5049,7 @@ impl Context {
                 }
                 let decimal = self.pp_decimal_precision();
                 let mut model = self.last_model.take().unwrap();
+                self.ensure_zero_div_tables(&mut model);
                 let id = self.str_ground(&mut model, id);
                 let completion = list.windows(2).any(|w| {
                     matches!(&w[0], SExpr::Atom(k) if k == ":model_completion" || k == ":model-completion")
@@ -5606,7 +5631,7 @@ impl Context {
                 } else if self.objectives.is_empty() {
                     // The opaque `sin`/`cos` already decide many goals (`unsat`);
                     // only an open one is purified.
-                    match self.check_sat() {
+                    match self.check_sat_zero_div_lazy() {
                         (SmtResult::Unknown, _) if purify => self
                             .check_sat_trig_purified()
                             .unwrap_or((SmtResult::Unknown, None)),
@@ -5944,18 +5969,54 @@ impl Context {
         d
     }
 
-    /// Bind the quotient/remainder of a division by zero to `div0(a)` / `mod0(a)`,
-    /// so two zero-divisor terms with the same dividend `a` denote the same value
-    /// (EUF congruence), even when their divisors are syntactically different
-    /// (a literal `0` vs an alias `dv = 0`). Without this, each gets an
-    /// independent free quotient and a nonlinear witness can pick inconsistent
-    /// values for what is really one `div0(a)`.
-    fn divmod_zero_consistency(&mut self, a: AstId, q: AstId, r: AstId) -> (AstId, AstId) {
-        let d0 = self.div0_decl();
-        let m0 = self.mod0_decl();
-        let qv = self.m.mk_app(d0, &[a]);
-        let rv = self.m.mk_app(m0, &[a]);
-        (self.m.mk_eq(q, qv), self.m.mk_eq(r, rv))
+    /// The condition under which two divisions `a / b` and `a2 / b2` both
+    /// divide by zero with equal dividends — when z3's division-by-zero
+    /// function (`div0`, `mod0`, `/0`) gives them the same value; `None` when it
+    /// cannot hold (a nonzero numeral divisor).
+    fn zero_div_guard(&mut self, a: AstId, b: AstId, a2: AstId, b2: AstId) -> Option<AstId> {
+        let mut parts = Vec::new();
+        for d in [b, b2] {
+            match self.m.as_numeral(d) {
+                Some(v) if v.is_zero() => {}
+                Some(_) => return None,
+                None => {
+                    let is_int = self.m.is_int_sort(self.m.get_sort(d));
+                    let zero = self
+                        .m
+                        .mk_numeral(Rational::from_integer(Int::from(0)), is_int);
+                    parts.push(self.m.mk_eq(d, zero));
+                }
+            }
+        }
+        if a != a2 {
+            parts.push(self.m.mk_eq(a, a2));
+        }
+        Some(match parts.len() {
+            0 => self.m.mk_true(),
+            1 => parts[0],
+            _ => self.m.mk_and(&parts),
+        })
+    }
+
+    /// Record a `div`/`mod` piece `(q, r)` of `a` by the possibly-zero divisor
+    /// `b`, constraining it to agree with every earlier one wherever both
+    /// divide by zero with equal dividends (functional consistency of z3's
+    /// `div0`/`mod0`): without this, two such terms could take different
+    /// values at equal arguments — a model z3 rejects (`x = z ∧ y = 0 ∧
+    /// div(x, y) = 1 ∧ div(z, y) = 2` is unsat).
+    fn zero_div_consistency(&mut self, ctx: &mut LiftCtx, a: AstId, b: AstId, q: AstId, r: AstId) {
+        if !self.zero_div_axioms {
+            return;
+        }
+        for (a2, b2, q2, r2) in ctx.zero_divs.clone() {
+            if let Some(g) = self.zero_div_guard(a, b, a2, b2) {
+                let qeq = self.m.mk_eq(q, q2);
+                ctx.defs.push(self.m.mk_implies(g, qeq));
+                let req = self.m.mk_eq(r, r2);
+                ctx.defs.push(self.m.mk_implies(g, req));
+            }
+        }
+        ctx.zero_divs.push((a, b, q, r));
     }
 
     /// If `t` is `(div a n)` or `(mod a n)` with a constant integer divisor
@@ -5987,15 +6048,9 @@ impl Context {
             }
             Some(_) => {
                 // Division by the literal 0 is unspecified in SMT-LIB, but z3's
-                // div0/mod0 are functions of the dividend: pin `q = div0(a)`,
-                // `r = mod0(a)` so distinct zero-divisor terms with the same
-                // dividend agree (consistency). Only needed when the dividend is
-                // shared by ≥2 div/mod terms.
-                if ctx.coincident_dividends.contains(&a) {
-                    let (qeq, req) = self.divmod_zero_consistency(a, q, r);
-                    ctx.defs.push(qeq);
-                    ctx.defs.push(req);
-                }
+                // div0/mod0 are functions of the dividend: zero-divisor terms
+                // with equal dividends agree.
+                self.zero_div_consistency(ctx, a, b, q, r);
             }
             None => {
                 // For a *compound* divisor expression, alias it to a fresh
@@ -6048,17 +6103,10 @@ impl Context {
                     let r0 = self.m.mk_eq(r, zero);
                     ctx.defs.push(self.m.mk_implies(bne0, r0));
                 }
-                // When the divisor is zero, pin `q = div0(a)`, `r = mod0(a)` so this
-                // term agrees with every other zero-divisor term of the same
-                // dividend (consistency — see `divmod_zero_consistency`). Only when
-                // the dividend is shared by ≥2 div/mod terms.
-                if ctx.coincident_dividends.contains(&a) {
-                    let (qeq, req) = self.divmod_zero_consistency(a, q, r);
-                    let ib0 = self.m.mk_implies(beq0, qeq);
-                    ctx.defs.push(ib0);
-                    let ib1 = self.m.mk_implies(beq0, req);
-                    ctx.defs.push(ib1);
-                }
+                // When the divisor is zero, this term agrees with every other
+                // zero-divisor term of an equal dividend (see
+                // `zero_div_consistency`).
+                self.zero_div_consistency(ctx, a, divv, q, r);
             }
         }
         ctx.dm.insert((a, b), (q, r));
@@ -6104,6 +6152,18 @@ impl Context {
             let q1 = self.m.mk_eq(q, one);
             ctx.defs.push(self.m.mk_implies(bne0, q1));
         }
+        // z3's `/0` is a function: two zero-divisor quotients of equal
+        // dividends agree (see `zero_div_consistency`).
+        for (a2, b2, q2) in ctx.zero_rdivs.clone() {
+            if !self.zero_div_axioms {
+                break;
+            }
+            if let Some(g) = self.zero_div_guard(a, b, a2, b2) {
+                let qeq = self.m.mk_eq(q, q2);
+                ctx.defs.push(self.m.mk_implies(g, qeq));
+            }
+        }
+        ctx.zero_rdivs.push((a, b, q));
         // Record for the post-lift exact-quotient identity (product dividend over a
         // provably-nonzero divisor). Only a symbolic (non-numeral) divisor reaches
         // here, so `b` is the divisor to test for nonzero-ness.
@@ -15395,7 +15455,7 @@ impl Context {
         // bounded so the ≤MAX_TRIES loop cannot blow up and guarded so the nested
         // decide never re-enters this witness search. Sound because a returned,
         // verified model of the residual is a model of the original (and
-        // div-by-zero consistency, `divmod_zero_consistency`, keeps coincident
+        // div-by-zero consistency, `zero_div_consistency`, keeps coincident
         // zero-divisor terms from being witnessed to inconsistent values).
         let mut nl_budget: u32 = if self.in_divmod_witness { 0 } else { 6 };
         let mut idx = alloc::vec![0usize; divs.len()];
@@ -23798,23 +23858,6 @@ impl Context {
                 self.m.mk_and(&parts)
             }
         };
-        // Dividends shared by ≥2 distinct div/mod terms need div0/mod0 consistency.
-        let mut div_terms_by_dividend: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
-        for t in self.m.postorder(base) {
-            if self.m.is_app(t)
-                && matches!(self.m.arith_op(t), Some(ArithOp::Idiv) | Some(ArithOp::Mod))
-            {
-                let args = self.m.app_args(t);
-                if args.len() == 2 {
-                    div_terms_by_dividend.entry(args[0]).or_default().insert(t);
-                }
-            }
-        }
-        let coincident_dividends: BTreeSet<AstId> = div_terms_by_dividend
-            .into_iter()
-            .filter(|(_, terms)| terms.len() >= 2)
-            .map(|(a, _)| a)
-            .collect();
         let mut lin_facts = Vec::new();
         if self.m.postorder(base).iter().any(|&t| self.is_sqrt_term(t)) {
             let mut conj = Vec::new();
@@ -23831,7 +23874,8 @@ impl Context {
             dm: BTreeMap::new(),
             toint: BTreeMap::new(),
             rdiv: BTreeMap::new(),
-            coincident_dividends,
+            zero_divs: Vec::new(),
+            zero_rdivs: Vec::new(),
             sqrt: BTreeMap::new(),
             lin_facts,
         };
@@ -38290,6 +38334,7 @@ impl Context {
         }
         // Then evaluate against the model (disjoint immutable borrow of `m`).
         let mut model = self.last_model.take().unwrap();
+        self.ensure_zero_div_tables(&mut model);
         let decimal = self.pp_decimal_precision();
         let mut out = String::from("(");
         for (i, (text, id)) in terms.iter().enumerate() {
@@ -38366,6 +38411,7 @@ impl Context {
             })
             .collect();
         let mut model = self.last_model.take().unwrap();
+        self.ensure_zero_div_tables(&mut model);
 
         // Build constant interpretations for every n-ary (non-array-range)
         // function, then *jointly* validate: a single function may validate in
@@ -38428,7 +38474,30 @@ impl Context {
         let (consts, funs): (Vec<Decl>, Vec<Decl>) =
             decls.into_iter().partition(|d| d.domain.is_empty());
         let mut out = String::from("(");
+        // z3 lists its division-by-zero functions among the model's functions
+        // (in its hash-table order): `mod0` and `/0` ahead of the declared ones
+        // and `div0` after them, as with a single declared function.
+        let zero_div = |ctx: &Self, model: &Model, kinds: &[crate::smt::ZeroDivKind]| {
+            kinds
+                .iter()
+                .filter_map(|&k| ctx.zero_div_listing(model, k))
+                .map(|l| alloc::format!("\n{l}"))
+                .collect::<String>()
+        };
+        let mut zero_div_head = Some(zero_div(
+            self,
+            &model,
+            &[
+                crate::smt::ZeroDivKind::Mod,
+                crate::smt::ZeroDivKind::RealDiv,
+            ],
+        ));
         for decl in consts.iter().chain(&funs) {
+            if !decl.domain.is_empty()
+                && let Some(h) = zero_div_head.take()
+            {
+                out.push_str(&h);
+            }
             if decl.domain.is_empty() {
                 if self.m.is_array_sort(decl.range) {
                     continue; // array interpretations not yet emitted (invalid)
@@ -38473,6 +38542,10 @@ impl Context {
                 ));
             }
         }
+        if let Some(h) = zero_div_head.take() {
+            out.push_str(&h);
+        }
+        out.push_str(&zero_div(self, &model, &[crate::smt::ZeroDivKind::Div]));
         // z3 registers a 0-ary `define-fun` as a defined function, and the model
         // lists it with its (unevaluated) body after the declared constants.
         let consts: Vec<(String, SExpr)> = self
@@ -38500,6 +38573,334 @@ impl Context {
         out.push_str("\n)");
         self.last_model = Some(model);
         Ok(out)
+    }
+
+    /// Compute `model`'s interpretations of z3's division-by-zero functions
+    /// `div0`, `mod0` and `/0` (once per model), so that `get-model` lists them
+    /// and `eval`/`get-value` of a division by zero read the value the
+    /// assertions need.
+    ///
+    /// z3 asserts `div0(a, b) = (div a b)` for every division whose divisor
+    /// is not a nonzero numeral (`mod0(a, 0) = (mod a 0)` likewise, and a `div`
+    /// brings its `mod` along), and the model interprets these functions from
+    /// the values the solver gave those terms. The values here come from
+    /// re-deciding the assertions with every constant fixed to its model
+    /// value and each division by zero replaced by an unknown — one per
+    /// function and dividend value, so the interpretation is a function.
+    /// Assertions over anything but arithmetic and Boolean constants are left
+    /// alone (no interpretation is built).
+    fn ensure_zero_div_tables(&mut self, model: &mut Model) -> ZeroDivStatus {
+        use crate::smt::{ZeroDivInterp, ZeroDivKind};
+        if model.zero_div_ready() {
+            return ZeroDivStatus::Done;
+        }
+        model.mark_zero_div_ready();
+        let Some(arith) = self.m.get_family_id(Symbol::new("arith")) else {
+            return ZeroDivStatus::NoDivisions;
+        };
+        let kind_of = |ctx: &Self, t: AstId| -> Option<ZeroDivKind> {
+            let args = ctx.m.app_args(t);
+            if args.len() != 2 || ctx.m.as_numeral(args[1]).is_some_and(|v| !v.is_zero()) {
+                return None;
+            }
+            match ctx.m.arith_op(t)? {
+                ArithOp::Idiv => Some(ZeroDivKind::Div),
+                ArithOp::Mod => Some(ZeroDivKind::Mod),
+                ArithOp::Div => Some(ZeroDivKind::RealDiv),
+                _ => None,
+            }
+        };
+        // A definition `x = t` that z3's `solve-eqs` eliminates (the first
+        // one of each solved constant) is never internalized: its divisions
+        // get no entries (the model converter evaluates `t` under the
+        // completed model instead).
+        let mut claimed: BTreeSet<String> = BTreeSet::new();
+        let mut kept: Vec<AstId> = Vec::new();
+        let mut defs: Vec<(AstId, AstId)> = Vec::new();
+        for a in self.assertions.clone() {
+            let defined = if !self.inc_mode && self.m.is_eq(a) {
+                let args = self.m.app_args(a).to_vec();
+                args.iter().enumerate().find_map(|(i, &c)| {
+                    let n = self.decl_name(self.m.app_decl(c))?;
+                    (self.m.is_uninterp_const(c)
+                        && self.solved_vars.contains(&n)
+                        && !claimed.contains(&n)
+                        && !self.m.postorder(args[1 - i]).contains(&c))
+                    .then_some((n, c, args[1 - i]))
+                })
+            } else {
+                None
+            };
+            match defined {
+                Some((n, c, t)) => {
+                    claimed.insert(n);
+                    defs.push((c, t));
+                }
+                None => kept.push(a),
+            }
+        }
+        // The other assertions see each eliminated constant as its definition.
+        for i in 0..defs.len() {
+            let (c, t) = defs[i];
+            for a in kept.iter_mut() {
+                *a = crate::rewriter::substitute(&mut self.m, *a, &[(c, t)]);
+            }
+            for d in defs.iter_mut().skip(i + 1) {
+                d.1 = crate::rewriter::substitute(&mut self.m, d.1, &[(c, t)]);
+            }
+        }
+        let roots: Vec<AstId> = kept
+            .into_iter()
+            .filter(|&a| {
+                self.m
+                    .postorder(a)
+                    .into_iter()
+                    .any(|t| self.m.is_app(t) && kind_of(self, t).is_some())
+            })
+            .collect();
+        if roots.is_empty() {
+            return ZeroDivStatus::NoDivisions;
+        }
+        // Rebuild the assertions bottom-up: constants to their values, each
+        // division whose divisor folds to 0 to the unknown of its function and
+        // dividend.
+        let order = self.m.postorder_many(&roots);
+        let mut new: BTreeMap<AstId, AstId> = BTreeMap::new();
+        // (function, dividend, unknown), in z3's entry order.
+        let mut unknowns: Vec<(ZeroDivKind, AstId, AstId)> = Vec::new();
+        // Rebuilt terms over an unknown.
+        let mut open: BTreeSet<AstId> = BTreeSet::new();
+        let mut counter = 0u32;
+        for &t in &order {
+            let Some(app) = self.m.app(t) else {
+                return ZeroDivStatus::Unsupported; // a quantifier or bound variable
+            };
+            let (decl, args) = (app.decl, app.args.clone());
+            let fam = self.m.func_decl(decl).map(|d| d.info.family_id);
+            let sort = self.m.get_sort(t);
+            let value_sort = self.m.is_arith_sort(sort) || self.m.is_bool_sort(sort);
+            if args.is_empty() && fam == Some(crate::ast::NULL_FAMILY_ID) {
+                if !value_sort {
+                    return ZeroDivStatus::Unsupported;
+                }
+                let Some(v) = self.eval_value_term(model, t) else {
+                    return ZeroDivStatus::Unsupported;
+                };
+                new.insert(t, v);
+                continue;
+            }
+            if fam != Some(arith) && fam != Some(crate::ast::BASIC_FAMILY_ID) || !value_sort {
+                return ZeroDivStatus::Unsupported;
+            }
+            let nargs: Vec<AstId> = args.iter().map(|a| new[a]).collect();
+            let rebuilt = self.m.mk_app(decl, &nargs);
+            let r = match kind_of(self, t) {
+                Some(kind)
+                    if crate::rewriter::simplify(&mut self.m, nargs[1])
+                        == self.m.mk_numeral(
+                            Rational::from_integer(Int::from(0)),
+                            self.m.is_int_sort(self.m.get_sort(nargs[1])),
+                        ) =>
+                {
+                    let dividend = crate::rewriter::simplify(&mut self.m, nargs[0]);
+                    // `div` brings its `mod` along (z3 internalizes both).
+                    let kinds: &[ZeroDivKind] = if kind == ZeroDivKind::Div {
+                        &[ZeroDivKind::Div, ZeroDivKind::Mod]
+                    } else {
+                        &[kind]
+                    };
+                    let mut mine = None;
+                    for &k in kinds {
+                        let u = match unknowns
+                            .iter()
+                            .find(|(k2, d, _)| *k2 == k && *d == dividend)
+                        {
+                            Some(&(_, _, u)) => u,
+                            None => {
+                                let name = alloc::format!("!zdiv!{counter}");
+                                counter += 1;
+                                let d = self.m.mk_func_decl(Symbol::new(&name), &[], sort);
+                                let u = self.m.mk_const(d);
+                                unknowns.push((k, dividend, u));
+                                u
+                            }
+                        };
+                        if k == kind {
+                            mine = Some(u);
+                        }
+                    }
+                    let u = mine.expect("own kind");
+                    open.insert(u);
+                    u
+                }
+                _ if nargs.iter().any(|a| open.contains(a)) => {
+                    open.insert(rebuilt);
+                    rebuilt
+                }
+                // A ground term folds to its value, so the re-decision is
+                // over the unknowns alone.
+                _ => {
+                    let mut scratch = Model::from_bv(BTreeMap::new());
+                    match self.eval_value_term(&mut scratch, rebuilt) {
+                        Some(v) => v,
+                        None => return ZeroDivStatus::Unsupported,
+                    }
+                }
+            };
+            new.insert(t, r);
+        }
+        let mut conj: Vec<AstId> = roots.iter().map(|r| new[r]).collect();
+        // Unknowns of one function at dividends that are not numerals (a
+        // division by zero nested in a dividend) agree at equal dividends.
+        for i in 0..unknowns.len() {
+            for j in i + 1..unknowns.len() {
+                let ((k1, d1, u1), (k2, d2, u2)) = (unknowns[i], unknowns[j]);
+                if k1 == k2 && (self.m.as_numeral(d1).is_none() || self.m.as_numeral(d2).is_none())
+                {
+                    let deq = self.m.mk_eq(d1, d2);
+                    let ueq = self.m.mk_eq(u1, u2);
+                    conj.push(self.m.mk_implies(deq, ueq));
+                }
+            }
+        }
+        let goal = if conj.len() == 1 {
+            conj[0]
+        } else {
+            self.m.mk_and(&conj)
+        };
+        let goal = crate::rewriter::simplify(&mut self.m, goal);
+        let (res, sub) = self.decide(goal);
+        let (SmtResult::Sat, Some(mut sub)) = (res, sub) else {
+            return if res == SmtResult::Unsat {
+                ZeroDivStatus::Inconsistent
+            } else {
+                ZeroDivStatus::Unsupported
+            };
+        };
+        let mut tables: [Vec<(Rational, Rational)>; 3] = Default::default();
+        for &(k, d, u) in &unknowns {
+            let (Value::Num(dv, _), Value::Num(uv, _)) =
+                (sub.eval_value(&self.m, d), sub.eval_value(&self.m, u))
+            else {
+                return ZeroDivStatus::Unsupported;
+            };
+            let entries = &mut tables[k as usize];
+            if !entries.iter().any(|(e, _)| *e == dv) {
+                entries.push((dv, uv));
+            }
+        }
+        for (i, entries) in tables.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            // z3's `else`: the result occurring most often (the first such),
+            // with the entries it covers dropped (`func_interp::compress`).
+            let mut best: Option<(&Rational, usize)> = None;
+            for (_, v) in &entries {
+                let n = entries.iter().filter(|(_, w)| w == v).count();
+                if best.is_none_or(|(_, m)| n > m) {
+                    best = Some((v, n));
+                }
+            }
+            let els = best.expect("non-empty").0.clone();
+            let entries: Vec<(Rational, Rational)> =
+                entries.into_iter().filter(|(_, v)| *v != els).collect();
+            let kind = [ZeroDivKind::Div, ZeroDivKind::Mod, ZeroDivKind::RealDiv][i];
+            model.set_zero_div(kind, Some(ZeroDivInterp { entries, els }));
+        }
+        // An eliminated constant takes its definition's value (as z3's model
+        // converter gives it).
+        let saved: Vec<(AstId, Option<Rational>, Option<bool>)> = defs
+            .iter()
+            .map(|&(c, _)| (c, model.assigned_num(c).cloned(), model.assigned_bool(c)))
+            .collect();
+        for &(c, t) in defs.iter().rev() {
+            match model.eval_value(&self.m, t) {
+                Value::Num(r, _) => model.set_arith(c, r),
+                Value::Bool(b) => model.set_bool(c, b),
+                _ => {}
+            }
+        }
+        // Keep the interpretations only when every assertion they concern
+        // holds under them (a division by a term over the unknowns can still
+        // divide by zero, outside the functions built here).
+        let holds = |ctx: &Self, model: &mut Model, a: AstId| {
+            matches!(model.eval_value(&ctx.m, a), Value::Bool(true))
+        };
+        let checked: Vec<AstId> = self
+            .assertions
+            .clone()
+            .into_iter()
+            .filter(|&a| {
+                self.m
+                    .postorder(a)
+                    .into_iter()
+                    .any(|t| self.m.is_app(t) && kind_of(self, t).is_some())
+            })
+            .collect();
+        if !checked.into_iter().all(|a| holds(self, model, a)) {
+            for kind in [ZeroDivKind::Div, ZeroDivKind::Mod, ZeroDivKind::RealDiv] {
+                model.set_zero_div(kind, None);
+            }
+            for (c, n, b) in saved {
+                model.unassign(c);
+                if let Some(n) = n {
+                    model.set_arith(c, n);
+                }
+                if let Some(b) = b {
+                    model.set_bool(c, b);
+                }
+            }
+            return ZeroDivStatus::Inconsistent;
+        }
+        ZeroDivStatus::Done
+    }
+
+    /// [`Self::check_sat`] deciding first without the division-by-zero
+    /// consistency constraints (they cost nonlinear goals dearly): a `sat`
+    /// stands when its model admits z3's `div0`/`mod0`/`/0` functions;
+    /// otherwise the check is redone with the constraints.
+    fn check_sat_zero_div_lazy(&mut self) -> (SmtResult, Option<Model>) {
+        self.zero_div_axioms = false;
+        let r = self.check_sat();
+        self.zero_div_axioms = true;
+        if let (SmtResult::Sat, Some(mut md)) = r {
+            match self.ensure_zero_div_tables(&mut md) {
+                ZeroDivStatus::Done | ZeroDivStatus::NoDivisions => {
+                    return (SmtResult::Sat, Some(md));
+                }
+                ZeroDivStatus::Unsupported | ZeroDivStatus::Inconsistent => {}
+            }
+            return self.check_sat();
+        }
+        r
+    }
+
+    /// The `get-model` listing of `model`'s division-by-zero function `kind`
+    /// (see [`Self::ensure_zero_div_tables`]), as z3 prints it.
+    fn zero_div_listing(&self, model: &Model, kind: crate::smt::ZeroDivKind) -> Option<String> {
+        use crate::smt::ZeroDivKind;
+        let f = model.zero_div(kind)?;
+        let (name, sort, is_int) = match kind {
+            ZeroDivKind::Div => ("div0", "Int", true),
+            ZeroDivKind::Mod => ("mod0", "Int", true),
+            ZeroDivKind::RealDiv => ("/0", "Real", false),
+        };
+        let num = |r: &Rational| Value::Num(r.clone(), is_int).render(&self.m);
+        let zero = num(&Rational::from_integer(Int::from(0)));
+        let mut out = alloc::format!("  (define-fun {name} ((x!0 {sort}) (x!1 {sort})) {sort}\n");
+        for (d, v) in &f.entries {
+            out.push_str(&alloc::format!(
+                "    (ite (and (= x!0 {}) (= x!1 {zero})) {}\n",
+                num(d),
+                num(v)
+            ));
+        }
+        let indent = if f.entries.is_empty() { 4 } else { 6 };
+        out.push_str(&" ".repeat(indent));
+        out.push_str(&num(&f.els));
+        out.push_str(&")".repeat(f.entries.len() + 1));
+        Some(out)
     }
 
     /// The declared functions the assertions mention, in order of first

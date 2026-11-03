@@ -173,6 +173,8 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                         alg: BTreeMap::new(),
                         defaults: BTreeMap::new(),
                         cong_depth: 0,
+                        zero_div: Default::default(),
+                        zero_div_ready: false,
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -209,6 +211,8 @@ pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>)
                             alg: BTreeMap::new(),
                             defaults: BTreeMap::new(),
                             cong_depth: 0,
+                            zero_div: Default::default(),
+                            zero_div_ready: false,
                         };
                         return (SmtResult::Sat, Some(model));
                     }
@@ -578,6 +582,44 @@ pub struct Model {
     /// Nesting depth of [`Model::congruent_assigned`] (its argument
     /// evaluation can reach it again through cyclic terms).
     cong_depth: usize,
+    /// z3's division-by-zero functions in this model, indexed by
+    /// [`ZeroDivKind`]: `div0`, `mod0`, `/0` (absent: division by zero
+    /// evaluates to nothing, rendered `0`).
+    zero_div: [Option<ZeroDivInterp>; 3],
+    /// Whether `zero_div` has been computed (see [`Model::set_zero_div`]).
+    zero_div_ready: bool,
+}
+
+/// Which of z3's division-by-zero functions: `div0` (integer `div`), `mod0`
+/// (`mod`) or `/0` (real `/`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ZeroDivKind {
+    /// `div0`, the value of `(div a 0)`.
+    Div = 0,
+    /// `mod0`, the value of `(mod a 0)`.
+    Mod = 1,
+    /// `/0`, the value of `(/ a 0.0)`.
+    RealDiv = 2,
+}
+
+/// The interpretation of one of z3's division-by-zero functions: its value at
+/// each listed dividend (in z3's entry order) and elsewhere.
+#[derive(Clone, Debug)]
+pub struct ZeroDivInterp {
+    /// `(dividend, value)` entries.
+    pub entries: Vec<(Rational, Rational)>,
+    /// The value at every other dividend.
+    pub els: Rational,
+}
+
+impl ZeroDivInterp {
+    /// The value at dividend `a`.
+    pub fn value(&self, a: &Rational) -> Rational {
+        self.entries
+            .iter()
+            .find(|(d, _)| d == a)
+            .map_or_else(|| self.els.clone(), |(_, v)| v.clone())
+    }
 }
 
 /// Are two model values equal?
@@ -615,6 +657,8 @@ impl Model {
             alg: BTreeMap::new(),
             defaults: BTreeMap::new(),
             cong_depth: 0,
+            zero_div: Default::default(),
+            zero_div_ready: false,
         }
     }
 
@@ -627,6 +671,44 @@ impl Model {
         self.alg.extend(other.alg);
         self.defaults.extend(other.defaults);
         self.euf.absorb(m, other.euf);
+    }
+
+    /// Whether the division-by-zero interpretations have been computed.
+    pub fn zero_div_ready(&self) -> bool {
+        self.zero_div_ready
+    }
+
+    /// Install the division-by-zero interpretations (`div0`, `mod0`, `/0`)
+    /// that `(div a 0)`, `(mod a 0)` and `(/ a 0.0)` evaluate through.
+    pub fn set_zero_div(&mut self, kind: ZeroDivKind, interp: Option<ZeroDivInterp>) {
+        self.zero_div[kind as usize] = interp;
+        self.zero_div_ready = true;
+    }
+
+    /// Mark the division-by-zero interpretations computed (possibly none).
+    pub fn mark_zero_div_ready(&mut self) {
+        self.zero_div_ready = true;
+    }
+
+    /// The interpretation of a division-by-zero function, if the model has one.
+    pub fn zero_div(&self, kind: ZeroDivKind) -> Option<&ZeroDivInterp> {
+        self.zero_div[kind as usize].as_ref()
+    }
+
+    /// The value the model assigns `t` itself, if any (no evaluation).
+    pub fn assigned_num(&self, t: AstId) -> Option<&Rational> {
+        self.arith.get(&t)
+    }
+
+    /// The truth value the model assigns `t` itself, if any (no evaluation).
+    pub fn assigned_bool(&self, t: AstId) -> Option<bool> {
+        self.bools.get(&t).copied()
+    }
+
+    /// Drop the numeric and Boolean values assigned to `t` itself.
+    pub fn unassign(&mut self, t: AstId) {
+        self.arith.remove(&t);
+        self.bools.remove(&t);
     }
 
     /// Set the value of the uninterpreted function `decl` at arguments no
@@ -1033,6 +1115,30 @@ impl Model {
         if let Some(r) = m.as_numeral(t) {
             return Some(r);
         }
+        // A division by zero reads the model's division-by-zero function
+        // (`div0`/`mod0`/`/0`) when it has one, ahead of any value an engine
+        // gave the term as an opaque leaf.
+        let zkind = match m.arith_op(t) {
+            Some(ArithOp::Idiv) => Some(ZeroDivKind::Div),
+            Some(ArithOp::Mod) => Some(ZeroDivKind::Mod),
+            Some(ArithOp::Div) => Some(ZeroDivKind::RealDiv),
+            _ => None,
+        };
+        if let Some(k) = zkind
+            && self.zero_div[k as usize].is_some()
+            && m.app_args(t).len() == 2
+        {
+            let args = m.app_args(t).to_vec();
+            // (An unassigned leaf reads as 0, as in `eval_full`.)
+            let num = |s: &mut Self, x: AstId| {
+                s.eval_num_full(m, x)
+                    .unwrap_or_else(|| ast_to_lin(m, x).eval(&s.arith))
+            };
+            if num(self, args[1]).is_zero() {
+                let a = num(self, args[0]);
+                return self.zero_div(k).map(|f| f.value(&a));
+            }
+        }
         // An arithmetic leaf pinned in the assignment: read it directly so that
         // *nonlinear* terms over it (e.g. `(* x x)`) fold to the true value
         // rather than the linear fallback's stray `0`. The assignment only ever
@@ -1103,13 +1209,18 @@ impl Model {
             ArithOp::Div => {
                 let a = ev(self, args[0])?;
                 let b = ev(self, args[1])?;
-                if b.is_zero() { None } else { Some(a / b) }
+                if b.is_zero() {
+                    self.zero_div(ZeroDivKind::RealDiv).map(|f| f.value(&a))
+                } else {
+                    Some(a / b)
+                }
             }
             ArithOp::Idiv => {
                 let a = ev(self, args[0])?.to_integer()?;
                 let b = ev(self, args[1])?.to_integer()?;
                 if b.is_zero() {
-                    None
+                    self.zero_div(ZeroDivKind::Div)
+                        .map(|f| f.value(&Rational::from_integer(a)))
                 } else {
                     Some(Rational::from_integer(a.div_euclid(&b)))
                 }
@@ -1118,7 +1229,8 @@ impl Model {
                 let a = ev(self, args[0])?.to_integer()?;
                 let b = ev(self, args[1])?.to_integer()?;
                 if b.is_zero() {
-                    None
+                    self.zero_div(ZeroDivKind::Mod)
+                        .map(|f| f.value(&Rational::from_integer(a)))
                 } else {
                     Some(Rational::from_integer(a.rem_euclid(&b)))
                 }
