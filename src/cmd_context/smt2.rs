@@ -999,6 +999,7 @@ mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
 mod re_len;
+mod re_sym;
 mod seq_bounded;
 mod seq_nth;
 mod simplify_th;
@@ -19787,8 +19788,18 @@ impl Context {
                     }
                 }
                 // (str.in_re s (str.to_re t)) ≡ s = t (seq_rewriter::mk_str_in_regexp).
+                if let Some(Regex::Lit(w)) = self.regex_of.get(&raw[1]) {
+                    let text: String = w.iter().filter_map(|&c| char::from_u32(c)).collect();
+                    if text.chars().count() == w.len() {
+                        let t = self.mk_str_lit(&text);
+                        return Ok(self.m.mk_eq(raw[0], t));
+                    }
+                }
                 if let Some(&t) = self.regex_to_re_arg.get(&raw[1]) {
                     return Ok(self.m.mk_eq(raw[0], t));
+                }
+                if let Some(t) = self.in_re_symbolic(raw[0], raw[1]) {
+                    return Ok(t);
                 }
                 self.symbolic_string(op, raw)
             }
@@ -24757,6 +24768,10 @@ impl Context {
             self.str_uf_vals.clear();
             // String-valued user functions are decided by purification.
             if let Some(r) = self.check_sat_str_uf() {
+                return r;
+            }
+            // String constants fixed by an equality, inside symbolic regexes.
+            if let Some(r) = self.check_sat_str_fixed() {
                 return r;
             }
             // Regex and length constraints on independent string variables.
@@ -37249,6 +37264,15 @@ impl Context {
             if !self.in_opaque_strengthen
                 && let Some(g2) = self.strengthen_opaque_atoms(goal)
             {
+                // The string axioms of what the strengthening leaves: its
+                // literals stay distinct (`"ba" = ""` is no model).
+                let mut conj = self.string_axioms(g2);
+                let g2 = if conj.is_empty() {
+                    g2
+                } else {
+                    conj.push(g2);
+                    self.m.mk_and(&conj)
+                };
                 self.in_opaque_strengthen = true;
                 let (r, m) = self.decide_inner(g2);
                 self.in_opaque_strengthen = false;
@@ -45289,6 +45313,42 @@ mod tests {
         assert_eq!(out[1], "((a \"abab\"))");
         assert_eq!(out[2], "sat");
         assert!(out[3].starts_with("((b \"x"), "{out:?}");
+    }
+
+    #[test]
+    fn memberships_in_symbolic_regexes_unfold() {
+        // `b = x·b·"ab"` has no solution; `a = ""` is in every star; a constant
+        // fixed by an equality makes its regex constant; and dropping the
+        // opaque star leaves `"ba" = ""`, which is no model.
+        let script = "
+            (declare-const a String)
+            (declare-const b String)
+            (assert (str.in_re b (re.++ (re.union (str.to_re \"aab\") (re.+ (re.range \"a\" \"b\")))
+                (str.to_re (str.++ b \"ab\")))))
+            (check-sat)
+            (reset)
+            (declare-const a String)
+            (declare-const b String)
+            (assert (str.in_re a (re.union (re.range \"a\" \"b\") (re.* (re.comp (str.to_re b))))))
+            (check-sat)
+            (reset)
+            (declare-const a String)
+            (declare-const b String)
+            (assert (= a \"a\"))
+            (assert (str.in_re b (re.* (re.union (str.to_re a) (re.range \"b\" \"b\")))))
+            (assert (= (str.len b) 3))
+            (assert (not (str.in_re b (re.* (re.range \"a\" \"b\")))))
+            (check-sat)
+            (reset)
+            (declare-const a String)
+            (declare-const b String)
+            (assert (= b \"ba\"))
+            (assert (or (= b \"\") (str.in_re b (re.* (str.to_re (str.substr a 0 1))))))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[..3], ["unsat", "sat", "unsat"]);
+        assert_ne!(out[3], "sat");
     }
 
     #[test]
