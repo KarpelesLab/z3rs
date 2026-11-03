@@ -7,6 +7,7 @@
 //! [`arith_rewriter`]) and rebuilding through
 //! the [`AstManager`] so results stay hash-consed.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::ast::AstId;
@@ -19,23 +20,45 @@ pub fn simplify(m: &mut AstManager, root: AstId) -> AstId {
     let order = m.postorder(root);
     // Original node ids are all `< m.len()` at entry; simplified results may be
     // newly created ids, which are never looked up here.
-    let mut cache: Vec<Option<AstId>> = alloc::vec![None; m.len()];
+    // A small term (an instance) caches by map, not by a table over the
+    // whole manager.
+    let dense = order.len() * 16 >= m.len();
+    let mut cache: Vec<Option<AstId>> = if dense {
+        alloc::vec![None; m.len()]
+    } else {
+        Vec::new()
+    };
+    let mut sparse: BTreeMap<AstId, AstId> = BTreeMap::new();
     for &id in &order {
         let simplified = match m.node(id).clone() {
             AstNode::App(a) => {
                 let new_args: Vec<AstId> = a
                     .args
                     .iter()
-                    .map(|&c| cache[c.0 as usize].unwrap())
+                    .map(|&c| {
+                        if dense {
+                            cache[c.0 as usize].unwrap()
+                        } else {
+                            sparse[&c]
+                        }
+                    })
                     .collect();
                 simplify_app(m, a.decl, &new_args)
             }
             // Variables and (leaf) constants rewrite to themselves.
             _ => id,
         };
-        cache[id.0 as usize] = Some(simplified);
+        if dense {
+            cache[id.0 as usize] = Some(simplified);
+        } else {
+            sparse.insert(id, simplified);
+        }
     }
-    cache[root.0 as usize].unwrap()
+    if dense {
+        cache[root.0 as usize].unwrap()
+    } else {
+        sparse[&root]
+    }
 }
 
 /// Simplify a single application, given already-simplified `args`.

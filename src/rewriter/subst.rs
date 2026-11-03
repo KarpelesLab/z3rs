@@ -39,7 +39,15 @@ where
     F: FnMut(&AstManager, AstId) -> Option<AstId>,
 {
     let order = m.postorder(root);
-    let mut cache: Vec<Option<AstId>> = alloc::vec![None; m.len()];
+    // A small term (an instance body) caches by map, not by a table over the
+    // whole manager.
+    let dense = order.len() * 16 >= m.len();
+    let mut cache: Vec<Option<AstId>> = if dense {
+        alloc::vec![None; m.len()]
+    } else {
+        Vec::new()
+    };
+    let mut sparse: BTreeMap<AstId, AstId> = BTreeMap::new();
     for &id in &order {
         let out = if let Some(r) = replace(m, id) {
             r
@@ -49,16 +57,30 @@ where
                     let new_args: Vec<AstId> = a
                         .args
                         .iter()
-                        .map(|&c| cache[c.0 as usize].unwrap())
+                        .map(|&c| {
+                            if dense {
+                                cache[c.0 as usize].unwrap()
+                            } else {
+                                sparse[&c]
+                            }
+                        })
                         .collect();
                     m.mk_app(a.decl, &new_args)
                 }
                 _ => id,
             }
         };
-        cache[id.0 as usize] = Some(out);
+        if dense {
+            cache[id.0 as usize] = Some(out);
+        } else {
+            sparse.insert(id, out);
+        }
     }
-    cache[root.0 as usize].unwrap()
+    if dense {
+        cache[root.0 as usize].unwrap()
+    } else {
+        sparse[&root]
+    }
 }
 
 #[cfg(test)]
