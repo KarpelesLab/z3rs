@@ -30810,6 +30810,96 @@ impl Context {
         RealOpt::Unknown
     }
 
+    /// Whether `model` (of the assertions plus `fixed`) proves `obj`
+    /// unbounded in the optimizing direction: its implicant cube (see
+    /// [`opt_implicant`](Self::opt_implicant)) is a linear system over
+    /// arithmetic constants with a recession direction `d` improving the
+    /// objective. Such a `d` can be taken integral, so the model's point plus
+    /// any multiple of it stays in the cube (integral where the model is)
+    /// while the objective grows without bound.
+    fn opt_unbounded_ray(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        fixed: &[AstId],
+        model: &mut Model,
+    ) -> bool {
+        use crate::smt::arith::{Constraint, LinExpr, Rel};
+        let mut cube = Vec::new();
+        let Some(cube_obj) = self.opt_resolve_ites(obj, model, &mut cube) else {
+            return false;
+        };
+        let arith = |ctx: &Self, t: AstId| {
+            ctx.m.is_uninterp_const(t) && ctx.m.is_arith_sort(ctx.m.get_sort(t))
+        };
+        let roots: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
+        for f in roots {
+            // A root without arithmetic holds at the model's Booleans.
+            if !self.m.postorder(f).into_iter().any(|t| arith(self, t)) {
+                continue;
+            }
+            if self.opt_implicant(f, true, model, &mut cube).is_none() {
+                return false;
+            }
+        }
+        // The Boolean literals stay at the model's values.
+        let lits: Vec<AstId> = cube
+            .into_iter()
+            .filter(|&c| self.m.postorder(c).into_iter().any(|t| arith(self, t)))
+            .collect();
+        let conj = match lits.len() {
+            0 => self.m.mk_true(),
+            1 => lits[0],
+            _ => self.m.mk_and(&lits),
+        };
+        let Some(cons) = linear_constraints(&self.m, conj) else {
+            return false;
+        };
+        let dir = ast_to_lin(&self.m, cube_obj);
+        if cons
+            .iter()
+            .flat_map(|c| c.expr.vars())
+            .chain(dir.vars())
+            .any(|v| !arith(self, v))
+        {
+            return false;
+        }
+        // The recession cone: the homogeneous closed system.
+        let homogeneous = |e: &LinExpr| {
+            let mut h = e.clone();
+            h.add_scaled(
+                &LinExpr::constant(e.const_term().clone()),
+                &Rational::from_integer(Int::from(-1)),
+            );
+            h
+        };
+        let mut cone: Vec<Constraint> = cons
+            .iter()
+            .map(|c| {
+                let e = homogeneous(&c.expr);
+                match c.rel {
+                    Rel::Eq => Constraint::eq(e),
+                    _ => Constraint::le(e),
+                }
+            })
+            .collect();
+        let mut gain = homogeneous(&dir);
+        if !maximize {
+            gain = gain.neg();
+        }
+        // gain·d ≤ 1: the optimum is 1 exactly when some d gains.
+        cone.push(Constraint::le(
+            gain.sub(&LinExpr::constant(Rational::from_integer(Int::from(1)))),
+        ));
+        let real = self.m.mk_real_sort();
+        let z = self.fresh_const(real);
+        let mut budget: u64 = 200_000;
+        matches!(
+            arith_optimize(&cone, &gain, z, true, &mut budget),
+            OptOutcome::Attained(v) if v.is_positive()
+        )
+    }
+
     /// `t` with its term-level `ite`s replaced, innermost first, by the
     /// branches `model` selects; the literals of their conditions are pushed
     /// onto `out` (see [`opt_implicant`](Self::opt_implicant)).
@@ -31252,8 +31342,17 @@ impl Context {
         let mut feasible = v0;
         let mut best: Option<Model> = None;
         let infeasible;
+        let mut probes = 0u32;
         loop {
             let cand = dir(&feasible, &step, maximize);
+            probes += 1;
+            // A long climb: try to certify unboundedness by a ray.
+            if probes.is_multiple_of(8)
+                && let Some(md) = best.as_mut()
+                && self.opt_unbounded_ray(obj, maximize, fixed, md)
+            {
+                return (OptResult::Unbounded, None);
+            }
             match sat_at(self, &cand, &mut budget) {
                 None => return (OptResult::Unknown, None),
                 Some(Some((v, m))) => {
@@ -51279,6 +51378,24 @@ mod tests {
         let out = run(src).unwrap();
         assert_eq!(out[1], "(objectives\n (g 2)\n (x 3)\n)");
         assert_eq!(out[3], "(objectives\n (g 0)\n ((- x) (- 3))\n)");
+    }
+
+    #[test]
+    fn integer_objective_unbounded_by_a_ray() {
+        // The climb would take ~200 probes; the model's cube has a ray.
+        let src = "
+            (declare-const x Int)
+            (declare-const y Int)
+            (declare-const z Int)
+            (assert (<= (- 5) x 1))
+            (assert (or (> (+ (* (- 2) x) (* (- 1) z)) 3) (> (+ (* 2 x) (* (- 2) z)) 1)))
+            (assert (or (= (+ (* (- 3) x) (* 2 y) (* 2 z)) (- 6)) (< (+ (* (- 1) x) (* 2 z)) (- 5))))
+            (minimize z)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(src).unwrap();
+        assert_eq!(out[1], "(objectives\n (z (* (- 1) oo))\n)");
     }
 
     #[test]
