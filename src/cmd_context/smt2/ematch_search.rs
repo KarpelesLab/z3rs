@@ -86,7 +86,16 @@ struct Rounds {
     /// Every binding instantiated so far, as (universal, binder terms):
     /// like z3's fingerprints, a binding is new only modulo the classes.
     done: Vec<(usize, Vec<AstId>)>,
+    /// The generation of each term an instance introduced (z3's enode
+    /// generation; the goal's own terms are generation 0), and the terms
+    /// known so far (the goal's, once read, and the instances').
+    generation: BTreeMap<AstId, u32>,
+    known: Option<BTreeSet<AstId>>,
 }
+
+/// z3's default `smt.qi.eager_threshold` and `smt.qi.lazy_threshold`.
+const QI_EAGER_THRESHOLD: f64 = 10.0;
+const QI_LAZY_THRESHOLD: f64 = 20.0;
 
 impl Context {
     /// The user functions and the quantifier abstractions: a relevant
@@ -97,6 +106,34 @@ impl Context {
         let mut user_decls: BTreeSet<AstId> = self.funcs.values().copied().collect();
         user_decls.extend(self.quant_pred_decls.iter().copied());
         user_decls
+    }
+
+    /// The highest instance cost z3's instantiation queue ever instantiates:
+    /// an instance costs its quantifier's weight (1) plus the highest
+    /// generation among its binding terms (`smt.qi.cost` `(+ weight
+    /// generation)`), is instantiated eagerly up to `smt.qi.eager_threshold`
+    /// and at the final check up to `smt.qi.lazy_threshold`, and never above
+    /// both (`qi_queue.cpp`).
+    fn qi_max_cost(&self) -> f64 {
+        let get = |names: [&str; 2], default: f64| {
+            names
+                .iter()
+                .find_map(|k| match self.params.get(k) {
+                    Some(crate::util::ParamValue::UInt(u)) => Some(*u as f64),
+                    Some(crate::util::ParamValue::Double(d)) => Some(*d),
+                    _ => None,
+                })
+                .unwrap_or(default)
+        };
+        let eager = get(
+            ["smt.qi.eager_threshold", "smt.qi.eager-threshold"],
+            QI_EAGER_THRESHOLD,
+        );
+        let lazy = get(
+            ["smt.qi.lazy_threshold", "smt.qi.lazy-threshold"],
+            QI_LAZY_THRESHOLD,
+        );
+        eager.max(lazy)
     }
 
     /// One E-matching round over `model`: the instances of the universals
@@ -116,6 +153,15 @@ impl Context {
     ) -> usize {
         let mut roots = self.assertions.clone();
         roots.extend(st.instances.iter().copied());
+        if st.known.is_none() {
+            st.known = Some(
+                self.m
+                    .postorder_many(&self.assertions)
+                    .into_iter()
+                    .collect(),
+            );
+        }
+        let max_cost = self.qi_max_cost();
         let mut memo = known;
         let terms = self.relevant_terms(&roots, model, &mut memo);
         let by_decl = self.relevant_classes(&terms, model, user_decls, &mut memo);
@@ -132,6 +178,17 @@ impl Context {
                     // New only modulo the classes (z3's fingerprints);
                     // instantiated with the matched terms.
                     let terms: Vec<AstId> = vars.iter().map(|v| binding[v]).collect();
+                    // z3's cost `weight + generation`: past the thresholds the
+                    // queue never instantiates the binding.
+                    let generation = terms
+                        .iter()
+                        .map(|t| st.generation.get(t).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0);
+                    let cost = 1 + generation;
+                    if f64::from(cost) > max_cost {
+                        continue;
+                    }
                     let key: Vec<AstId> = terms.iter().map(|&t| self.class_rep(t)).collect();
                     if !fingerprints.insert((ui, key)) {
                         continue;
@@ -153,6 +210,14 @@ impl Context {
                     }
                     if self.m.is_true(inst) || !st.seen.insert(inst) {
                         continue;
+                    }
+                    // The terms the instance introduces take its cost as their
+                    // generation (z3's `qi.new_gen` `cost`).
+                    let known = st.known.get_or_insert_with(BTreeSet::new);
+                    for t in self.m.postorder(inst) {
+                        if known.insert(t) {
+                            st.generation.insert(t, cost);
+                        }
                     }
                     st.instances.push(inst);
                 }
