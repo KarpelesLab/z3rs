@@ -94,6 +94,17 @@ impl Budget {
     }
 }
 
+/// The size of `p`'s largest coefficient, in 64-bit limbs.
+fn limbs(p: &Polynomial) -> u64 {
+    let bits = p
+        .terms()
+        .iter()
+        .map(|(c, _)| c.numerator().bit_len() + c.denominator().bit_len())
+        .max()
+        .unwrap_or(0);
+    u64::from(bits / 64 + 1)
+}
+
 /// `p` as a dense univariate polynomial in `x` (every other variable absent).
 fn to_upoly(p: &Polynomial, x: Var) -> crate::math::upoly::UPoly {
     let d = p.degree_of(x);
@@ -153,7 +164,7 @@ fn gcd_core(a: &Polynomial, b: &Polynomial, bud: &mut Budget) -> Option<Polynomi
     let (da, db) = (a.degree_of(x), b.degree_of(x));
     let univ = |p: &Polynomial| p.terms().iter().all(|(_, m)| m.vars().all(|v| v == x));
     if univ(a) && univ(b) {
-        bud.charge(u64::from(da + 1) * u64::from(db + 1))?;
+        bud.charge(u64::from(da + 1) * u64::from(db + 1) * (limbs(a) + limbs(b)))?;
         return Some(normalize(&from_upoly(
             &to_upoly(a, x).gcd(&to_upoly(b, x)),
             x,
@@ -174,7 +185,11 @@ fn gcd_core(a: &Polynomial, b: &Polynomial, bud: &mut Budget) -> Option<Polynomi
     let pb = b.div_exact(&cb)?;
     let (mut r0, mut r1) = if da >= db { (pa, pb) } else { (pb, pa) };
     loop {
-        bud.charge((r0.num_terms() * r1.num_terms()) as u64 * u64::from(r0.degree_of(x) + 1))?;
+        bud.charge(
+            (r0.num_terms() * r1.num_terms()) as u64
+                * u64::from(r0.degree_of(x) + 1)
+                * (limbs(&r0) + limbs(&r1)),
+        )?;
         let r = prem(&r0, &r1, x);
         if r.is_zero() {
             break;
@@ -236,7 +251,8 @@ fn factor_sqf_pp(
             return factor_core(&p.div_exact(&c)?, out, bud);
         }
     }
-    if vars.len() == 1 && p.degree_of(x) >= 2 {
+    // Univariate factoring (Berlekamp–Zassenhaus) only while it is cheap.
+    if vars.len() == 1 && p.degree_of(x) >= 2 && p.degree_of(x) <= 24 && limbs(p) <= 4 {
         let d = p.degree_of(x);
         let coeffs: Vec<Rational> = (0..=d)
             .map(|k| {
