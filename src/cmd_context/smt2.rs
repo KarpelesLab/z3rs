@@ -2826,6 +2826,40 @@ struct Scope {
     table: usize,
     /// Length of `asserted_mentions` at the push.
     mentions: usize,
+    /// z3's polymorphism-theory assertion head at the push (its trail restores
+    /// it on pop).
+    poly_qhead: usize,
+}
+
+/// The parts of z3's solver state that decide how its model lists the
+/// constants the solver interprets: those live in an `obj_map` keyed by
+/// declaration hash, and once the manager has type variables every check
+/// adds a fresh skolem `poly!N` assumption that the model holds until
+/// `compress` drops it (moving the last constant into its slot).
+#[derive(Default)]
+struct Z3SolverState {
+    /// `ast_manager::has_type_vars`: set by the first final check of a
+    /// context running z3's finite-set theory (it builds a polymorphic
+    /// signature).
+    type_vars: bool,
+    /// `ast_manager::m_fresh_id`, the counter suffixing fresh names.
+    fresh_id: u32,
+    /// The incremental solver's context exists.
+    inc_ctx: bool,
+    /// The incremental context has its polymorphism theory.
+    inc_poly: bool,
+    /// The polymorphism theory's head into the asserted formulas.
+    poly_qhead: usize,
+    /// The `poly!N` assumption of the last check, if it made one.
+    last_poly: Option<u32>,
+    /// The last check's search start registers the polymorphism theory in
+    /// the incremental context.
+    pending_poly: bool,
+    /// The last check ran on the incremental solver.
+    last_inc: bool,
+    /// Declared sort names in first-declaration order (z3's user-sort kinds;
+    /// kind 0 is taken before any user declaration).
+    user_sorts: Vec<String>,
 }
 
 /// The active `let`/macro-parameter binding scopes (innermost last), with a
@@ -2932,6 +2966,9 @@ struct Context {
     inc_mode: bool,
     /// A `check-sat` has run (later assertions switch to incremental mode).
     check_sat_done: bool,
+    /// The z3 solver state that shapes its model's constant order (see
+    /// [`Context::z3_note_check`]).
+    z3_state: Z3SolverState,
     /// Constants a top-level `x = t` assertion defines (`solve-eqs`
     /// candidates), in assertion order.
     solved_vars: Vec<String>,
@@ -4167,6 +4204,7 @@ impl Context {
             asserted_mentions: Vec::new(),
             inc_mode: false,
             check_sat_done: false,
+            z3_state: Z3SolverState::default(),
             solved_vars: Vec::new(),
             sort_order: Vec::new(),
             last_model: None,
@@ -4605,6 +4643,7 @@ impl Context {
                         quant_defs: self.quant_defs.len(),
                         table: self.decl_table_stack.len(),
                         mentions: self.asserted_mentions.len(),
+                        poly_qhead: self.z3_state.poly_qhead,
                     });
                     self.inc_mode = true;
                 }
@@ -4637,6 +4676,7 @@ impl Context {
                         self.decl_table.erase(&name);
                     }
                     self.asserted_mentions.truncate(mark.mentions);
+                    self.z3_state.poly_qhead = mark.poly_qhead;
                     self.inc_mode = true;
                     for name in self.sort_order.drain(mark.sorts..) {
                         self.sorts.remove(&name);
@@ -4666,6 +4706,7 @@ impl Context {
                 self.asserted_mentions.clear();
                 self.inc_mode = false;
                 self.check_sat_done = false;
+                self.z3_state = Z3SolverState::default();
                 self.solved_vars.clear();
                 for name in self.sort_order.drain(..) {
                     self.sorts.remove(&name);
@@ -4678,6 +4719,9 @@ impl Context {
             "reset-assertions" => {
                 // Drop assertions and the assertion stack, but keep declarations
                 // and options (unlike `reset`).
+                self.z3_state.inc_ctx = false;
+                self.z3_state.inc_poly = false;
+                self.z3_state.poly_qhead = 0;
                 self.assertions.clear();
                 self.assert_names.clear();
                 self.named_terms.clear();
@@ -4702,6 +4746,9 @@ impl Context {
                     .and_then(|a| Self::sym(a).ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
+                if !self.z3_state.user_sorts.contains(&name) {
+                    self.z3_state.user_sorts.push(name.clone());
+                }
                 if arity == 0 {
                     let s = self.m.mk_uninterpreted_sort(Symbol::new(&name));
                     self.sorts.insert(name.clone(), s);
@@ -5538,6 +5585,7 @@ impl Context {
                 self.str_witness.clear();
                 self.trig_basis.clear();
                 let plain = is_using || list.len() <= 1;
+                self.z3_note_check(!is_using && (self.inc_mode || !plain));
                 let purify = is_using
                     && self.objectives.is_empty()
                     && list
@@ -5605,6 +5653,7 @@ impl Context {
                 }
                 let extra: Vec<AstId> = self.last_assumptions.iter().map(|&(_, t)| t).collect();
                 let (res, model) = self.finish_str_model(res, model, &extra);
+                self.z3_note_result(res);
                 self.check_sat_done = true;
                 if !plain {
                     self.inc_mode = true;
@@ -5631,6 +5680,7 @@ impl Context {
                 self.str_witness.clear();
                 self.check_sat_done = true;
                 self.inc_mode = true;
+                self.z3_note_check(true);
                 // With objectives, z3 optimizes under the assumptions.
                 let (res, model) = if self.objectives.is_empty() {
                     self.check_with(&terms)
@@ -5638,6 +5688,7 @@ impl Context {
                     self.optimize(&terms)
                 };
                 let (res, model) = self.finish_str_model(res, model, &terms);
+                self.z3_note_result(res);
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -38365,6 +38416,13 @@ impl Context {
                 Some(&sel) => self.m.is_bool_sort(self.m.get_sort(sel)),
                 None => self.m.is_bool_sort(d.range),
             },
+            |d| {
+                if !d.domain.is_empty() {
+                    return None;
+                }
+                let r = self.z3_sort_hash(d.range);
+                Some(r.map(|r| super::ast_hash::decl_hash(&d.name, &[], r, 0)))
+            },
         );
         // z3 prints the model's constants before its functions.
         let (consts, funs): (Vec<Decl>, Vec<Decl>) =
@@ -38521,6 +38579,7 @@ impl Context {
         decls: Vec<T>,
         name: impl Fn(&T) -> &String,
         is_bool: impl Fn(&T) -> bool,
+        hash: impl Fn(&T) -> Option<Option<u32>>,
     ) -> Vec<T> {
         let used = self.asserted_names();
         let (mut first, rest): (Vec<T>, Vec<T>) = decls
@@ -38543,6 +38602,9 @@ impl Context {
             Some(k) => (2, usize::MAX - k),
             None => (usize::from(!is_bool(d)), pos(name(d))),
         });
+        if self.z3_state.last_inc {
+            first = self.z3_model_slot_order(first, &is_bool, &hash);
+        }
         let mut rest: Vec<Option<T>> = rest.into_iter().map(Some).collect();
         for n in self.decl_table.names() {
             if let Some(slot) = rest
@@ -38554,6 +38616,279 @@ impl Context {
         }
         first.extend(rest.into_iter().flatten());
         first
+    }
+
+    /// Track the z3 solver state a `check-sat` updates before its search
+    /// (`incremental`: it runs on the incremental solver). Once its context
+    /// has the polymorphism theory, a check adds a fresh `poly!N` assumption
+    /// when there are formulas the theory has not seen (the asserted
+    /// formulas, without `true` and repeats, which z3's preprocessing drops).
+    /// A tactic check's fresh context gets the theory at setup when the
+    /// manager already has type variables; the incremental context only when
+    /// a later search starts (see [`Context::z3_note_result`]).
+    fn z3_note_check(&mut self, incremental: bool) {
+        let n = self
+            .assertions
+            .iter()
+            .filter(|&&a| !self.m.is_true(a))
+            .collect::<BTreeSet<_>>()
+            .len();
+        let st = &mut self.z3_state;
+        st.last_inc = incremental;
+        st.last_poly = None;
+        st.pending_poly = false;
+        if incremental {
+            if !st.inc_ctx {
+                st.inc_ctx = true;
+                st.inc_poly = false;
+                st.poly_qhead = 0;
+            }
+            if st.inc_poly && st.poly_qhead != n {
+                st.last_poly = Some(st.fresh_id);
+                st.fresh_id += 1;
+                st.poly_qhead = n;
+            }
+            st.pending_poly = !st.inc_poly && st.type_vars;
+        } else if st.type_vars && n > 0 {
+            st.last_poly = Some(st.fresh_id);
+            st.fresh_id += 1;
+        }
+    }
+
+    /// After a check with answer `res`. Unless the assertions were refuted
+    /// before z3's search started, the search start registered the pending
+    /// polymorphism theory. A `sat` answer ran the final check, which in a
+    /// context with z3's finite-set theory gives the manager type variables:
+    /// without a logic the incremental context always has that theory (its
+    /// generic setup), a tactic check's context when the goal has sequences.
+    fn z3_note_result(&mut self, res: SmtResult) {
+        if self.z3_state.pending_poly && (res != SmtResult::Unsat || !self.z3_refuted_early()) {
+            self.z3_state.inc_poly = true;
+        }
+        if res != SmtResult::Sat || self.z3_state.type_vars || self.logic.is_some() {
+            return;
+        }
+        if self.z3_state.last_inc {
+            self.z3_state.type_vars = true;
+            return;
+        }
+        let seq_sorts: BTreeSet<AstId> = self
+            .seq_sorts
+            .values()
+            .copied()
+            .chain(self.string_sort)
+            .chain(self.reglan_sort)
+            .collect();
+        if seq_sorts.is_empty() {
+            return;
+        }
+        let mut seen = BTreeSet::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            if let Some(app) = self.m.app(t) {
+                if seq_sorts.contains(&self.m.get_sort(t)) {
+                    self.z3_state.type_vars = true;
+                    return;
+                }
+                stack.extend(app.args.iter().copied());
+            }
+        }
+    }
+
+    /// Are the assertions refuted before z3's search starts — by its
+    /// preprocessing or base-level propagation? Approximated by the top-level
+    /// literals alone: `false`, a literal with its negation, or a term equated
+    /// to two distinct values.
+    fn z3_refuted_early(&self) -> bool {
+        let mut lits: Vec<AstId> = Vec::new();
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend(self.m.app_args(t).iter().copied());
+            } else {
+                lits.push(t);
+            }
+        }
+        let is_value = |t: AstId| {
+            self.m.is_true(t)
+                || self.m.is_false(t)
+                || self.m.as_numeral(t).is_some()
+                || self.m.bv_numeral_value(t).is_some()
+                || self.str_value(t).is_some()
+        };
+        // Union-find over the terms the top-level equalities relate.
+        let mut parent: BTreeMap<AstId, AstId> = BTreeMap::new();
+        fn find(parent: &mut BTreeMap<AstId, AstId>, x: AstId) -> AstId {
+            let mut r = x;
+            while let Some(&p) = parent.get(&r) {
+                if p == r {
+                    break;
+                }
+                r = p;
+            }
+            parent.insert(x, r);
+            r
+        }
+        let set: BTreeSet<AstId> = lits.iter().copied().collect();
+        for &l in &lits {
+            if self.m.is_false(l) {
+                return true;
+            }
+            if self.m.is_not(l) && set.contains(&self.m.app_args(l)[0]) {
+                return true;
+            }
+            if self.m.is_eq(l) {
+                let args = self.m.app_args(l);
+                let (x, y) = (find(&mut parent, args[0]), find(&mut parent, args[1]));
+                if x != y {
+                    parent.insert(x, y);
+                }
+            }
+        }
+        let mut value_of: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let terms: Vec<AstId> = parent.keys().copied().collect();
+        for t in terms {
+            if !is_value(t) {
+                continue;
+            }
+            let r = find(&mut parent, t);
+            match value_of.get(&r) {
+                Some(&v) if v != t => return true,
+                _ => {
+                    value_of.insert(r, t);
+                }
+            }
+        }
+        false
+    }
+
+    /// z3's structural hash of `sort` (see [`super::ast_hash`]), for the sorts
+    /// whose z3 construction is known.
+    fn z3_sort_hash(&self, sort: AstId) -> Option<u32> {
+        use super::ast_hash::*;
+        if self.m.is_bool_sort(sort) {
+            return Some(bool_sort_hash());
+        }
+        if self.m.is_int_sort(sort) {
+            return Some(sort_hash("Int", Some(info_hash(ARITH_FID, 1, &[]))));
+        }
+        if self.m.is_arith_sort(sort) {
+            return Some(sort_hash("Real", Some(info_hash(ARITH_FID, 0, &[]))));
+        }
+        if Some(sort) == self.string_sort {
+            return Some(string_sort_hash());
+        }
+        if Some(sort) == self.reglan_sort {
+            let s = string_sort_hash();
+            return Some(sort_hash("RegEx", Some(info_hash(SEQ_FID, 1, &[s]))));
+        }
+        if let Some(e) = self.seq_elem_sort(sort) {
+            let e = self.z3_sort_hash(e)?;
+            return Some(sort_hash("Seq", Some(info_hash(SEQ_FID, 0, &[e]))));
+        }
+        if let Some(w) = self.m.bv_sort_width(sort) {
+            return Some(sort_hash("bv", Some(info_hash(BV_FID, 0, &[w]))));
+        }
+        if let Some((i, e)) = self.m.array_sort_params(sort) {
+            let (i, e) = (self.z3_sort_hash(i)?, self.z3_sort_hash(e)?);
+            return Some(sort_hash("Array", Some(info_hash(ARRAY_FID, 0, &[i, e]))));
+        }
+        if let Some(&(eb, sb)) = self
+            .fp_sorts
+            .iter()
+            .find(|&(_, &s)| s == sort)
+            .map(|(k, _)| k)
+        {
+            return Some(sort_hash(
+                "FloatingPoint",
+                Some(info_hash(FPA_FID, 0, &[eb, sb])),
+            ));
+        }
+        if Some(sort) == self.rm_sort {
+            return Some(sort_hash("RoundingMode", Some(info_hash(FPA_FID, 1, &[]))));
+        }
+        if let Some((base, args)) = self.mono_datatypes.get(&sort) {
+            let mut ps = alloc::vec![symbol_hash(base)];
+            for &a in args {
+                ps.push(self.z3_sort_hash(a)?);
+            }
+            return Some(sort_hash(base, Some(info_hash(DATATYPE_FID, 0, &ps))));
+        }
+        let name = self.m.sort(sort)?.name.as_str()?;
+        if self.enums.contains_key(&sort)
+            || self.records.contains_key(&sort)
+            || self.datatypes.contains_key(&sort)
+        {
+            return Some(sort_hash(
+                name,
+                Some(info_hash(DATATYPE_FID, 0, &[symbol_hash(name)])),
+            ));
+        }
+        if self.declared_sorts.contains(&sort) {
+            let k = self.z3_state.user_sorts.iter().position(|n| n == name)? + 1;
+            return Some(sort_hash(
+                name,
+                Some(info_hash(USER_SORT_FID, k as i32, &[])),
+            ));
+        }
+        None
+    }
+
+    /// Reorder the constants of `first` (the solver's model registration
+    /// order: Booleans, then the others) as z3's incremental solver lists
+    /// them: `proto_model::mk_model` copies them by the slot order of their
+    /// `obj_map`, then `model::compress` drops the `poly!N` skolem by moving
+    /// the last constant into its place. Unchanged when a constant's sort
+    /// hash is unknown (`hash` is `None` for a function, `Some(None)` for a
+    /// constant of such a sort).
+    fn z3_model_slot_order<T>(
+        &self,
+        first: Vec<T>,
+        is_bool: &impl Fn(&T) -> bool,
+        hash: &impl Fn(&T) -> Option<Option<u32>>,
+    ) -> Vec<T> {
+        use super::ast_hash::*;
+        let consts: Vec<usize> = (0..first.len())
+            .filter(|&i| hash(&first[i]).is_some())
+            .collect();
+        if consts.iter().any(|&i| hash(&first[i]) == Some(None)) {
+            return first;
+        }
+        // `mk_bool_model` registers the Boolean constants (the `poly!N`
+        // assumption internalized after the asserted ones), `mk_values` the
+        // others, and `mk_func_interps` looks those up again.
+        let n_bool = consts.iter().filter(|&&i| is_bool(&first[i])).count();
+        let mut entries: Vec<(Option<usize>, u32)> = consts
+            .iter()
+            .map(|&i| (Some(i), hash(&first[i]).flatten().unwrap()))
+            .collect();
+        if let Some(p) = self.z3_state.last_poly {
+            let pn = alloc::format!("poly!{p}");
+            let h = decl_hash(&pn, &[], bool_sort_hash(), skolem_info_hash());
+            entries.insert(n_bool, (None, h));
+        }
+        let hashes: Vec<u32> = entries.iter().map(|e| e.1).collect();
+        let mut order: Vec<Option<usize>> = obj_map_slot_order(&hashes, consts.len() > n_bool)
+            .into_iter()
+            .map(|k| entries[k].0)
+            .collect();
+        if let Some(at) = order.iter().position(Option::is_none) {
+            let last = order.pop().unwrap();
+            if at < order.len() {
+                order[at] = last;
+            }
+        }
+        let mut slots: Vec<Option<T>> = first.into_iter().map(Some).collect();
+        let mut out: Vec<T> = order
+            .into_iter()
+            .flatten()
+            .map(|i| slots[i].take().unwrap())
+            .collect();
+        out.extend(slots.into_iter().flatten());
+        out
     }
 
     /// Render a sort as SMT-LIB2 text (a named sort by its name, arrays nested).

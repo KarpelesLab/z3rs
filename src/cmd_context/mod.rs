@@ -11,6 +11,7 @@
 //! ## Status: IN PROGRESS
 
 mod algebraic_pp;
+mod ast_hash;
 mod decl_table;
 mod regex_simp;
 pub mod smt2;
