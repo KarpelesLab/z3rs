@@ -2695,23 +2695,45 @@ struct ParseErr {
 }
 
 /// Render an s-expression back to its textual form (used to echo `get-value`
-/// query terms).
+/// query terms). Iterative, into one buffer (linear in the output size).
 fn render_sexpr(s: &SExpr) -> String {
-    match s {
+    fn atom(a: &str, out: &mut String) {
         // The tokenizer strips `|…|` from a quoted symbol; restore it. String
         // literals, keywords, `#x`/`#b` numerals and decimals are not symbols.
-        SExpr::Atom(a)
-            if !a.starts_with(['"', ':', '#'])
-                && !a.chars().all(|c| c.is_ascii_digit() || c == '.') =>
-        {
-            crate::util::symbol::smt2_symbol(a).into_owned()
-        }
-        SExpr::Atom(a) => a.clone(),
-        SExpr::List(l) => {
-            let inner: Vec<String> = l.iter().map(render_sexpr).collect();
-            alloc::format!("({})", inner.join(" "))
+        if !a.starts_with(['"', ':', '#']) && !a.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            out.push_str(&crate::util::symbol::smt2_symbol(a));
+        } else {
+            out.push_str(a);
         }
     }
+    let mut out = String::new();
+    let SExpr::List(root) = s else {
+        let SExpr::Atom(a) = s else { unreachable!() };
+        atom(a, &mut out);
+        return out;
+    };
+    out.push('(');
+    let mut stack: Vec<(&[SExpr], usize)> = alloc::vec![(root.as_slice(), 0)];
+    while let Some(top) = stack.last_mut() {
+        let (l, i) = *top;
+        if i == l.len() {
+            out.push(')');
+            stack.pop();
+            continue;
+        }
+        top.1 += 1;
+        if i > 0 {
+            out.push(' ');
+        }
+        match &l[i] {
+            SExpr::Atom(a) => atom(a, &mut out),
+            SExpr::List(inner) => {
+                out.push('(');
+                stack.push((inner.as_slice(), 0));
+            }
+        }
+    }
+    out
 }
 
 /// Whether any atom anywhere in `s` contains the substring `needle` (used to
@@ -8138,16 +8160,13 @@ impl Context {
     /// the combination count is too large. Sound: it substitutes concrete values
     /// and re-decides each ground instance.
     fn bounded_nonlinear_enum(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
-        use crate::ast::ArithOp;
         let mut nlvars: BTreeSet<AstId> = BTreeSet::new();
-        for t in self.m.postorder(goal) {
-            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
-                let (_, vars) = self.flatten_mul(t);
-                if vars.len() >= 2 {
-                    for v in vars {
-                        if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
-                            nlvars.insert(v);
-                        }
+        for t in self.maximal_products(goal) {
+            let (_, vars) = self.flatten_mul(t);
+            if vars.len() >= 2 {
+                for v in vars {
+                    if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
+                        nlvars.insert(v);
                     }
                 }
             }
@@ -8578,16 +8597,13 @@ impl Context {
     /// quotient variables that hide the residue. SAT-only: a non-SAT ground result
     /// falls through (other residue representatives are unexplored).
     fn try_modular_sat_witness(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
-        use crate::ast::ArithOp;
         let mut nlvars: BTreeSet<AstId> = BTreeSet::new();
-        for t in self.m.postorder(goal) {
-            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
-                let (_, vars) = self.flatten_mul(t);
-                if vars.len() >= 2 {
-                    for v in vars {
-                        if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
-                            nlvars.insert(v);
-                        }
+        for t in self.maximal_products(goal) {
+            let (_, vars) = self.flatten_mul(t);
+            if vars.len() >= 2 {
+                for v in vars {
+                    if self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v)) {
+                        nlvars.insert(v);
                     }
                 }
             }
@@ -18043,45 +18059,46 @@ impl Context {
 
     /// Rewrite `(str.replace S T R)` (concrete `S`, `T`; first occurrence of `T`)
     /// into `(str.++ "before" R "after")` at the S-expression level, so the
-    /// concat-vs-literal split decides the equation. Returns the input unchanged
-    /// otherwise.
-    fn expand_replace_sexpr(&mut self, s: &SExpr) -> SExpr {
+    /// concat-vs-literal split decides the equation; `None` when `s` is not such
+    /// a term (the caller keeps `s`, uncopied).
+    fn expand_replace_sexpr(&mut self, s: &SExpr) -> Option<SExpr> {
         let SExpr::List(l) = s else {
-            return s.clone();
+            return None;
         };
         if l.len() != 4 || !matches!(&l[0], SExpr::Atom(h) if h == "str.replace") {
-            return s.clone();
+            return None;
         }
         let (Ok(sv), Ok(tv)) = (self.term(&l[1]), self.term(&l[2])) else {
-            return s.clone();
+            return None;
         };
         let (Some(sval), Some(tval)) = (self.str_value(sv), self.str_value(tv)) else {
-            return s.clone();
+            return None;
         };
         if tval.is_empty() {
-            return s.clone();
+            return None;
         }
         let Some(p) = (tval.len() <= sval.len())
             .then(|| (0..=sval.len() - tval.len()).find(|&p| sval[p..p + tval.len()] == tval[..]))
             .flatten()
         else {
             // `T` absent: `str.replace` returns `S` unchanged.
-            return SExpr::Atom(smt_string_literal(&sval));
+            return Some(SExpr::Atom(smt_string_literal(&sval)));
         };
         let lit = |cs: &[u32]| SExpr::Atom(smt_string_literal(cs));
-        SExpr::List(alloc::vec![
+        Some(SExpr::List(alloc::vec![
             SExpr::Atom("str.++".to_string()),
             lit(&sval[..p]),
             l[3].clone(),
             lit(&sval[p + tval.len()..]),
-        ])
+        ]))
     }
 
     fn try_split_concat_eq(&mut self, a: &SExpr, b: &SExpr) -> Result<Option<AstId>, String> {
         // Expand `(str.replace S T R)` with concrete `S`, `T` into
         // `(str.++ before R after)` so the concat split below applies.
-        let a = &self.expand_replace_sexpr(a);
-        let b = &self.expand_replace_sexpr(b);
+        let ea = self.expand_replace_sexpr(a);
+        let eb = self.expand_replace_sexpr(b);
+        let (a, b) = (ea.as_ref().unwrap_or(a), eb.as_ref().unwrap_or(b));
         // Flatten a (possibly nested) `str.++` into its sequence of parts.
         fn flatten(s: &SExpr, out: &mut Vec<SExpr>) {
             if let SExpr::List(l) = s
@@ -24629,7 +24646,8 @@ impl Context {
                     Some(ctx.m.is_bool_sort(ctx.m.get_sort(t)) as i64)
                 };
                 // A dry run: the shape must give bounded ranges.
-                let set = self.range_falsifiers(*body, false, k, &others, &mut eval)?;
+                let occ = self.binder_occurrences(*body, k, &others);
+                let set = self.range_falsifiers(*body, false, k, &occ, &mut eval)?;
                 if !set.iter().all(|&(lo, hi)| lo.is_some() && hi.is_some()) {
                     return None;
                 }
@@ -24663,7 +24681,8 @@ impl Context {
                             _ => None,
                         }
                     };
-                    let set = self.range_falsifiers(*body, false, k, &others, &mut eval)?;
+                    let occ = self.binder_occurrences(*body, k, &others);
+                    let set = self.range_falsifiers(*body, false, k, &occ, &mut eval)?;
                     let mut vals: Vec<i64> = Vec::new();
                     for (lo, hi) in set {
                         match (lo, hi) {
@@ -24738,21 +24757,22 @@ impl Context {
     /// unbounded), or `None` when the shape is not understood. Comparisons
     /// of `k` with a term free of the binders bound it; a binder-free
     /// formula is false everywhere or nowhere. `eval` gives the value of
-    /// such a term (or `1`/`0` for a formula).
+    /// such a term (or `1`/`0` for a formula). `occ` is
+    /// [`Self::binder_occurrences`] of the body `t` is part of.
     #[allow(clippy::type_complexity)]
     fn range_falsifiers(
         &mut self,
         t: AstId,
         neg: bool,
         k: AstId,
-        others: &[AstId],
+        occ: &BTreeMap<AstId, (bool, bool)>,
         eval: &mut dyn FnMut(&mut Self, AstId) -> Option<i64>,
     ) -> Option<Vec<(Option<i64>, Option<i64>)>> {
         use crate::ast::ArithOp;
         let all = alloc::vec![(None, None)];
-        let terms = self.m.postorder(t);
-        if !terms.contains(&k) {
-            if others.iter().any(|o| terms.contains(o)) {
+        let (has_k, has_other) = occ.get(&t).copied().unwrap_or((true, true));
+        if !has_k {
+            if has_other {
                 return Some(all);
             }
             let v = eval(self, t)?;
@@ -24763,7 +24783,7 @@ impl Context {
         // Conjunction-like (false where any part is) or disjunction-like
         // (false where every part is), after pushing the negation.
         let parts: Option<(bool, Vec<(AstId, bool)>)> = if self.m.is_not(t) {
-            return self.range_falsifiers(args[0], !neg, k, others, eval);
+            return self.range_falsifiers(args[0], !neg, k, occ, eval);
         } else if self.m.is_and(t) {
             Some((!neg, args.iter().map(|&a| (a, neg)).collect()))
         } else if self.m.is_or(t) {
@@ -24776,7 +24796,7 @@ impl Context {
         if let Some((conj, parts)) = parts {
             let mut acc: Option<Vec<(Option<i64>, Option<i64>)>> = None;
             for (p, n) in parts {
-                let s = self.range_falsifiers(p, n, k, others, eval)?;
+                let s = self.range_falsifiers(p, n, k, occ, eval)?;
                 acc = Some(match acc {
                     None => s,
                     Some(a) if conj => a.into_iter().chain(s).collect(),
@@ -24810,13 +24830,10 @@ impl Context {
         if args.len() != 2 || !self.m.is_int_sort(self.m.get_sort(args[0])) {
             return Some(all);
         }
-        let free = |ctx: &Self, e: AstId| {
-            let ts = ctx.m.postorder(e);
-            !ts.contains(&k) && !others.iter().any(|o| ts.contains(o))
-        };
-        let (e, op) = if args[0] == k && free(self, args[1]) {
+        let free = |e: AstId| occ.get(&e).is_some_and(|&(a, b)| !a && !b);
+        let (e, op) = if args[0] == k && free(args[1]) {
             (args[1], op)
-        } else if args[1] == k && free(self, args[0]) {
+        } else if args[1] == k && free(args[0]) {
             let flipped = match op {
                 ArithOp::Le => ArithOp::Ge,
                 ArithOp::Ge => ArithOp::Le,
@@ -24844,6 +24861,28 @@ impl Context {
             ArithOp::Le => (None, Some(v)),
             _ => (None, Some(v.checked_sub(1)?)),
         }])
+    }
+
+    /// For each subterm of `body`: whether it mentions the binder `k`, and
+    /// whether it mentions one of `others` (one bottom-up pass, so the
+    /// recursive [`Self::range_falsifiers`] stays linear on a deep body).
+    fn binder_occurrences(
+        &self,
+        body: AstId,
+        k: AstId,
+        others: &[AstId],
+    ) -> BTreeMap<AstId, (bool, bool)> {
+        let mut occ: BTreeMap<AstId, (bool, bool)> = BTreeMap::new();
+        for t in self.m.postorder(body) {
+            let mut v = (t == k, others.contains(&t));
+            for &c in self.m.expr_children(t) {
+                if let Some(&(a, b)) = occ.get(&c) {
+                    v = (v.0 || a, v.1 || b);
+                }
+            }
+            occ.insert(t, v);
+        }
+        occ
     }
 
     /// `base` conjoined with the instances of every arithmetic universal (at
@@ -31904,22 +31943,39 @@ impl Context {
     }
 
     /// Multiply out a term into `(rational coefficient, sorted variable factors)`.
+    /// Iterative (a product may nest arbitrarily deep).
     fn flatten_mul(&self, t: AstId) -> (Rational, Vec<AstId>) {
-        if let Some(n) = self.m.as_numeral(t) {
-            return (n, Vec::new());
-        }
-        if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
-            let mut coeff = Rational::from_integer(Int::from(1));
-            let mut vars = Vec::new();
-            for &a in self.m.app_args(t) {
-                let (c, mut vs) = self.flatten_mul(a);
-                coeff = &coeff * &c;
-                vars.append(&mut vs);
+        let mut coeff = Rational::from_integer(Int::from(1));
+        let mut vars = Vec::new();
+        let mut stack = alloc::vec![t];
+        while let Some(u) = stack.pop() {
+            if let Some(n) = self.m.as_numeral(u) {
+                coeff = &coeff * &n;
+            } else if matches!(self.m.arith_op(u), Some(ArithOp::Mul)) {
+                stack.extend(self.m.app_args(u).iter().rev());
+            } else {
+                vars.push(u);
             }
-            vars.sort();
-            return (coeff, vars);
         }
-        (Rational::from_integer(Int::from(1)), alloc::vec![t])
+        vars.sort();
+        (coeff, vars)
+    }
+
+    /// The products in `goal` that are not a factor of another product: their
+    /// [`Self::flatten_mul`] variables cover those of every product inside them,
+    /// so scanning only these is linear rather than quadratic in a deep product.
+    fn maximal_products(&self, goal: AstId) -> Vec<AstId> {
+        let order = self.m.postorder(goal);
+        let mut inner: BTreeSet<AstId> = BTreeSet::new();
+        for &t in &order {
+            if matches!(self.m.arith_op(t), Some(ArithOp::Mul)) {
+                inner.extend(self.m.app_args(t).iter().copied());
+            }
+        }
+        order
+            .into_iter()
+            .filter(|t| matches!(self.m.arith_op(*t), Some(ArithOp::Mul)) && !inner.contains(t))
+            .collect()
     }
 
     /// Exponentiation with a zero exponent over a *symbolic* base: `(^ b 0) = 1`

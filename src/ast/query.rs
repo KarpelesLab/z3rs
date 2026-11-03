@@ -15,7 +15,7 @@ use crate::ast::{AstId, BASIC_FAMILY_ID, DeclKind, FamilyId};
 impl AstManager {
     /// The direct expression children of `id` (application arguments; none for
     /// variables/constants). Sorts and declarations have no expression children.
-    fn expr_children(&self, id: AstId) -> &[AstId] {
+    pub fn expr_children(&self, id: AstId) -> &[AstId] {
         match self.node(id) {
             AstNode::App(a) => &a.args,
             // A quantifier's single expression child is its body; bound-variable
