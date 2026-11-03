@@ -5791,6 +5791,16 @@ impl Context {
                 {
                     model = Some(better);
                 }
+                // A datatype value the solver left abstract (no constructor) is
+                // completed to a constructor term, as z3's datatype factory does.
+                if plain
+                    && res == SmtResult::Sat
+                    && self.objectives.is_empty()
+                    && let Some(md) = model.as_mut()
+                    && let Some(better) = self.complete_dt_values(md)
+                {
+                    model = Some(better);
+                }
                 // A nonlinear real `sat` decided without a witness (e.g. an
                 // irrational solution of `x² = 2`): the CAD feasibility check
                 // supplies one with algebraic coordinates.
@@ -6985,7 +6995,17 @@ impl Context {
                         matches!(model.eval(&self.m, tester), Value::Bool(true))
                     })
                 })
-                .or_else(|| ctors.iter().find(|(_, sels, _)| sels.is_empty()));
+                .or_else(|| ctors.iter().find(|(_, sels, _)| sels.is_empty()))
+                // Else the first constructor without recursive fields.
+                .or_else(|| {
+                    ctors.iter().find(|(_, sels, _)| {
+                        sels.iter().all(|&sd| {
+                            self.m
+                                .func_decl(sd)
+                                .is_some_and(|d| !self.datatypes.contains_key(&d.range))
+                        })
+                    })
+                });
             let (cdecl, sels, _) = chosen?;
             return self.render_ctor(model, *cdecl, sels, id, sort);
         }
@@ -24328,6 +24348,78 @@ impl Context {
     /// `(not (= 0.0 (/ 1.0 0.0)))`, which must stay `sat` — the re-solve is `unsat`
     /// and the original model stands. Sound either way: a returned model still
     /// satisfies every assertion (the pins are extra constraints).
+    /// A model of the assertions in which every datatype term the model
+    /// leaves abstract — a constant or a field of one, of a datatype sort with
+    /// no nullary constructor, whose tester values hold none — is a
+    /// constructor term: each is pinned to the first constructor without
+    /// recursive fields (fresh fields) and the assertions re-decided. `None`
+    /// when nothing is abstract or the pinned check is not `sat`.
+    fn complete_dt_values(&mut self, model: &mut Model) -> Option<Model> {
+        const MAX_DEPTH: usize = 3;
+        if self.datatypes.is_empty() {
+            return None;
+        }
+        let mut todo: Vec<(AstId, usize)> = self
+            .m
+            .postorder_many(&self.assertions)
+            .into_iter()
+            .filter(|&t| {
+                self.m.is_uninterp_const(t) && self.datatypes.contains_key(&self.m.get_sort(t))
+            })
+            .map(|t| (t, 0))
+            .collect();
+        let mut pins: Vec<AstId> = Vec::new();
+        let mut seen: BTreeSet<AstId> = BTreeSet::new();
+        while let Some((t, depth)) = todo.pop() {
+            if !seen.insert(t) || depth > MAX_DEPTH {
+                continue;
+            }
+            let sort = self.m.get_sort(t);
+            let ctors = self.datatypes.get(&sort)?.clone();
+            if ctors.iter().any(|(_, sels, _)| sels.is_empty()) {
+                continue; // the rendering falls back to a nullary constructor
+            }
+            let held = ctors.iter().find(|(_, _, tdecl)| {
+                let tester = self.m.mk_app(*tdecl, &[t]);
+                matches!(model.eval(&self.m, tester), Value::Bool(true))
+            });
+            match held {
+                Some((_, sels, _)) => {
+                    for &sd in sels {
+                        let fs = self.m.func_decl(sd)?.range;
+                        if self.datatypes.contains_key(&fs) {
+                            todo.push((self.m.mk_app(sd, &[t]), depth + 1));
+                        }
+                    }
+                }
+                None => {
+                    let (cdecl, sels, _) = ctors.iter().find(|(_, sels, _)| {
+                        sels.iter().all(|&sd| {
+                            self.m
+                                .func_decl(sd)
+                                .is_some_and(|d| !self.datatypes.contains_key(&d.range))
+                        })
+                    })?;
+                    let mut args = Vec::with_capacity(sels.len());
+                    for &sd in sels {
+                        let fs = self.m.func_decl(sd)?.range;
+                        args.push(self.fresh_const(fs));
+                    }
+                    let c = self.m.mk_app(*cdecl, &args);
+                    pins.push(self.m.mk_eq(t, c));
+                }
+            }
+        }
+        if pins.is_empty() {
+            return None;
+        }
+        let n = self.assertions.len();
+        self.assertions.extend(pins);
+        let (res, m) = self.check_sat();
+        self.assertions.truncate(n);
+        if res == SmtResult::Sat { m } else { None }
+    }
+
     fn complete_div0(&mut self) -> Option<Model> {
         let pins = self.div_by_zero_subterms();
         if pins.is_empty() {
@@ -43990,6 +44082,24 @@ mod tests {
         assert_eq!(out[1], "((a \"abab\"))");
         assert_eq!(out[2], "sat");
         assert!(out[3].starts_with("((b \"x"), "{out:?}");
+    }
+
+    #[test]
+    fn abstract_datatype_values_are_completed_to_constructors() {
+        // No nullary constructor: an unconstrained or merely distinct value
+        // is still a constructor term, never `T!val!k`.
+        let script = "
+            (declare-datatypes ((T 0)) (((leaf (val Int)) (node (left T) (right T)))))
+            (declare-const t T)
+            (declare-const s T)
+            (assert ((_ is node) t))
+            (assert (distinct (left t) (right t) s))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(!out[1].contains("!val!"), "{}", out[1]);
     }
 
     #[test]
