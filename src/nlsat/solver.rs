@@ -2654,6 +2654,59 @@ mod tests {
         assert!(sat > 20 && unsat > 20, "sat {sat} unsat {unsat}");
     }
 
+    /// Conjunctions over three variables with equalities: nlsat (levelwise
+    /// explanations, core simplification) and CAD agree in both directions.
+    #[test]
+    fn conjunctions_agree_with_cad_in_three_variables() {
+        use crate::nlsat::cad::cad_sat;
+        use crate::nlsat::icp::Rel;
+        let mut g = Lcg(7);
+        let (mut sat, mut unsat) = (0, 0);
+        for _ in 0..150 {
+            let mut lits: Vec<(Polynomial, Kind, bool)> = Vec::new();
+            for _ in 0..2 + g.next(3) {
+                let k = [Kind::Eq, Kind::Lt, Kind::Gt, Kind::Eq][g.next(4) as usize];
+                lits.push((random_poly(&mut g, 3), k, g.next(4) == 0));
+            }
+            let input: Vec<Vec<InLit>> = lits
+                .iter()
+                .map(|(p, k, n)| alloc::vec![InLit::Ineq(p.clone(), *k, *n)])
+                .collect();
+            let rel = |k: Kind, n: bool| match (k, n) {
+                (Kind::Eq, false) => Rel::Eq,
+                (Kind::Eq, true) => Rel::Ne,
+                (Kind::Lt, false) => Rel::Lt,
+                (Kind::Lt, true) => Rel::Ge,
+                (Kind::Gt, false) => Rel::Gt,
+                _ => Rel::Le,
+            };
+            let conj: Vec<(Polynomial, Rel)> = lits
+                .iter()
+                .map(|(p, k, n)| (p.clone(), rel(*k, *n)))
+                .collect();
+            let expected = cad_sat(&conj, 3);
+            match check(3, 0, &input) {
+                NlsatResult::Sat(vals, _) => {
+                    sat += 1;
+                    assert_ne!(expected, Some(false), "{lits:?}");
+                    for (p, k, n) in &lits {
+                        let s = sign_at_point(p, &vals).unwrap();
+                        assert!(
+                            crate::nlsat::cad::rel_holds(s, rel(*k, *n)),
+                            "{lits:?} at {vals:?}"
+                        );
+                    }
+                }
+                NlsatResult::Unsat => {
+                    unsat += 1;
+                    assert_ne!(expected, Some(true), "{lits:?}");
+                }
+                NlsatResult::Unknown => {}
+            }
+        }
+        assert!(sat > 20 && unsat > 20, "sat {sat} unsat {unsat}");
+    }
+
     #[test]
     fn disjunction_needs_backjumping() {
         // (x·y > 1 ∨ x > 3) ∧ x < 2 ∧ y < 0 ∧ x > 0  → unsat
