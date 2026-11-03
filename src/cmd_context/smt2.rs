@@ -5683,14 +5683,29 @@ impl Context {
                         self.optimize(&assumptions)
                     }
                 } else if self.objectives.is_empty() {
+                    // A tactic ending in `smt` decides with z3's SMT kernel,
+                    // whose case splits try `false` first.
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let smt_kernel = is_using
+                        && list
+                            .get(1)
+                            .and_then(elim_uncnstr::tactic_chain)
+                            .is_some_and(|c| c.last().is_some_and(|l| l == "smt"));
+                    let phase = &crate::sat::solver::DECIDE_FALSE_FIRST;
+                    let saved_phase = phase.load(Relaxed);
+                    if smt_kernel {
+                        phase.store(true, Relaxed);
+                    }
                     // The opaque `sin`/`cos` already decide many goals (`unsat`);
                     // only an open one is purified.
-                    match self.check_sat_zero_div_lazy() {
+                    let r = match self.check_sat_zero_div_lazy() {
                         (SmtResult::Unknown, _) if purify => self
                             .check_sat_trig_purified()
                             .unwrap_or((SmtResult::Unknown, None)),
                         r => r,
-                    }
+                    };
+                    phase.store(saved_phase, Relaxed);
+                    r
                 } else {
                     self.optimize(&[])
                 };
