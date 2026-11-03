@@ -575,7 +575,8 @@ mod tests {
 
     #[test]
     fn long_values_wrap_with_numerals_as_literals() {
-        let v = "(+ (root-obj (+ (* 3 (^ x 3)) (* 9 (^ x 2)) (* 9 x) (- 125)) 1) (* (- 1.0) epsilon))";
+        let v =
+            "(+ (root-obj (+ (* 3 (^ x 3)) (* 9 (^ x 2)) (* 9 x) (- 125)) 1) (* (- 1.0) epsilon))";
         assert_eq!(
             pp_value(v),
             "(+ (root-obj (+ (* 3 (^ x 3)) (* 9 (^ x 2)) (* 9 x) (- 125)) 1)\n   (* (- 1.0) epsilon))"
