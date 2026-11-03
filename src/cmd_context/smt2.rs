@@ -41851,8 +41851,40 @@ impl Context {
         for (&sort, ctors) in &self.enums {
             model.set_enum_ctors(sort, ctors.clone());
         }
+        self.pin_unassigned_fn_indices(model);
         self.ensure_zero_div_tables(model);
         self.ensure_fn_defaults(model);
+    }
+
+    /// Give each array index that applies a declared function (`select a
+    /// (f j)`) and that the solver left without a value the value its
+    /// congruence check gave it, `0` (an absent arithmetic variable), before
+    /// anything evaluates it: through `f`'s default it could otherwise
+    /// collide with another index the solver kept apart (`a[f j]` and `a[2]`
+    /// with different values, but `f j` evaluating to `2`), and the arrays
+    /// and `f` could not be built (z3's model completion assigns such a term
+    /// first, then builds the arrays).
+    fn pin_unassigned_fn_indices(&mut self, model: &mut Model) {
+        let dt_members = self.datatype_member_decls();
+        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        for t in self.m.postorder_many(&self.assertions) {
+            if !self.m.is_select(t) {
+                continue;
+            }
+            for &i in &self.m.app_args(t)[1..] {
+                let s = self.m.get_sort(i);
+                if self.m.is_arith_sort(s)
+                    && let Some(app) = self.m.app(i)
+                    && !app.args.is_empty()
+                    && user.contains(&app.decl)
+                    && !dt_members.contains(&app.decl)
+                    && !model.knows(&self.m, i)
+                {
+                    let zero = Rational::from(0);
+                    model.pin_value(i, Value::Num(zero, self.m.is_int_sort(s)));
+                }
+            }
+        }
     }
 
     /// The declared n-ary functions `get-model` interprets (not datatype
