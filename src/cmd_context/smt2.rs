@@ -285,6 +285,36 @@ fn render_eps_bound(r: &str, zero: bool, k: &Rational, maximize: bool) -> String
     }
 }
 
+/// An objective value as z3's `display_assignment` prints it: each term
+/// (the value, or both ends of a ` (interval lo hi)`) laid out on its own at
+/// 80 columns, as `out << expr` does.
+fn layout_objective_value(val: &str) -> String {
+    use super::smt2_pp::pp_value;
+    let Some(body) = val
+        .strip_prefix(" (interval ")
+        .and_then(|b| b.strip_suffix(')'))
+    else {
+        return pp_value(val);
+    };
+    // Split the two bounds at the first top-level space.
+    let mut depth = 0i32;
+    for (i, c) in body.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ' ' if depth == 0 => {
+                return alloc::format!(
+                    " (interval {} {})",
+                    pp_value(&body[..i]),
+                    pp_value(&body[i + 1..])
+                );
+            }
+            _ => {}
+        }
+    }
+    val.to_string()
+}
+
 /// A non-integer rational as z3 prints it: `(/ p.0 q.0)`, negated outside
 /// (`(- (/ 1.0 2.0))`).
 fn render_fraction(r: &Rational) -> String {
@@ -30582,7 +30612,10 @@ impl Context {
                 Objective::Term { text, .. } => (text, val.clone()),
                 Objective::Soft { id, items } => (id, rescale_value(val, &soft_scale(items))),
             };
-            out.push_str(&alloc::format!("\n ({name} {val})"));
+            out.push_str(&alloc::format!(
+                "\n ({name} {})",
+                layout_objective_value(&val)
+            ));
         }
         out.push_str("\n)");
         out

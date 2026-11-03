@@ -34,9 +34,9 @@ const MAX_DEG: u32 = 12;
 const MAX_PROJ: usize = 500;
 const MAX_CELLS: usize = 40_000;
 /// Cap on the product of a sample point's coordinate degrees when lifting.
-const MAX_POINT_DEGREE: usize = 36;
+const MAX_POINT_DEGREE: usize = 256;
 /// Cap on the total lifting work (Σ point degree per lifted sample).
-const MAX_LIFT_WORK: usize = 2_000;
+const MAX_LIFT_WORK: usize = 20_000;
 
 /// Does sign `σ` satisfy `⋈ 0`?
 pub fn rel_holds(sigma: i32, rel: Rel) -> bool {

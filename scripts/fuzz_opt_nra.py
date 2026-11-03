@@ -48,4 +48,4 @@ def one(i):
 res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
-    if k in ("VERDICT","VALUE-DIFF"): print(k,p)
+    if k!="same": print(k,p)

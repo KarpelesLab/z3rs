@@ -464,6 +464,84 @@ pub fn pp_func_interp(
     alloc::format!("  {}", layout(&def))
 }
 
+/// An already-rendered value term (an objective value such as
+/// `(+ (root-obj …) (* (- 1.0) epsilon))`) laid out as z3 prints the
+/// expression on its own: 80 columns from its first character. Numerals —
+/// `root-obj`, `(- n)`, `(/ p q)` and their negations — are single literals
+/// as in z3's printer. Text that is not a well-formed s-expression is
+/// returned unchanged.
+pub fn pp_value(text: &str) -> String {
+    /// Parse one s-expression from `t` at `*i` into `arena`; its index.
+    fn parse(t: &[u8], i: &mut usize, src: &str, arena: &mut Vec<PpNode>) -> Option<usize> {
+        while *i < t.len() && t[*i] == b' ' {
+            *i += 1;
+        }
+        let start = *i;
+        if *i >= t.len() || t[*i] == b')' {
+            return None;
+        }
+        if t[*i] != b'(' {
+            while *i < t.len() && !matches!(t[*i], b' ' | b'(' | b')') {
+                *i += 1;
+            }
+            arena.push(PpNode {
+                head: String::from(&src[start..*i]),
+                args: Vec::new(),
+                indexed: false,
+            });
+            return Some(arena.len() - 1);
+        }
+        *i += 1;
+        let first_node = arena.len();
+        let h0 = *i;
+        while *i < t.len() && !matches!(t[*i], b' ' | b'(' | b')') {
+            *i += 1;
+        }
+        let head = String::from(&src[h0..*i]);
+        let mut args = Vec::new();
+        loop {
+            while *i < t.len() && t[*i] == b' ' {
+                *i += 1;
+            }
+            if *i >= t.len() {
+                return None;
+            }
+            if t[*i] == b')' {
+                *i += 1;
+                break;
+            }
+            args.push(parse(t, i, src, arena)?);
+        }
+        let leaf = |a: &usize| arena[*a].args.is_empty();
+        let numeral = head == "root-obj"
+            || (head == "/" && args.len() == 2 && args.iter().all(leaf))
+            || (head == "-" && args.len() == 1 && args.iter().all(leaf));
+        if numeral {
+            arena.truncate(first_node);
+            arena.push(PpNode {
+                head: String::from(&src[start..*i]),
+                args: Vec::new(),
+                indexed: false,
+            });
+        } else {
+            arena.push(PpNode {
+                head,
+                args,
+                indexed: false,
+            });
+        }
+        Some(arena.len() - 1)
+    }
+    let mut arena = Vec::new();
+    let mut i = 0;
+    match parse(text.as_bytes(), &mut i, text, &mut arena) {
+        Some(root) if i == text.len() && root + 1 == arena.len() => {
+            pp_term(&arena, root, &|_| false)
+        }
+        _ => String::from(text),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +571,17 @@ mod tests {
             "(let ((a!1 (re.++ (re.* r) (re.* (re.++ r (re.* r))))))\n  (= (re.++ r (re.* r)) (re.++ r a!1)))"
         );
         assert_eq!(pp_term(&nodes, 2, &|_| false), "(re.++ r (re.* r))");
+    }
+
+    #[test]
+    fn long_values_wrap_with_numerals_as_literals() {
+        let v = "(+ (root-obj (+ (* 3 (^ x 3)) (* 9 (^ x 2)) (* 9 x) (- 125)) 1) (* (- 1.0) epsilon))";
+        assert_eq!(
+            pp_value(v),
+            "(+ (root-obj (+ (* 3 (^ x 3)) (* 9 (^ x 2)) (* 9 x) (- 125)) 1)\n   (* (- 1.0) epsilon))"
+        );
+        assert_eq!(pp_value("(+ 7.0 epsilon)"), "(+ 7.0 epsilon)");
+        assert_eq!(pp_value("(- 2)"), "(- 2)");
+        assert_eq!(pp_value("oo"), "oo");
     }
 }
