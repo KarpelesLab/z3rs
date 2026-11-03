@@ -39491,6 +39491,16 @@ impl Context {
         // z3 prints the model's constants before its functions.
         let (consts, funs): (Vec<Decl>, Vec<Decl>) =
             decls.into_iter().partition(|d| d.domain.is_empty());
+        let funs = self.z3_fn_slot_order(
+            funs,
+            |d| &d.name,
+            |d| {
+                let dom: Option<Vec<u32>> =
+                    d.domain.iter().map(|&s| self.z3_sort_hash(s)).collect();
+                let r = self.z3_sort_hash(d.range)?;
+                Some(super::ast_hash::decl_hash(&d.name, &dom?, r, 0))
+            },
+        );
         let mut out = String::from("(");
         // z3 lists its division-by-zero functions among the model's functions
         // (in its hash-table order): `mod0` and `/0` ahead of the declared ones
@@ -40158,8 +40168,72 @@ impl Context {
         });
         if self.z3_state.last_inc {
             first = self.z3_model_slot_order(first, &is_bool, &hash);
+        } else if self.objectives.is_empty() {
+            // The solver's model is copied in slot order too; the constants
+            // `solve-eqs` eliminated follow, re-added by its model converter.
+            // (An optimization's model keeps the internalization order.)
+            let k = first
+                .iter()
+                .take_while(|d| solved(name(d)).is_none())
+                .count();
+            let tail = first.split_off(k);
+            first = self.z3_model_slot_order(first, &is_bool, &hash);
+            first.extend(tail);
         }
         self.append_declared_rest(first, rest, &name)
+    }
+
+    /// Reorder the functions the solver's model interprets (those the
+    /// assertions mention, leading `funs` in their internalization order) as
+    /// z3 lists them: `proto_model::mk_model` copies the function
+    /// interpretations by the slot order of their `obj_map`, keyed by the
+    /// declaration's hash (`hash`; unchanged when one is unknown). The
+    /// declarations `add_declared_functions` appends stay after them.
+    fn z3_fn_slot_order<T>(
+        &self,
+        funs: Vec<T>,
+        name: impl Fn(&T) -> &String,
+        hash: impl Fn(&T) -> Option<u32>,
+    ) -> Vec<T> {
+        if self.uncnstr_model_order.is_some() {
+            return funs;
+        }
+        let used = self.asserted_names();
+        let mut funs = funs;
+        let n = funs
+            .iter()
+            .take_while(|d| used.contains(name(d).as_str()))
+            .count();
+        // Inserted in internalization order, arguments before their
+        // application (predicates are not first, as the Boolean constants
+        // are).
+        let wanted: BTreeSet<AstId> = funs[..n]
+            .iter()
+            .filter_map(|d| self.funcs.get(name(d)).copied())
+            .collect();
+        let mut order: Vec<AstId> = Vec::new();
+        for t in self.ground_apps_in_order(&wanted) {
+            let d = self.m.app_decl(t);
+            if !order.contains(&d) {
+                order.push(d);
+            }
+        }
+        let pos = |d: &T| {
+            let decl = self.funcs.get(name(d)).copied();
+            order
+                .iter()
+                .position(|&o| Some(o) == decl)
+                .unwrap_or(usize::MAX)
+        };
+        funs[..n].sort_by_key(|d| pos(d));
+        let Some(hashes) = funs[..n].iter().map(&hash).collect::<Option<Vec<u32>>>() else {
+            return funs;
+        };
+        let order = super::ast_hash::obj_map_slot_order(&hashes, false);
+        let mut slots: Vec<Option<T>> = funs.into_iter().map(Some).collect();
+        let mut out: Vec<T> = order.iter().map(|&i| slots[i].take().unwrap()).collect();
+        out.extend(slots.into_iter().flatten());
+        out
     }
 
     /// `first`, then the declarations of `rest` as
@@ -46437,6 +46511,32 @@ mod tests {
             "{script}(assert (forall ((u A)) (p u)))(assert (not (p a4)))(check-sat)"
         );
         assert_eq!(run(&unsat).unwrap(), ["unsat"]);
+    }
+
+    #[test]
+    fn model_lists_interpretations_in_slot_order() {
+        // z3 copies the solver's model by the slot order of its hash maps:
+        // `c b a` (not their internalization order `a b c`), and the
+        // functions `zz mm aa` (inserted `mm zz aa`).
+        let names = |out: &str| -> Vec<String> {
+            out.split("(define-fun ")
+                .skip(1)
+                .map(|s| s.split(' ').next().unwrap().to_string())
+                .collect()
+        };
+        let out = run(
+            "(declare-const a Int)(declare-const b Int)(declare-const c Int)\
+             (declare-fun f (Int) Int)(assert (distinct (f a) (f b) (f c)))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(names(&out[1]), ["c", "b", "a", "f"], "{out:?}");
+        let out = run(
+            "(declare-const c Int)(declare-fun zz (Int) Int)(declare-fun aa (Int) Int)\
+             (declare-fun mm (Int) Int)(assert (= (mm c) 1))(assert (> (zz c) 1))\
+             (assert (> (aa c) 1))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(names(&out[1]), ["c", "zz", "mm", "aa"], "{out:?}");
     }
 
     #[test]
