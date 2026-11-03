@@ -37222,6 +37222,15 @@ impl Context {
                 inlined = next;
             }
             if inlined != goal {
+                // The substitution makes new array terms (an equality between
+                // the inlined `store`s): their axioms join the goal, else
+                // the equal arrays need not agree on any read (a spurious
+                // model).
+                let mut axioms = self.array_axioms(inlined);
+                if !axioms.is_empty() {
+                    axioms.push(inlined);
+                    inlined = self.m.mk_and(&axioms);
+                }
                 let (r2, m2) = self.decide_inner(inlined);
                 if r2 != SmtResult::Unknown {
                     return (r2, m2);
