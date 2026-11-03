@@ -1499,8 +1499,27 @@ impl Model {
     /// left without (a term only ever used as a function argument, like `f(1)`
     /// in `f(f(1))`, is no point a function's default covers).
     fn euf_class_num(&mut self, m: &AstManager, t: AstId) -> Option<Rational> {
-        if !Self::is_uf_num_app(m, t) || !self.euf.contains(t) {
+        if !Self::is_uf_num_app(m, t) {
             return None;
+        }
+        if !self.euf.contains(t) {
+            // An application over e-graph terms only (`hd(tl(y))` when
+            // `y = x`) joins the class of a congruent interned one; one with
+            // a value argument is matched on values by `congruent_assigned`.
+            let args = m.app_args(t);
+            if args.iter().any(|&a| {
+                let s = m.get_sort(a);
+                m.is_bool_sort(s) || m.is_arith_sort(s) || m.bv_sort_width(s).is_some()
+            }) {
+                return None;
+            }
+            self.complete_euf_nums(m);
+            // (The arguments complete first, as an uninterpreted term does,
+            // to a constructor or their function's default.)
+            for a in args.iter().copied() {
+                self.uninterp_class(m, a);
+            }
+            self.euf.class_of(m, t);
         }
         self.complete_euf_nums(m);
         self.euf

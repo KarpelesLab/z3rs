@@ -39603,6 +39603,20 @@ impl Context {
                 chosen.push((decl.d, render, term));
             }
         }
+        // A function no assertion mentions keeps its interpretation whatever
+        // the check below says of the others.
+        let mentioned: BTreeSet<AstId> = {
+            let mut roots = self.assertions.clone();
+            roots.extend(self.universals.iter().map(|(_, b)| *b));
+            self.m
+                .postorder_many(&roots)
+                .into_iter()
+                .filter_map(|t| self.m.app(t).map(|a| a.decl))
+                .collect()
+        };
+        let (mut chosen, unmentioned): (Vec<_>, Vec<_>) = chosen
+            .into_iter()
+            .partition(|(d, _, _)| mentioned.contains(d));
         while !chosen.is_empty() {
             let pairs: Vec<(AstId, Option<AstId>)> =
                 chosen.iter().map(|(d, _, t)| (*d, *t)).collect();
@@ -39611,8 +39625,11 @@ impl Context {
             }
             chosen.pop();
         }
-        let fn_bodies: BTreeMap<AstId, String> =
-            chosen.into_iter().map(|(d, r, _)| (d, r)).collect();
+        let fn_bodies: BTreeMap<AstId, String> = chosen
+            .into_iter()
+            .chain(unmentioned)
+            .map(|(d, r, _)| (d, r))
+            .collect();
 
         // A constant elim-uncnstr eliminated takes the place of the fresh
         // variable that replaced its selector application.
