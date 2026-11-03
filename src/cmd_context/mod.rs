@@ -13,6 +13,7 @@
 mod algebraic_pp;
 mod ast_hash;
 mod decl_table;
+mod len_abs;
 mod regex_simp;
 pub mod smt2;
 mod smt2_pp;

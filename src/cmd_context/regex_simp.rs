@@ -12,6 +12,7 @@
 //! union/intersection normal forms sort by. Results print through
 //! [`super::smt2_pp`].
 
+use super::len_abs::LenAbs;
 use super::smt2_pp::{PpNode, pp_term};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -69,6 +70,24 @@ enum Node {
     App(Op, Vec<Id>),
 }
 
+/// A declaration parameter, as z3's `ast_lt` compares them (a numeral's
+/// value, a loop bound, a string literal's characters).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DeclParam {
+    Num(i64),
+    Str(Vec<u32>),
+}
+
+/// The name of a sort, which z3's `ast_lt` orders sorts by.
+fn srt_name(s: Srt) -> &'static str {
+    match s {
+        Srt::Bool => "Bool",
+        Srt::Str => "String",
+        Srt::Re => "RegEx",
+        Srt::Int => "Int",
+    }
+}
+
 /// The regex `info` of z3's `seq_util::rex` (the parts the rewriter uses).
 #[derive(Clone, Copy, Debug)]
 struct Info {
@@ -76,7 +95,10 @@ struct Info {
     interpreted: bool,
     /// `Some(b)`: the empty word is (not) accepted; `None`: unknown.
     nullable: Option<bool>,
+    /// The least length of an accepted word (`len.lo()`).
     min_length: u32,
+    /// The abstraction of the accepted lengths (bounds, period, residues).
+    len: LenAbs,
 }
 
 const UNKNOWN_INFO: Info = Info {
@@ -84,7 +106,28 @@ const UNKNOWN_INFO: Info = Info {
     interpreted: false,
     nullable: None,
     min_length: 0,
+    len: LenAbs::TOP,
 };
+
+/// z3's nullability of a conjunction (`l_true` iff both, `l_false` if
+/// either).
+fn nullable_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), Some(true)) => Some(true),
+        (Some(false), _) | (_, Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
+/// z3's nullability of a disjunction (`l_true` if either, `l_false` iff
+/// both).
+fn nullable_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+    match (a, b) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
 
 /// z3's `zstring::max_char()` (unicode encoding).
 const MAX_CHAR: u32 = 196607;
@@ -287,33 +330,37 @@ impl ReSimp {
         }
     }
 
+    /// z3's `rex::mk_info_rec` with the `info` operations of
+    /// `seq_decl_plugin.cpp`: nullability, interpretation and the length
+    /// abstraction of `t`.
     fn info(&self, t: Id) -> Info {
-        let known = |interpreted, nullable, min_length| Info {
+        let known = |interpreted, nullable, len: LenAbs| Info {
             known: true,
             interpreted,
             nullable,
-            min_length,
+            min_length: len.lo(),
+            len,
         };
         let Some((op, args)) = self.op_of(t) else {
             return UNKNOWN_INFO;
         };
         match op {
-            Op::ReNone => known(true, Some(false), u32::MAX),
-            Op::ReAll => known(true, Some(true), 0),
-            Op::Star | Op::Opt => {
+            Op::ReNone => known(true, Some(false), LenAbs::bounds(u32::MAX, 0)),
+            Op::ReAll => known(true, Some(true), LenAbs::bounds(0, u32::MAX)),
+            Op::Star => {
                 let i = self.info(args[0]);
-                known(i.interpreted, Some(true), 0)
+                known(i.interpreted, Some(true), i.len.star())
             }
-            Op::Range => {
-                if let Some((lo, hi)) = self.char_range(t) {
-                    if lo <= hi {
-                        return known(true, Some(false), 1);
-                    }
-                    return known(true, Some(false), 1);
-                }
-                known(false, Some(false), 1)
+            Op::Opt => {
+                let i = self.info(args[0]);
+                known(i.interpreted, Some(true), i.len.opt())
             }
-            Op::ReAllChar => known(true, Some(false), 1),
+            Op::Range => known(
+                self.char_range(t).is_some(),
+                Some(false),
+                LenAbs::bounds(1, 1),
+            ),
+            Op::ReAllChar => known(true, Some(false), LenAbs::bounds(1, 1)),
             Op::Concat => {
                 let (a, b) = (self.info(args[0]), self.info(args[1]));
                 if !a.known {
@@ -332,7 +379,7 @@ impl ReSimp {
                 known(
                     a.interpreted && b.interpreted,
                     nullable,
-                    a.min_length.saturating_add(b.min_length),
+                    a.len.concat(&b.len),
                 )
             }
             Op::Union => {
@@ -340,17 +387,10 @@ impl ReSimp {
                 if !a.known && !b.known {
                     return b;
                 }
-                let nullable = if a.nullable == Some(true) || b.nullable == Some(true) {
-                    Some(true)
-                } else if a.nullable == Some(false) && b.nullable == Some(false) {
-                    Some(false)
-                } else {
-                    None
-                };
                 known(
                     a.interpreted && b.interpreted,
-                    nullable,
-                    a.min_length.min(b.min_length),
+                    nullable_or(a.nullable, b.nullable),
+                    a.len.unite(&b.len),
                 )
             }
             Op::Inter => {
@@ -361,24 +401,20 @@ impl ReSimp {
                 if !b.known {
                     return b;
                 }
-                let nullable = if a.nullable == Some(true) && b.nullable == Some(true) {
-                    Some(true)
-                } else if a.nullable == Some(false) || b.nullable == Some(false) {
-                    Some(false)
-                } else {
-                    None
-                };
                 known(
                     a.interpreted && b.interpreted,
-                    nullable,
-                    a.min_length.max(b.min_length),
+                    nullable_and(a.nullable, b.nullable),
+                    a.len.meet(&b.len),
                 )
             }
             Op::ToRe => {
                 let s = args[0];
                 match self.str_lit(s) {
-                    Some(l) => known(true, Some(l.is_empty()), l.len() as u32),
-                    None => known(false, None, 0),
+                    Some(l) => {
+                        let n = l.len() as u32;
+                        known(true, Some(l.is_empty()), LenAbs::bounds(n, n))
+                    }
+                    None => known(false, None, LenAbs::bounds(0, u32::MAX)),
                 }
             }
             Op::Plus => {
@@ -386,23 +422,27 @@ impl ReSimp {
                 if !a.known {
                     return a;
                 }
-                known(a.interpreted, a.nullable, a.min_length)
+                known(a.interpreted, a.nullable, a.len.plus())
             }
             Op::Comp => {
                 let a = self.info(args[0]);
                 if !a.known {
                     return a;
                 }
+                // The complement's lengths are not determined by the
+                // argument's: top.
                 let n = a.nullable.map(|b| !b);
-                known(a.interpreted, n, if n == Some(false) { 1 } else { 0 })
+                let lo = if n == Some(false) { 1 } else { 0 };
+                known(a.interpreted, n, LenAbs::bounds(lo, u32::MAX))
             }
-            Op::Loop(lo, _) => {
+            Op::Loop(lo, hi) => {
                 let a = self.info(args[0]);
                 if !a.known {
                     return a;
                 }
                 let nullable = if *lo == 0 { Some(true) } else { a.nullable };
-                known(a.interpreted, nullable, a.min_length.saturating_mul(*lo))
+                let len = a.len.repeat_range(*lo, hi.unwrap_or(u32::MAX));
+                known(a.interpreted, nullable, len)
             }
             Op::Diff => {
                 let (a, b) = (self.info(args[0]), self.info(args[1]));
@@ -419,22 +459,42 @@ impl ReSimp {
                 } else {
                     None
                 };
-                known(a.interpreted && b.interpreted, nullable, a.min_length)
+                known(a.interpreted && b.interpreted, nullable, a.len)
             }
             Op::Ite => {
+                // `orelse`: one of the two branches.
                 let (a, b) = (self.info(args[1]), self.info(args[2]));
-                if a.known && b.known && a.nullable == b.nullable {
-                    known(
-                        a.interpreted && b.interpreted,
-                        a.nullable,
-                        a.min_length.min(b.min_length),
-                    )
-                } else {
-                    UNKNOWN_INFO
+                if !a.known {
+                    return a;
                 }
+                if !b.known {
+                    return b;
+                }
+                let nullable = match (a.nullable, b.nullable) {
+                    (Some(true), Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                };
+                known(false, nullable, a.len.unite(&b.len))
             }
             _ => UNKNOWN_INFO,
         }
+    }
+
+    /// z3's `seq_util::can_be_member`: can a word of `a`'s length shape be in
+    /// `r`, by the residues of `r`'s length abstraction?
+    fn can_be_member(&self, a: Id, r: Id) -> bool {
+        let info = self.info(r);
+        if !info.known || info.len.period() <= 1 {
+            return true;
+        }
+        // `str::length_shape`: a literal is its length, anything else is a
+        // term of unknown length.
+        let (cst, g) = match self.str_lit(a) {
+            Some(l) => (l.len() as u32, 0),
+            None => (0, 1),
+        };
+        info.len.residue_reachable(cst, g)
     }
 
     /// No variables below `t`.
@@ -518,6 +578,136 @@ impl ReSimp {
             return self.reduce_re_eq(a, b);
         }
         self.raw(Op::Eq, &[a, b])
+    }
+
+    /// The sort of `t`.
+    fn sort_of(&self, t: Id) -> Srt {
+        match &self.nodes[t] {
+            Node::Var(_, srt) => *srt,
+            Node::Lit(_) => Srt::Str,
+            Node::Num(_) => Srt::Int,
+            Node::True | Node::False => Srt::Bool,
+            Node::App(op, args) => match op {
+                Op::Not | Op::Eq | Op::And | Op::Or | Op::InRe | Op::Prefix | Op::Suffix => {
+                    Srt::Bool
+                }
+                Op::StrLen => Srt::Int,
+                Op::Ite => self.sort_of(args[1]),
+                _ => Srt::Re,
+            },
+        }
+    }
+
+    /// The depth of `t` (z3's `get_depth`: 1 for a constant).
+    fn depth(&self, t: Id) -> u32 {
+        match &self.nodes[t] {
+            Node::App(_, args) => 1 + args.iter().map(|&a| self.depth(a)).max().unwrap_or(0),
+            _ => 1,
+        }
+    }
+
+    /// The declaration of `t` as z3's `ast_lt` compares it: its name, its
+    /// parameters, its domain and its range.
+    fn decl_key(&self, t: Id) -> (&str, Vec<DeclParam>, Vec<Srt>, Srt) {
+        let range = self.sort_of(t);
+        match &self.nodes[t] {
+            Node::Var(n, _) => (n.as_str(), Vec::new(), Vec::new(), range),
+            Node::Lit(l) => ("String", vec![DeclParam::Str(l.clone())], Vec::new(), range),
+            Node::Num(n) => (
+                "Int",
+                vec![DeclParam::Num(*n), DeclParam::Num(1)],
+                Vec::new(),
+                range,
+            ),
+            Node::True => ("true", Vec::new(), Vec::new(), range),
+            Node::False => ("false", Vec::new(), Vec::new(), range),
+            Node::App(op, args) => {
+                let name = match op {
+                    Op::Not => "not",
+                    Op::Eq => "=",
+                    Op::And => "and",
+                    Op::Or => "or",
+                    Op::Ite => "if",
+                    Op::InRe => "str.in_re",
+                    Op::ToRe => "str.to_re",
+                    Op::ReNone => "re.empty",
+                    Op::ReAll => "re.all",
+                    Op::ReAllChar => "re.allchar",
+                    Op::Range => "re.range",
+                    Op::Concat => "re.++",
+                    Op::Union => "re.union",
+                    Op::Inter => "re.inter",
+                    Op::Star => "re.*",
+                    Op::Plus => "re.+",
+                    Op::Opt => "re.opt",
+                    Op::Comp => "re.comp",
+                    Op::Diff => "re.diff",
+                    Op::Loop(..) => "re.loop",
+                    Op::Prefix => "str.prefixof",
+                    Op::Suffix => "str.suffixof",
+                    Op::StrLen => "str.len",
+                };
+                let params = match op {
+                    Op::Loop(lo, hi) => core::iter::once(*lo)
+                        .chain(*hi)
+                        .map(|k| DeclParam::Num(i64::from(k)))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let domain = args.iter().map(|&a| self.sort_of(a)).collect();
+                (name, params, domain, range)
+            }
+        }
+    }
+
+    /// z3's `ast_lt`: a total order on terms independent of their ids
+    /// (argument count, depth, declaration, then the arguments in turn).
+    fn ast_lt(&self, mut a: Id, mut b: Id) -> bool {
+        loop {
+            if a == b {
+                return false;
+            }
+            let (na, nb) = (self.arity(a), self.arity(b));
+            if na != nb {
+                return na < nb;
+            }
+            let (da, db) = (self.depth(a), self.depth(b));
+            if da != db {
+                return da < db;
+            }
+            let (ka, kb) = (self.decl_key(a), self.decl_key(b));
+            if ka.0 != kb.0 {
+                return ka.0.as_bytes() < kb.0.as_bytes();
+            }
+            if ka.1.len() != kb.1.len() {
+                return ka.1.len() < kb.1.len();
+            }
+            if let Some((x, y)) = ka.1.iter().zip(&kb.1).find(|(x, y)| x != y) {
+                return x < y;
+            }
+            if let Some((x, y)) = ka.2.iter().zip(&kb.2).find(|(x, y)| x != y) {
+                return srt_name(*x) < srt_name(*y);
+            }
+            if ka.3 != kb.3 {
+                return srt_name(ka.3) < srt_name(kb.3);
+            }
+            let (xs, ys) = match (&self.nodes[a], &self.nodes[b]) {
+                (Node::App(_, xs), Node::App(_, ys)) => (xs, ys),
+                _ => return false,
+            };
+            match xs.iter().zip(ys).find(|(x, y)| x != y) {
+                Some((&x, &y)) => (a, b) = (x, y),
+                None => return false,
+            }
+        }
+    }
+
+    /// The number of arguments of `t`.
+    fn arity(&self, t: Id) -> usize {
+        match &self.nodes[t] {
+            Node::App(_, args) => args.len(),
+            _ => 0,
+        }
     }
 
     /// Is `t` a regular expression?
@@ -758,6 +948,11 @@ impl ReSimp {
         Some(d)
     }
 
+    /// Are `a` and `b` complementary literals (`p` and `(not p)`)?
+    fn complementary(&self, a: Id, b: Id) -> bool {
+        self.un(a, &Op::Not) == Some(b) || self.un(b, &Op::Not) == Some(a)
+    }
+
     fn mk_and(&mut self, args: &[Id]) -> Id {
         let mut out: Vec<Id> = Vec::new();
         for &a in args {
@@ -778,6 +973,12 @@ impl ReSimp {
                 }
             }
         }
+        if out
+            .iter()
+            .any(|&x| out.iter().any(|&y| self.complementary(x, y)))
+        {
+            return self.boolean(false);
+        }
         match out.len() {
             0 => self.boolean(true),
             1 => out[0],
@@ -785,13 +986,19 @@ impl ReSimp {
         }
     }
 
+    /// z3's `bool_rewriter::mk_or`: nested disjunctions flattened, `false`
+    /// and repeated disjuncts dropped, `p ∨ ¬p` is `true`. When a disjunct was
+    /// dropped or two are out of [`Self::ast_lt`] order, the disjuncts are
+    /// sorted by id (`sort_disjunctions`, with `ast_lt` comparing ids).
     fn mk_or(&mut self, args: &[Id]) -> Id {
         let mut out: Vec<Id> = Vec::new();
+        let mut changed = false;
         for &a in args {
             match &self.nodes[a] {
                 Node::True => return a,
-                Node::False => {}
+                Node::False => changed = true,
                 Node::App(Op::Or, xs) => {
+                    changed = true;
                     for &x in xs.clone().iter() {
                         if !out.contains(&x) {
                             out.push(x);
@@ -799,11 +1006,22 @@ impl ReSimp {
                     }
                 }
                 _ => {
-                    if !out.contains(&a) {
+                    if out.contains(&a) {
+                        changed = true;
+                    } else {
                         out.push(a);
                     }
                 }
             }
+        }
+        if out
+            .iter()
+            .any(|&x| out.iter().any(|&y| self.complementary(x, y)))
+        {
+            return self.boolean(true);
+        }
+        if changed || out.windows(2).any(|w| self.ast_lt(w[1], w[0])) {
+            out.sort();
         }
         match out.len() {
             0 => self.boolean(false),
@@ -891,6 +1109,9 @@ impl ReSimp {
             let in_b1 = self.simplify(in_b1);
             let t = self.boolean(true);
             return self.mk_ite(is_empty, t, in_b1);
+        }
+        if !self.can_be_member(a, b) {
+            return self.boolean(false);
         }
         self.raw(Op::InRe, &[a, b])
     }
@@ -1901,5 +2122,37 @@ mod tests {
         let m = r.app(Op::InRe, &[x, c]);
         let s = r.simplify(m);
         assert_eq!(show(&r, s), "false");
+    }
+
+    #[test]
+    fn length_residues_refute_membership() {
+        // `(ab){1,2}` has even lengths, `re.allchar` length 1: their
+        // intersection accepts nothing (z3's `can_be_member`).
+        let mut r = ReSimp::default();
+        let a = r.var("a", Srt::Str);
+        let ab = r.lit(&['a' as u32, 'b' as u32]);
+        let rab = r.app(Op::ToRe, &[ab]);
+        let lp = r.app(Op::Loop(1, Some(2)), &[rab]);
+        let any = r.app(Op::ReAllChar, &[]);
+        let i = r.app(Op::Inter, &[lp, any]);
+        let m = r.app(Op::InRe, &[a, i]);
+        let s = r.simplify(m);
+        assert_eq!(show(&r, s), "false");
+    }
+
+    #[test]
+    fn disjunctions_out_of_order_are_sorted_by_id() {
+        // `ite(len a = 0, true, a = "ab")` becomes a disjunction whose
+        // disjuncts are out of `ast_lt` order, so z3 sorts them by id.
+        let mut r = ReSimp::default();
+        let a = r.var("a", Srt::Str);
+        let e = r.lit(&[]);
+        let ab = r.lit(&['a' as u32, 'b' as u32]);
+        let re = r.app(Op::ToRe, &[e]);
+        let rab = r.app(Op::ToRe, &[ab]);
+        let u = r.app(Op::Union, &[re, rab]);
+        let m = r.app(Op::InRe, &[a, u]);
+        let s = r.simplify(m);
+        assert_eq!(show(&r, s), "(or (= (str.len a) 0) (= a \"ab\"))");
     }
 }
