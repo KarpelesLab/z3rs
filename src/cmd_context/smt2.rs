@@ -42363,14 +42363,15 @@ impl Context {
 
     /// Whether `md` reads back as a model: its division-by-zero functions
     /// can be built from its values, or every assertion holds as
-    /// `get-model`/`eval` evaluate it anyway.
+    /// `get-model`/`eval` evaluate it anyway (exactly, over its irrational
+    /// values: [`Model::alg_holds`]).
     fn zero_div_model_readable(&mut self, md: &mut Model) -> bool {
         !matches!(self.ensure_zero_div_tables(md), ZeroDivStatus::Inconsistent)
             || self
                 .assertions
                 .clone()
                 .into_iter()
-                .all(|a| matches!(md.eval_value(&self.m, a), Value::Bool(true)))
+                .all(|a| md.alg_holds(&self.m, a) == Some(true))
     }
 
     /// The `get-model` listing of `model`'s division-by-zero function `kind`

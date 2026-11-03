@@ -1300,6 +1300,120 @@ impl Model {
         go(self, m, t)
     }
 
+    /// The exact truth value of the Boolean term `t` under this model when it
+    /// depends on irrational leaves (see [`Model::set_alg`]), reading every
+    /// arithmetic term as `get-model`/`eval` print it: by exact algebraic
+    /// arithmetic, a division by zero as the model's `/0`-style value
+    /// ([`Model::eval_value`]). Subterms over no irrational leaf are read by
+    /// [`Model::eval_value`]. `None` when some arithmetic subterm over an
+    /// irrational leaf is beyond `+ - * /` and comparisons.
+    pub fn alg_holds(&mut self, m: &AstManager, t: AstId) -> Option<bool> {
+        use crate::ast::arith::ArithOp;
+        use puremp::Algebraic;
+        let over_alg = |md: &Model, t: AstId| m.postorder(t).iter().any(|v| md.alg.contains_key(v));
+        fn num(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
+            if let Some(a) = md.alg.get(&t) {
+                return Some(a.clone());
+            }
+            if !m.postorder(t).iter().any(|v| md.alg.contains_key(v)) {
+                return match md.eval_value(m, t) {
+                    Value::Num(r, _) => Some(Algebraic::from_rational(r)),
+                    _ => None,
+                };
+            }
+            let args = m.app_args(t).to_vec();
+            let op = m.arith_op(t)?;
+            if op == ArithOp::Div && args.len() == 2 {
+                let d = num(md, m, args[1])?;
+                if d.signum() == 0 {
+                    // A division by zero reads as `eval` prints it.
+                    return match md.eval_value(m, t) {
+                        Value::Num(r, _) => Some(Algebraic::from_rational(r)),
+                        _ => None,
+                    };
+                }
+                return Some(num(md, m, args[0])?.div(&d));
+            }
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(num(md, m, a)?);
+            }
+            let mut it = vals.into_iter();
+            let first = it.next()?;
+            Some(match op {
+                ArithOp::Add => it.fold(first, |acc, v| acc.add(&v)),
+                ArithOp::Mul => it.fold(first, |acc, v| acc.mul(&v)),
+                ArithOp::Sub => {
+                    let rest: Vec<Algebraic> = it.collect();
+                    if rest.is_empty() {
+                        first.neg()
+                    } else {
+                        rest.iter().fold(first, |acc, v| acc.sub(v))
+                    }
+                }
+                ArithOp::Uminus => first.neg(),
+                ArithOp::ToReal => first,
+                _ => return None,
+            })
+        }
+        if !over_alg(self, t) {
+            return match self.eval_value(m, t) {
+                Value::Bool(b) => Some(b),
+                _ => None,
+            };
+        }
+        let args = m.app_args(t).to_vec();
+        if m.is_not(t) {
+            return self.alg_holds(m, args[0]).map(|b| !b);
+        }
+        if m.is_and(t) || m.is_or(t) || m.is_xor(t) || m.is_implies(t) {
+            let mut vals = Vec::with_capacity(args.len());
+            for &a in &args {
+                vals.push(self.alg_holds(m, a)?);
+            }
+            return Some(if m.is_and(t) {
+                vals.iter().all(|&b| b)
+            } else if m.is_or(t) {
+                vals.iter().any(|&b| b)
+            } else if m.is_xor(t) {
+                vals.iter().fold(false, |acc, &b| acc ^ b)
+            } else {
+                !vals[0] || vals[1]
+            });
+        }
+        if m.is_ite(t) {
+            let c = self.alg_holds(m, args[0])?;
+            return self.alg_holds(m, args[if c { 1 } else { 2 }]);
+        }
+        let arith_args = !args.is_empty() && args.iter().all(|&a| m.is_arith_sort(m.get_sort(a)));
+        if arith_args && (m.is_eq(t) || m.is_distinct(t)) {
+            let mut vals = Vec::with_capacity(args.len());
+            for &a in &args {
+                vals.push(num(self, m, a)?);
+            }
+            let eq = |a: &Algebraic, b: &Algebraic| a.sub(b).signum() == 0;
+            return Some(if m.is_eq(t) {
+                vals.windows(2).all(|w| eq(&w[0], &w[1]))
+            } else {
+                (0..vals.len()).all(|i| (i + 1..vals.len()).all(|j| !eq(&vals[i], &vals[j])))
+            });
+        }
+        if m.is_eq(t) && args.len() == 2 && m.is_bool_sort(m.get_sort(args[0])) {
+            return Some(self.alg_holds(m, args[0])? == self.alg_holds(m, args[1])?);
+        }
+        let op = m.arith_op(t)?;
+        if !matches!(op, ArithOp::Le | ArithOp::Ge | ArithOp::Lt | ArithOp::Gt) || args.len() != 2 {
+            return None;
+        }
+        let s = num(self, m, args[0])?.sub(&num(self, m, args[1])?).signum();
+        Some(match op {
+            ArithOp::Le => s <= 0,
+            ArithOp::Ge => s >= 0,
+            ArithOp::Lt => s < 0,
+            _ => s > 0,
+        })
+    }
+
     /// Pin an arithmetic leaf variable to a concrete value. Used when a witness
     /// search substitutes a variable out of the goal before checking (so the
     /// resulting model no longer mentions it) and must re-attach the value it was
