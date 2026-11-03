@@ -12,7 +12,7 @@ values included): BADMODEL if z3 then finds the assertions unsat.
 Also reports the completeness gap: cases z3 decides within the timeout but
 z3rs leaves unknown / times out (GAP).
 
-Usage: scripts/fuzz_nlsat_hard.py <z3rs> <z3> <n> <outdir> [--int] [--timeout S] [--seed K]
+Usage: scripts/fuzz_nlsat_hard.py <z3rs> <z3> <n> <outdir> [seed-offset] [--int] [--timeout S] [--seed K]
 """
 import concurrent.futures
 import random
@@ -25,6 +25,7 @@ RS, Z3, N, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 INT = "--int" in sys.argv
 TIMEOUT = float(sys.argv[sys.argv.index("--timeout") + 1]) if "--timeout" in sys.argv else 10.0
 SEED = int(sys.argv[sys.argv.index("--seed") + 1]) if "--seed" in sys.argv else 0
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 and not sys.argv[5].startswith("--") else 0  # seed offset
 
 
 def gen(r):
@@ -151,7 +152,7 @@ def one(i):
     return f"{a}/{b}", p
 
 
-res = list(concurrent.futures.ThreadPoolExecutor(8).map(one, range(N)))
+res = list(concurrent.futures.ThreadPoolExecutor(8).map(one, range(OFF, OFF + N)))
 print(Counter(k for k, _ in res))
 for k, p in res:
     if k in ("DISAGREE", "BADMODEL", "REPLAY-ERROR"):
