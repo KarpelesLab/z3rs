@@ -1148,6 +1148,18 @@ impl Model {
                 }
                 ArithOp::Uminus => first.neg(),
                 ArithOp::ToReal => first,
+                // Real division by a nonzero value (a division by zero is
+                // the model's `/0`, evaluated the ordinary way).
+                ArithOp::Div => {
+                    let rest: Vec<Algebraic> = it.collect();
+                    let [d] = rest.as_slice() else {
+                        return None;
+                    };
+                    if d.signum() == 0 {
+                        return None;
+                    }
+                    first.div(d)
+                }
                 _ => return None,
             })
         }
