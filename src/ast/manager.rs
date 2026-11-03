@@ -38,6 +38,70 @@ pub struct AstManager {
     /// The initial decision phase of the SAT searches over this manager's
     /// terms (per context, never process-global; see [`InitialPhase`]).
     initial_phase: InitialPhase,
+    /// The resource limit of the searches over this manager's terms.
+    limit: ResLimit,
+    /// Reusable visit marks of the traversals (see [`AstManager::with_marks`]).
+    marks: core::cell::RefCell<VisitMarks>,
+}
+
+/// Per-node visit marks reused across traversals: a node is marked when its
+/// stamp equals the current epoch, so starting a traversal is one increment,
+/// not an allocation and clearing of a table over every node.
+#[derive(Default)]
+pub struct VisitMarks {
+    stamp: Vec<u32>,
+    epoch: u32,
+}
+
+impl VisitMarks {
+    /// Whether `id` is marked in this traversal.
+    pub fn is_marked(&self, id: AstId) -> bool {
+        self.stamp[id.0 as usize] == self.epoch
+    }
+
+    /// Mark `id`.
+    pub fn mark(&mut self, id: AstId) {
+        self.stamp[id.0 as usize] = self.epoch;
+    }
+}
+
+/// A resource limit shared by every search over one manager's terms (z3's
+/// `reslimit`, `z3/src/util/rlimit.h`): searches charge their work (SAT
+/// conflicts) to it and give up — answering `unknown` — once it runs out.
+/// Unlimited unless a caller sets one around a decision that may not end.
+#[derive(Default)]
+pub struct ResLimit {
+    /// The units left; `None` is unlimited.
+    left: core::cell::Cell<Option<u64>>,
+}
+
+impl ResLimit {
+    /// The units left (`None`: unlimited).
+    pub fn left(&self) -> Option<u64> {
+        self.left.get()
+    }
+
+    /// Replace the limit by `units` (`None`: unlimited), returning the
+    /// previous one so a caller can restore it.
+    pub fn set(&self, units: Option<u64>) -> Option<u64> {
+        self.left.replace(units)
+    }
+
+    /// Charge `units` of work; `false` once the limit is exhausted.
+    pub fn charge(&self, units: u64) -> bool {
+        match self.left.get() {
+            None => true,
+            Some(l) => {
+                self.left.set(Some(l.saturating_sub(units)));
+                l > units
+            }
+        }
+    }
+
+    /// Whether the limit is exhausted.
+    pub fn exhausted(&self) -> bool {
+        self.left.get() == Some(0)
+    }
 }
 
 impl Default for AstManager {
@@ -56,6 +120,8 @@ impl AstManager {
             mask: INIT_BUCKETS - 1,
             families: vec![Symbol::new("basic")],
             initial_phase: InitialPhase::default(),
+            limit: ResLimit::default(),
+            marks: Default::default(),
         }
     }
 
@@ -65,6 +131,35 @@ impl AstManager {
     #[inline]
     pub fn initial_phase(&self) -> &InitialPhase {
         &self.initial_phase
+    }
+
+    /// Run `f` with fresh visit marks over every node (none marked). A nested
+    /// call (marks in use) gets marks of its own.
+    pub fn with_marks<R>(&self, f: impl FnOnce(&mut VisitMarks) -> R) -> R {
+        let fresh = |marks: &mut VisitMarks| {
+            marks.stamp.resize(self.nodes.len(), 0);
+            if marks.epoch == u32::MAX {
+                marks.stamp.iter_mut().for_each(|s| *s = 0);
+                marks.epoch = 0;
+            }
+            marks.epoch += 1;
+        };
+        match self.marks.try_borrow_mut() {
+            Ok(mut marks) => {
+                fresh(&mut marks);
+                f(&mut marks)
+            }
+            Err(_) => {
+                let mut marks = VisitMarks::default();
+                fresh(&mut marks);
+                f(&mut marks)
+            }
+        }
+    }
+
+    /// The resource limit of the searches over this manager's terms.
+    pub fn limit(&self) -> &ResLimit {
+        &self.limit
     }
 
     // --- theory families --------------------------------------------------

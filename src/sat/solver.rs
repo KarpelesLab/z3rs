@@ -192,6 +192,8 @@ pub struct Solver {
     /// The backjump distance past which a conflict backtracks
     /// chronologically ([`CHRONO_LEVELS`]).
     chrono_levels: u32,
+    /// Conflicts over every search so far (see [`Solver::conflicts`]).
+    conflicts: u64,
 
     ok: bool,
 }
@@ -261,6 +263,7 @@ impl Solver {
             theory_vars: None,
             theory_seen: 0,
             chrono_levels: CHRONO_LEVELS,
+            conflicts: 0,
             ok: true,
         }
     }
@@ -908,6 +911,21 @@ impl Solver {
             .unwrap_or(SatResult::Unsat)
     }
 
+    /// [`Solver::solve_with_theory`], giving up after `max_conflicts`
+    /// conflicts (`None`, the caller's `unknown`).
+    pub fn solve_with_theory_budgeted(
+        &mut self,
+        theory: &mut dyn TheoryHook,
+        max_conflicts: u64,
+    ) -> Option<SatResult> {
+        self.search(&[], max_conflicts, Some(theory))
+    }
+
+    /// The conflicts met over every search of this solver so far.
+    pub fn conflicts(&self) -> u64 {
+        self.conflicts
+    }
+
     /// Attach an all-false clause (a theory conflict `¬C`, or a falsified
     /// implication `(p ∨ ¬R)`) and return its index for [`Solver::analyze`].
     /// Returns `None` for a degenerate (<2-literal) clause, which the caller
@@ -1126,6 +1144,7 @@ impl Solver {
                 self.var_inc /= 0.95; // decay
                 self.cla_inc /= 0.999; // clause-activity decay
                 total_conflicts += 1;
+                self.conflicts += 1;
                 if total_conflicts > max_conflicts {
                     self.cancel_until(0);
                     return None; // budget exhausted → unknown

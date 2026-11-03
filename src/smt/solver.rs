@@ -375,14 +375,26 @@ impl SmtCore {
         // the whole call terminates in bounded time even when many blocking-clause
         // rounds each face an expensive (blow-up-prone) theory check.
         let mut budget = self.work_budget;
+        // Theory-inconsistent assignments blocked whole so far.
+        let mut full_blocks: u32 = 0;
         loop {
             rounds += 1;
             if rounds > self.round_limit {
                 return (SmtResult::Unknown, None);
             }
             self.watch_atoms();
+            // The manager's resource limit bounds the search: a conflict costs
+            // more units the larger the problem (its propagation work grows
+            // with the variables), so a limit bounds the time, not just the
+            // count of conflicts.
+            let before = self.sat.conflicts();
+            let per_conflict = 1 + self.sat.num_vars() as u64 / 1024;
+            let cap = m.limit().left().map_or(u64::MAX, |l| l / per_conflict);
+            if cap == 0 {
+                return (SmtResult::Unknown, None);
+            }
             let solved = if self.euf.is_none() && self.arith.is_none() {
-                self.sat.solve()
+                self.sat.solve_budgeted(cap)
             } else {
                 // The online congruence closure: EUF conflicts and equality
                 // propagation during the search, on partial assignments (the
@@ -394,11 +406,16 @@ impl SmtCore {
                     euf: self.euf.take(),
                     arith: self.arith.take(),
                 };
-                let r = self.sat.solve_with_theory(&mut online);
+                let r = self.sat.solve_with_theory_budgeted(&mut online, cap);
                 self.eqs = online.eqs;
                 self.euf = online.euf;
                 self.arith = online.arith;
                 r
+            };
+            m.limit()
+                .charge((self.sat.conflicts() - before).saturating_mul(per_conflict));
+            let Some(solved) = solved else {
+                return (SmtResult::Unknown, None);
             };
             if solved == SatResult::Unsat {
                 return (SmtResult::Unsat, None);
@@ -598,8 +615,32 @@ impl SmtCore {
                     }
                 }
                 // Definitively inconsistent → block this assignment and retry.
+                // Blocking whole assignments enumerates them: once that keeps
+                // on, an integer-only infeasibility (no rational core) is
+                // explained by a minimized core instead, which prunes every
+                // assignment sharing it.
                 TheoryOutcome::Unsat => {
-                    add_full_block(sat, euf_eq, arith_atoms, pred_atoms);
+                    full_blocks += 1;
+                    let core = (full_blocks > FULL_BLOCKS_BEFORE_CORE)
+                        .then(|| integer_conflict_core(&build_arith_system(m, arith_atoms, sat)))
+                        .flatten()
+                        .filter(|core| {
+                            core_is_inconsistent(
+                                m,
+                                core,
+                                euf_roots,
+                                euf_eq,
+                                arith_atoms,
+                                pred_atoms,
+                            )
+                        });
+                    match core {
+                        Some(core) => {
+                            let clause: Vec<Lit> = core.iter().map(|&l| !l).collect();
+                            sat.add_clause(&clause);
+                        }
+                        None => add_full_block(sat, euf_eq, arith_atoms, pred_atoms),
+                    }
                 }
             }
         }
@@ -4015,6 +4056,75 @@ fn arith_conflict_core(sys: &ArithSystem, why: &[Vec<Lit>]) -> Option<Vec<Lit>> 
     None
 }
 
+/// The integer feasibility checks [`integer_conflict_core`] may run.
+const INTEGER_CORE_CHECKS: usize = 64;
+
+/// A conflict core of `sys` when it is infeasible over the integers only
+/// (rationally feasible, so [`arith_conflict_core`] finds none — a parity or
+/// disequality argument): deletion-based minimization over the constraints
+/// and disequalities, dropping halves, then quarters, … of the kept ones
+/// while the rest stays infeasible (few checks when the core is small).
+/// Every kept set is proven infeasible, so stopping early only leaves a
+/// weaker core. `None` when `sys` is not proven infeasible.
+fn integer_conflict_core(sys: &ArithSystem) -> Option<Vec<Lit>> {
+    let nc = sys.cons.len();
+    if sys.con_lits.len() != nc || sys.diseq_lits.len() != sys.diseqs.len() {
+        return None;
+    }
+    // Indices below `nc` are constraints, the rest disequalities.
+    let sub = |kept: &[usize]| ArithSystem {
+        cons: kept
+            .iter()
+            .filter(|&&i| i < nc)
+            .map(|&i| sys.cons[i].clone())
+            .collect(),
+        diseqs: kept
+            .iter()
+            .filter(|&&i| i >= nc)
+            .map(|&i| sys.diseqs[i - nc].clone())
+            .collect(),
+        int_set: sys.int_set.clone(),
+        con_lits: Vec::new(),
+        diseq_lits: Vec::new(),
+    };
+    let infeasible = |kept: &[usize]| {
+        let mut b = INTEGER_PROBE_BUDGET;
+        matches!(arith_feasible(&sub(kept), &mut b), Feas::Unsat)
+    };
+    let mut kept: Vec<usize> = (0..nc + sys.diseqs.len()).collect();
+    if !infeasible(&kept) {
+        return None;
+    }
+    let mut checks = 1;
+    let mut size = kept.len().div_ceil(2);
+    while size >= 1 && checks < INTEGER_CORE_CHECKS {
+        let mut i = 0;
+        while i < kept.len() && checks < INTEGER_CORE_CHECKS {
+            checks += 1;
+            let end = (i + size).min(kept.len());
+            let rest: Vec<usize> = kept[..i].iter().chain(&kept[end..]).copied().collect();
+            if infeasible(&rest) {
+                kept = rest;
+            } else {
+                i = end;
+            }
+        }
+        if size == 1 {
+            break;
+        }
+        size = size.div_ceil(2);
+    }
+    let mut out: BTreeSet<Lit> = BTreeSet::new();
+    for i in kept {
+        out.insert(if i < nc {
+            sys.con_lits[i]
+        } else {
+            sys.diseq_lits[i - nc]
+        });
+    }
+    Some(out.into_iter().collect())
+}
+
 /// The arithmetic model must respect congruence: two applications of one
 /// function whose arguments get equal values must get equal values too (else
 /// `f(0) ≠ f(k)` gets `k = 0`). Each violation is repaired by re-solving with
@@ -4125,6 +4235,10 @@ fn collect_int_vars(m: &AstManager, e: &LinExpr, set: &mut BTreeSet<AstId>) {
 /// worst-case exponential enumeration of theory-atom assignments; on exhaustion
 /// the result is a sound [`SmtResult::Unknown`].
 const DPLL_ROUND_LIMIT: u32 = 5_000;
+
+/// The whole-assignment blocks [`SmtCore::check`] adds before it explains an
+/// integer infeasibility by a minimized core (see [`integer_conflict_core`]).
+const FULL_BLOCKS_BEFORE_CORE: u32 = 64;
 
 /// A total work budget for the integer feasibility search: the number of base
 /// `model` solves permitted across all branch-and-bound nodes *and* the

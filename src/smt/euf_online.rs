@@ -19,7 +19,7 @@
 //! over — the arithmetic and theory-combination reasoning — so it can only make
 //! the search faster, never change its verdict.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use puremp::Rational;
@@ -103,8 +103,14 @@ pub struct IncEgraph {
     target: Vec<usize>,
     just: Vec<Just>,
     stamp: Vec<u64>,
+    /// Per node: the explanation (epoch) that last read its proof edge.
+    cstamp: Vec<u64>,
     epoch: u64,
     atoms: Vec<Atom>,
+    /// Per atom: the propagation pass that last implied it, so a pass
+    /// explains each implied atom once however many merges re-derive it.
+    implied_pass: Vec<u64>,
+    pass: u64,
     /// Atoms per SAT variable.
     var_atoms: Vec<Vec<usize>>,
     undo: Vec<Undo>,
@@ -158,8 +164,11 @@ impl IncEgraph {
             target: Vec::new(),
             just: Vec::new(),
             stamp: Vec::new(),
+            cstamp: Vec::new(),
             epoch: 0,
             atoms: Vec::new(),
+            implied_pass: Vec::new(),
+            pass: 0,
             var_atoms: Vec::new(),
             undo: Vec::new(),
             pending: Vec::new(),
@@ -231,6 +240,7 @@ impl IncEgraph {
     fn add_atom(&mut self, lit: Lit, atom: Atom, nodes: &[usize]) {
         let id = self.atoms.len();
         self.atoms.push(atom);
+        self.implied_pass.push(0);
         let v = lit.var() as usize;
         if self.var_atoms.len() <= v {
             self.var_atoms.resize(v + 1, Vec::new());
@@ -255,6 +265,7 @@ impl IncEgraph {
         self.target.push(NONE);
         self.just.push(Just::Cong(id, id));
         self.stamp.push(0);
+        self.cstamp.push(0);
         self.term.push(None);
         self.arith.push(false);
         let args: Vec<usize> = sig.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
@@ -451,7 +462,9 @@ impl IncEgraph {
             if let Atom::Eq(lit, x, y) = self.atoms[id]
                 && self.root[x] == self.root[y]
                 && val(lit) != LBool::True
+                && self.implied_pass[id] != self.pass
             {
+                self.implied_pass[id] = self.pass;
                 let why = self.explain(x, y);
                 self.implied.push((lit, why));
             }
@@ -471,7 +484,8 @@ impl IncEgraph {
             for id in ws {
                 if let Atom::Pred(lit, t) = self.atoms[id] {
                     let l = if bv { lit } else { !lit };
-                    if val(l) != LBool::True {
+                    if val(l) != LBool::True && self.implied_pass[id] != self.pass {
+                        self.implied_pass[id] = self.pass;
                         let why = self.explain(t, vnode);
                         self.implied.push((l, why));
                     }
@@ -526,11 +540,15 @@ impl IncEgraph {
     /// The asserted literals whose merges (closed under congruence) make `a`
     /// and `b` equal. Precondition: same class.
     fn explain(&mut self, a: usize, b: usize) -> Vec<Lit> {
-        let mut out: BTreeSet<Lit> = BTreeSet::new();
+        let mut out: Vec<Lit> = Vec::new();
         let mut work: Vec<(usize, usize)> = alloc::vec![(a, b)];
-        let mut done: BTreeSet<(usize, usize)> = BTreeSet::new();
+        // Each proof edge is expanded at most once per explanation (z3 marks
+        // the processed equations the same way): `cstamp[n] == ce` once the
+        // edge out of `n` was read.
+        self.epoch += 1;
+        let ce = self.epoch;
         while let Some((x, y)) = work.pop() {
-            if x == y || !done.insert((x.min(y), x.max(y))) {
+            if x == y {
                 continue;
             }
             // Nearest common ancestor in the proof tree.
@@ -548,13 +566,15 @@ impl IncEgraph {
             for start in [x, y] {
                 let mut n = start;
                 while n != anc && n != NONE {
-                    match self.just[n] {
-                        Just::Lit(l) => {
-                            out.insert(l);
-                        }
-                        Just::Cong(p, q) => {
-                            if let (Some((_, ap)), Some((_, aq))) = (&self.sig[p], &self.sig[q]) {
-                                work.extend(ap.iter().copied().zip(aq.iter().copied()));
+                    if self.cstamp[n] != ce {
+                        self.cstamp[n] = ce;
+                        match self.just[n] {
+                            Just::Lit(l) => out.push(l),
+                            Just::Cong(p, q) => {
+                                if let (Some((_, ap)), Some((_, aq))) = (&self.sig[p], &self.sig[q])
+                                {
+                                    work.extend(ap.iter().copied().zip(aq.iter().copied()));
+                                }
                             }
                         }
                     }
@@ -562,7 +582,9 @@ impl IncEgraph {
                 }
             }
         }
-        out.into_iter().collect()
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// Process pending congruence merges until none remain or a conflict.
@@ -625,6 +647,7 @@ impl TheoryHook for IncEgraph {
         self.pending.clear();
         self.implied.clear();
         self.conflict = None;
+        self.pass += 1;
         let first_mark = self.marks.len();
         let start = self.processed;
         let trail = ctx.trail;

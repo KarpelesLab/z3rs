@@ -360,6 +360,10 @@ fn render_real(r: &Rational) -> String {
 /// The deepest datatype value model-based instantiation builds.
 const MBQI_DT_DEPTH: u32 = 6;
 
+/// The candidates all enumerative witness searches of one command may try
+/// together (see `Context::witness_tries`).
+const WITNESS_TRIES: usize = 20_000;
+
 /// A function interpretation as a finite table (see
 /// `Context::fn_table_interps`): `(argument values, result)` entries and the
 /// value elsewhere.
@@ -3543,6 +3547,11 @@ struct Context {
     /// decides a divisor-concretised residual, so nested `decide_inner` calls do
     /// not re-enter the witness search (which would risk unbounded recursion).
     in_divmod_witness: bool,
+    /// The candidates the enumerative witness searches (`try_string_witness`,
+    /// `try_seq_witness`, the divisor witnesses) may still try during the
+    /// current command: each search is bounded, but a check runs many of them
+    /// (one per case split and component), so their total is bounded too.
+    witness_tries: usize,
     /// Re-entrancy guard for the opaque-atom strengthening in `decide`.
     in_opaque_strengthen: bool,
     /// Set while `decide` looks for a refutation of a goal with quantifier
@@ -4597,6 +4606,7 @@ impl Context {
             int_div0_decl: None,
             int_mod0_decl: None,
             in_divmod_witness: false,
+            witness_tries: WITNESS_TRIES,
             in_opaque_strengthen: false,
             in_quant_refute: false,
             seq_len_decls: BTreeSet::new(),
@@ -4822,6 +4832,7 @@ impl Context {
 
     fn command(&mut self, form: &SExpr) -> Result<Option<String>, String> {
         self.as_const_seen = 0;
+        self.witness_tries = WITNESS_TRIES;
         let list = match form {
             SExpr::List(l) if !l.is_empty() => l,
             _ => return Err("expected a command list".to_string()),
@@ -13975,6 +13986,21 @@ impl Context {
                 let whole = self.m.mk_and(&[found, same_len]);
                 let is_needle = self.m.mk_eq(args[0], args[1]);
                 ax.push(self.m.mk_implies(whole, is_needle));
+                // z3's `add_indexof_axiom`: the result is a position or -1; an
+                // offset outside `[0, len x]` finds nothing, and a found
+                // position is not before the offset. Refutes
+                // `i < 0 ∧ indexof s "ba" i ≠ -1`.
+                let m1 = self.m.mk_int(-1);
+                ax.push(self.m.mk_ge(*app, m1));
+                if let Some(&off) = args.get(2) {
+                    let none = self.m.mk_eq(*app, m1);
+                    let neg = self.m.mk_lt(off, zero);
+                    let past = self.m.mk_gt(off, lx);
+                    let outside = self.m.mk_or(&[neg, past]);
+                    ax.push(self.m.mk_implies(outside, none));
+                    let after = self.m.mk_ge(*app, off);
+                    ax.push(self.m.mk_or(&[none, after]));
+                }
             }
         }
         // `str.to_code` inverse: `str.to_code x = c` (0 ≤ c ≤ 0x10FFFF) pins x to the
@@ -15892,6 +15918,10 @@ impl Context {
                 return None;
             }
             tries += 1;
+            if self.witness_tries == 0 {
+                return None;
+            }
+            self.witness_tries -= 1;
             let subst: Vec<(AstId, AstId)> = divs
                 .iter()
                 .enumerate()
@@ -16024,6 +16054,10 @@ impl Context {
                 return None;
             }
             tries += 1;
+            if self.witness_tries == 0 {
+                return None;
+            }
+            self.witness_tries -= 1;
             let subst: Vec<(AstId, AstId)> = divs
                 .iter()
                 .enumerate()
@@ -16881,13 +16915,19 @@ impl Context {
             return None;
         }
         const MAX_TRIES: usize = 5000;
+        const STRUCTURAL_CUTOFF: usize = 64;
         let mut idx = alloc::vec![0usize; vars.len()];
         let mut tries = 0;
+        let mut structural = 0;
         loop {
             if tries >= MAX_TRIES {
                 return None;
             }
             tries += 1;
+            if self.witness_tries == 0 {
+                return None;
+            }
+            self.witness_tries -= 1;
             let mut subst: Vec<(AstId, AstId)> = vars
                 .iter()
                 .enumerate()
@@ -16937,10 +16977,33 @@ impl Context {
             let g1 = self.subst_seq(goal, &subst);
             let mut memo = BTreeMap::new();
             let g2 = self.refold_str_markers(g1, &mut memo);
-            let clean = !self.m.postorder(g2).iter().any(|&t| {
-                self.str_symbolic.contains(&t)
-                    || (self.m.is_app(t) && self.seqop_ops.contains_key(&self.m.app_decl(t)))
-            });
+            let leftovers: Vec<AstId> = self
+                .m
+                .postorder(g2)
+                .into_iter()
+                .filter(|&t| {
+                    self.str_symbolic.contains(&t)
+                        || (self.m.is_app(t) && self.seqop_ops.contains_key(&self.m.app_decl(t)))
+                })
+                .collect();
+            let clean = leftovers.is_empty();
+            // A leftover operation over a free constant other than the
+            // enumerated sequences (`extract s 1 i`) stays symbolic under every
+            // candidate: when each early candidate leaves one, the rest would
+            // fail the same way.
+            if !clean
+                && self.m.postorder_many(&leftovers).iter().any(|&t| {
+                    self.m.is_app(t)
+                        && self.m.app_args(t).is_empty()
+                        && self.is_user_constant_or_bits(t)
+                        && self.seq_elem_sort(self.m.get_sort(t)).is_none()
+                })
+            {
+                structural += 1;
+                if structural == tries && tries >= STRUCTURAL_CUTOFF {
+                    return None;
+                }
+            }
             if clean {
                 // Concrete sequences are uninterpreted constants; without (dis)
                 // equality axioms `check_model` could equate two *different* ones
@@ -18242,6 +18305,10 @@ impl Context {
                 return None;
             }
             tries += 1;
+            if self.witness_tries == 0 {
+                return None;
+            }
+            self.witness_tries -= 1;
             let choice: Vec<AstId> = (0..all_vars.len()).map(|k| per_term[k][idx[k]]).collect();
             let subst = self.witness_subst(&all_vars, &choice, &derived, &derived_prod);
             if let Some(m) = self.witness_check(goal, &subst) {
@@ -25581,7 +25648,16 @@ impl Context {
         if let Some(r) = self.try_modular_sat_witness(combined) {
             return r;
         }
+        // Over un-saturated universals the instance goal only refutes or seeds
+        // MBQI (which restarts from the instance-free goal when it gives up), so
+        // its search is bounded: a large instance set must not stall the check.
+        const INSTANCE_GOAL_CONFLICTS: u64 = 2000;
+        let prev = (!no_instances && !saturated)
+            .then(|| self.m.limit().set(Some(INSTANCE_GOAL_CONFLICTS)));
         let (mut res, mut model, mut goal) = self.decide_combined(combined);
+        if let Some(prev) = prev {
+            self.m.limit().set(prev);
+        }
         // Many instances can swamp the nonlinear refuters; the instances at the
         // small constants alone may already refute (sound: any instance set).
         if res == SmtResult::Unknown
@@ -28266,9 +28342,78 @@ impl Context {
         elim.sort();
         elim.dedup();
         for v in elim {
-            cs = project(&cs, v, budget)?;
+            // An equality over `v` defines it: substitute (Gaussian
+            // elimination, exact and size-preserving) instead of pairing
+            // every lower bound with every upper bound.
+            let def = cs
+                .iter()
+                .position(|c| c.rel == Rel::Eq && !c.expr.coeff_of(v).is_zero());
+            cs = match def {
+                Some(i) => {
+                    let d = cs.remove(i);
+                    let a = d.expr.coeff_of(v);
+                    // a·v + r = 0  ⇒  v = −r / a.
+                    let r = d.expr.sub(&LinExpr::var(v).scale(&a));
+                    let v_expr = r.scale(&a.neg().recip());
+                    cs.iter()
+                        .map(|c| Self::con(substitute_lin(&c.expr, v, &v_expr), c.rel))
+                        .collect()
+                }
+                None => project(&cs, v, budget)?,
+            };
+            cs = Self::poly_normalize(cs);
         }
         Some(cs)
+    }
+
+    /// `cs` without repeated constraints (up to a positive factor) and
+    /// without true constant ones, which Fourier–Motzkin breeds.
+    fn poly_normalize(cs: Vec<Constraint>) -> Vec<Constraint> {
+        // A constraint by its relation, coefficients and constant.
+        type Key = (u8, Vec<(AstId, Rational)>, Rational);
+        let mut seen: BTreeSet<Key> = BTreeSet::new();
+        let mut out = Vec::new();
+        for c in cs {
+            if let Some(k) = c.expr.as_constant() {
+                let holds = match c.rel {
+                    Rel::Le => !k.is_positive(),
+                    Rel::Lt => k.is_negative(),
+                    Rel::Eq => k.is_zero(),
+                };
+                if holds {
+                    continue;
+                }
+            }
+            // Scale so the first coefficient (or the constant) has magnitude 1.
+            let lead = c
+                .expr
+                .terms()
+                .next()
+                .map(|(_, a)| a.clone())
+                .unwrap_or_else(|| c.expr.constant_part().clone());
+            let mut e = if lead.is_zero() {
+                c.expr.clone()
+            } else {
+                c.expr.scale(&lead.abs().recip())
+            };
+            if c.rel == Rel::Eq && lead.is_negative() {
+                e = e.neg();
+            }
+            let tag = match c.rel {
+                Rel::Le => 0,
+                Rel::Lt => 1,
+                Rel::Eq => 2,
+            };
+            let key = (
+                tag,
+                e.terms().map(|(v, a)| (v, a.clone())).collect(),
+                e.constant_part().clone(),
+            );
+            if seen.insert(key) {
+                out.push(Self::con(e, c.rel));
+            }
+        }
+        out
     }
 
     /// Does `poly` entail the constraint `c`? (`poly ⇒ c`, decided by
@@ -28362,24 +28507,27 @@ impl Context {
                     return None; // too many polyhedra — bail
                 }
             }
-            if !changed {
-                // Fixpoint reached. A query is unreachable in the over-approx ⇒ safe.
-                for (_bs, body_app, guards, head_app) in &rules.clone() {
-                    if head_app.is_some() {
-                        continue;
-                    }
-                    let guard_cubes = self.chc_guard_cubes(guards)?;
-                    let body_polys = self.chc_body_polys(*body_app, &reach, &state)?;
-                    for bpoly in &body_polys {
-                        for gcube in &guard_cubes {
-                            let mut cs = bpoly.clone();
-                            cs.extend(gcube.clone());
-                            if feasible(&cs) {
-                                return None; // over-approx hits the query — inconclusive
-                            }
+            // The reach only grows: once it hits a query, the fixpoint will
+            // too, and the over-approximation is inconclusive — give up now
+            // rather than at the fixpoint.
+            for (_bs, body_app, guards, head_app) in &rules.clone() {
+                if head_app.is_some() {
+                    continue;
+                }
+                let guard_cubes = self.chc_guard_cubes(guards)?;
+                let body_polys = self.chc_body_polys(*body_app, &reach, &state)?;
+                for bpoly in &body_polys {
+                    for gcube in &guard_cubes {
+                        let mut cs = bpoly.clone();
+                        cs.extend(gcube.clone());
+                        if feasible(&cs) {
+                            return None; // over-approx hits the query — inconclusive
                         }
                     }
                 }
+            }
+            if !changed {
+                // Fixpoint reached. No query is reachable in the over-approx ⇒ safe.
                 return Some(SmtResult::Sat);
             }
         }

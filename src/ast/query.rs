@@ -28,27 +28,7 @@ impl AstManager {
     /// All expressions reachable from `root`, in post-order (children before
     /// parents), each visited exactly once.
     pub fn postorder(&self, root: AstId) -> Vec<AstId> {
-        let mut visited = alloc::vec![false; self.len()];
-        let mut order = Vec::new();
-        // Iterative DFS: push (node, children-expanded?) frames.
-        let mut stack: Vec<(AstId, bool)> = alloc::vec![(root, false)];
-        while let Some((id, expanded)) = stack.pop() {
-            if visited[id.0 as usize] {
-                continue;
-            }
-            if expanded {
-                visited[id.0 as usize] = true;
-                order.push(id);
-            } else {
-                stack.push((id, true));
-                for &c in self.expr_children(id) {
-                    if !visited[c.0 as usize] {
-                        stack.push((c, false));
-                    }
-                }
-            }
-        }
-        order
+        self.postorder_many(core::slice::from_ref(&root))
     }
 
     /// The expressions reachable from `root` through the arguments of the
@@ -98,29 +78,31 @@ impl AstManager {
     /// [`postorder`](Self::postorder) and dropping repeats: what earlier roots
     /// visited is closed under children, so skipping it keeps the rest in order.
     pub fn postorder_many(&self, roots: &[AstId]) -> Vec<AstId> {
-        let mut visited = alloc::vec![false; self.len()];
-        let mut order = Vec::new();
-        let mut stack: Vec<(AstId, bool)> = Vec::new();
-        for &root in roots {
-            stack.push((root, false));
-            while let Some((id, expanded)) = stack.pop() {
-                if visited[id.0 as usize] {
-                    continue;
-                }
-                if expanded {
-                    visited[id.0 as usize] = true;
-                    order.push(id);
-                } else {
-                    stack.push((id, true));
-                    for &c in self.expr_children(id) {
-                        if !visited[c.0 as usize] {
-                            stack.push((c, false));
+        self.with_marks(|visited| {
+            let mut order = Vec::new();
+            // Iterative DFS: push (node, children-expanded?) frames.
+            let mut stack: Vec<(AstId, bool)> = Vec::new();
+            for &root in roots {
+                stack.push((root, false));
+                while let Some((id, expanded)) = stack.pop() {
+                    if visited.is_marked(id) {
+                        continue;
+                    }
+                    if expanded {
+                        visited.mark(id);
+                        order.push(id);
+                    } else {
+                        stack.push((id, true));
+                        for &c in self.expr_children(id) {
+                            if !visited.is_marked(c) {
+                                stack.push((c, false));
+                            }
                         }
                     }
                 }
             }
-        }
-        order
+            order
+        })
     }
 
     /// Visit every expression reachable from `root` once, in post-order.
