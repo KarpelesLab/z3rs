@@ -877,6 +877,7 @@ use super::decl_table::DeclTable;
 mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
+mod fp_real;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -3157,6 +3158,9 @@ struct Context {
     /// records whether the source was `to_fp_unsigned` (only meaningful when `x`
     /// is a bit-vector, where the sign of the top bit changes the numeric value).
     fp_conv: BTreeMap<AstId, (AstId, AstId, u32, u32, bool)>,
+    /// The bit-vector image of each `to_fp` of a symbolic real -> (rm, the
+    /// real, eb, sb); its rounding constraints join the goal (`fp_real`).
+    fp_round_real: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
     /// Opaque `fp.rem` markers -> (x, y, eb, sb). Folded once both operands are
     /// pinned to concrete FP constants by top-level equalities.
     fp_rem_markers: BTreeMap<AstId, (AstId, AstId, u32, u32)>,
@@ -4309,6 +4313,7 @@ impl Context {
             sort_defs: BTreeMap::new(),
             fp_sorts: BTreeMap::new(),
             fp_conv: BTreeMap::new(),
+            fp_round_real: BTreeMap::new(),
             fp_class_markers: BTreeMap::new(),
             array_default_decls: BTreeMap::new(),
             fp_cmp_markers: BTreeMap::new(),
@@ -22689,69 +22694,17 @@ impl Context {
     /// ([`Self::fp_real_unspec`]). `None` for a float without a bit-vector
     /// image or an exponent too wide to enumerate.
     fn fp_to_real_bits(&mut self, x: AstId) -> Option<AstId> {
-        const MAX_EB: u32 = 8;
         let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
-        if eb > MAX_EB || sb < 2 {
-            return None;
-        }
         let bv = self.fp_to_bv(x)?;
-        let w = eb + sb;
-        let sign = self.m.mk_bv_extract(w - 1, w - 1, bv);
-        let exp = self.m.mk_bv_extract(w - 2, sb - 1, bv);
-        let sig = self.m.mk_bv_extract(sb - 2, 0, bv);
-        let int = self.m.mk_int_sort();
-        let sig_sort = self.m.get_sort(sig);
-        let b2n = self.m.mk_func_decl(Symbol::new("bv2nat"), &[sig_sort], int);
-        let sig_int = self.m.mk_app(b2n, &[sig]);
-        let sigv = self.m.mk_to_real(sig_int);
-        let bias = (1i64 << (eb - 1)) - 1;
-        let hidden = Rational::from_integer(pow2(sb - 1));
-        let two = Rational::from_integer(Int::from(2));
-        let pow = |k: i64| -> Rational {
-            let mut r = Rational::from_integer(Int::from(1));
-            for _ in 0..k.unsigned_abs() {
-                r = if k > 0 { &r * &two } else { &r / &two };
-            }
-            r
-        };
-        // The magnitude for each finite exponent field value, the largest last.
-        let top = (1i64 << eb) - 2;
-        let mut mag: Option<AstId> = None;
-        for k in (0..=top).rev() {
-            let scale = pow(k.max(1) - bias - (sb as i64 - 1));
-            let base = if k == 0 {
-                Rational::from_integer(Int::from(0))
-            } else {
-                &scale * &hidden
-            };
-            let c = self.m.mk_numeral(scale, false);
-            let scaled = self.m.mk_mul(&[c, sigv]);
-            let b = self.m.mk_numeral(base, false);
-            let mk = self.m.mk_add(&[b, scaled]);
-            mag = Some(match mag {
-                None => mk,
-                Some(rest) => {
-                    let kv = self.m.mk_bv_numeral(Int::from(k), eb);
-                    let is_k = self.m.mk_eq(exp, kv);
-                    self.m.mk_ite(is_k, mk, rest)
-                }
-            });
-        }
-        let mag = mag?;
-        let neg = self.m.mk_uminus(mag);
-        let one = self.m.mk_bv(1, 1);
-        let is_neg = self.m.mk_eq(sign, one);
-        let val = self.m.mk_ite(is_neg, neg, mag);
-        let ones = self.m.mk_bv_numeral(pow2(eb) - Int::from(1), eb);
-        let special = self.m.mk_eq(exp, ones);
-        let zero_sig = self.m.mk_bv(0, sb - 1);
-        let is_inf_sig = self.m.mk_eq(sig, zero_sig);
+        let p = self.fp_parts(bv, eb, sb)?;
+        let neg = self.m.mk_uminus(p.mag);
+        let val = self.m.mk_ite(p.is_neg, neg, p.mag);
         let nan = self.fp_real_unspec(eb, sb, 0);
         let pinf = self.fp_real_unspec(eb, sb, 1);
         let ninf = self.fp_real_unspec(eb, sb, 2);
-        let inf = self.m.mk_ite(is_neg, ninf, pinf);
-        let spec = self.m.mk_ite(is_inf_sig, inf, nan);
-        Some(self.m.mk_ite(special, spec, val))
+        let inf = self.m.mk_ite(p.is_neg, ninf, pinf);
+        let spec = self.m.mk_ite(p.sig_zero, inf, nan);
+        Some(self.m.mk_ite(p.special, spec, val))
     }
 
     fn fp_real_unspec(&mut self, eb: u32, sb: u32, class: u8) -> AstId {
@@ -33016,6 +32969,7 @@ impl Context {
         axioms.extend(self.power_zero_axioms(lifted));
         axioms.extend(self.determined_int_axioms(lifted));
         axioms.extend(self.fp_from_bv_axioms(lifted));
+        axioms.extend(self.fp_round_real_goal_axioms(lifted));
         axioms.extend(self.fp_commutativity_axioms(lifted));
         axioms.extend(self.divmod_axioms(lifted));
         if axioms.is_empty() {
@@ -41377,6 +41331,27 @@ impl Context {
                             }
                         }
                         let s = self.fp_sort(eb, sb);
+                        // A real (or integer) rounded into a small format:
+                        // fresh bits tied to it by the rounding relation.
+                        if has_rm
+                            && self.m.is_arith_sort(self.m.get_sort(x))
+                            && eb <= fp_real::ROUND_MAX_EB
+                        {
+                            let rm = self.term(&l[1])?;
+                            if self.rm_bits(rm).is_some() {
+                                let xr = if self.m.is_int_sort(self.m.get_sort(x)) {
+                                    self.m.mk_to_real(x)
+                                } else {
+                                    x
+                                };
+                                let bvs = self.m.mk_bv_sort(eb + sb);
+                                let r = self.fresh_const(bvs);
+                                let t = self.fresh_const(s);
+                                self.fp_bv.insert(t, r);
+                                self.fp_round_real.insert(r, (rm, xr, eb, sb));
+                                return Ok(t);
+                            }
+                        }
                         let t = self.fresh_const(s);
                         self.str_symbolic.insert(t);
                         if has_rm {
@@ -43257,6 +43232,43 @@ mod tests {
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "((q 14.0)\n (f (fp #b0 #b110 #b11)))");
         assert_eq!(out[2], "unsat");
+    }
+
+    #[test]
+    fn to_fp_of_a_symbolic_real_rounds() {
+        // (3,5) floats near 1: spacing 1/16. x in (1, 1+1/32) rounds to 1
+        // under RNE and to 1+1/16 under RTP.
+        let script = "
+            (declare-const x Real)
+            (assert (< 1.0 x (+ 1.0 (/ 1.0 32.0))))
+            (assert (not (= ((_ to_fp 3 5) RNE x) ((_ to_fp 3 5) RNE 1.0))))
+            (check-sat)
+            (reset)
+            (declare-const x Real)
+            (assert (< 1.0 x (+ 1.0 (/ 1.0 32.0))))
+            (assert (= ((_ to_fp 3 5) RTP x) ((_ to_fp 3 5) RNE (+ 1.0 (/ 1.0 16.0)))))
+            (check-sat)
+            (reset)
+            (declare-const x Real)
+            (declare-const f (_ FloatingPoint 3 5))
+            (assert (= f ((_ to_fp 3 5) RTZ x)))
+            (assert (fp.isInfinite f))
+            (check-sat)
+            (reset)
+            (declare-const x Real)
+            (declare-const f (_ FloatingPoint 3 5))
+            (assert (= f ((_ to_fp 3 5) RNE x)))
+            (assert (fp.isInfinite f))
+            (check-sat)
+            (get-value ((fp.isNegative f)))
+            (eval (or (>= x 15.75) (<= x (- 15.75))))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_eq!(out[1], "sat");
+        assert_eq!(out[2], "unsat");
+        assert_eq!(out[3], "sat");
+        assert_eq!(out[5], "true");
     }
 
     #[test]
