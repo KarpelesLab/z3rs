@@ -1891,6 +1891,9 @@ fn nra_conflicts(work: u64) -> usize {
 const NLA_NRA_MAX_WORK: u64 = 1_000_000;
 /// Refuted conjunctions up to this many literals get their core minimized.
 const NLA_CORE_MAX: usize = 40;
+/// The `(work, final checks)` of the linear abstraction of a nonlinear goal
+/// (see [`crate::smt::SmtCore::set_work_budget`]).
+const NL_ABSTRACTION_BUDGET: (u64, u32) = (50_000, 500);
 
 /// Whether `s` is an ordinary application `(f a₁ … aₙ)` whose term is built
 /// from the terms of its arguments in the current scope (no binder, annotation,
@@ -38253,7 +38256,19 @@ impl Context {
             }
             return self.decide_bool_array(goal);
         }
-        let (res, model) = check_model(&self.m, goal);
+        let (res, model) = if self.arith_nonlinear(goal) {
+            // The linear abstraction of a nonlinear goal (products as
+            // variables) only settles `unsat`: a bounded search, branching
+            // left to the search as in the incremental linearization.
+            let mut core = crate::smt::SmtCore::new();
+            core.branch_only();
+            core.set_work_budget(NL_ABSTRACTION_BUDGET.0);
+            core.set_round_limit(NL_ABSTRACTION_BUDGET.1);
+            core.assert(&self.m, goal);
+            core.check(&self.m)
+        } else {
+            check_model(&self.m, goal)
+        };
         // SAT witness for symbolic-divisor div/mod goals: a small concrete divisor
         // often makes the goal linear and satisfiable (e.g. `mod(35,y)≥1 ∧ y<6`
         // at y=2). A confirmed linear model is a real `sat` — and `check_model`'s
