@@ -52,8 +52,11 @@ struct Reduce {
     /// Applications rebuilt over shadow functions: `(original, shadow)`.
     rebuilt: Vec<(AstId, AstId)>,
     gates: usize,
+    /// Constraints of the conversions (`int2bv`).
+    side: Vec<AstId>,
     /// The declarations treated as uninterpreted: the user's functions and
-    /// the record constructors and selectors (whose axioms the goal carries).
+    /// the record constructors and selectors (whose axioms the goal carries);
+    /// also the bit-vector division-by-zero functions.
     ufs: BTreeSet<AstId>,
 }
 
@@ -104,6 +107,7 @@ impl Context {
                 }
             }
         }
+        parts.extend(st.side.iter().copied());
         let reduced = if parts.len() == 1 {
             parts[0]
         } else {
@@ -150,9 +154,51 @@ impl Context {
         }
     }
 
+    /// For a conversion of a bit-vector to an integer, whether it reads the
+    /// bits as signed.
+    fn bvb_to_int_kind(&self, t: AstId) -> Option<bool> {
+        let d = self.m.func_decl(self.m.app_decl(t))?;
+        match d.name.as_str()? {
+            "bv2int" | "bv2nat" | "ubv_to_int" => Some(false),
+            "sbv_to_int" => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Is `t` an `int2bv` conversion?
+    fn bvb_is_int2bv(&self, t: AstId) -> bool {
+        self.m
+            .func_decl(self.m.app_decl(t))
+            .and_then(|d| d.name.as_str())
+            .is_some_and(|n| n == "int2bv")
+            && self.m.is_int_sort(self.m.get_sort(self.m.app_args(t)[0]))
+    }
+
+    /// The integer value of `bits`: `Σ ite(bᵢ, 2ⁱ, 0)`, the top bit weighing
+    /// `−2ⁿ⁻¹` when `signed`.
+    fn bvb_bits_value(&mut self, bits: &[AstId], signed: bool) -> AstId {
+        let zero = self.m.mk_int(0);
+        let mut terms = Vec::with_capacity(bits.len());
+        for (i, &b) in bits.iter().enumerate() {
+            let mut w = super::pow2(i as u32);
+            if signed && i + 1 == bits.len() {
+                w = -w;
+            }
+            let wt = self.m.mk_numeral(puremp::Rational::from_integer(w), true);
+            terms.push(self.m.mk_ite(b, wt, zero));
+        }
+        match terms.len() {
+            0 => zero,
+            1 => terms[0],
+            _ => self.m.mk_add(&terms),
+        }
+    }
+
     /// Is `t` an application of an uninterpreted function (`st.ufs`)?
     fn bvb_is_uf(&self, st: &Reduce, t: AstId) -> bool {
-        self.m.app(t).is_some_and(|a| st.ufs.contains(&a.decl))
+        self.m
+            .app(t)
+            .is_some_and(|a| st.ufs.contains(&a.decl) || self.is_bv_div0_decl(a.decl))
     }
 
     /// The translation of the non-bit-vector term `t`: bit-vector atoms as
@@ -198,6 +244,13 @@ impl Context {
                 }
                 _ => return None,
             }
+        } else if args.len() == 1
+            && bv_arg(&self.m, args[0])
+            && let Some(signed) = self.bvb_to_int_kind(t)
+        {
+            // `bv2nat`: the weighted sum of the bits (z3's bv2int axiom).
+            let bits = self.bvb_blast(st, args[0])?;
+            self.bvb_bits_value(&bits, signed)
         } else if args.iter().any(|&a| bv_arg(&self.m, a)) {
             // A declared function (or record constructor) over bit-vectors:
             // its shadow over the abstract sorts.
@@ -400,6 +453,20 @@ impl Context {
             let a = self.bvb_blast(st, args[1])?;
             let b = self.bvb_blast(st, args[2])?;
             self.bvb_mux(st, c, &a, &b)
+        } else if args.len() == 1 && self.bvb_is_int2bv(t) {
+            // `int2bv n`: fresh bits whose value is `n mod 2^w`.
+            let n = self.bvb_tr(st, args[0])?;
+            let b = self.m.mk_bool_sort();
+            let bits: Vec<AstId> = (0..w).map(|_| self.fresh_const(b)).collect();
+            let val = self.bvb_bits_value(&bits, false);
+            let modulus = self
+                .m
+                .mk_numeral(puremp::Rational::from_integer(super::pow2(w as u32)), true);
+            let r = self.m.mk_mod(n, modulus);
+            let ax = self.m.mk_eq(val, r);
+            st.side.push(ax);
+            st.leaves.push(t);
+            bits
         } else if self.m.is_uninterp_const(t) || (self.bvb_is_uf(st, t) && !args.is_empty()) {
             if self.str_symbolic.contains(&t) || self.is_opaque_fp_marker(t) {
                 return None;

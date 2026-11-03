@@ -9664,6 +9664,20 @@ impl Context {
         }
     }
 
+    /// Is `d` one of the bit-vector division-by-zero functions of
+    /// `:rewriter.hi-div0 false` (`bvudiv0` &c., see
+    /// [`Self::bv_div_underspecified`]), uninterpreted unary functions?
+    fn is_bv_div0_decl(&self, d: AstId) -> bool {
+        self.m.func_decl(d).is_some_and(|fd| {
+            fd.domain.len() == 1
+                && fd.info.family_id == crate::ast::NULL_FAMILY_ID
+                && matches!(
+                    fd.name.as_str(),
+                    Some("bvudiv0" | "bvurem0" | "bvsdiv0" | "bvsrem0" | "bvsmod0")
+                )
+        })
+    }
+
     /// z3's `(eval t)` without model completion: a symbol the model does not
     /// interpret — a declared constant/function, or an unspecified
     /// `bvudiv0`-style division-by-zero function, absent from every assertion —
@@ -33920,7 +33934,9 @@ impl Context {
     /// integer bounded to `[0, 2ⁿ−1]`. This is a sound bijection (the value
     /// exists iff an integer in range does), and it removes the bit-vector so a
     /// goal that was only mixed via `bv2int` becomes pure integer and decidable.
-    fn eliminate_pure_bv2int(&mut self, goal: AstId) -> AstId {
+    /// Also returns each eliminated bit-vector with its integer, whose model
+    /// value gives the bit-vector's.
+    fn eliminate_pure_bv2int(&mut self, goal: AstId) -> (AstId, Vec<(AstId, AstId)>) {
         let sub = self.m.postorder(goal);
         let mut apps: Vec<(AstId, AstId)> = Vec::new(); // (bv2int(a), a)
         let mut impure: BTreeSet<AstId> = BTreeSet::new();
@@ -33977,11 +33993,11 @@ impl Context {
             subst.push((app, n));
         }
         if subst.is_empty() {
-            return goal;
+            return (goal, Vec::new());
         }
         let g2 = crate::rewriter::substitute(&mut self.m, goal, &subst);
         ranges.push(g2);
-        self.m.mk_and(&ranges)
+        (self.m.mk_and(&ranges), assigned.into_iter().collect())
     }
 
     /// Does `branch` (a conjunction) pin some string variable to a concrete
@@ -35684,7 +35700,25 @@ impl Context {
     }
 
     fn decide_inner_core(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
-        let goal = self.eliminate_pure_bv2int(goal);
+        let (goal, eliminated) = self.eliminate_pure_bv2int(goal);
+        let (r, mut model) = self.decide_inner_core_bv2int_free(goal);
+        // An eliminated bit-vector takes the value of its integer.
+        if let Some(md) = model.as_mut() {
+            for (a, n) in eliminated {
+                let w = self.m.bv_sort_width(self.m.get_sort(a)).unwrap_or(0);
+                if let Value::Num(v, _) = md.eval_value(&self.m, n)
+                    && let Some(v) = v.to_integer()
+                {
+                    md.pin_value(a, Value::Bv(v, w));
+                }
+            }
+        }
+        (r, model)
+    }
+
+    /// [`Self::decide_inner_core`] after the `bv2int`-only bit-vectors are
+    /// eliminated.
+    fn decide_inner_core_bv2int_free(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let goal = self.lift_arith_ites(goal);
         // Fold ground algebraic (in)equalities — e.g. `(0.375^¼)² = (0.375²)^¼`
         // (both √0.375, so `true`) — to `true`/`false` via exact algebraic
@@ -36428,6 +36462,10 @@ impl Context {
     /// coincide. Decides `∀x. g(x)=x+1 ∧ g(200)=0`.
     fn free_uf_bv_groups(&self, goal: AstId) -> Vec<Vec<AstId>> {
         let mut groups: BTreeMap<AstId, Vec<AstId>> = BTreeMap::new();
+        // Only the user's functions (and the division-by-zero functions) are
+        // free: a conversion (`int2bv`), an opaque marker or a datatype member
+        // has a meaning of its own.
+        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
         for t in self.m.postorder(goal) {
             let s = self.m.get_sort(t);
             // A bit-vector- or Boolean-sorted uninterpreted application: both can be
@@ -36439,10 +36477,7 @@ impl Context {
                 && (self.m.bv_sort_width(s).is_some() || self.m.is_bool_sort(s))
                 && !self.m.is_select(t)
                 && !self.m.is_store(t)
-                && self
-                    .m
-                    .func_decl(app.decl)
-                    .is_some_and(|fd| fd.info.family_id == crate::ast::NULL_FAMILY_ID)
+                && (user.contains(&app.decl) || self.is_bv_div0_decl(app.decl))
             {
                 let bucket = groups.entry(app.decl).or_default();
                 if !bucket.contains(&t) {
@@ -43071,6 +43106,58 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn bv2nat_eliminated_bit_vector_gets_its_value() {
+        // `y` occurs only under `bv2nat`, replaced by a bounded integer: the
+        // model must give `y` that integer's value.
+        let script = "
+            (declare-const y (_ BitVec 4))
+            (declare-const j Int)
+            (assert (distinct j (bv2nat y)))
+            (assert (= j 0))
+            (check-sat)
+            (eval (bv2nat y))
+            (reset)
+            (declare-const x (_ BitVec 4))
+            (declare-const i Int)
+            (declare-fun f (Int) (_ BitVec 4))
+            (assert (= i (+ 3 (bv2nat (f i)))))
+            (assert (= ((_ int2bv 4) i) #x5))
+            (assert (bvult x (f i)))
+            (check-sat)
+            (eval (= i (+ 3 (bv2nat (f i)))))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_ne!(out[1], "0");
+        assert_eq!(out[2], "sat");
+        assert_eq!(out[3], "true");
+    }
+
+    #[test]
+    fn int2bv_is_not_ackermannized_as_free() {
+        // `int2bv j` has a value (j mod 16), not a fresh bit-vector's.
+        let script = "
+            (declare-const x (_ BitVec 4))
+            (declare-const j Int)
+            (assert (= ((_ int2bv 4) j) (bvand x x)))
+            (assert (= j 3))
+            (check-sat)
+            (eval x)
+            (reset)
+            (declare-const y (_ BitVec 4))
+            (declare-const k Int)
+            (assert (= ((_ int2bv 4) k) y))
+            (assert (= k 18))
+            (assert (= y #x3))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "#x3");
+        assert_ne!(out[2], "sat");
     }
 
     #[test]
