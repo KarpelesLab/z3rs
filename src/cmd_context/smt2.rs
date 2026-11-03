@@ -880,6 +880,7 @@ mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
 mod re_len;
+mod seq_bounded;
 mod seq_nth;
 mod simplify_th;
 mod str_uf;
@@ -24594,6 +24595,12 @@ impl Context {
         {
             return r2;
         }
+        // Sequences of bounded length by their elements.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_seq_bounded()
+        {
+            return r2;
+        }
         r
     }
 
@@ -30471,7 +30478,10 @@ impl Context {
                 });
             }
         } else if !is_forall && self.m.is_and(body) {
-            guards = args;
+            // Nested conjunctions too: `∃v. (lo ≤ v ∧ v < hi) ∧ φ`.
+            for a in args {
+                self.icp_flatten_and(a, &mut guards);
+            }
         } else {
             return None;
         }
@@ -44178,6 +44188,23 @@ mod tests {
              (assert (= (str.len b) 9))(check-sat)")
         .unwrap();
         assert_eq!(out, alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn bounded_sequences_decided_by_their_elements() {
+        let sat = "(declare-const a (Seq Int))(declare-const b (Seq Int))\
+             (declare-const j Int)\
+             (assert (<= 0 (seq.len a)))(assert (<= (seq.len a) 0))\
+             (assert (<= 0 (seq.len b)))(assert (<= (seq.len b) 1))\
+             (assert (>= (seq.nth a (seq.len b)) 1))\
+             (assert (not (exists ((k Int)) (and (and (<= 1 k) (< k 4)) (>= (seq.nth b k) 1)))))\
+             (check-sat)";
+        assert_eq!(run(sat).unwrap(), alloc::vec!["sat"]);
+        let unsat = "(declare-const a (Seq Int))\
+             (assert (<= 1 (seq.len a)))(assert (<= (seq.len a) 2))\
+             (assert (forall ((k Int)) (=> (and (<= 0 k) (< k 2)) (> (seq.nth a k) 3))))\
+             (assert (< (seq.nth a 0) 2))(check-sat)";
+        assert_eq!(run(unsat).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
