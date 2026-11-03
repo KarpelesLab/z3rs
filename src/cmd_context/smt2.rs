@@ -16527,10 +16527,113 @@ impl Context {
             }
             self.str_witness = saved;
         }
+        // Pin the sequences left open to concrete values of their model
+        // lengths and re-decide: z3 always prints concrete sequence values.
+        if let Some(m2) = self.pin_str_witness(&mut md, extra) {
+            return (res, Some(m2));
+        }
         if refuted {
             return (SmtResult::Unknown, None);
         }
         (res, Some(md))
+    }
+
+    /// Complete an open string/sequence model by re-deciding the assertions
+    /// (and `extra`) with every string/sequence variable pinned: the witnessed
+    /// ones to their values, the others to concrete values of the lengths
+    /// `model` gives them (zeros / `A`s first, then distinct contents per
+    /// variable). The first `sat` pinning whose model also validates is
+    /// returned, with the pins as the string witness.
+    fn pin_str_witness(&mut self, model: &mut Model, extra: &[AstId]) -> Option<Model> {
+        const MAX_VARS: usize = 4;
+        const MAX_LEN: usize = 16;
+        let roots: Vec<AstId> = self.assertions.iter().chain(extra).copied().collect();
+        let mut open: Vec<AstId> = Vec::new();
+        for t in self.m.postorder_many(&roots) {
+            if self.is_str_seq_var(t)
+                && !self.str_witness.iter().any(|(w, _)| *w == t)
+                && !open.contains(&t)
+            {
+                open.push(t);
+            }
+        }
+        if open.is_empty() || open.len() > MAX_VARS {
+            return None;
+        }
+        let mut lens: Vec<usize> = Vec::new();
+        for &v in &open {
+            let sort = self.m.get_sort(v);
+            let len_term = if Some(sort) == self.string_sort {
+                let d = self.str_len_fn();
+                self.m.mk_app(d, &[v])
+            } else {
+                let d = self.seq_len_decl_for(sort);
+                self.m.mk_app(d, &[v])
+            };
+            let len = match model.eval_value(&self.m, len_term) {
+                Value::Num(r, _) if r.is_integer() && !r.is_negative() => r.to_i64()? as usize,
+                _ => 0,
+            };
+            if len > MAX_LEN {
+                return None;
+            }
+            lens.push(len);
+        }
+        let saved = self.str_witness.clone();
+        for distinct in [false, true] {
+            let mut pins = saved.clone();
+            for (k, (&v, &len)) in open.iter().zip(&lens).enumerate() {
+                let sort = self.m.get_sort(v);
+                let c = if Some(sort) == self.string_sort {
+                    let ch = if distinct {
+                        'A' as u32 + k as u32
+                    } else {
+                        'A' as u32
+                    };
+                    let text: String = (0..len).filter_map(|_| char::from_u32(ch)).collect();
+                    self.mk_str_lit(&text)
+                } else {
+                    let elem = self.seq_elem_sort(sort)?;
+                    let n = if distinct { k as i64 } else { 0 };
+                    if len == 0 {
+                        self.seq_empty_of(sort)
+                    } else {
+                        let e = if self.m.is_arith_sort(elem) {
+                            let is_int = self.m.is_int_sort(elem);
+                            self.m.mk_numeral(Rational::from(n), is_int)
+                        } else {
+                            let w = self.m.bv_sort_width(elem)?;
+                            self.m.mk_bv(n, w)
+                        };
+                        let es = alloc::vec![e; len];
+                        if len == 1 {
+                            self.seq_op("seq.unit", &es).ok()?
+                        } else {
+                            self.mk_seq(es)
+                        }
+                    }
+                };
+                pins.push((v, c));
+            }
+            let mut assumptions: Vec<AstId> =
+                pins.iter().map(|&(v, c)| self.m.mk_eq(v, c)).collect();
+            assumptions.extend_from_slice(extra);
+            self.str_witness.clear();
+            let (r, m2) = self.check_with(&assumptions);
+            if r == SmtResult::Sat
+                && let Some(mut m2) = m2
+            {
+                self.str_witness = pins;
+                if !self.str_model_refuted(&mut m2, extra) && !self.str_model_incomplete(extra) {
+                    return Some(m2);
+                }
+            }
+            self.str_witness = saved.clone();
+            if open.len() == 1 && lens[0] <= 1 {
+                break; // a single short value: the two candidates coincide
+            }
+        }
+        None
     }
 
     /// Does some assertion (or `extra` assumption) fold to `false` once the
@@ -43013,6 +43116,17 @@ mod tests {
              (eval (= (seq.mapi G 3 b) (seq.++ (seq.unit (seq.len a)) (seq.unit 0))))")
         .unwrap();
         assert_eq!(out, alloc::vec!["sat", "true"]);
+        // Sequences the witness left open are pinned to concrete values, never
+        // printed as `Seq!val!N` placeholders.
+        let out = run(
+            "(declare-const a (Seq Int))(declare-const b (Seq Int))(declare-const i Int)\
+             (assert (<= 2 (seq.len a)))(assert (<= (seq.len a) 3))\
+             (assert (<= 2 (seq.len b)))(assert (<= (seq.len b) 2))\
+             (assert (= a b))(assert (>= (seq.nth a 0) i))(check-sat)(get-value (a b))",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(!out[1].contains("!val!"), "{}", out[1]);
     }
 
     #[test]
