@@ -5,11 +5,12 @@ Random universals over Int and an uninterpreted sort U, with functions f, g, h
 and predicates p, q, plus ground assertions. Flags definite sat/unsat
 disagreements (DISAGREE).
 
-Usage: scripts/fuzz_mbqi.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_mbqi.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     a=["(declare-sort U 0)","(declare-fun f (Int) Int)","(declare-fun g (U) U)","(declare-fun p (Int) Bool)","(declare-fun q (U) Bool)","(declare-fun h (U) Int)"]
     a+=["(declare-const c Int)","(declare-const d Int)","(declare-const u U)","(declare-const v U)"]
@@ -49,7 +50,7 @@ def one(i):
     a,b=run(RS,p),run(Z3,p)
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="DISAGREE": print(k,p)

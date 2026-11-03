@@ -7,11 +7,12 @@ fp.to_ubv) that tie the groups together. Exercises the independent-component
 split of mixed goals. Only definite answers are compared: a DISAGREE is a
 soundness bug.
 
-Usage: scripts/fuzz_mixed_components.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_mixed_components.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 F="(_ FloatingPoint 3 3)"
 def gen(r):
     def bv():
@@ -50,7 +51,7 @@ def one(i):
     a,b=run(RS,p),run(Z3,p)
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="DISAGREE": print(k,p)

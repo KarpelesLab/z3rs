@@ -7,11 +7,12 @@ constraints. Definite verdicts are compared with z3 (DISAGREE = soundness
 bug), and each z3rs `sat` model is replayed through z3 as define-funs
 (BADMODEL = wrong model or a non-literal value).
 
-Usage: scripts/fuzz_word_eq.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_word_eq.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,re,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 VARS=["a","b","c","d","e"]
 def gen(r):
     vs=VARS[:r.randint(2,5)]
@@ -48,7 +49,7 @@ def one(i):
         if z!="sat": return "BADMODEL",p
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k in("DISAGREE","BADMODEL"): print(k,p)

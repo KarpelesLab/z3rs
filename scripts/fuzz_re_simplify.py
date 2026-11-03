@@ -9,11 +9,12 @@ and intersection operands by internal expression ids, which z3rs only
 approximates by creation order). One simplify per script, so earlier
 commands do not perturb z3's ids.
 
-Usage: scripts/fuzz_re_simplify.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_re_simplify.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 HDR="(declare-const a String)\n(declare-const r (RegEx String))\n(declare-const s (RegEx String))\n"
 def gen(r, ground):
     def lit(): return r.choice(['""','"a"','"b"','"ab"','"ba"'])
@@ -51,7 +52,7 @@ def one(i):
     if a==b: return "same",p
     if {a,b}=={"true","false"}: return "WRONG",p
     return "DIFF",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k!="same": print(k,p)

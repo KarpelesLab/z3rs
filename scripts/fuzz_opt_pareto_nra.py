@@ -8,11 +8,12 @@ is compared as a set, since the order points are found in depends on the
 models. A front that differs (FRONT-DIFF) or a definite verdict mismatch
 (DISAGREE) is a bug.
 
-Usage: scripts/fuzz_opt_pareto_nra.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_opt_pareto_nra.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,re,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     k=r.choice([2,3,5])
     src="(set-option :opt.priority pareto)\n(declare-const x Real)\n(declare-const y Real)\n"
@@ -45,7 +46,7 @@ def one(i):
     a,b=front(run(RS,p)),front(run(Z3,p))
     if a is None or b is None: return f"{'none' if a is None else 'ok'}/{'none' if b is None else 'ok'}",p
     return ("same" if a==b else "FRONT-DIFF"),p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="FRONT-DIFF": print(k,p)

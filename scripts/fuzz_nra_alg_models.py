@@ -8,11 +8,12 @@ is replayed into z3: a rational value is a `define-fun`, an irrational
 window around the `:pp.decimal` rendering (precision 30) of the same model.
 z3 re-checks the assertions: anything but `sat` is a wrong model (BADMODEL).
 
-Usage: scripts/fuzz_nra_alg_models.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_nra_alg_models.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,re,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     vs=[f"x{i}" for i in range(r.randint(1,3))]
     def num(): k=r.randint(-3,3); return f"{k}.0" if k>=0 else f"(- {-k}.0)"
@@ -62,7 +63,7 @@ def one(i):
     z=run(Z3,"\n".join(src)+"\n"+"\n".join(asserts)+"\n(check-sat)\n",q).strip()
     tag="alg" if alg else "rat"
     return (f"ok-{tag}" if z=="sat" else "BADMODEL" if z=="unsat" else "z3:"+z[:20]),q
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="BADMODEL" or not k.startswith(("ok","skip")): print(k,p)

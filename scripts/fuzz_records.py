@@ -7,11 +7,12 @@ their selectors (fields as Boolean atoms, bit-vector and integer comparisons,
 `get-value` of every field is checked against the assertions by z3. A
 DISAGREE or BADMODEL is a soundness bug.
 
-Usage: scripts/fuzz_records.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_records.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures,re
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 FIELDS=[("b","Bool"),("v","(_ BitVec 4)"),("n","Int"),("w","(_ BitVec 1)")]
 def gen(r):
     recs=["r","s"]
@@ -53,7 +54,7 @@ def one(i):
         if a0=="sat" and not check_model(src,a,p): return "BADMODEL",p
         return "agree",p
     return f"{a0}/{b0}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k in("DISAGREE","BADMODEL"): print(k,p)

@@ -8,11 +8,12 @@ preprocessing). The pareto front order depends on the solver's models, so each
 pareto answer is instead checked against the front computed by brute force:
 distinct front points, `sat` once per point, then `unsat`.
 
-Usage: scripts/fuzz_opt_priority.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_opt_priority.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,itertools,re,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 c=lambda k: str(k) if k>=0 else f"(- {-k})"
 def gen(r):
     nv=r.randint(2,3); vs=[f"x{i}" for i in range(nv)]
@@ -61,7 +62,7 @@ def one(i):
     pts=[v for vv,v in ra[:exp_n]]
     ok = verds[:len(want)]==want and len(set(pts))==len(pts) and all(q in front for q in pts)
     return ("pareto-valid" if ok else "BAD-pareto"),p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k.startswith(("DIFF","BAD","rs-")): print(k,p)

@@ -8,11 +8,12 @@ plus units, concatenation, seq.len and seq.nth. Definite answers are
 compared (DISAGREE = soundness bug); for a z3rs `sat`, each assertion is
 re-evaluated under the model (`eval`), and a `false` is a BADMODEL.
 
-Usage: scripts/fuzz_seq_hof.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_seq_hof.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 HDR="""(declare-const a (Seq Int))
 (declare-const b (Seq Int))
 (declare-const i Int)
@@ -65,7 +66,7 @@ def one(n):
     if a=="sat" and "false" in out[1:]: return "BADMODEL",pe
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k in("DISAGREE","BADMODEL"): print(k,p)

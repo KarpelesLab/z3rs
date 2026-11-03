@@ -8,12 +8,13 @@ value, with search-dependent endpoints. Flags a definite value that differs
 from z3's, or a value outside the other solver's interval (BAD-*), and verdict
 disagreements.
 
-Usage: scripts/fuzz_opt_lex_unbounded.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_opt_lex_unbounded.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,re,concurrent.futures
 from fractions import Fraction as F
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 c=lambda k: str(k) if k>=0 else f"(- {-k})"
 def gen(r):
     srt=r.choice(["Int","Real"]); vs=["x","y","z"][:r.randint(2,3)]
@@ -75,7 +76,7 @@ def one(i):
             if isinstance(v,F) and (lo=="-oo" or v>=lo) and (hi=="oo" or v<=hi): continue
             return "BAD-outside",p
     return "compatible",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k.startswith(("BAD","VERDICT")): print(k,p)

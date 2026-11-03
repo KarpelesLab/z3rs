@@ -6,11 +6,12 @@ with one objective. Flags sat/unsat disagreements (VERDICT) and objective values
 that differ where both solvers give one (VALUE-DIFF). z3 sometimes prints an
 interval where z3rs gives the exact value; those are counted separately.
 
-Usage: scripts/fuzz_opt_nra.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_opt_nra.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     vs=["x","y"][:r.randint(1,2)]
     num=lambda: (lambda k: f"{k}.0" if k>=0 else f"(- {-k}.0)")(r.randint(-4,4))
@@ -44,7 +45,7 @@ def one(i):
     if "unknown" in la: return "rs-unknown-val",p
     if "interval" in lb or "unknown" in lb: return "z3-interval",p
     return "VALUE-DIFF",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k in ("VERDICT","VALUE-DIFF"): print(k,p)

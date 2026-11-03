@@ -12,7 +12,7 @@ z3rs prints:
   MATCH       the output is byte-for-byte z3's
   DIFF        a complete, valid model that differs from z3's
 
-Usage: scripts/fuzz_get_model.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_get_model.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import concurrent.futures
 import random
@@ -22,6 +22,7 @@ import sys
 from collections import Counter
 
 RS, Z3, N, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 NAMES = ["a", "b", "c", "f", "g", "p", "q", "u"]
 
 
@@ -101,7 +102,7 @@ def one(i):
     return ("MATCH" if a == b else "DIFF"), p
 
 
-res = list(concurrent.futures.ThreadPoolExecutor(8).map(one, range(N)))
+res = list(concurrent.futures.ThreadPoolExecutor(8).map(one, range(OFF, OFF + N)))
 print(Counter(k for k, _ in res))
 for k, p in res:
     if k in ("BADMODEL", "INCOMPLETE"):

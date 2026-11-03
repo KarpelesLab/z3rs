@@ -6,11 +6,12 @@ constants and — under `(check-sat-using qfnra-nlsat)` — `sin`/`cos` of a rea
 `t` used nowhere else (z3's purify-arith turns them into a point of the unit
 circle). Only definite answers are compared: a DISAGREE is a soundness bug.
 
-Usage: scripts/fuzz_root_obj_trig.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_root_obj_trig.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 ROOTS=["(root-obj (+ (^ x 2) (- 2)) 1)","(root-obj (+ (^ x 2) (- 2)) 2)",
        "(root-obj (+ (* 2 (^ x 2)) (- 1)) 2)","(root-obj (+ (^ x 3) (- 2)) 1)",
        "(root-obj (+ (* 4 (^ x 2)) (- 3)) 1)","(root-obj (+ (^ x 2) (- 1)) 2)"]
@@ -40,7 +41,7 @@ def one(i):
     a,b=run(RS,p),run(Z3,p)
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="DISAGREE": print(k,p)

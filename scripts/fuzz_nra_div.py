@@ -5,11 +5,12 @@ Random conjunctions over 2-5 reals mixing products, division by variables or
 products (unspecified at zero, as in SMT-LIB), comparisons and disequalities.
 Only definite sat/unsat answers are compared: a DISAGREE is a soundness bug.
 
-Usage: scripts/fuzz_nra_div.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_nra_div.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     vs=[f"r{i}" for i in range(r.randint(2,5))]
     def num():
@@ -36,7 +37,7 @@ def one(i):
     a,b=run(RS,p),run(Z3,p)
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="DISAGREE": print(k,p)

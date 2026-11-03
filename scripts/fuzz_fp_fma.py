@@ -9,11 +9,12 @@ sb=3 formats are left out: z3 5.3.2 folds concrete fma with its software
 floats, which mis-round there (e.g. (3,3) RNE 1.25*8+0 gives +oo, not 10);
 z3rs agrees with exact rational rounding on all of those.
 
-Usage: scripts/fuzz_fp_fma.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_fp_fma.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 FMTS=[(2,4),(3,4),(2,5),(4,4),(3,5),(4,6),(5,11),(8,24)]
 RMS=["RNE","RNA","RTP","RTN","RTZ"]
 def lit(r,eb,sb):
@@ -38,7 +39,7 @@ def one(i):
     p=f"{OUT}/fma_{i}.smt2"; open(p,"w").write(gen(random.Random(i)))
     a,b=run(RS,p),run(Z3,p)
     return ("same" if a==b else "DIFF"),p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k!="same": print(k,p)

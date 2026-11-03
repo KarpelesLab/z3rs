@@ -7,11 +7,12 @@ terms (integer constants, sequence lengths), over arrays, functions and
 sequences read at `k`, plus ground constraints on the bounds. Definite
 verdicts are compared with z3: a DISAGREE is a soundness bug.
 
-Usage: scripts/fuzz_range_quant.py <z3rs> <z3> <n> <outdir>
+Usage: scripts/fuzz_range_quant.py <z3rs> <z3> <n> <outdir> [seed-offset]
 """
 import random,subprocess,sys,concurrent.futures
 from collections import Counter
 RS,Z3,N,OUT=sys.argv[1],sys.argv[2],int(sys.argv[3]),sys.argv[4]
+OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
 def gen(r):
     def bound(): return r.choice(["0","1","n","m","(seq.len s)","(+ n 1)","(- m 1)"])
     def val(k): return r.choice([f"(select a {k})",f"(f {k})",f"(seq.nth s {k})","n",k,f"(+ {k} 1)"])
@@ -45,7 +46,7 @@ def one(i):
     a,b=run(RS,p),run(Z3,p)
     if a in("sat","unsat") and b in("sat","unsat"): return ("agree" if a==b else "DISAGREE"),p
     return f"{a}/{b}",p
-res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(N)))
+res=list(concurrent.futures.ThreadPoolExecutor(8).map(one,range(OFF, OFF + N)))
 print(Counter(k for k,_ in res))
 for k,p in res:
     if k=="DISAGREE": print(k,p)
