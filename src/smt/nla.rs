@@ -412,6 +412,10 @@ fn tangent_lemmas(
 /// Lemmas per refinement round (z3's `nla::core::done`).
 const MAX_LEMMAS: usize = 10;
 
+/// The integer search work a final check of a round stands for (see
+/// [`NlaSearch::set_work_budget`]).
+const WORK_PER_FINAL_CHECK: u64 = 100;
+
 /// The outcome of one round of [`NlaSearch::step`].
 pub enum NlaStep {
     /// Decided (or given up: `Unknown`).
@@ -477,9 +481,12 @@ impl NlaSearch {
     }
 
     /// Bound the integer search of each round by `budget` (see
-    /// [`SmtCore::set_work_budget`]).
+    /// [`SmtCore::set_work_budget`]), and its final checks by one per
+    /// [`WORK_PER_FINAL_CHECK`] of it.
     pub fn set_work_budget(&mut self, budget: u64) {
         self.core.set_work_budget(budget);
+        self.core
+            .set_round_limit(u32::try_from(budget / WORK_PER_FINAL_CHECK).unwrap_or(u32::MAX));
     }
 
     /// z3's patching (`nla_patcher`) at the level of models: the

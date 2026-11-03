@@ -132,6 +132,9 @@ pub struct SmtCore {
     /// Whether each final check probes for an integer model itself before
     /// asking the search for branches (see [`SmtCore::branch_only`]).
     int_probe: bool,
+    /// The final checks of each [`SmtCore::check`] (see
+    /// [`SmtCore::set_work_budget`]).
+    round_limit: u32,
 }
 
 impl Default for SmtCore {
@@ -164,6 +167,7 @@ impl SmtCore {
             watched: (0, 0, 0),
             work_budget: BB_WORK_BUDGET,
             int_probe: true,
+            round_limit: DPLL_ROUND_LIMIT,
         }
     }
 
@@ -181,6 +185,12 @@ impl SmtCore {
     /// the default: an exhausted budget answers `unknown`.
     pub fn set_work_budget(&mut self, budget: u64) {
         self.work_budget = budget;
+    }
+
+    /// Give up (`unknown`) after `rounds` final checks in a [`SmtCore::check`]
+    /// instead of the default.
+    pub fn set_round_limit(&mut self, rounds: u32) {
+        self.round_limit = rounds;
     }
 
     /// Leave integer branching to the search, as z3's `theory_lra` final
@@ -359,7 +369,7 @@ impl SmtCore {
         let mut budget = self.work_budget;
         loop {
             rounds += 1;
-            if rounds > DPLL_ROUND_LIMIT {
+            if rounds > self.round_limit {
                 return (SmtResult::Unknown, None);
             }
             self.watch_atoms();
