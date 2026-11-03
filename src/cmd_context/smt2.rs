@@ -30460,14 +30460,20 @@ impl Context {
         phi: AstId,
     ) -> Option<bool> {
         use crate::smt::cooper::{self, Atom};
+        let bound: BTreeSet<AstId> = xvars.iter().chain(yvars).copied().collect();
         let cubes = self.body_dnf(phi, true)?;
         let mut dnf: cooper::Dnf = Vec::new();
         for cube in &cubes {
             let mut c: Vec<Atom> = Vec::new();
             for con in cube {
-                // Cooper needs integer coefficients.
+                // Cooper needs integer coefficients, and a term over a binder
+                // other than the binder itself (`q·d`) is no variable of its own.
                 if !con.expr.const_term().is_integer()
-                    || con.expr.terms().any(|(_, k)| !k.is_integer())
+                    || con.expr.terms().any(|(u, k)| {
+                        !k.is_integer()
+                            || (!bound.contains(&u)
+                                && self.m.postorder(u).iter().any(|t| bound.contains(t)))
+                    })
                 {
                     return None;
                 }
@@ -43165,6 +43171,19 @@ mod tests {
             (check-sat)
         ";
         assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn cooper_forall_exists_keeps_products_of_binders() {
+        // `q1·d` mentions the binder: no variable Cooper may treat as free
+        // (it answered `unsat`, though `d = 1` is a model).
+        let script = "
+            (declare-const d Int)
+            (assert (forall ((q1 Int)) (and (exists ((q2 Int)) (> q2 (* 3 d)))
+                (>= q1 (* q1 d)))))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
