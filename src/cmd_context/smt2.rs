@@ -30349,6 +30349,9 @@ impl Context {
                 // the bound is on `v` itself (`e ≤ −|a|ε`). The LP optimum is
                 // linear in a small enough shift δ, so k is the slope at two
                 // such δs (1 when they disagree: the shift crossed a breakpoint).
+                // z3 reads the bounds after `solve-eqs` eliminated the
+                // variables its equalities define.
+                let (cons, obj_lin) = self.opt_solve_linear_eqs(lifted, &cons, &obj_lin);
                 let mut slope = |delta: Rational| -> Option<Rational> {
                     let shifted: Vec<_> =
                         cons.iter()
@@ -30384,6 +30387,240 @@ impl Context {
             }
             OptOutcome::Exhausted => RealOpt::Unknown,
         }
+    }
+
+    /// `cons` and `obj` with the variables z3's `solve-eqs` eliminates
+    /// substituted out. Each top-level linear equality of `goal` offers its
+    /// variables, in the order they are written, as candidates
+    /// (`arith_extract_eq::solve_add`; over the reals any coefficient);
+    /// `solve_eqs::extract_subst` then visits the variables in order of first
+    /// offer, depth first, giving each the first of its equalities whose other
+    /// variables were not visited before it (levels keep the substitution
+    /// acyclic). Rounds repeat on the rewritten equalities while one solves.
+    fn opt_solve_linear_eqs(
+        &self,
+        goal: AstId,
+        cons: &[crate::smt::arith::Constraint],
+        obj: &crate::smt::arith::LinExpr,
+    ) -> (
+        Vec<crate::smt::arith::Constraint>,
+        crate::smt::arith::LinExpr,
+    ) {
+        use crate::smt::arith::{Constraint, LinExpr, Rel};
+        // `simplify` first makes a one-variable bound `a·x ⋈ c` into
+        // `x ⋈ c/a`; a substitution then keeps the scale it finds.
+        let mut cons: Vec<Constraint> = cons
+            .iter()
+            .map(|c| match c.expr.terms().next() {
+                Some((_, a)) if c.rel != Rel::Eq && c.expr.num_vars() == 1 => Constraint {
+                    expr: c.expr.scale(&a.abs().recip()),
+                    rel: c.rel,
+                },
+                _ => c.clone(),
+            })
+            .collect();
+        let mut obj = obj.clone();
+        let mut conj = Vec::new();
+        let mut todo = alloc::vec![goal];
+        while let Some(f) = todo.pop() {
+            if self.m.is_and(f) {
+                todo.extend(self.m.app_args(f).iter().rev());
+            } else {
+                conj.push(f);
+            }
+        }
+        // Each equality as `lin = 0` with its constants in written order.
+        let mut eqs: Vec<(LinExpr, Vec<AstId>)> = Vec::new();
+        for f in conj {
+            if !self.m.is_eq(f) {
+                continue;
+            }
+            let args = self.m.app_args(f).to_vec();
+            if !self.m.is_arith_sort(self.m.get_sort(args[0])) {
+                continue;
+            }
+            let lin = ast_to_lin(&self.m, args[0]).sub(&ast_to_lin(&self.m, args[1]));
+            let mut order: Vec<AstId> = Vec::new();
+            let mut stack: Vec<AstId> = args.iter().rev().copied().collect();
+            while let Some(t) = stack.pop() {
+                if self.m.is_uninterp_const(t) {
+                    if !order.contains(&t) {
+                        order.push(t);
+                    }
+                } else if self.m.app(t).is_some() {
+                    stack.extend(self.m.app_args(t).iter().rev());
+                }
+            }
+            eqs.push((lin, order));
+        }
+        let subst = |e: &LinExpr, v: AstId, def: &LinExpr| -> LinExpr {
+            let c = e.coeff_of(v);
+            if c.is_zero() {
+                return e.clone();
+            }
+            let mut out = e.clone();
+            out.add_scaled(&LinExpr::var(v), &c.neg());
+            out.add_scaled(def, &c);
+            out
+        };
+        // `propagate-values` first substitutes the constants an equality
+        // over one variable pins (`simplify` makes it `x = c`).
+        while let Some(k) = eqs.iter().position(|(lin, _)| lin.num_vars() == 1) {
+            let (lin, _) = eqs.remove(k);
+            let Some((v, a)) = lin.terms().next().map(|(v, a)| (v, a.clone())) else {
+                continue;
+            };
+            let val = LinExpr::constant(lin.const_term().neg().div(&a));
+            cons = cons
+                .into_iter()
+                .map(|c| Constraint {
+                    expr: subst(&c.expr, v, &val),
+                    rel: c.rel,
+                })
+                .filter(|c| !(c.rel == Rel::Eq && c.expr.is_constant()))
+                .collect();
+            obj = subst(&obj, v, &val);
+            eqs = eqs
+                .into_iter()
+                .map(|(lin, order)| (subst(&lin, v, &val), order))
+                .filter(|(lin, _)| !lin.is_constant())
+                .collect();
+        }
+        for _round in 0..20 {
+            // The candidates `(variable, equality)` and the variables in
+            // order of first offer.
+            let mut vars: Vec<AstId> = Vec::new();
+            let mut next: BTreeMap<AstId, Vec<usize>> = BTreeMap::new();
+            for (i, (lin, order)) in eqs.iter().enumerate() {
+                for &v in order {
+                    if lin.coeff_of(v).is_zero() || self.m.is_int_sort(self.m.get_sort(v)) {
+                        continue;
+                    }
+                    if !vars.contains(&v) {
+                        vars.push(v);
+                    }
+                    next.entry(v).or_default().push(i);
+                }
+            }
+            let n = vars.len() as u64;
+            let mut level: BTreeMap<AstId, u64> = BTreeMap::new();
+            let mut chosen: Vec<(AstId, usize)> = Vec::new();
+            let mut init_level = u64::MAX;
+            for &root in &vars {
+                if level.contains_key(&root) {
+                    continue;
+                }
+                init_level -= n + 1;
+                let mut curr = init_level;
+                let mut todo = alloc::vec![root];
+                while let Some(j) = todo.pop() {
+                    if level.contains_key(&j) {
+                        continue;
+                    }
+                    level.insert(j, curr);
+                    curr += 1;
+                    for &i in next.get(&j).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let todo_sz = todo.len();
+                        let mut safe = true;
+                        // Visited last argument first, so the first one is
+                        // explored next.
+                        for &u in eqs[i].1.iter().rev() {
+                            if u == j || eqs[i].0.coeff_of(u).is_zero() || !next.contains_key(&u) {
+                                continue;
+                            }
+                            match level.get(&u) {
+                                Some(&l) if l < curr => {
+                                    safe = false;
+                                    break;
+                                }
+                                Some(_) => {}
+                                None => todo.push(u),
+                            }
+                        }
+                        if safe {
+                            chosen.push((j, i));
+                            break;
+                        }
+                        todo.truncate(todo_sz);
+                    }
+                }
+            }
+            if chosen.is_empty() {
+                break;
+            }
+            // Solve each chosen equality for its variable, then resolve the
+            // definitions against each other (acyclic by the levels).
+            // Each definition with its constants in written order (the
+            // equality's other arguments).
+            let mut defs: Vec<(AstId, LinExpr, Vec<AstId>)> = chosen
+                .iter()
+                .map(|&(v, i)| {
+                    let (lin, order) = &eqs[i];
+                    let a = lin.coeff_of(v);
+                    let mut def = lin.clone();
+                    def.add_scaled(&LinExpr::var(v), &a.neg());
+                    let order = order.iter().copied().filter(|&u| u != v).collect();
+                    (v, def.scale(&a.recip().neg()), order)
+                })
+                .collect();
+            // A rewritten sum lists its constants where the substituted one
+            // stood, merged by first occurrence.
+            let expand = |order: &[AstId], v: AstId, with: &[AstId]| -> Vec<AstId> {
+                let mut out: Vec<AstId> = Vec::new();
+                for &u in order {
+                    let part: &[AstId] = if u == v {
+                        with
+                    } else {
+                        core::slice::from_ref(&u)
+                    };
+                    for &w in part {
+                        if !out.contains(&w) {
+                            out.push(w);
+                        }
+                    }
+                }
+                out
+            };
+            for _ in 0..defs.len() {
+                let snapshot = defs.clone();
+                for (_, d, o) in defs.iter_mut() {
+                    for (v, dv, ov) in &snapshot {
+                        if !d.coeff_of(*v).is_zero() {
+                            *d = subst(d, *v, dv);
+                            *o = expand(o, *v, ov);
+                        }
+                    }
+                }
+            }
+            let apply = |e: &LinExpr| defs.iter().fold(e.clone(), |e, (v, d, _)| subst(&e, *v, d));
+            let apply_order = |lin: &LinExpr, order: Vec<AstId>| {
+                defs.iter().fold(order, |o, (v, _, ov)| {
+                    if lin.coeff_of(*v).is_zero() {
+                        o
+                    } else {
+                        expand(&o, *v, ov)
+                    }
+                })
+            };
+            cons = cons
+                .into_iter()
+                .map(|c| Constraint {
+                    expr: apply(&c.expr),
+                    rel: c.rel,
+                })
+                .filter(|c| !(c.rel == Rel::Eq && c.expr.is_constant()))
+                .collect();
+            obj = apply(&obj);
+            eqs = eqs
+                .into_iter()
+                .map(|(lin, order)| {
+                    let order = apply_order(&lin, order);
+                    (apply(&lin), order)
+                })
+                .filter(|(lin, _)| !lin.is_constant())
+                .collect();
+        }
+        (cons, obj)
     }
 
     /// The bound constraint `obj ≥ k` (maximize) or `obj ≤ k` (minimize).
@@ -50269,6 +50506,44 @@ mod tests {
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "sat");
         assert!(out[2].contains("(n 0)") || out[2].contains("(n 1)") || out[2].contains("(n 2)"));
+    }
+
+    #[test]
+    fn open_linear_optimum_scales_epsilon_after_solve_eqs() {
+        // solve-eqs eliminates y (the first constant of the sum): x > 3 is
+        // then a bound on x and y - x = 4 - 3x ends at -5 - 3ε.
+        let first_of_sum = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (assert (= (+ (+ y x) x) 4.0))
+            (assert (< (- (+ y 1.0) x) (- 4.0)))
+            (maximize (- y x))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(first_of_sum).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((- y x) (+ (- 5.0) (* (- 3.0) epsilon)))\n)"
+        );
+        // z := (x - y + 5)/2 turns the bound z < 1 into the row
+        // x/2 - y/2 < -3/2, whose ε keeps that scale.
+        let kept_scale = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (declare-const z Real)
+            (assert (= (+ (* (- 2.0) z) x (* (- 1.0) y)) (- 5.0)))
+            (assert (<= (+ (* (- 2.0) z) (* (- 2.0) y)) 2.0))
+            (assert (< (* 2.0 z) 2.0))
+            (maximize (+ (* (- 2.0) z) (* (- 3.0) y)))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(kept_scale).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((+ (* (- 2.0) z) (* (- 3.0) y)) (+ 4.0 (* (- 1.0) epsilon)))\n)"
+        );
     }
 
     #[test]
