@@ -3309,6 +3309,12 @@ struct Context {
     /// mentions any is answered `unknown` (their word semantics aren't solved),
     /// keeping every definite verdict sound.
     str_symbolic: BTreeSet<AstId>,
+    /// The square roots `r` of `(^ b 1/2)` whose base `b` may be negative
+    /// (opaque in `str_symbolic`), by root: `r → b` (see
+    /// [`Context::decide_sqrt_roots`]).
+    sqrt_roots: BTreeMap<AstId, AstId>,
+    /// The definitions of those roots (see [`Context::sqrt_piece`]).
+    sqrt_defs: BTreeSet<AstId>,
     /// The concrete `(string var → literal)` assignment from the last successful
     /// string-witness search, so `get-value`/`get-model` report a concrete string
     /// (e.g. `"aaa"`) rather than an uninterpreted placeholder.
@@ -4503,6 +4509,8 @@ impl Context {
             str_uf_active: false,
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
+            sqrt_roots: BTreeMap::new(),
+            sqrt_defs: BTreeSet::new(),
             str_witness: Vec::new(),
             str_inlined: Vec::new(),
             str_pred_len: Vec::new(),
@@ -6611,14 +6619,19 @@ impl Context {
                 // A possibly negative base: z3 gives the root no value there, so
                 // `r` stays opaque for `sat` (only refutations are trusted).
                 let bge = self.m.mk_ge(b, zero);
-                ctx.defs.push(self.m.mk_implies(bge, body));
+                let def = self.m.mk_implies(bge, body);
+                ctx.defs.push(def);
                 self.str_symbolic.insert(r);
+                self.sqrt_roots.insert(r, b);
+                self.sqrt_defs.insert(def);
             }
         }
         for (&b2, &r2) in &ctx.sqrt.clone() {
             let same = self.m.mk_eq(b, b2);
             let eqr = self.m.mk_eq(r, r2);
-            ctx.defs.push(self.m.mk_implies(same, eqr));
+            let def = self.m.mk_implies(same, eqr);
+            ctx.defs.push(def);
+            self.sqrt_defs.insert(def);
         }
         ctx.sqrt.insert(b, r);
         Some(r)
@@ -37141,6 +37154,59 @@ impl Context {
         crate::rewriter::simplify(&mut self.m, g)
     }
 
+    /// Decide a goal whose only opaque terms are square roots of possibly
+    /// negative bases (see [`Context::sqrt_piece`]). z3 leaves `(^ b 1/2)`
+    /// uninterpreted at a negative `b`: a refutation of the goal with the
+    /// roots as plain variables (their definitions only constrain
+    /// nonnegative bases, consistently across equal bases) is an `unsat`. z3
+    /// answers `unknown` rather than `sat` while such a root remains in the
+    /// goal; a `sat` is reported only when the goal does not mention the
+    /// roots outside their definitions, with a model whose bases are
+    /// nonnegative (each root then the square root its definition pins).
+    /// `None` when neither settles it.
+    fn decide_sqrt_roots(&mut self, goal: AstId) -> Option<(SmtResult, Option<Model>)> {
+        let mut roots = Vec::new();
+        for t in self.m.postorder(goal) {
+            if self.str_symbolic.contains(&t) {
+                roots.push((t, *self.sqrt_roots.get(&t)?));
+            } else if self.is_opaque_fp_marker(t)
+                || self.str_op_marker(t)
+                || (self.m.is_app(t) && self.seqop_ops.contains_key(&self.m.app_decl(t)))
+            {
+                return None;
+            }
+        }
+        if roots.is_empty() {
+            return None;
+        }
+        for &(r, _) in &roots {
+            self.str_symbolic.remove(&r);
+        }
+        let zero = self
+            .m
+            .mk_numeral(Rational::from_integer(Int::from(0)), false);
+        let mut strong = alloc::vec![goal];
+        for &(_, b) in &roots {
+            strong.push(self.m.mk_ge(b, zero));
+        }
+        let strong = self.m.mk_and(&strong);
+        let mut conj = Vec::new();
+        self.icp_flatten_and(goal, &mut conj);
+        let used = conj.iter().any(|&c| {
+            !self.sqrt_defs.contains(&c) && roots.iter().any(|&(r, _)| self.term_contains(c, r))
+        });
+        let mut out = None;
+        if !used && let (SmtResult::Sat, m) = self.decide_inner(strong) {
+            out = Some((SmtResult::Sat, m));
+        } else if let (SmtResult::Unsat, _) = self.decide_inner(goal) {
+            out = Some((SmtResult::Unsat, None));
+        }
+        for &(r, _) in &roots {
+            self.str_symbolic.insert(r);
+        }
+        out
+    }
+
     fn decide_inner(&mut self, goal: AstId) -> (SmtResult, Option<Model>) {
         let mark = self.fp_fold_pins.len();
         let (res, model) = self.decide_inner_core(goal);
@@ -37412,6 +37478,9 @@ impl Context {
                     || (self.m.is_app(*t) && self.seqop_ops.contains_key(&self.m.app_decl(*t)))
             });
         if has_symbolic_str {
+            if let Some(r) = self.decide_sqrt_roots(goal) {
+                return r;
+            }
             // Comparisons over ground transcendentals are decided outright: an
             // equivalent goal with fewer opaque terms.
             if let Some(g2) = self.fold_ground_transcendentals(goal) {
@@ -47442,6 +47511,35 @@ mod tests {
         assert_eq!(
             run("(declare-const x String)\
                  (assert (= (str.++ \"a\" x \"c\") \"abc\"))(assert (not (= x \"b\")))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+    }
+
+    #[test]
+    fn square_roots_of_possibly_negative_bases() {
+        // √(y+x) ≤ −1 with y·x² ≥ √3 > 0: refuted whatever value the root
+        // takes at a negative base.
+        assert_eq!(
+            run("(declare-const x Real)(declare-const y Real)\
+                 (assert (>= x 0.0))(assert (>= y (- 1.0)))\
+                 (assert (<= (^ 3.0 0.5) (* y (* x x))))\
+                 (assert (>= (- 1.0) (^ (+ y x) 0.5)))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A root at a forced negative base has no value z3 commits to.
+        assert_eq!(
+            run("(declare-const x Real)(assert (= x (- 1.0)))\
+                 (assert (= (^ x 0.5) 5.0))(check-sat)")
+            .unwrap(),
+            alloc::vec!["unknown"]
+        );
+        // ... but it is a function of its base.
+        assert_eq!(
+            run("(declare-const x Real)(declare-const y Real)\
+                 (assert (= x (- 1.0)))(assert (= y (- 1.0)))\
+                 (assert (= (^ x 0.5) 5.0))(assert (= (^ y 0.5) 6.0))(check-sat)")
             .unwrap(),
             alloc::vec!["unsat"]
         );
