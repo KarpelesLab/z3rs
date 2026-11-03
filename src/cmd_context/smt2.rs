@@ -166,6 +166,43 @@ struct MbqiState {
 /// A proven bracket `[lo, hi]` on an objective value (`None` = infinite).
 type Bracket = (Option<Rational>, Option<Rational>);
 
+/// z3's `opt::geometric_step`: the step of a one-sided search, doubled only
+/// after one more update at the current size than the last time.
+struct GeometricStep {
+    steps: u32,
+    incs: u32,
+    value: Rational,
+}
+
+impl GeometricStep {
+    /// A step of 1.
+    fn new() -> Self {
+        GeometricStep {
+            steps: 0,
+            incs: 0,
+            value: Rational::from_integer(Int::from(1)),
+        }
+    }
+
+    /// Record a successful step; `can_increase = false` resets it to 1.
+    fn update(&mut self, can_increase: bool) {
+        if !can_increase {
+            self.value = Rational::from_integer(Int::from(1));
+        } else if self.steps > self.incs {
+            self.value = self.value.mul(&Rational::from_integer(Int::from(2)));
+            self.incs += 1;
+            self.steps = 0;
+        } else {
+            self.steps += 1;
+        }
+    }
+
+    /// Back to a step of 1.
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
 /// The result of optimizing a real-valued objective.
 enum RealOpt {
     /// A proven-exact attained optimum.
@@ -28521,11 +28558,7 @@ impl Context {
             let is_int = self.m.is_int_sort(fsort);
             // Search over g = ±f so that larger is better.
             let g = if fmax { f } else { self.m.mk_uminus(f) };
-            let start = match model.as_mut().map(|m| m.eval(&self.m, g)) {
-                Some(Value::Num(r, _)) => Some(r),
-                _ => None,
-            };
-            match self.limit_after_unbounded(u, umax, g, is_int, start, fixed) {
+            match self.limit_after_unbounded(u, umax, g, is_int, fixed) {
                 Ok(l) => {
                     values[j] = render_rational(&if fmax { l.clone() } else { l.neg() });
                     let lv = self.m.mk_numeral(l, is_int);
@@ -28562,93 +28595,141 @@ impl Context {
     /// assertions plus `fixed`; `g` (to maximize) then takes the value
     /// `L = lim_{c→∞} sup { g : u beyond c }`. For a threshold `t`: if `g ≥ t`
     /// keeps `u` unbounded then `t ≤ L`; if `g > t` leaves `u` bounded or
-    /// infeasible then `L ≤ t`. A threshold with both is `L` (`Ok`). Thresholds
-    /// come from model values and the optimum of `g` above the last one, each
-    /// checked by `u`'s own search; failing that, `Err` holds the proven
-    /// bracket `[lo, hi]` (`None` = infinite).
+    /// infeasible then `L ≤ t`. A threshold with both is `L` (`Ok`).
+    ///
+    /// The trials follow z3's: a pending candidate (a witness model's value of
+    /// `g`, or the optimum of `g` under the last trial when larger) inside the
+    /// bracket first; otherwise a geometric step (z3's `geometric_step`) away
+    /// from the one finite end, a strict `g > lo` probe for a real objective
+    /// whose `lo` is not yet known to be exceeded, or the midpoint. A limit of
+    /// ±oo is never certified: 16 rounds with an infinite end stop the search,
+    /// as does z3's round budget (`opt.optsmt_bisect_rounds`). Failing a
+    /// decision, `Err` holds the proven bracket `[lo, hi]` (`None` = infinite).
     fn limit_after_unbounded(
         &mut self,
         u: AstId,
         umax: bool,
         g: AstId,
         is_int: bool,
-        start: Option<Rational>,
         fixed: &[AstId],
     ) -> Result<Rational, Box<Bracket>> {
-        const ROUNDS: usize = 32;
         const MAX_ONE_SIDED: usize = 16;
-        let (mut lo, mut hi): (Option<Rational>, Option<Rational>) = (None, None);
-        let mut cand = start;
-        let mut step = Rational::from_integer(Int::from(1));
+        let rounds = match self.params.get("opt.optsmt_bisect_rounds") {
+            Some(crate::util::ParamValue::UInt(n)) => *n as usize,
+            _ => 64,
+        };
+        let one = Rational::from_integer(Int::from(1));
         let two = Rational::from_integer(Int::from(2));
+        let (mut lo, mut hi): (Option<Rational>, Option<Rational>) = (None, None);
+        let mut cand: Option<Rational> = None;
+        let mut above_lo_feasible = false;
+        let mut has_best = false;
+        let mut step = GeometricStep::new();
         let mut one_sided = 0;
-        for _ in 0..ROUNDS {
-            // A limit of ±oo is never certified: stop a one-sided climb.
-            if (lo.is_none() || hi.is_none()) && lo.is_some() != hi.is_some() {
+        for _ in 0..rounds {
+            if is_int
+                && let (Some(l), Some(h)) = (&lo, &hi)
+                && *h <= l.add(&one)
+            {
+                return Ok(l.clone());
+            }
+            if has_best && (lo.is_none() || hi.is_none()) {
                 one_sided += 1;
                 if one_sided > MAX_ONE_SIDED {
                     break;
                 }
             }
-            if is_int
-                && let (Some(l), Some(h)) = (&lo, &hi)
-                && *h <= l.add(&Rational::from_integer(Int::from(1)))
-            {
-                return Ok(l.clone());
-            }
             let inside = |c: &Rational| {
                 lo.as_ref().is_none_or(|l| c > l) && hi.as_ref().is_none_or(|h| c < h)
             };
-            let mut t = match cand.take().filter(inside) {
-                Some(c) => c,
-                None => match (&lo, &hi) {
-                    (Some(l), Some(h)) => l.add(h).div(&two),
-                    (Some(l), None) => l.add(&step),
-                    (None, Some(h)) => h.sub(&step),
-                    (None, None) => break,
-                },
+            // `(threshold, strict?)`; `None` for the initial trial-free round.
+            let trial = match cand.take().filter(inside) {
+                Some(c) => Some((c, false)),
+                None if !has_best => None,
+                None => Some(match (&lo, &hi) {
+                    // z3 reads the rational part of an infinite `hi`: 0.
+                    (None, h) => (h.clone().unwrap_or_default().sub(&step.value), false),
+                    (Some(l), None) => (l.add(&step.value), false),
+                    (Some(l), Some(_)) if !is_int && !above_lo_feasible => (l.clone(), true),
+                    (Some(l), Some(h)) => {
+                        let mid = l.add(h).div(&two);
+                        (
+                            if is_int {
+                                Rational::from_integer(mid.floor())
+                            } else {
+                                mid
+                            },
+                            false,
+                        )
+                    }
+                }),
             };
-            if is_int {
-                t = Rational::from_integer(t.ceil());
-                if !inside(&t) {
-                    break;
+            let trial = trial.map(|(t, strict)| {
+                if is_int {
+                    (Rational::from_integer(t.ceil()), strict)
+                } else {
+                    (t, strict)
                 }
-            }
-            let tv = self.m.mk_numeral(t.clone(), is_int);
-            let ge = self.m.mk_ge(g, tv);
+            });
             let mut ex = fixed.to_vec();
-            ex.push(ge);
-            match self.opt_unbounded(u, umax, &ex) {
-                None => break,
-                Some(false) => {
-                    hi = Some(t);
-                    step = Rational::from_integer(Int::from(1));
+            if let Some((t, strict)) = &trial {
+                let tv = self.m.mk_numeral(t.clone(), is_int);
+                ex.push(if *strict {
+                    self.m.mk_gt(g, tv)
+                } else {
+                    self.m.mk_ge(g, tv)
+                });
+            }
+            let Some((reaches, witness)) = self.opt_unbounded_witness(u, umax, &ex) else {
+                break;
+            };
+            if reaches {
+                has_best = true;
+                match &trial {
+                    Some((_, true)) => above_lo_feasible = true,
+                    Some((t, false)) => {
+                        lo = Some(t.clone());
+                        above_lo_feasible = false;
+                    }
+                    None => {}
                 }
-                Some(true) => {
-                    lo = Some(t.clone());
-                    step = step.mul(&two);
-                    let gt = self.m.mk_gt(g, tv);
-                    let mut ex = fixed.to_vec();
-                    ex.push(gt);
-                    match self.opt_unbounded(u, umax, &ex) {
-                        None => break,
-                        Some(false) => return Ok(t),
-                        Some(true) => {
-                            // The (relaxed) optimum of g above t is the next
-                            // threshold to check (only a hint).
-                            cand = match self.lp_relaxation(g, true, &ex) {
-                                Some(OptOutcome::Attained(r) | OptOutcome::Bound(r)) => {
-                                    Some(if is_int {
-                                        Rational::from_integer(r.floor())
-                                    } else {
-                                        r
-                                    })
-                                }
-                                _ => None,
-                            };
-                        }
+                let above_lo = |v: &Rational| lo.as_ref().is_none_or(|l| v > l);
+                if let Some(Value::Num(v, _)) = witness.map(|mut m| m.eval(&self.m, g))
+                    && above_lo(&v)
+                {
+                    cand = Some(v);
+                }
+                // The largest value of g the arithmetic solver sees under
+                // the trial is only a threshold to check. Past linear
+                // problems, a real objective's supremum stands in for it.
+                let hint = match self.lp_relaxation(g, true, &ex) {
+                    Some(OptOutcome::Attained(r) | OptOutcome::Bound(r)) => Some(r),
+                    None if !is_int => match self.real_optimize(g, true, &ex) {
+                        RealOpt::Attained(r) | RealOpt::Supremum(r, _) => Some(r),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(r) = hint {
+                    let r = if is_int {
+                        Rational::from_integer(r.floor())
+                    } else {
+                        r
+                    };
+                    if above_lo(&r) && cand.as_ref().is_none_or(|c| r > *c) {
+                        cand = Some(r);
                     }
                 }
+                step.update(true);
+            } else {
+                let Some((t, strict)) = trial else {
+                    break;
+                };
+                if strict {
+                    return Ok(t);
+                }
+                hi = Some(t);
+                step.reset();
             }
         }
         Err(Box::new((lo, hi)))
@@ -28693,14 +28774,24 @@ impl Context {
     /// `Some(false)` when it is bounded or `fixed` is infeasible, `None` when
     /// that is not determined.
     fn opt_unbounded(&mut self, u: AstId, umax: bool, fixed: &[AstId]) -> Option<bool> {
+        self.opt_unbounded_witness(u, umax, fixed).map(|(r, _)| r)
+    }
+
+    /// [`Self::opt_unbounded`], with the satisfying model found on the way.
+    fn opt_unbounded_witness(
+        &mut self,
+        u: AstId,
+        umax: bool,
+        fixed: &[AstId],
+    ) -> Option<(bool, Option<Model>)> {
         let (res, mut model) = self.check_with(fixed);
         match res {
-            SmtResult::Unsat => return Some(false),
+            SmtResult::Unsat => return Some((false, None)),
             SmtResult::Sat => {}
             _ => return None,
         }
         if let Some(r) = self.lp_relaxation(u, umax, fixed) {
-            return Some(matches!(r, OptOutcome::Unbounded));
+            return Some((matches!(r, OptOutcome::Unbounded), model));
         }
         let usort = self.m.get_sort(u);
         if self.m.is_int_sort(usort) {
@@ -28709,17 +28800,17 @@ impl Context {
                 _ => return None,
             };
             return match self.opt_int_search(u, umax, v0, fixed).0 {
-                OptResult::Unbounded => Some(true),
-                OptResult::Optimum(_) => Some(false),
+                OptResult::Unbounded => Some((true, model)),
+                OptResult::Optimum(_) => Some((false, None)),
                 OptResult::Unknown => None,
             };
         }
         match self.real_optimize(u, umax, fixed) {
-            RealOpt::Unbounded => Some(true),
-            RealOpt::Attained(_) | RealOpt::Supremum(..) => Some(false),
+            RealOpt::Unbounded => Some((true, model)),
+            RealOpt::Attained(_) | RealOpt::Supremum(..) => Some((false, None)),
             RealOpt::Unknown => match self.nra_optimize(u, umax, fixed)? {
-                NraOpt::Unbounded => Some(true),
-                _ => Some(false),
+                NraOpt::Unbounded => Some((true, model)),
+                _ => Some((false, None)),
             },
         }
     }
