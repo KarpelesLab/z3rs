@@ -4781,7 +4781,7 @@ impl Context {
                 let mut id = id;
                 if !self.str_witness.is_empty() {
                     let sub = self.str_witness.clone();
-                    id = crate::rewriter::substitute(&mut self.m, id, &sub);
+                    id = self.subst_seq(id, &sub);
                     let mut memo = BTreeMap::new();
                     id = self.refold_str_markers(id, &mut memo);
                     id = crate::rewriter::simplify(&mut self.m, id);
@@ -5401,11 +5401,8 @@ impl Context {
                 {
                     model = Some(md);
                 }
-                if res == SmtResult::Sat
-                    && let Some(md) = model.as_mut()
-                {
-                    self.complete_str_witness(md);
-                }
+                let extra: Vec<AstId> = self.last_assumptions.iter().map(|&(_, t)| t).collect();
+                let (res, model) = self.finish_str_model(res, model, &extra);
                 self.check_sat_done = true;
                 if !plain {
                     self.inc_mode = true;
@@ -5429,6 +5426,7 @@ impl Context {
                     terms.push(id);
                 }
                 self.reason_unknown = None;
+                self.str_witness.clear();
                 self.check_sat_done = true;
                 self.inc_mode = true;
                 // With objectives, z3 optimizes under the assumptions.
@@ -5437,6 +5435,7 @@ impl Context {
                 } else {
                     self.optimize(&terms)
                 };
+                let (res, model) = self.finish_str_model(res, model, &terms);
                 self.last_model = model;
                 self.last_verdict = Some(res);
                 Ok(Some(verdict_word(res).to_string()))
@@ -14697,6 +14696,79 @@ impl Context {
         ax
     }
 
+    /// [`crate::rewriter::substitute`] that also reaches the element lists of
+    /// concrete sequences: `seq.unit (seq.len a)` is a constant whose element
+    /// (held in `seq_of`, not as a subterm) mentions `a`, which a plain
+    /// substitution would leave stale — a witness for `a` then checked, and
+    /// printed, the sequence against `a`'s old value.
+    fn subst_seq(&mut self, t: AstId, subst: &[(AstId, AstId)]) -> AstId {
+        if subst.is_empty() || self.seq_of.is_empty() {
+            return crate::rewriter::substitute(&mut self.m, t, subst);
+        }
+        let keys: BTreeSet<AstId> = subst.iter().map(|p| p.0).collect();
+        let mut memo: BTreeMap<AstId, Option<AstId>> = BTreeMap::new();
+        let mut all = subst.to_vec();
+        for u in self.m.postorder(t) {
+            if self.seq_of.contains_key(&u)
+                && !keys.contains(&u)
+                && let Some(n) = self.seq_leaf_subst(u, &keys, subst, &mut memo)
+            {
+                all.push((u, n));
+            }
+        }
+        crate::rewriter::substitute(&mut self.m, t, &all)
+    }
+
+    /// The concrete sequence `leaf` with `subst` applied to its elements (and,
+    /// recursively, to the sequences among them), each changed element
+    /// re-folded; `None` when unchanged.
+    fn seq_leaf_subst(
+        &mut self,
+        leaf: AstId,
+        keys: &BTreeSet<AstId>,
+        subst: &[(AstId, AstId)],
+        memo: &mut BTreeMap<AstId, Option<AstId>>,
+    ) -> Option<AstId> {
+        if let Some(&r) = memo.get(&leaf) {
+            return r;
+        }
+        let elems = self.seq_of.get(&leaf).cloned().unwrap_or_default();
+        let mut changed = false;
+        let mut out = Vec::with_capacity(elems.len());
+        for e in elems {
+            let mut all = subst.to_vec();
+            for u in self.m.postorder(e) {
+                if self.seq_of.contains_key(&u)
+                    && !keys.contains(&u)
+                    && let Some(n) = self.seq_leaf_subst(u, keys, subst, memo)
+                {
+                    all.push((u, n));
+                }
+            }
+            let e2 = crate::rewriter::substitute(&mut self.m, e, &all);
+            if e2 == e {
+                out.push(e);
+                continue;
+            }
+            // Fold the element's string/sequence operations over the new values
+            // (`seq.len a` with `a` now concrete is a number).
+            let mut rmemo = BTreeMap::new();
+            let e2 = self.refold_str_markers(e2, &mut rmemo);
+            let e2 = crate::rewriter::simplify(&mut self.m, e2);
+            changed = true;
+            out.push(e2);
+        }
+        let r = if !changed {
+            None
+        } else if out.len() == 1 {
+            self.seq_op("seq.unit", &out).ok()
+        } else {
+            Some(self.mk_seq(out))
+        };
+        memo.insert(leaf, r);
+        r
+    }
+
     /// Re-fold symbolic string markers whose arguments have become concrete
     /// (after substituting string variables by literals): a marker `op(a,…)`
     /// with literal args is replaced by `string_op(op, args)` (which folds to a
@@ -14763,6 +14835,31 @@ impl Context {
                 }
             } else {
                 self.m.mk_app(decl, &args)
+            }
+        } else if let Some(elems) = self.seq_of.get(&t).cloned()
+            && elems
+                .iter()
+                .any(|&e| self.m.is_app(e) && !self.m.app_args(e).is_empty())
+        {
+            // A concrete sequence's elements are not subterms: fold them too
+            // (`seq.unit (seq.len s)` once `s` is concrete).
+            let out: Vec<AstId> = elems
+                .iter()
+                .map(|&e| {
+                    let r = self.refold_str_markers(e, memo);
+                    if r == e {
+                        e
+                    } else {
+                        crate::rewriter::simplify(&mut self.m, r)
+                    }
+                })
+                .collect();
+            if out == elems {
+                t
+            } else if out.len() == 1 {
+                self.seq_op("seq.unit", &out).unwrap_or(t)
+            } else {
+                self.mk_seq(out)
             }
         } else {
             t
@@ -15897,7 +15994,7 @@ impl Context {
                     subst.push((*dv, sv));
                 }
             }
-            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g1 = self.subst_seq(goal, &subst);
             let mut memo = BTreeMap::new();
             let g2 = self.refold_str_markers(g1, &mut memo);
             let clean = !self.m.postorder(g2).iter().any(|&t| {
@@ -15936,6 +16033,8 @@ impl Context {
                 let g3 = self.lift_term_ites(g3);
                 let (res, m) = check_model(&self.m, g3);
                 if res == SmtResult::Sat {
+                    // The model's other constants were chosen for these values.
+                    self.str_witness = subst;
                     // `check_model` may report `sat` without a model when the goal
                     // folded to a ground truth; the assignment still exists.
                     return Some(m.unwrap_or_else(|| Model::from_bv(BTreeMap::new())));
@@ -15989,7 +16088,7 @@ impl Context {
             let lit = lits.iter().find(|&&l| model.terms_equal(&self.m, v, l))?;
             subst.push((v, *lit));
         }
-        let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g1 = self.subst_seq(goal, &subst);
         let mut memo = BTreeMap::new();
         let g2 = self.refold_str_markers(g1, &mut memo);
         let clean = !self
@@ -16019,7 +16118,7 @@ impl Context {
     /// Substitute `subst` into `t` and fold the string/sequence operations
     /// over the resulting concrete values (as `eval` and `get-value` do).
     fn str_concretize(&mut self, t: AstId, subst: &[(AstId, AstId)]) -> AstId {
-        let t = crate::rewriter::substitute(&mut self.m, t, subst);
+        let t = self.subst_seq(t, subst);
         let mut memo = BTreeMap::new();
         let t = self.refold_str_markers(t, &mut memo);
         crate::rewriter::simplify(&mut self.m, t)
@@ -16029,14 +16128,15 @@ impl Context {
     /// the Boolean/numeric/bit-vector constants the assertions mention and fold
     /// the string/sequence operations over them, so `eval`/`get-value` see the
     /// concrete value (`str.at "ab" i` with `i = 1` is `"b"`). Other terms are
-    /// returned unchanged.
+    /// returned unchanged, but for their out-of-bounds `seq.nth` elements (see
+    /// [`Self::unify_nth_oob`]).
     fn str_ground(&mut self, model: &mut Model, t: AstId) -> AstId {
         let stringy = self.m.postorder(t).iter().any(|&u| {
             let s = self.m.get_sort(u);
             Some(s) == self.string_sort || self.seq_elem_sort(s).is_some()
         });
         if !stringy {
-            return t;
+            return self.unify_nth_oob(model, t);
         }
         let mentioned: BTreeSet<AstId> = self
             .asserted_names()
@@ -16046,7 +16146,64 @@ impl Context {
         let mut csub = self.model_const_subst(model);
         csub.retain(|d, _| mentioned.contains(d));
         let g = self.subst_all(t, &csub, &BTreeMap::new());
-        self.str_concretize(g, &[])
+        let g = self.str_concretize(g, &[]);
+        self.unify_nth_oob(model, g)
+    }
+
+    /// An out-of-bounds `seq.nth` of a concrete sequence is a free element per
+    /// (sequence term, index), but z3's `seq.nth_u` is a function of the
+    /// sequence's *value*: re-target each such element in `t` to the oldest one
+    /// (the one the solver constrained) of a sequence with the same value under
+    /// `model`, at the same index.
+    fn unify_nth_oob(&mut self, model: &mut Model, t: AstId) -> AstId {
+        if self.seq_nth_oob.is_empty() {
+            return t;
+        }
+        let consts: BTreeSet<AstId> = self.m.postorder(t).into_iter().collect();
+        let entries: Vec<((AstId, i64), AstId)> =
+            self.seq_nth_oob.iter().map(|(&k, &c)| (k, c)).collect();
+        if !entries.iter().any(|(_, c)| consts.contains(c)) {
+            return t;
+        }
+        let mut values: BTreeMap<AstId, Option<Vec<AstId>>> = BTreeMap::new();
+        let mut value_of = |me: &mut Self, model: &mut Model, s: AstId| -> Option<Vec<AstId>> {
+            if let Some(v) = values.get(&s) {
+                return v.clone();
+            }
+            let v = me.seq_of.get(&s).cloned().and_then(|es| {
+                es.iter()
+                    .map(|&e| me.eval_value_term(model, e))
+                    .collect::<Option<Vec<AstId>>>()
+            });
+            values.insert(s, v.clone());
+            v
+        };
+        let mut subst: Vec<(AstId, AstId)> = Vec::new();
+        for &((s, i), c) in &entries {
+            if !consts.contains(&c) {
+                continue;
+            }
+            let Some(vs) = value_of(self, model, s) else {
+                continue;
+            };
+            let mut best: Option<AstId> = None;
+            for &((s2, i2), c2) in &entries {
+                if i2 == i
+                    && c2 < c
+                    && best.is_none_or(|b| c2 < b)
+                    && value_of(self, model, s2).as_ref() == Some(&vs)
+                {
+                    best = Some(c2);
+                }
+            }
+            if let Some(b) = best {
+                subst.push((c, b));
+            }
+        }
+        if subst.is_empty() {
+            return t;
+        }
+        crate::rewriter::substitute(&mut self.m, t, &subst)
     }
 
     /// Is `t` a string or sequence variable: an uninterpreted constant of a
@@ -16255,6 +16412,118 @@ impl Context {
             self.str_witness = full;
             return;
         }
+    }
+
+    /// The formula a string/sequence witness is confirmed against: the
+    /// pre-axiom [`Self::witness_base`] when set, else `goal`. `None` when it
+    /// mentions a quantifier sentinel — an opaque formula, not a Boolean a
+    /// candidate may choose. (A split's sub-goal can be free of the sentinel its
+    /// base still carries: the base accepted a candidate by making the sentinel
+    /// `true`, a fuzz-found invalid model.)
+    fn witness_goal(&self, goal: AstId) -> Option<AstId> {
+        let wg = self.witness_base.unwrap_or(goal);
+        if self.has_quant_atoms() && self.m.postorder(wg).iter().any(|&t| self.is_quant_atom(t)) {
+            return None;
+        }
+        Some(wg)
+    }
+
+    /// Finish a `sat` model on the string/sequence side: complete the string
+    /// witness (see [`Self::complete_str_witness`]) and validate it against
+    /// every assertion (and the check's `extra` assumptions). A witness that
+    /// breaks one — a stale assignment, or one confirmed against a goal other
+    /// than this check's — is discarded and searched again over the whole
+    /// assertion set; without a valid one the verdict falls back to `unknown`
+    /// rather than print an invalid model.
+    fn finish_str_model(
+        &mut self,
+        res: SmtResult,
+        model: Option<Model>,
+        extra: &[AstId],
+    ) -> (SmtResult, Option<Model>) {
+        if res != SmtResult::Sat || (self.string_sort.is_none() && self.seq_sorts.is_empty()) {
+            return (res, model);
+        }
+        let Some(mut md) = model else {
+            return (res, None);
+        };
+        self.complete_str_witness(&mut md);
+        let refuted = self.str_model_refuted(&mut md, extra);
+        if !refuted && !self.str_model_incomplete(extra) {
+            return (res, Some(md));
+        }
+        if refuted {
+            // A fresh completion from the model alone.
+            let saved = core::mem::take(&mut self.str_witness);
+            self.complete_str_witness(&mut md);
+            if !self.str_model_refuted(&mut md, extra) && !self.str_model_incomplete(extra) {
+                return (res, Some(md));
+            }
+            self.str_witness = saved;
+        }
+        // A joint search over the whole assertion set: its model fixes the
+        // other constants together with the sequences.
+        let mut parts = self.assertions.clone();
+        parts.extend_from_slice(extra);
+        if self.universals.is_empty() && !parts.is_empty() {
+            let saved = core::mem::take(&mut self.str_witness);
+            let g = if parts.len() == 1 {
+                parts[0]
+            } else {
+                self.m.mk_and(&parts)
+            };
+            let g = self.lift(g);
+            let base = self.witness_base.take();
+            let found = match self.witness_goal(g) {
+                Some(g) => self.try_seq_witness(g),
+                None => None,
+            };
+            self.witness_base = base;
+            if let Some(mut m2) = found {
+                self.complete_str_witness(&mut m2);
+                if !self.str_model_refuted(&mut m2, extra) {
+                    return (res, Some(m2));
+                }
+            }
+            self.str_witness = saved;
+        }
+        if refuted {
+            return (SmtResult::Unknown, None);
+        }
+        (res, Some(md))
+    }
+
+    /// Does some assertion (or `extra` assumption) fold to `false` once the
+    /// string witness and the model's constants are substituted? Only a
+    /// definite `false` counts: a formula left open (a quantifier, an opaque
+    /// operation) is not evidence against the model.
+    fn str_model_refuted(&mut self, model: &mut Model, extra: &[AstId]) -> bool {
+        let mut parts = self.assertions.clone();
+        parts.extend_from_slice(extra);
+        let full = self.str_witness.clone();
+        let csub = self.model_const_subst(model);
+        for a in parts {
+            let c = self.str_concretize(a, &full);
+            if self.m.is_false(c) {
+                return true;
+            }
+            let g = self.subst_all(c, &csub, &BTreeMap::new());
+            let g = self.str_concretize(g, &[]);
+            if self.m.is_false(g) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Is some string/sequence variable of the assertions (or `extra`) left
+    /// without a concrete value by the string witness?
+    fn str_model_incomplete(&self, extra: &[AstId]) -> bool {
+        let roots: Vec<AstId> = self.assertions.iter().chain(extra).copied().collect();
+        self.m
+            .postorder_many(&roots)
+            .into_iter()
+            .any(|t| self.is_str_seq_var(t) && !self.str_witness.iter().any(|(w, _)| *w == t))
     }
 
     fn try_string_witness(&mut self, goal: AstId, hint: Option<&mut Model>) -> Option<Model> {
@@ -16976,7 +17245,7 @@ impl Context {
         // substituting the now-concrete integer args into the producer term and
         // folding it to a literal; skip it if it doesn't fold.
         for (dv, prod) in derived_prod {
-            let p1 = crate::rewriter::substitute(&mut self.m, *prod, &subst);
+            let p1 = self.subst_seq(*prod, &subst);
             let mut pmemo = BTreeMap::new();
             let p2 = self.refold_str_markers(p1, &mut pmemo);
             if let Some(val) = self.str_value(p2) {
@@ -17204,7 +17473,7 @@ impl Context {
                     (v, me.mk_str_lit(&text))
                 })
                 .collect();
-            let wg = me.witness_base.unwrap_or(goal);
+            let wg = me.witness_goal(goal)?;
             me.witness_check(wg, &subst)
                 .map(|m| (SmtResult::Sat, Some(m)))
         };
@@ -17246,7 +17515,7 @@ impl Context {
     /// free of symbolic markers and satisfiable together with the string
     /// axioms. Records the witness and returns the model on success.
     fn witness_check(&mut self, goal: AstId, subst: &[(AstId, AstId)]) -> Option<Model> {
-        let g1 = crate::rewriter::substitute(&mut self.m, goal, subst);
+        let g1 = self.subst_seq(goal, subst);
         let mut memo = BTreeMap::new();
         let g2 = self.refold_str_markers(g1, &mut memo);
         // Only trust the result if every symbolic marker folded away.
@@ -17312,7 +17581,7 @@ impl Context {
             conjuncts
                 .iter()
                 .filter(|&&c| {
-                    let c1 = crate::rewriter::substitute(&mut ctx.m, c, &subst);
+                    let c1 = ctx.subst_seq(c, &subst);
                     let c2 = ctx.refold_str_markers(c1, &mut memo);
                     let c3 = crate::rewriter::simplify(&mut ctx.m, c2);
                     ctx.m.is_true(c3)
@@ -22387,7 +22656,7 @@ impl Context {
                 };
                 subst.push((v, seq));
             }
-            let g1 = crate::rewriter::substitute(&mut self.m, goal, &subst);
+            let g1 = self.subst_seq(goal, &subst);
             let mut memo = BTreeMap::new();
             let g2 = self.refold_str_markers(g1, &mut memo);
             let unfolded = !self.m.postorder(g2).iter().any(|&t| {
@@ -34036,7 +34305,7 @@ impl Context {
             if subst.is_empty() {
                 break;
             }
-            let g2 = crate::rewriter::substitute(&mut self.m, g, &subst);
+            let g2 = self.subst_seq(g, &subst);
             let mut memo = BTreeMap::new();
             g = self.refold_str_markers(g2, &mut memo);
         }
@@ -34117,7 +34386,7 @@ impl Context {
             .filter(|(_, l)| lit_consts.contains(l))
             .copied()
             .collect();
-        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = self.subst_seq(goal, &subst);
         let mut memo = BTreeMap::new();
         self.refold_str_markers(g, &mut memo)
     }
@@ -34227,7 +34496,7 @@ impl Context {
         if subst.is_empty() && extra.is_empty() {
             return goal;
         }
-        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = self.subst_seq(goal, &subst);
         let mut memo = BTreeMap::new();
         let g = self.refold_str_markers(g, &mut memo);
         if extra.is_empty() {
@@ -34368,7 +34637,7 @@ impl Context {
         if subst.is_empty() {
             return goal;
         }
-        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = self.subst_seq(goal, &subst);
         let mut memo = BTreeMap::new();
         self.refold_str_markers(g, &mut memo)
     }
@@ -34444,7 +34713,7 @@ impl Context {
             return goal;
         }
         self.fp_fold_pins.extend(subst.iter().copied());
-        let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
+        let g = self.subst_seq(goal, &subst);
         // A string marker over a now-constant index (`str.at "aab" i`, i = 0)
         // is a fresh term the opaque gate no longer knows: fold it.
         let mut memo = BTreeMap::new();
@@ -34866,13 +35135,14 @@ impl Context {
             if let Some(m) = self.try_seq_hof_witness(goal) {
                 return (SmtResult::Sat, Some(m));
             }
-            let wg = self.witness_base.unwrap_or(goal);
+            let wg = self.witness_goal(goal);
             // The abstract model may already pin every string variable to a
             // literal (e.g. a concat-vs-literal split forces `x="ab", y="cd"`);
             // verify that concrete assignment directly — it confirms `sat` without
             // an exponential candidate search.
             let mut model0 = model0;
-            if let Some(model) = model0.as_mut()
+            if let Some(wg) = wg
+                && let Some(model) = model0.as_mut()
                 && let Some(m) = self.verify_string_model(wg, model)
             {
                 return (SmtResult::Sat, Some(m));
@@ -34882,11 +35152,14 @@ impl Context {
             // abstract model's length assignment seeds a filler-word candidate so a
             // pure-length goal (`len(x·y) ≥ 13`) is witnessed past the small
             // enumeration cap.
-            if let Some(m) = self.try_string_witness(wg, model0.as_mut()) {
+            if let Some(wg) = wg
+                && let Some(m) = self.try_string_witness(wg, model0.as_mut())
+            {
                 return (SmtResult::Sat, Some(m));
             }
             // (Not inside a length split: its cases are already concrete.)
             if !self.in_seq_len_split
+                && let Some(wg) = wg
                 && let Some(m) = self.try_seq_witness(wg)
             {
                 return (SmtResult::Sat, Some(m));
@@ -37475,7 +37748,7 @@ impl Context {
             // term evaluates to its concrete literal instead of a placeholder.
             if !self.str_witness.is_empty() {
                 let sub = self.str_witness.clone();
-                id = crate::rewriter::substitute(&mut self.m, id, &sub);
+                id = self.subst_seq(id, &sub);
                 let mut memo = BTreeMap::new();
                 id = self.refold_str_markers(id, &mut memo);
                 id = crate::rewriter::simplify(&mut self.m, id);
@@ -37898,7 +38171,15 @@ impl Context {
                 let args = self.m.app_args(id).to_vec();
                 let decl = self.m.app_decl(id);
                 if args.is_empty() {
-                    csub.get(&decl).copied().unwrap_or(id)
+                    match csub.get(&decl) {
+                        Some(&v) => v,
+                        // A concrete sequence's elements (held in `seq_of`, not
+                        // as subterms) are substituted too.
+                        None if self.seq_of.contains_key(&id) => {
+                            self.subst_seq_elems(id, csub, fsub).unwrap_or(id)
+                        }
+                        None => id,
+                    }
                 } else if let Some(&v) = fsub.get(&decl) {
                     v
                 } else {
@@ -37915,6 +38196,29 @@ impl Context {
             memo.insert(id, new);
         }
         memo[&root]
+    }
+
+    /// The concrete sequence `seq` with [`Self::subst_all`] applied to its
+    /// elements; `None` when no element changes.
+    fn subst_seq_elems(
+        &mut self,
+        seq: AstId,
+        csub: &BTreeMap<AstId, AstId>,
+        fsub: &BTreeMap<AstId, AstId>,
+    ) -> Option<AstId> {
+        let elems = self.seq_of.get(&seq).cloned()?;
+        let out: Vec<AstId> = elems
+            .iter()
+            .map(|&e| self.subst_all(e, csub, fsub))
+            .collect();
+        if out == elems {
+            return None;
+        }
+        if out.len() == 1 {
+            self.seq_op("seq.unit", &out).ok()
+        } else {
+            Some(self.mk_seq(out))
+        }
     }
 
     /// The substitution mapping each declared 0-ary constant to its model value
@@ -42637,6 +42941,34 @@ mod tests {
             .unwrap(),
             alloc::vec!["sat"]
         );
+    }
+
+    #[test]
+    fn seq_witness_models_satisfy_assertions() {
+        // A split's sub-goal was witnessed against a base that still held the
+        // `∃k` sentinel of the dropped disjunct, as a free Boolean: the model
+        // `a=[0], b=[0,0], i=1` broke the second assertion (fuzz-found).
+        let out = run("(declare-const a (Seq Int))(declare-const b (Seq Int))(declare-const i Int)\
+             (assert (<= 1 (seq.len a)))(assert (<= (seq.len a) 2))\
+             (assert (<= 2 (seq.len b)))(assert (<= (seq.len b) 3))\
+             (assert (or (exists ((k Int)) (and (and (<= 0 k) (< k 3)) (< (- (seq.len a) i) (+ i 1)))) \
+               (= (seq.len (seq.at (seq.++ b b) (seq.len b))) (+ i 1))))\
+             (assert (or (exists ((k Int)) (and (and (<= 1 k) (< k 2)) \
+               (= (ite (< i (+ i 1)) (seq.++ (seq.unit 0) b) b) \
+                  (seq.extract a (- (seq.len a) i) (- (seq.len a) i))))) \
+               (= (seq.len b) (- (seq.len a) i))))\
+             (check-sat)(eval (= (seq.len b) (- (seq.len a) i)))")
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat", "true"]);
+        // A concrete sequence's elements follow the witness of the variables
+        // they mention: `seq.unit (seq.len a)` with `a` of length 2 is `[2]`.
+        let out = run("(declare-const a (Seq Int))(declare-const b (Seq Int))\
+             (declare-const G (Array Int Int Int))\
+             (assert (= (seq.mapi G 3 b) (seq.++ (seq.unit (seq.len a)) (seq.unit 0))))\
+             (assert (> (seq.len (seq.++ b a)) 3))(check-sat)\
+             (eval (= (seq.mapi G 3 b) (seq.++ (seq.unit (seq.len a)) (seq.unit 0))))")
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat", "true"]);
     }
 
     #[test]
