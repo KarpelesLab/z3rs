@@ -468,8 +468,8 @@ pub fn pp_func_interp(
 /// `(+ (root-obj …) (* (- 1.0) epsilon))`) laid out as z3 prints the
 /// expression on its own: 80 columns from its first character. Numerals —
 /// `root-obj`, `(- n)`, `(/ p q)` and their negations — are single literals
-/// as in z3's printer. Text that is not a well-formed s-expression is
-/// returned unchanged.
+/// as in z3's printer. Text that is not a well-formed s-expression, or
+/// that quotes a symbol or string, is returned unchanged.
 pub fn pp_value(text: &str) -> String {
     /// Parse one s-expression from `t` at `*i` into `arena`; its index.
     fn parse(t: &[u8], i: &mut usize, src: &str, arena: &mut Vec<PpNode>) -> Option<usize> {
@@ -531,6 +531,10 @@ pub fn pp_value(text: &str) -> String {
             });
         }
         Some(arena.len() - 1)
+    }
+    // Quoted symbols and string literals may hold spaces: keep them as is.
+    if text.contains(['"', '|']) {
+        return String::from(text);
     }
     let mut arena = Vec::new();
     let mut i = 0;

@@ -315,6 +315,20 @@ fn layout_objective_value(val: &str) -> String {
     val.to_string()
 }
 
+/// The integer an objective value printed by [`render_int`] denotes
+/// (`n` or `(- n)`); `None` for anything else (intervals, infinities).
+fn parse_numeral_term(v: &str) -> Option<Rational> {
+    let (neg, digits) = match v.strip_prefix("(- ").and_then(|r| r.strip_suffix(')')) {
+        Some(d) => (true, d),
+        None => (false, v),
+    };
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let n = Int::from_str_radix(digits, 10).ok()?;
+    Some(Rational::from_integer(if neg { n.neg() } else { n }))
+}
+
 /// A non-integer rational as z3 prints it: `(/ p.0 q.0)`, negated outside
 /// (`(- (/ 1.0 2.0))`).
 fn render_fraction(r: &Rational) -> String {
@@ -5879,7 +5893,8 @@ impl Context {
             "maximize" | "minimize" => {
                 let t = self.term(&list[1])?;
                 let maximize = matches!(&list[0], SExpr::Atom(a) if a == "maximize");
-                let text = render_sexpr(&bv_literals_as_z3(&list[1]));
+                let shown = self.objective_sexpr(&list[1], &BTreeMap::new());
+                let text = render_sexpr(&bv_literals_as_z3(&shown));
                 self.objectives.push(Objective::Term {
                     term: t,
                     maximize,
@@ -29296,6 +29311,52 @@ impl Context {
             return (render_rational(&c), false);
         }
         if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
+            // A real objective over integer constants only (`to_real` of
+            // integer terms, rational coefficients) is optimized as the
+            // integer term `D·Σ aᵢxᵢ` (D the coefficients' common
+            // denominator), its value `opt/D + c`.
+            let lin = crate::smt::solver::ast_to_lin(&self.m, obj);
+            let over_ints = lin.terms().count() > 0
+                && lin.terms().all(|(v, _)| {
+                    self.m.is_uninterp_const(v) && self.m.is_int_sort(self.m.get_sort(v))
+                });
+            if over_ints {
+                let terms: Vec<(AstId, Rational)> =
+                    lin.terms().map(|(v, c)| (v, c.clone())).collect();
+                let d = terms.iter().fold(Int::from(1), |acc, (_, c)| {
+                    let q = c.denominator().clone();
+                    let g = acc.gcd(&q);
+                    acc.mul(&q).div_trunc(&g)
+                });
+                let scale = Rational::from_integer(d);
+                let parts: Vec<AstId> = terms
+                    .into_iter()
+                    .map(|(v, c)| {
+                        let k = self.m.mk_numeral(c.mul(&scale), true);
+                        self.m.mk_mul(&[k, v])
+                    })
+                    .collect();
+                let int_obj = if parts.len() == 1 {
+                    parts[0]
+                } else {
+                    self.m.mk_add(&parts)
+                };
+                let (v, unbounded) = self.optimize_one(int_obj, maximize, fixed, model);
+                if unbounded {
+                    return (v, true);
+                }
+                let c = lin.const_term().clone();
+                if scale.is_one() && c.is_integer() {
+                    return match parse_numeral_term(&v) {
+                        Some(r) => (render_rational(&r.add(&c)), false),
+                        None => (v, false),
+                    };
+                }
+                return match parse_numeral_term(&v) {
+                    Some(r) => (render_rational(&r.div(&scale).add(&c)), false),
+                    None => unknown(),
+                };
+            }
             // Real objective: Fourier–Motzkin optimum, then verify it.
             return match self.real_optimize(obj, maximize, fixed) {
                 RealOpt::Attained(r) => {
@@ -31488,14 +31549,112 @@ impl Context {
         r
     }
 
+    /// An objective term `e` as z3 prints it (`display_objective` prints the
+    /// parsed term, not the source): `let`s expanded (`env` holds the
+    /// bindings in scope), an `n`-ary `-` nested to the left, a decimal as
+    /// `n.0` or `(/ p.0 q.0)`, `bv2nat`/`bv2int` as `ubv_to_int`, and the
+    /// integer arguments of real arithmetic wrapped in `to_real`.
+    fn objective_sexpr(&mut self, e: &SExpr, env: &BTreeMap<String, SExpr>) -> SExpr {
+        let atom = |a: &str| SExpr::Atom(a.to_string());
+        match e {
+            SExpr::Atom(a) => {
+                if let Some(b) = env.get(a) {
+                    return b.clone();
+                }
+                if let Some((int, frac)) = a.split_once('.')
+                    && !int.is_empty()
+                    && int.chars().all(|c| c.is_ascii_digit())
+                    && frac.chars().all(|c| c.is_ascii_digit())
+                    && let Some((r, _)) = parse_numeral(a)
+                {
+                    return if r.is_integer() {
+                        SExpr::Atom(alloc::format!("{}.0", r.numerator()))
+                    } else {
+                        SExpr::List(alloc::vec![
+                            atom("/"),
+                            SExpr::Atom(alloc::format!("{}.0", r.numerator())),
+                            SExpr::Atom(alloc::format!("{}.0", r.denominator())),
+                        ])
+                    };
+                }
+                e.clone()
+            }
+            SExpr::List(l) => {
+                let head = match l.first() {
+                    Some(SExpr::Atom(h)) => h.as_str(),
+                    _ => return e.clone(),
+                };
+                if head == "let" && l.len() == 3 {
+                    let SExpr::List(binds) = &l[1] else {
+                        return e.clone();
+                    };
+                    let mut inner = env.clone();
+                    for b in binds {
+                        if let SExpr::List(kv) = b
+                            && let [SExpr::Atom(k), v] = kv.as_slice()
+                        {
+                            let v = self.objective_sexpr(v, env);
+                            inner.insert(k.clone(), v);
+                        }
+                    }
+                    return self.objective_sexpr(&l[2], &inner);
+                }
+                if matches!(head, "forall" | "exists" | "!" | "_" | "as" | "lambda") {
+                    return e.clone();
+                }
+                let mut args: Vec<SExpr> = l[1..]
+                    .iter()
+                    .map(|a| self.objective_sexpr(a, env))
+                    .collect();
+                let head = match head {
+                    "bv2nat" | "bv2int" => "ubv_to_int",
+                    h => h,
+                };
+                if matches!(head, "+" | "-" | "*" | "/" | "<=" | "<" | ">=" | ">" | "=")
+                    && args.len() >= 2
+                {
+                    // Mixed integer and real arguments: z3's parser coerces.
+                    let sorts: Vec<Option<bool>> = args
+                        .iter()
+                        .map(|a| {
+                            let t = self.term(a).ok()?;
+                            let srt = self.m.get_sort(t);
+                            self.m.is_arith_sort(srt).then(|| self.m.is_int_sort(srt))
+                        })
+                        .collect();
+                    if sorts.contains(&Some(false)) && sorts.contains(&Some(true)) {
+                        for (a, s) in args.iter_mut().zip(&sorts) {
+                            if *s == Some(true) {
+                                *a = SExpr::List(alloc::vec![atom("to_real"), a.clone()]);
+                            }
+                        }
+                    }
+                }
+                if head == "-" && args.len() > 2 {
+                    let mut acc = args[0].clone();
+                    for a in &args[1..] {
+                        acc = SExpr::List(alloc::vec![atom("-"), acc, a.clone()]);
+                    }
+                    return acc;
+                }
+                let mut out = alloc::vec![atom(head)];
+                out.extend(args);
+                SExpr::List(out)
+            }
+        }
+    }
+
     /// The `(objectives …)` response after an optimizing `check-sat`.
     fn get_objectives(&self) -> String {
         let mut out = String::from("(objectives");
         for (o, val) in self.objectives.iter().zip(&self.objective_values) {
             // A soft group is named by its `:id` (empty when none).
+            // A term is laid out as z3 prints it on its own (`out << term`).
             let (name, val) = match o {
-                Objective::Term { text, .. } => (text, val.clone()),
-                Objective::Soft { id, items } => (id, rescale_value(val, &soft_scale(items))),
+                Objective::Term { text, .. } => (super::smt2_pp::pp_value(text), val.clone()),
+                Objective::Soft { id, items } => {
+                    (id.clone(), rescale_value(val, &soft_scale(items)))
+                }
             };
             out.push_str(&alloc::format!(
                 "\n ({name} {})",
@@ -51378,6 +51537,34 @@ mod tests {
         let out = run(src).unwrap();
         assert_eq!(out[1], "(objectives\n (g 2)\n (x 3)\n)");
         assert_eq!(out[3], "(objectives\n (g 0)\n ((- x) (- 3))\n)");
+    }
+
+    #[test]
+    fn objective_names_print_the_parsed_term() {
+        let src = "
+            (declare-const r Real)
+            (declare-const x Int)
+            (declare-const y Int)
+            (declare-const b (_ BitVec 8))
+            (assert (<= r 3.0))
+            (assert (<= 0 x 4))
+            (assert (<= 0 y 4))
+            (assert (bvult b #x20))
+            (maximize (+ r 1))
+            (maximize (let ((z x)) (+ z z)))
+            (maximize (- x y 1))
+            (maximize (+ (to_real x) 0.5))
+            (maximize (bv2nat b))
+            (maximize (to_real x))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(src).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((+ r (to_real 1)) 4)\n ((+ x x) 8)\n ((- (- x y) 1) 3)\n \
+             ((+ (to_real x) (/ 1.0 2.0)) (/ 9.0 2.0))\n ((ubv_to_int b) 31)\n ((to_real x) 4)\n)"
+        );
     }
 
     #[test]
