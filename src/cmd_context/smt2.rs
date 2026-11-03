@@ -23078,7 +23078,25 @@ impl Context {
                     let s = self.m.get_sort(args[0]);
                     return Ok(self.mk_seq_sorted(s, joined));
                 }
+                // The empty sequence is the unit of concatenation.
+                let rest: Vec<AstId> = args
+                    .iter()
+                    .copied()
+                    .filter(|a| self.seq_of.get(a).is_none_or(|l| !l.is_empty()))
+                    .collect();
+                if rest.len() == 1 {
+                    return Ok(rest[0]);
+                }
+                if rest.len() != args.len() && rest.len() > 1 {
+                    return self.symbolic_seq(op, &rest);
+                }
                 self.symbolic_seq(op, args)
+            }
+            "seq.prefixof" | "seq.suffixof"
+                if self.seq_of.get(&args[0]).is_some_and(|l| l.is_empty()) =>
+            {
+                // The empty sequence is a prefix and a suffix of every one.
+                Ok(self.m.mk_true())
             }
             "seq.len" => {
                 if let Some(l) = self.seq_of.get(&args[0]) {
@@ -26243,12 +26261,31 @@ impl Context {
         const MAX_COMBOS: usize = 16;
         let goal_terms: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
         let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        // String constants take the values of a concrete witness of the
+        // ground assertions (its pins stay as the model's string witness).
+        if self.string_sort.is_some() && goal_terms.iter().any(|&t| self.is_str_seq_var(t)) {
+            let saved_u = core::mem::take(&mut self.universals);
+            self.complete_str_witness(model);
+            let ok = !self.str_model_refuted(model, &[]) && !self.str_model_incomplete(&[]);
+            self.universals = saved_u;
+            if !ok {
+                return Mbqi::Unknown;
+            }
+        }
         // The candidate must be a model of the ground goal itself.
         let Some(fix) = self.mbqi_fix_constants(goal, model, &BTreeSet::new(), &goal_terms) else {
             return Mbqi::Unknown;
         };
         let g = crate::rewriter::substitute(&mut self.m, goal, &fix);
-        let g = crate::rewriter::simplify(&mut self.m, g);
+        let mut g = crate::rewriter::simplify(&mut self.m, g);
+        if !self.m.is_true(g) && self.string_sort.is_some() {
+            // String operations over literals fold through the string folder.
+            g = self.refold_str_markers(g, &mut BTreeMap::new());
+            g = crate::rewriter::simplify(&mut self.m, g);
+            if !self.m.is_true(g) {
+                g = self.str_concretize(g, &[]);
+            }
+        }
         if !self.m.is_true(g) {
             return Mbqi::Unknown;
         }
@@ -26336,7 +26373,9 @@ impl Context {
                 if !(self.m.is_bool_sort(s)
                     || self.m.is_arith_sort(s)
                     || self.m.bv_sort_width(s).is_some()
-                    || self.fp_format_of(s).is_some())
+                    || self.fp_format_of(s).is_some()
+                    || Some(s) == self.string_sort
+                    || self.seq_elem_sort(s).is_some())
                 {
                     return Mbqi::Unknown;
                 }
@@ -26377,7 +26416,11 @@ impl Context {
             let Some(fix) = self.mbqi_fix_constants(raw, model, &symbolic, goal_terms) else {
                 return Mbqi::Unknown;
             };
-            let phi = crate::rewriter::substitute(&mut self.m, raw, &fix);
+            let mut phi = crate::rewriter::substitute(&mut self.m, raw, &fix);
+            if self.string_sort.is_some() {
+                // String operations whose arguments became literals fold.
+                phi = self.refold_str_markers(phi, &mut BTreeMap::new());
+            }
             let phi = crate::rewriter::simplify(&mut self.m, phi);
             if self.m.is_true(phi) {
                 continue;
@@ -26385,7 +26428,25 @@ impl Context {
             let neg = self.m.mk_not(phi);
             let saved_u = core::mem::take(&mut self.universals);
             let saved_a = core::mem::replace(&mut self.assertions, alloc::vec![neg]);
-            let (r, cex) = self.check_sat();
+            let (mut r, mut cex) = self.check_sat();
+            // A string counterexample is confirmed by a concrete witness,
+            // which gives the string binders their literals.
+            let mut str_vals: BTreeMap<AstId, AstId> = BTreeMap::new();
+            let string_binder = fresh
+                .iter()
+                .any(|&x0| self.is_str_seq_sort(self.m.get_sort(x0)));
+            if r == SmtResult::Sat && string_binder {
+                let saved_w = core::mem::take(&mut self.str_witness);
+                (r, cex) = self.finish_str_model(r, cex, &[]);
+                for &x0 in &fresh {
+                    if let Some(&(_, v)) = self.str_witness.iter().find(|(w, _)| *w == x0)
+                        && self.is_str_seq_value(v)
+                    {
+                        str_vals.insert(x0, v);
+                    }
+                }
+                self.str_witness = saved_w;
+            }
             self.assertions = saved_a;
             self.universals = saved_u;
             match r {
@@ -26409,6 +26470,11 @@ impl Context {
                                     None => return Mbqi::Unknown,
                                 },
                                 _ => return Mbqi::Unknown,
+                            }
+                        } else if self.is_str_seq_sort(s) {
+                            match str_vals.get(&x0) {
+                                Some(&lit) => lit,
+                                None => return Mbqi::Unknown,
                             }
                         } else {
                             match cm.eval(&self.m, x0) {
@@ -26454,6 +26520,11 @@ impl Context {
             if symbolic.contains(&n) || !self.m.is_uninterp_const(n) {
                 continue;
             }
+            // A string literal, concrete sequence or concrete regex is a value
+            // already.
+            if self.is_str_seq_value(n) || self.regex_of.contains_key(&n) {
+                continue;
+            }
             let s = self.m.get_sort(n);
             if self.fp_format_of(s).is_some() && self.fp_bv.contains_key(&n) {
                 // An FP constant stands for its bits, fixed separately.
@@ -26465,6 +26536,36 @@ impl Context {
             if !goal_terms.contains(&n) && !self.is_user_constant_or_bits(n) {
                 return None;
             }
+            if self.is_str_seq_sort(s) {
+                // Its witness value, or the literal the model equates it with;
+                // a user constant the goal leaves free takes the empty value
+                // (the one its model prints).
+                let lit = self
+                    .str_witness
+                    .iter()
+                    .find(|(w, v)| *w == n && self.is_str_seq_value(*v))
+                    .map(|&(_, v)| v)
+                    .or_else(|| {
+                        self.str_lits
+                            .values()
+                            .copied()
+                            .chain(self.seq_of.keys().copied())
+                            .find(|&c| self.m.get_sort(c) == s && model.terms_equal(&self.m, n, c))
+                    });
+                let lit = match lit {
+                    Some(l) => l,
+                    None if !goal_terms.contains(&n) && !self.occurs_in_assertions(n) => {
+                        if Some(s) == self.string_sort {
+                            self.mk_str_lit("")
+                        } else {
+                            self.seq_empty_of(s)
+                        }
+                    }
+                    None => return None,
+                };
+                fix.push((n, lit));
+                continue;
+            }
             let lit = match model.eval(&self.m, n) {
                 Value::Bool(b) if self.m.is_bool_sort(s) => self.mk_bool(b),
                 Value::Num(r, is_int) if self.m.is_arith_sort(s) => self.m.mk_numeral(r, is_int),
@@ -26474,6 +26575,16 @@ impl Context {
             fix.push((n, lit));
         }
         Some(fix)
+    }
+
+    /// Is `s` the String sort or a sequence sort?
+    fn is_str_seq_sort(&self, s: AstId) -> bool {
+        Some(s) == self.string_sort || self.seq_elem_sort(s).is_some()
+    }
+
+    /// Is `t` a string literal or a concrete sequence?
+    fn is_str_seq_value(&self, t: AstId) -> bool {
+        self.str_value(t).is_some() || self.seq_of.contains_key(&t)
     }
 
     /// Is `n` a user-declared constant, or the bit-vector image of a
@@ -26499,6 +26610,8 @@ impl Context {
                 .collect()
         } else if let Some(w) = self.m.bv_sort_width(sort) {
             alloc::vec![self.m.mk_bv(0, w), self.m.mk_bv(1, w)]
+        } else if Some(sort) == self.string_sort {
+            alloc::vec![self.mk_str_lit(""), self.mk_str_lit("a")]
         } else if let Some((eb, sb)) = self.fp_format_of(sort) {
             // +0 and 1.0.
             let one = ((1u64 << (eb - 1)) - 1) << (sb - 1);
@@ -32694,8 +32807,11 @@ impl Context {
         let binders: BTreeSet<AstId> = vars.iter().copied().collect();
         // Either side may be the defined application `f(x̄)`.
         for &side in &args {
+            // A datatype selector or tester is interpreted: an equation over it
+            // is a constraint, not a definition.
             if let Some(app) = self.m.app(side)
                 && user_decls.contains(&app.decl)
+                && self.is_free_function(app.decl)
                 && !app.args.is_empty()
             {
                 let mut seen: BTreeSet<AstId> = BTreeSet::new();
