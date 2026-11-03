@@ -605,19 +605,27 @@ fn alg_floor(a: &Alg) -> Int {
     match a {
         Alg::Rational(r) => r.floor(),
         Alg::Irrational { .. } => {
-            let mut k = a.approx().floor();
+            // Refine the isolating interval below width 1 (a wide interval's
+            // midpoint can lie arbitrarily many integers away), then the
+            // floor is `⌊lo⌋`, or decided by the one integer inside.
+            let mut b = a.clone();
             loop {
-                let kr = Alg::Rational(Rational::from_integer(k.clone()));
-                if a.compare(&kr) == Ordering::Less {
-                    k = k.sub(&Int::from(1));
-                    continue;
+                let (lo, hi) = b.interval();
+                if (&hi - &lo) < Rational::from_integer(Int::from(1)) {
+                    let k = lo.floor();
+                    let k1 = k.add(&Int::from(1));
+                    let k1r = Rational::from_integer(k1.clone());
+                    if k1r >= hi {
+                        return k;
+                    }
+                    // `lo < k + 1 < hi`: the root is a non-integer.
+                    return if a.locate(&k1r) == Ordering::Less {
+                        k1
+                    } else {
+                        k
+                    };
                 }
-                let k1 = Alg::Rational(Rational::from_integer(k.add(&Int::from(1))));
-                if a.compare(&k1) != Ordering::Less {
-                    k = k.add(&Int::from(1));
-                    continue;
-                }
-                return k;
+                b.refine();
             }
         }
     }
@@ -2557,6 +2565,30 @@ mod tests {
     fn r(n: i64) -> Rational {
         rat(n)
     }
+
+    /// The floor of an algebraic number isolated in a wide interval: its
+    /// midpoint is far from the number, which must not cost a step per
+    /// integer in between.
+    #[test]
+    fn floor_of_a_widely_isolated_root() {
+        use crate::math::upoly::UPoly;
+        // x² − 2 has the one root √2 in (0, 10¹²), and −√2 in (−10¹², 0).
+        let p = UPoly::from_coeffs(alloc::vec![r(-2), r(0), r(1)]);
+        let big = Rational::from_integer(Int::from(1_000_000_000_000i64));
+        let pos = Alg::Irrational {
+            poly: p.clone(),
+            lo: r(0),
+            hi: big.clone(),
+        };
+        let neg = Alg::Irrational {
+            poly: p,
+            lo: -big,
+            hi: r(0),
+        };
+        assert_eq!(alg_floor(&pos), Int::from(1));
+        assert_eq!(alg_floor(&neg), Int::from(-2));
+    }
+
     fn poly(terms: &[(i64, &[(Var, u32)])]) -> Polynomial {
         Polynomial::from_terms(
             terms
