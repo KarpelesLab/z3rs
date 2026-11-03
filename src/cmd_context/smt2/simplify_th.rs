@@ -10,10 +10,11 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::super::smt2_pp::{PpNode, pp_term};
-use super::{Context, SExpr, parse_numeral};
+use super::{Context, SExpr, parse_bv_literal, parse_numeral};
 use crate::ast::AstId;
-use crate::rewriter::th_simp::{Op, Simp, Sort, T};
+use crate::rewriter::th_simp::{BvOp, Op, Simp, Sort, T};
 use crate::util::symbol::smt2_symbol;
+use puremp::Int;
 
 /// The front end's state while building one term.
 struct Builder {
@@ -54,6 +55,9 @@ impl Context {
                 Sort::Real
             });
         }
+        if let Some(w) = self.m.bv_sort_width(s) {
+            return Some(Sort::Bv(w));
+        }
         if self.declared_sorts.contains(&s) {
             return Some(Sort::User(alloc::format!("{}", self.m.sort(s)?.name)));
         }
@@ -65,6 +69,38 @@ impl Context {
         match e {
             SExpr::Atom(a) => self.th_atom(b, a),
             SExpr::List(l) if !l.is_empty() => {
+                // `(_ bvN w)`: a bit-vector literal.
+                if let [SExpr::Atom(u), SExpr::Atom(bvn), SExpr::Atom(w)] = l.as_slice()
+                    && u == "_"
+                    && let Some(digits) = bvn.strip_prefix("bv")
+                {
+                    let v = Int::from_str_radix(digits, 10).ok()?;
+                    let w: u32 = w.parse().ok()?;
+                    if w == 0 {
+                        return None;
+                    }
+                    return Some(b.s.mk_bv_num(&v, w));
+                }
+                // `((_ extract h l) x)` and the other indexed operators.
+                if let SExpr::List(idx) = &l[0] {
+                    let op = th_indexed(idx)?;
+                    if l.len() != 2 {
+                        return None;
+                    }
+                    let x = self.th_term(b, &l[1])?;
+                    let Sort::Bv(w) = *b.s.sort(x) else {
+                        return None;
+                    };
+                    if let Op::Extract(h, lo) = op
+                        && (h < lo || h >= w)
+                    {
+                        return None;
+                    }
+                    if matches!(op, Op::Repeat(0)) {
+                        return None;
+                    }
+                    return Some(b.s.mk(op, alloc::vec![x]));
+                }
                 let SExpr::Atom(head) = &l[0] else {
                     return None;
                 };
@@ -119,6 +155,9 @@ impl Context {
             "true" => return Some(b.s.mk_true()),
             "false" => return Some(b.s.mk_false()),
             _ => {}
+        }
+        if let Some((v, w)) = parse_bv_literal(a) {
+            return Some(b.s.mk_bv_num(&v, w));
         }
         if let Some((r, is_int)) = parse_numeral(a) {
             if r.is_negative() {
@@ -264,6 +303,28 @@ impl Context {
             "to_real" if n == 1 && *s.sort(args[0]) == Sort::Int => s.mk(Op::ToReal, args),
             "to_int" if n == 1 && *s.sort(args[0]) == Sort::Real => s.mk(Op::ToInt, args),
             "is_int" if n == 1 && *s.sort(args[0]) == Sort::Real => s.mk(Op::IsInt, args),
+            _ if bv_op(head).is_some() => {
+                let op = bv_op(head)?;
+                let Sort::Bv(w) = *s.sort(args[0]) else {
+                    return None;
+                };
+                if op == BvOp::Concat {
+                    if args.iter().any(|&a| !matches!(s.sort(a), Sort::Bv(_))) {
+                        return None;
+                    }
+                } else if args.iter().any(|&a| *s.sort(a) != Sort::Bv(w)) {
+                    return None;
+                }
+                let unary = matches!(op, BvOp::Not | BvOp::Neg);
+                let nary = matches!(
+                    op,
+                    BvOp::Add | BvOp::Mul | BvOp::And | BvOp::Or | BvOp::Xor | BvOp::Concat
+                );
+                if (unary && n != 1) || (!unary && !nary && n != 2) || (nary && n < 2) {
+                    return None;
+                }
+                s.mk(Op::Bv(op), args)
+            }
             name => {
                 if self.macros.contains_key(name) {
                     return None;
@@ -284,6 +345,95 @@ impl Context {
         };
         Some(t)
     }
+}
+
+/// The bit-vector operator named `h` (not lowered: `bvugt` stays `bvugt`).
+fn bv_op(h: &str) -> Option<BvOp> {
+    Some(match h {
+        "bvadd" => BvOp::Add,
+        "bvsub" => BvOp::Sub,
+        "bvmul" => BvOp::Mul,
+        "bvneg" => BvOp::Neg,
+        "bvudiv" => BvOp::Udiv,
+        "bvurem" => BvOp::Urem,
+        "bvsdiv" => BvOp::Sdiv,
+        "bvsrem" => BvOp::Srem,
+        "bvsmod" => BvOp::Smod,
+        "bvand" => BvOp::And,
+        "bvor" => BvOp::Or,
+        "bvxor" => BvOp::Xor,
+        "bvnot" => BvOp::Not,
+        "bvnand" => BvOp::Nand,
+        "bvnor" => BvOp::Nor,
+        "bvxnor" => BvOp::Xnor,
+        "bvshl" => BvOp::Shl,
+        "bvlshr" => BvOp::Lshr,
+        "bvashr" => BvOp::Ashr,
+        "concat" => BvOp::Concat,
+        "bvule" => BvOp::Ule,
+        "bvult" => BvOp::Ult,
+        "bvuge" => BvOp::Uge,
+        "bvugt" => BvOp::Ugt,
+        "bvsle" => BvOp::Sle,
+        "bvslt" => BvOp::Slt,
+        "bvsge" => BvOp::Sge,
+        "bvsgt" => BvOp::Sgt,
+        "bvcomp" => BvOp::Comp,
+        _ => return None,
+    })
+}
+
+/// The indexed operator `(_ name k…)`.
+fn th_indexed(idx: &[SExpr]) -> Option<Op> {
+    let SExpr::Atom(u) = idx.first()? else {
+        return None;
+    };
+    if u != "_" {
+        return None;
+    }
+    let SExpr::Atom(name) = idx.get(1)? else {
+        return None;
+    };
+    let mut ks = Vec::new();
+    for x in &idx[2..] {
+        let SExpr::Atom(k) = x else {
+            return None;
+        };
+        ks.push(k.parse::<u32>().ok()?);
+    }
+    Some(match (name.as_str(), ks.as_slice()) {
+        ("extract", [h, l]) => Op::Extract(*h, *l),
+        ("zero_extend", [k]) => Op::ZeroExt(*k),
+        ("sign_extend", [k]) => Op::SignExt(*k),
+        ("repeat", [k]) => Op::Repeat(*k),
+        ("rotate_left", [k]) => Op::RotL(*k),
+        ("rotate_right", [k]) => Op::RotR(*k),
+        _ => return None,
+    })
+}
+
+/// z3's rendering of a bit-vector numeral: `#x…` for widths divisible by
+/// four, else `#b…`.
+fn bv_text(v: &Int, w: u32) -> String {
+    let mut out = String::new();
+    if w.is_multiple_of(4) {
+        out.push_str("#x");
+        for nib in (0..w / 4).rev() {
+            let mut d = 0u32;
+            for b in 0..4 {
+                if v.bit(u64::from(nib * 4 + b)) {
+                    d |= 1 << b;
+                }
+            }
+            out.push(char::from_digit(d, 16).unwrap());
+        }
+    } else {
+        out.push_str("#b");
+        for i in (0..w).rev() {
+            out.push(if v.bit(u64::from(i)) { '1' } else { '0' });
+        }
+    }
+    out
 }
 
 /// z3's rendering of a rational numeral of the given sort (a single leaf, as
@@ -312,7 +462,17 @@ fn render(s: &Simp, t: T) -> String {
     pp_term(&arena, root, &|h| {
         matches!(
             h,
-            "and" | "or" | "xor" | "+" | "*" | "bvadd" | "bvmul" | "bvand" | "bvor" | "bvxor"
+            "and"
+                | "or"
+                | "xor"
+                | "+"
+                | "*"
+                | "bvadd"
+                | "bvmul"
+                | "bvand"
+                | "bvor"
+                | "bvxor"
+                | "concat"
         )
     })
 }
@@ -330,8 +490,35 @@ fn to_pp(s: &Simp, t: T, arena: &mut Vec<PpNode>, map: &mut BTreeMap<T, usize>) 
             });
             arena.len() - 1
         }
+        Op::BvNum(v) => {
+            let Sort::Bv(w) = *s.sort(t) else {
+                unreachable!()
+            };
+            arena.push(PpNode {
+                head: bv_text(v, w),
+                args: Vec::new(),
+                indexed: false,
+            });
+            arena.len() - 1
+        }
         op => {
+            let indexed = matches!(
+                op,
+                Op::Extract(..)
+                    | Op::ZeroExt(_)
+                    | Op::SignExt(_)
+                    | Op::Repeat(_)
+                    | Op::RotL(_)
+                    | Op::RotR(_)
+            );
             let head = match op {
+                Op::Extract(h, l) => alloc::format!("(_ extract {h} {l})"),
+                Op::ZeroExt(k) => alloc::format!("(_ zero_extend {k})"),
+                Op::SignExt(k) => alloc::format!("(_ sign_extend {k})"),
+                Op::Repeat(k) => alloc::format!("(_ repeat {k})"),
+                Op::RotL(k) => alloc::format!("(_ rotate_left {k})"),
+                Op::RotR(k) => alloc::format!("(_ rotate_right {k})"),
+                Op::Bv(b) => Simp::op_name(&Op::Bv(*b)).unwrap().to_string(),
                 Op::Ite => "ite".to_string(),
                 Op::Uf(n) => smt2_symbol(n).into_owned(),
                 Op::Uminus => "-".to_string(),
@@ -346,7 +533,7 @@ fn to_pp(s: &Simp, t: T, arena: &mut Vec<PpNode>, map: &mut BTreeMap<T, usize>) 
             arena.push(PpNode {
                 head,
                 args,
-                indexed: false,
+                indexed,
             });
             arena.len() - 1
         }

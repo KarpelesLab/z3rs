@@ -23,6 +23,8 @@ use core::cmp::Ordering;
 
 use puremp::{Int, Rational};
 
+mod bv;
+
 /// A term: an index into [`Simp`]'s arena.
 pub type T = usize;
 
@@ -82,6 +84,11 @@ pub enum BvOp {
     Sdiv,
     Srem,
     Smod,
+    UdivI,
+    UremI,
+    SdivI,
+    SremI,
+    SmodI,
     And,
     Or,
     Xor,
@@ -116,6 +123,11 @@ impl BvOp {
             BvOp::Sdiv => "bvsdiv",
             BvOp::Srem => "bvsrem",
             BvOp::Smod => "bvsmod",
+            BvOp::UdivI => "bvudiv_i",
+            BvOp::UremI => "bvurem_i",
+            BvOp::SdivI => "bvsdiv_i",
+            BvOp::SremI => "bvsrem_i",
+            BvOp::SmodI => "bvsmod_i",
             BvOp::And => "bvand",
             BvOp::Or => "bvor",
             BvOp::Xor => "bvxor",
@@ -551,6 +563,14 @@ impl Simp {
         )
     }
 
+    /// The operator's printed name.
+    pub fn op_name(op: &Op) -> Option<&'static str> {
+        match op {
+            Op::Bv(b) => Some(b.name()),
+            _ => None,
+        }
+    }
+
     /// Is this an application of the bit-vector family?
     fn is_bv_app(&self, t: T) -> bool {
         matches!(
@@ -773,11 +793,25 @@ impl Simp {
                 }
                 self.bool_eq(args[0], args[1])
             }
-            Op::Distinct => self.bool_distinct(args),
+            Op::Distinct => {
+                if matches!(self.nodes[args[0]].sort, Sort::Bv(_))
+                    && let Some(st) = self.bv_distinct(args)
+                {
+                    return Some(st);
+                }
+                self.bool_distinct(args)
+            }
             Op::And => self.bool_and(args),
             Op::Or => self.bool_or(args),
             Op::Not => self.bool_not(args[0]),
-            Op::Ite => self.bool_ite(args[0], args[1], args[2]),
+            Op::Ite => {
+                if matches!(self.nodes[args[1]].sort, Sort::Bv(_))
+                    && let Some(st) = self.bv_ite(args[0], args[1], args[2])
+                {
+                    return Some(st);
+                }
+                self.bool_ite(args[0], args[1], args[2])
+            }
             Op::Implies => {
                 let n = self.mk_not_rw(args[0]);
                 Some(St::Done(self.mk_or_rw(&[n, args[1]])))
@@ -792,6 +826,13 @@ impl Simp {
             },
             Op::True | Op::False => None,
             _ if self.arith_op(op) => self.arith_app(op, args),
+            Op::Bv(_)
+            | Op::Extract(..)
+            | Op::ZeroExt(_)
+            | Op::SignExt(_)
+            | Op::Repeat(_)
+            | Op::RotL(_)
+            | Op::RotR(_) => self.bv_app(op, args),
             _ => None,
         }
     }
@@ -823,6 +864,24 @@ impl Simp {
     fn reduce_eq(&mut self, a: T, b: T) -> Option<St> {
         if self.nodes[a].sort.is_arith_sort() {
             return self.arith_eq(a, b);
+        }
+        if matches!(self.nodes[a].sort, Sort::Bv(_))
+            && let Some(st) = self.bv_eq(a, b)
+        {
+            return Some(st);
+        }
+        // apply_tamagotchi: (= (= x bit) A) → (= x (ite A bit !bit))
+        if let Some((x, v)) = self.is_eq_bit(a) {
+            let one = self.mk_bv_num(&Int::from(u8::from(v)), 1);
+            let other = self.mk_bv_num(&Int::from(u8::from(!v)), 1);
+            let i = self.mk_ite(b, one, other);
+            return Some(St::Rw(self.mk_eq(x, i), 2));
+        }
+        if let Some((x, v)) = self.is_eq_bit(b) {
+            let one = self.mk_bv_num(&Int::from(u8::from(v)), 1);
+            let other = self.mk_bv_num(&Int::from(u8::from(!v)), 1);
+            let i = self.mk_ite(a, one, other);
+            return Some(St::Rw(self.mk_eq(x, i), 2));
         }
         None
     }

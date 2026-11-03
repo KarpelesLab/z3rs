@@ -14,6 +14,9 @@ from collections import Counter
 
 RS, Z3, N, OUT = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
 OFF = int(sys.argv[5]) if len(sys.argv) > 5 else 0  # seed offset
+# Odd seed offsets also draw signed division, rotations, extracts,
+# extensions, concatenations and bit-vector ite.
+WIDE = OFF % 2 == 1
 HDR = (
     "(declare-const x Int)\n(declare-const y Int)\n(declare-const z Int)\n"
     "(declare-const a Real)\n(declare-const b Real)\n"
@@ -73,11 +76,37 @@ def gen(r):
         if d > 2 or c < 0.35:
             return r.choice(["u", "v", "#x00", "#x01", "#xff", "#x0f", "u"])
         ops = ["bvadd", "bvmul", "bvand", "bvor", "bvxor", "bvsub", "bvshl", "bvlshr", "bvudiv", "bvurem"]
-        if c < 0.85:
+        if WIDE:
+            ops += ["bvashr", "bvsdiv", "bvsrem", "bvsmod", "bvnand", "bvnor", "bvxnor"]
+        if c < 0.75:
             return f"({r.choice(ops)} {bv(d+1)} {bv(d+1)})"
+        if WIDE and c < 0.8:
+            k = r.randint(0, 7)
+            return f"((_ {r.choice(['rotate_left', 'rotate_right'])} {k}) {bv(d+1)})"
+        if WIDE and c < 0.85:
+            lo = r.randint(0, 7)
+            hi = r.randint(lo, 7)
+            n = 8 - (hi - lo + 1)
+            ext = r.choice(["zero_extend", "sign_extend"])
+            inner = f"((_ extract {hi} {lo}) {bv(d+1)})"
+            if n == 0:
+                return inner
+            if r.random() < 0.5:
+                return f"((_ {ext} {n}) {inner})"
+            return f"(concat {bvk(n, d)} {inner})"
+        if WIDE and c < 0.88:
+            return f"(ite {bt(d+1)} {bv(d+1)} {bv(d+1)})"
         if c < 0.92:
             return f"(bvnot {bv(d+1)})"
         return f"(bvneg {bv(d+1)})"
+
+    def bvk(n, d):
+        """A bit-vector term of width n (1..7)."""
+        c = r.random()
+        if c < 0.4:
+            return "#b" + "".join(r.choice("01") for _ in range(n))
+        lo = r.randint(0, 8 - n)
+        return f"((_ extract {lo + n - 1} {lo}) {bv(d+1)})"
 
     def bt(d):
         c = r.random()
