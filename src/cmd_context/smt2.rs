@@ -8487,7 +8487,19 @@ impl Context {
             let g = crate::rewriter::substitute(&mut self.m, goal, &subst);
             let g = crate::rewriter::simplify(&mut self.m, g);
             match self.decide_inner(g) {
-                (SmtResult::Sat, m) => return Some((SmtResult::Sat, m)),
+                (SmtResult::Sat, m) => {
+                    // The instance no longer mentions the enumerated variables:
+                    // pin their values into its model.
+                    let m = m.map(|mut model| {
+                        for &(v, val) in &subst {
+                            if let Some(r) = self.m.as_numeral(val) {
+                                model.set_arith(v, r);
+                            }
+                        }
+                        model
+                    });
+                    return Some((SmtResult::Sat, m));
+                }
                 (SmtResult::Unknown, _) => all_unsat = false,
                 (SmtResult::Unsat, _) => {}
             }
