@@ -36077,6 +36077,8 @@ impl Context {
                 && !untrustworthy_sat
             {
                 (SmtResult::Sat, Some(full(self, m)))
+            } else if let Some((r, m)) = self.nlsat_decide_goal(lin, !untrustworthy_sat) {
+                (r, m.map(|m| full(self, m)))
             } else {
                 (SmtResult::Unknown, None)
             }
@@ -36675,6 +36677,198 @@ impl Context {
             }
         }
         None
+    }
+
+    /// Decide a nonlinear goal — any Boolean combination of polynomial
+    /// constraints — with the nlsat solver ([`crate::nlsat::solver`]). The goal
+    /// becomes a CNF (Tseitin variables for nested connectives). An `unsat` is
+    /// always sound (opaque terms and integer variables only relax the
+    /// problem); a `sat` is reported only when every arithmetic leaf is a real
+    /// constant, with nlsat's exact (possibly irrational) assignment as model.
+    fn nlsat_decide_goal(&self, goal: AstId, sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
+        use crate::nlsat::Rel as NRel;
+        use crate::nlsat::solver::{InLit, Kind, NlsatResult, check};
+        struct Cnf {
+            clauses: Vec<Vec<InLit>>,
+            bools: Vec<AstId>,
+            num_tseitin: u32,
+            memo: BTreeMap<AstId, InLit>,
+            var_map: BTreeMap<AstId, u32>,
+        }
+        fn negate(l: &InLit) -> InLit {
+            match l {
+                InLit::Bool(b, n) => InLit::Bool(*b, !*n),
+                InLit::Ineq(p, k, n) => InLit::Ineq(p.clone(), *k, !*n),
+            }
+        }
+        // Boolean variable numbers: the goal's Boolean constants, then Tseitin
+        // variables (numbered after all of them, fixed up at the end).
+        const TSEITIN: u32 = 1 << 30;
+        fn lit(ctx: &Context, cnf: &mut Cnf, t: AstId) -> Option<InLit> {
+            if let Some(l) = cnf.memo.get(&t) {
+                return Some(l.clone());
+            }
+            let m = &ctx.m;
+            let l = if m.is_not(t) {
+                negate(&lit(ctx, cnf, m.app_args(t)[0])?)
+            } else if m.is_true(t) || m.is_false(t) {
+                // `x = x` is true: a constant polynomial literal.
+                let p = crate::math::polynomial::Polynomial::zero();
+                InLit::Ineq(p, Kind::Eq, m.is_false(t))
+            } else if m.is_uninterp_const(t) && m.is_bool_sort(m.get_sort(t)) {
+                let b = match cnf.bools.iter().position(|&x| x == t) {
+                    Some(i) => i as u32,
+                    None => {
+                        cnf.bools.push(t);
+                        cnf.bools.len() as u32 - 1
+                    }
+                };
+                InLit::Bool(b, false)
+            } else if m.is_and(t) || m.is_or(t) || m.is_implies(t) {
+                let args = m.app_args(t).to_vec();
+                let mut ls = Vec::with_capacity(args.len());
+                for (i, &a) in args.iter().enumerate() {
+                    let la = lit(ctx, cnf, a)?;
+                    // `a => b` is `¬a ∨ b`.
+                    ls.push(if m.is_implies(t) && i == 0 {
+                        negate(&la)
+                    } else {
+                        la
+                    });
+                }
+                let v = InLit::Bool(TSEITIN + cnf.num_tseitin, false);
+                cnf.num_tseitin += 1;
+                if m.is_and(t) {
+                    // v ⇔ ∧ls
+                    let mut big = alloc::vec![v.clone()];
+                    for l in &ls {
+                        cnf.clauses.push(alloc::vec![negate(&v), l.clone()]);
+                        big.push(negate(l));
+                    }
+                    cnf.clauses.push(big);
+                } else {
+                    // v ⇔ ∨ls
+                    let mut big = alloc::vec![negate(&v)];
+                    for l in &ls {
+                        cnf.clauses.push(alloc::vec![v.clone(), negate(l)]);
+                        big.push(l.clone());
+                    }
+                    cnf.clauses.push(big);
+                }
+                v
+            } else if (m.is_ite(t) && m.is_bool_sort(m.get_sort(t)))
+                || (m.is_eq(t) && m.is_bool_sort(m.get_sort(m.app_args(t)[0])))
+                || m.is_xor(t)
+            {
+                let args = m.app_args(t).to_vec();
+                let v = InLit::Bool(TSEITIN + cnf.num_tseitin, false);
+                cnf.num_tseitin += 1;
+                let nv = negate(&v);
+                if m.is_ite(t) {
+                    let (c, a, b) = (
+                        lit(ctx, cnf, args[0])?,
+                        lit(ctx, cnf, args[1])?,
+                        lit(ctx, cnf, args[2])?,
+                    );
+                    cnf.clauses
+                        .push(alloc::vec![nv.clone(), negate(&c), a.clone()]);
+                    cnf.clauses
+                        .push(alloc::vec![nv.clone(), c.clone(), b.clone()]);
+                    cnf.clauses
+                        .push(alloc::vec![v.clone(), negate(&c), negate(&a)]);
+                    cnf.clauses.push(alloc::vec![v.clone(), c, negate(&b)]);
+                } else {
+                    if args.len() != 2 {
+                        return None;
+                    }
+                    let (a, b) = (lit(ctx, cnf, args[0])?, lit(ctx, cnf, args[1])?);
+                    // v ⇔ (a ⇔ b), or its negation for xor.
+                    let (v, nv) = if m.is_xor(t) { (nv, v) } else { (v, nv) };
+                    cnf.clauses
+                        .push(alloc::vec![nv.clone(), negate(&a), b.clone()]);
+                    cnf.clauses
+                        .push(alloc::vec![nv.clone(), a.clone(), negate(&b)]);
+                    cnf.clauses
+                        .push(alloc::vec![v.clone(), a.clone(), b.clone()]);
+                    cnf.clauses
+                        .push(alloc::vec![v.clone(), negate(&a), negate(&b)]);
+                    let r = if m.is_xor(t) { nv } else { v };
+                    cnf.memo.insert(t, r.clone());
+                    return Some(r);
+                }
+                v
+            } else {
+                let c = ctx.icp_atom(t, false, &mut cnf.var_map)?;
+                match c.rel {
+                    NRel::Lt => InLit::Ineq(c.poly, Kind::Lt, false),
+                    NRel::Gt => InLit::Ineq(c.poly, Kind::Gt, false),
+                    NRel::Le => InLit::Ineq(c.poly, Kind::Gt, true),
+                    NRel::Ge => InLit::Ineq(c.poly, Kind::Lt, true),
+                    NRel::Eq => InLit::Ineq(c.poly, Kind::Eq, false),
+                    NRel::Ne => InLit::Ineq(c.poly, Kind::Eq, true),
+                }
+            };
+            cnf.memo.insert(t, l.clone());
+            Some(l)
+        }
+        let mut cnf = Cnf {
+            clauses: Vec::new(),
+            bools: Vec::new(),
+            num_tseitin: 0,
+            memo: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+        };
+        // Top-level conjuncts and disjunctions become clauses directly.
+        let mut conj = Vec::new();
+        self.icp_flatten_and(goal, &mut conj);
+        for c in conj {
+            let parts: Vec<AstId> = if self.m.is_or(c) {
+                self.m.app_args(c).to_vec()
+            } else {
+                alloc::vec![c]
+            };
+            let mut cl = Vec::with_capacity(parts.len());
+            for p in parts {
+                cl.push(lit(self, &mut cnf, p)?);
+            }
+            cnf.clauses.push(cl);
+        }
+        if cnf.var_map.is_empty() {
+            return None;
+        }
+        let nb = cnf.bools.len() as u32;
+        let fix = |l: &mut InLit| {
+            if let InLit::Bool(b, _) = l
+                && *b >= TSEITIN
+            {
+                *b = *b - TSEITIN + nb;
+            }
+        };
+        for c in cnf.clauses.iter_mut() {
+            c.iter_mut().for_each(fix);
+        }
+        let num_bools = (nb + cnf.num_tseitin) as usize;
+        match check(cnf.var_map.len(), num_bools, &cnf.clauses) {
+            NlsatResult::Unsat => Some((SmtResult::Unsat, None)),
+            NlsatResult::Sat(values, bvals) if sat_ok => {
+                // Only real constants as leaves: then the assignment is a model.
+                let exact = cnf.var_map.keys().all(|&t| {
+                    self.m.is_uninterp_const(t) && !self.m.is_int_sort(self.m.get_sort(t))
+                });
+                if !exact {
+                    return None;
+                }
+                let mut model = Model::from_bv(BTreeMap::new());
+                for (&t, &v) in &cnf.var_map {
+                    model.set_alg(t, alg_to_algebraic(&values[v as usize]));
+                }
+                for (i, &b) in cnf.bools.iter().enumerate() {
+                    model.set_bool(b, bvals[i]);
+                }
+                Some((SmtResult::Sat, Some(model)))
+            }
+            _ => None,
+        }
     }
 
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {

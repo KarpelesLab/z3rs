@@ -382,6 +382,21 @@ impl Alg {
             (_, Alg::Rational(b)) => return self.locate(b).reverse(),
             _ => {}
         }
+        // Exact equality first: `self = other` iff `self` is a root of
+        // `other`'s defining polynomial lying in `other`'s isolating interval
+        // (which isolates a single root of it). Distinct numbers then separate
+        // under refinement.
+        if let Alg::Irrational {
+            poly: pb,
+            lo: blo,
+            hi: bhi,
+        } = other
+            && self.sign_of(pb) == 0
+            && self.locate(blo) == Ordering::Less
+            && self.locate(bhi) == Ordering::Greater
+        {
+            return Ordering::Equal;
+        }
         let mut a = self.clone();
         let mut b = other.clone();
         for _ in 0..2000 {

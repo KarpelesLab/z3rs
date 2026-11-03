@@ -26,7 +26,7 @@ pub type Var = u32;
 /// A canonical monomial: the product of `var^exp` for each entry, with every
 /// `exp > 0` and entries sorted ascending by `var` (so the representation is
 /// unique). The empty vector is the constant monomial `1`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Monomial {
     powers: Vec<(Var, u32)>,
 }
@@ -142,7 +142,7 @@ impl Monomial {
 /// A canonical multivariate polynomial: a sorted list of `(coeff, monomial)`
 /// terms with nonzero coefficients and distinct monomials. The empty term list
 /// is the zero polynomial.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Polynomial {
     /// Sorted descending by [`Monomial::grlex_cmp`] (leading term first).
     terms: Vec<(Rational, Monomial)>,

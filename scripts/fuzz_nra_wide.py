@@ -57,6 +57,8 @@ def one(i):
     if a=="sat":
         body=out[out.find("(",4):]
         defs=re.findall(r"\(define-fun .*?(?=\n  \(define-fun|\n\)\s*$)",body,re.S)
+        # z3's division-by-zero functions are built in: not redefinable.
+        defs=[d for d in defs if d.split()[1] not in ("/0","div0","mod0")]
         names=set(re.findall(r"\(define-fun (\S+)",body))
         if defs:
             ds=[d for d in decls if d.split()[1] not in names]

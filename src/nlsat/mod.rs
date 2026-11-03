@@ -5,6 +5,8 @@
 //!
 //! ## Upstream C++ components to port
 //! - [~] `z3/src/nlsat` → [`icp`] (interval-propagation *refutation* half of nlsat)
+//!   and [`solver`] (the conflict-driven nlsat search with the classic
+//!   sample-cell projection explanation)
 //! - [ ] `z3/src/realclosure`
 //!
 //! ## Status: IN PROGRESS — sound nonlinear refutation via interval propagation
@@ -15,6 +17,7 @@ pub mod icp;
 pub mod nla;
 pub mod realclosure;
 pub mod search;
+pub mod solver;
 pub mod univariate;
 
 pub use icp::{Constraint, Rel, refute};

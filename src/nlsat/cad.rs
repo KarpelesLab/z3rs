@@ -523,7 +523,7 @@ pub(crate) fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec
 /// integer polynomial whose roots ⊇ the fiber roots, isolate those, then keep
 /// only the genuine ones (`sign_at_point(f, sample++β) == 0`). `None` if `f` is
 /// nullified at the sample (the eliminated polynomial is identically zero).
-fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
+pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
     if f.degree_of(var) == 0 {
         return Some(Vec::new()); // no root boundaries from a var-free polynomial
     }
