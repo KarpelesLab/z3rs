@@ -9,15 +9,16 @@
 //! value of `x`; each literal's *infeasible set* (the values of `x`, under the
 //! assignment of the lower variables, at which it is false) comes from the
 //! roots of its polynomial. When the infeasible sets of a clause cover the
-//! real line, the conflict is explained by a lemma built by the sample-cell
-//! projection of `nlsat_explain` (the classic projection; z3's levelwise
-//! variant is not ported): a clause, valid in the reals, whose literals over the
-//! lower variables describe a cell around the current sample in which the
-//! conflict persists. CDCL-style resolution of these lemmas then either
+//! real line, the conflict is explained by a lemma built by z3's levelwise
+//! single-cell construction (`levelwise`; the classic sample-cell projection
+//! of `nlsat_explain` is the fallback): a clause, valid in the reals, whose
+//! literals over the lower variables describe a cell around the current sample
+//! in which the conflict persists. CDCL-style resolution of these lemmas then either
 //! backjumps to a lower stage or derives the empty clause.
 //!
 //! Projection polynomials are replaced by their factors (`math::factor`, a
-//! partial factorization). Integer variables are handled as z3's
+//! partial factorization); root isolation and atom degrees work on the
+//! factors too, as z3's atoms are products of factors. Integer variables are handled as z3's
 //! `search_check` does: branch and bound on a non-integral value of a
 //! satisfying assignment.
 //!
@@ -27,9 +28,11 @@
 //! primitive (an inexact resultant, an unresolved root comparison) or an
 //! exhausted budget yields `Unknown`.
 //!
-//! Not ported: core simplification by equalities and core minimization, the
-//! levelwise projection, the Thom encoding of quadratic roots, restarts and
-//! reordering during search, and lazy-mode clause skipping.
+//! Root literals of linear and quadratic polynomials become sign conditions
+//! (`mk_linear_root`, `mk_quadratic_root`'s Thom encoding).
+//!
+//! Not ported: core simplification by equalities and core minimization,
+//! restarts and reordering during search, and lazy-mode clause skipping.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -41,6 +44,8 @@ use crate::math::polynomial::{Monomial, Polynomial, Var};
 use crate::math::resultant::psc_chain;
 use crate::nlsat::cad::roots_at;
 use crate::nlsat::realclosure::{Alg, sign_at_point};
+
+mod levelwise;
 
 /// The kind of an arithmetic atom: `p = 0`, `p < 0`, `p > 0`, or a comparison
 /// of the atom's variable with the `i`-th real root of `p` (`x = root_i(p)`, …).
@@ -161,6 +166,9 @@ struct Atom {
     x: Var,
     /// The 1-based root index of a root atom (0 for an inequality).
     i: u32,
+    /// Its degree in `x`: for an inequality, the largest degree of a factor
+    /// of `p` (z3's atoms are products of factors).
+    deg: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -719,6 +727,10 @@ struct Solver {
     root_cache: BTreeMap<(Var, Polynomial), (Vec<Alg>, Vec<i32>)>,
     /// Signs at the current assignment, by `(max_var(p), p)`.
     sign_cache: BTreeMap<(Var, Polynomial), i32>,
+    /// Principal subresultant chains, by `(x, p, q)` (z3's polynomial cache).
+    psc_cache: BTreeMap<(Var, Polynomial, Polynomial), Vec<Polynomial>>,
+    /// Factorizations (`math::factor::factors`), memoized.
+    factor_cache: BTreeMap<Polynomial, Vec<Polynomial>>,
 }
 
 impl Solver {
@@ -756,6 +768,8 @@ impl Solver {
             budget: 2_000_000,
             root_cache: BTreeMap::new(),
             sign_cache: BTreeMap::new(),
+            psc_cache: BTreeMap::new(),
+            factor_cache: BTreeMap::new(),
         }
     }
 
@@ -800,7 +814,14 @@ impl Solver {
         }
         let b = self.mk_bool_var();
         let (kind, x, i, p) = key.clone();
-        self.atoms.push(Atom { kind, p, x, i });
+        let deg = if kind.is_root() {
+            p.degree_of(x)
+        } else {
+            self.factors_cached(&p)
+                .map(|fs| fs.iter().map(|f| f.degree_of(x)).max().unwrap_or(0))
+                .unwrap_or_else(|_| p.degree_of(x))
+        };
+        self.atoms.push(Atom { kind, p, x, i, deg });
         self.bool2atom[b as usize] = Some(self.atoms.len() - 1);
         self.atom_index.insert(key, b);
         b
@@ -825,7 +846,7 @@ impl Solver {
     }
 
     fn atom_degree(&self, a: &Atom) -> u32 {
-        a.p.degree_of(a.x)
+        a.deg
     }
 
     /// z3's `lit_lt`: Boolean literals first, then by maximal variable,
@@ -931,8 +952,27 @@ impl Solver {
             };
             return Ok((Vec::new(), alloc::vec![s]));
         }
-        let mut roots = roots_at(p, &pt, x).ok_or(Abort)?;
+        // The roots of the factors (z3's atoms are factored): smaller
+        // polynomials to isolate along the fiber.
+        let fs = self.factors_cached(p)?;
+        let mut roots = if fs.len() > 1 {
+            let mut rs = Vec::new();
+            for f in &fs {
+                if f.degree_of(x) > 0 {
+                    rs.extend(self.roots(f, x)?);
+                } else if self.sign(f)? == 0 {
+                    // A vanishing factor free of `x`: `p` is identically
+                    // zero along the fiber (no roots, sign 0).
+                    return Ok((Vec::new(), alloc::vec![0]));
+                }
+            }
+            rs
+        } else {
+            roots_at(p, &pt, x).ok_or(Abort)?
+        };
         roots.sort_by(|a, b| a.compare(b));
+        // Factors from a partial factorization may share roots.
+        roots.dedup_by(|a, b| a.compare(b) == Ordering::Equal);
         let mut samples: Vec<Rational> = Vec::with_capacity(roots.len() + 1);
         if roots.is_empty() {
             samples.push(zero());
@@ -950,6 +990,17 @@ impl Solver {
             signs.push(sign_at_point(p, &q).ok_or(Abort)?);
         }
         Ok((roots, signs))
+    }
+
+    /// The factors of `p` (memoized).
+    fn factors_cached(&mut self, p: &Polynomial) -> Res<Vec<Polynomial>> {
+        if let Some(fs) = self.factor_cache.get(p) {
+            return Ok(fs.clone());
+        }
+        self.spend(4)?;
+        let fs = crate::math::factor::factors(p);
+        self.factor_cache.insert(p.clone(), fs.clone());
+        Ok(fs)
     }
 
     fn roots(&mut self, p: &Polynomial, x: Var) -> Res<Vec<Alg>> {
@@ -1867,9 +1918,18 @@ impl Solver {
         if p.is_constant() {
             return Ok(());
         }
-        let y = max_var(p).expect("non-constant");
-        if let (Some((q, i)), _, _) = self.find_cell_roots(core::slice::from_ref(p), y)? {
-            self.add_root_literal(Kind::RootEq, y, i, &q);
+        // A square-free representative (z3's `square_free`): the product of
+        // the distinct factors.
+        let mut q = Polynomial::constant(Rational::from_integer(Int::from(1)));
+        for f in self.factors_cached(p)? {
+            q = q.mul(&f);
+        }
+        if q.is_constant() {
+            return Ok(());
+        }
+        let y = max_var(&q).expect("non-constant");
+        if let (Some((q, i)), _, _) = self.find_cell_roots(core::slice::from_ref(&q), y)? {
+            self.add_root_literal(Kind::RootEq, y, i, &q)?;
         }
         Ok(())
     }
@@ -1881,33 +1941,127 @@ impl Solver {
         self.add_literal(l);
     }
 
-    fn add_root_literal(&mut self, kind: Kind, y: Var, i: u32, p: &Polynomial) {
+    fn add_root_literal(
+        &mut self,
+        kind: Kind,
+        y: Var,
+        i: u32,
+        p: &Polynomial,
+    ) -> Result<(), ExplainErr> {
         // A root of a polynomial linear in `y` with a constant coefficient is
         // an inequality (`mk_linear_root`).
         if p.degree_of(y) == 1
             && let Some(c) = p.coeff_of_var(y, 1).as_constant()
         {
-            let p = if c.is_negative() { p.neg() } else { p.clone() };
-            let (k, lsign) = match kind {
-                Kind::RootEq => (Kind::Eq, false),
-                Kind::RootLt => (Kind::Lt, false),
-                Kind::RootGt => (Kind::Gt, false),
-                Kind::RootLe => (Kind::Gt, true),
-                Kind::RootGe => (Kind::Lt, true),
-                _ => unreachable!("root kinds"),
-            };
-            self.add_assumption(k, &p, lsign);
-            return;
+            self.mk_linear_root(kind, p, c.is_negative());
+            return Ok(());
+        }
+        if self.mk_quadratic_root(kind, y, i, p)? {
+            return Ok(());
         }
         let b = self.mk_root_atom(kind, y, i, p);
         self.add_literal(Lit::new(b, true));
+        Ok(())
     }
 
-    fn add_cell_lits(&mut self, ps: &[Polynomial], y: Var) -> Res<Vec<Polynomial>> {
+    /// The root literal of `p`, linear in its variable, as an inequality
+    /// (`mk_linear_root`; `neg`: the coefficient is negative).
+    fn mk_linear_root(&mut self, kind: Kind, p: &Polynomial, neg: bool) {
+        let p = if neg { p.neg() } else { p.clone() };
+        let (k, lsign) = match kind {
+            Kind::RootEq => (Kind::Eq, false),
+            Kind::RootLt => (Kind::Lt, false),
+            Kind::RootGt => (Kind::Gt, false),
+            Kind::RootLe => (Kind::Gt, true),
+            Kind::RootGe => (Kind::Lt, true),
+            _ => unreachable!("root kinds"),
+        };
+        self.add_assumption(k, &p, lsign);
+    }
+
+    /// A pseudo-linear root: `q` linear in `y` with a coefficient of known
+    /// sign (`mk_plinear_root`).
+    fn mk_plinear_root(&mut self, kind: Kind, y: Var, q: &Polynomial) -> Result<bool, ExplainErr> {
+        if q.degree_of(y) != 1 {
+            return Ok(false);
+        }
+        let c = q.coeff_of_var(y, 1);
+        let s = self.sign(&c)?;
+        if s == 0 {
+            return Ok(false);
+        }
+        self.ensure_sign(&c)?;
+        self.mk_linear_root(kind, q, s < 0);
+        Ok(true)
+    }
+
+    /// The root literal of a quadratic `p = A·y² + B·y + C` by the signs of
+    /// the discriminant, `A`, `p' = 2A·y + B` and `p` (Thom's lemma,
+    /// `mk_quadratic_root`): those signs, fixed in the cell, place `y` with
+    /// respect to both roots.
+    fn mk_quadratic_root(
+        &mut self,
+        kind: Kind,
+        y: Var,
+        i: u32,
+        p: &Polynomial,
+    ) -> Result<bool, ExplainErr> {
+        if p.degree_of(y) != 2 || (i != 1 && i != 2) {
+            return Ok(false);
+        }
+        let a = p.coeff_of_var(y, 2);
+        let b = p.coeff_of_var(y, 1);
+        let c = p.coeff_of_var(y, 0);
+        let four = Rational::from_integer(Int::from(4));
+        let q = b.mul(&b).sub(&a.mul(&c).scale(&four));
+        let yy = Polynomial::var(y);
+        let two = Rational::from_integer(Int::from(2));
+        let (p_diff, _) = normalize(&a.mul(&yy).scale(&two).add(&b));
+        let sq = self.ensure_sign_quad(&q)?;
+        if sq < 0 {
+            return Ok(false);
+        }
+        let sa = self.ensure_sign_quad(&a)?;
+        if sa == 0 {
+            let q = b.mul(&yy).add(&c);
+            return self.mk_plinear_root(kind, y, &q);
+        }
+        self.ensure_sign(&p_diff)?;
+        if sq > 0 {
+            self.ensure_sign(p)?;
+        }
+        Ok(true)
+    }
+
+    /// Add the current sign of `p` as an assumption and `p` to the projection
+    /// (`ensure_sign`).
+    fn ensure_sign(&mut self, p: &Polynomial) -> Result<(), ExplainErr> {
+        if p.is_constant() {
+            return Ok(());
+        }
+        self.ensure_sign_quad(p).map(|_| ())
+    }
+
+    /// [`Self::ensure_sign`], returning the sign (`ensure_sign_quad`).
+    fn ensure_sign_quad(&mut self, p: &Polynomial) -> Result<i32, ExplainErr> {
+        let s = self.sign(p)?;
+        if !p.is_constant() {
+            let k = match s {
+                0 => Kind::Eq,
+                s if s < 0 => Kind::Lt,
+                _ => Kind::Gt,
+            };
+            self.add_assumption(k, p, false);
+            self.insert_fresh_factors_in_todo(p.clone())?;
+        }
+        Ok(s)
+    }
+
+    fn add_cell_lits(&mut self, ps: &[Polynomial], y: Var) -> Result<Vec<Polynomial>, ExplainErr> {
         let mut samples = Vec::new();
         let (eq, lower, upper) = self.find_cell_roots(ps, y)?;
         if let Some((p, i)) = eq {
-            self.add_root_literal(Kind::RootEq, y, i, &p);
+            self.add_root_literal(Kind::RootEq, y, i, &p)?;
             samples.push(p);
             return Ok(samples);
         }
@@ -1917,7 +2071,7 @@ impl Solver {
             } else {
                 Kind::RootGt
             };
-            self.add_root_literal(k, y, i, &p);
+            self.add_root_literal(k, y, i, &p)?;
             samples.push(p);
         }
         if let Some((p, i, _)) = upper {
@@ -1926,7 +2080,7 @@ impl Solver {
             } else {
                 Kind::RootLt
             };
-            self.add_root_literal(k, y, i, &p);
+            self.add_root_literal(k, y, i, &p)?;
             samples.push(p);
         }
         Ok(samples)
@@ -1969,8 +2123,7 @@ impl Solver {
     /// Add the first nonzero principal subresultant coefficient of `p`, `q`
     /// in `x` (`psc`).
     fn psc(&mut self, p: &Polynomial, q: &Polynomial, x: Var) -> Result<(), ExplainErr> {
-        self.spend(16)?;
-        let chain = psc_chain(p, q, x).ok_or(Abort)?;
+        let chain = self.psc_chain_cached(p, q, x)?;
         let s = chain[0].clone();
         if s.is_zero() {
             // `p` and `q` share a common factor: project all coefficients.
@@ -1983,6 +2136,22 @@ impl Solver {
             return Ok(());
         }
         self.insert_fresh_factors_in_todo(s)
+    }
+
+    /// [`psc_chain`] of `p` and `q` in `x`, memoized.
+    fn psc_chain_cached(&mut self, p: &Polynomial, q: &Polynomial, x: Var) -> Res<Vec<Polynomial>> {
+        let key = if p <= q {
+            (x, p.clone(), q.clone())
+        } else {
+            (x, q.clone(), p.clone())
+        };
+        if let Some(c) = self.psc_cache.get(&key) {
+            return Ok(c.clone());
+        }
+        self.spend(16)?;
+        let chain = psc_chain(p, q, x).ok_or(Abort)?;
+        self.psc_cache.insert(key, chain.clone());
+        Ok(chain)
     }
 
     fn psc_discriminant(&mut self, ps: &[Polynomial], x: Var) -> Result<(), ExplainErr> {
@@ -2035,6 +2204,12 @@ impl Solver {
         self.todo_extracted.clear();
         for p in ps {
             self.insert_fresh_factors_in_todo(p)?;
+        }
+        // Levelwise single cell (z3's default); when it fails, the explanation
+        // restarts in the classic projection with all coefficients.
+        if !self.add_all_coeffs {
+            let ps = core::mem::take(&mut self.todo);
+            return self.levelwise(&ps, max_x);
         }
         let (x, mut ps) = self.extract_max_polys();
         let Some(mut x) = x else {
@@ -2132,24 +2307,40 @@ impl Solver {
 }
 
 /// The variable order z3's `heuristic_reorder` chooses: higher maximal degree
-/// first, then more occurrences, then index. Returns `order[k]` = the input
-/// variable placed at position `k`.
+/// first, then more occurrences (both over the factors of every literal's
+/// polynomial, as z3's atoms are factored), then z3's seeded shuffle. Returns
+/// `order[k]` = the input variable placed at position `k`.
 fn heuristic_order(num_vars: usize, polys: &[&Polynomial]) -> Vec<Var> {
     let mut max_deg = alloc::vec![0u32; num_vars];
     let mut occs = alloc::vec![0usize; num_vars];
-    for p in polys {
-        for v in p.vars() {
-            let d = p.degree_of(v);
-            occs[v as usize] += 1;
-            max_deg[v as usize] = max_deg[v as usize].max(d);
+    let mut memo: BTreeMap<&Polynomial, Vec<Polynomial>> = BTreeMap::new();
+    for &p in polys {
+        let fs = memo
+            .entry(p)
+            .or_insert_with(|| crate::math::factor::factors(p));
+        for f in fs.iter() {
+            for v in f.vars() {
+                let d = f.degree_of(v);
+                occs[v as usize] += 1;
+                max_deg[v as usize] = max_deg[v as usize].max(d);
+            }
         }
+    }
+    // init_shuffle: the identity shuffled by `random_gen(1)`.
+    let mut shuffle: Vec<usize> = (0..num_vars).collect();
+    let mut rand = RandomGen(1);
+    let mut n = num_vars;
+    while n > 0 {
+        n -= 1;
+        let k = rand.next() as usize % (n + 1);
+        shuffle.swap(n, k);
     }
     let mut order: Vec<Var> = (0..num_vars as Var).collect();
     order.sort_by(|&x, &y| {
         max_deg[y as usize]
             .cmp(&max_deg[x as usize])
             .then(occs[y as usize].cmp(&occs[x as usize]))
-            .then(x.cmp(&y))
+            .then(shuffle[x as usize].cmp(&shuffle[y as usize]))
     });
     order
 }

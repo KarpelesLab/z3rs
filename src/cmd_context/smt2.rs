@@ -37604,6 +37604,12 @@ impl Context {
         let mut conj = Vec::new();
         self.icp_flatten_and(goal, &mut conj);
         for c in conj {
+            // A valid axiom (the product sign and square rules added for the
+            // other procedures) holds at every point: dropping it changes
+            // neither verdict, and keeps it out of the search and projection.
+            if self.valid_axioms.contains(&c) {
+                continue;
+            }
             let parts: Vec<AstId> = if self.m.is_or(c) {
                 self.m.app_args(c).to_vec()
             } else {
@@ -37648,6 +37654,15 @@ impl Context {
                 let mut model = Model::from_bv(BTreeMap::new());
                 for (&t, &v) in &cnf.var_map {
                     model.set_alg(t, alg_to_algebraic(&values[v as usize]));
+                }
+                // Constants only in the dropped valid axioms: any value works.
+                for t in self.m.postorder(goal) {
+                    if self.m.is_uninterp_const(t)
+                        && self.m.is_arith_sort(self.m.get_sort(t))
+                        && !cnf.var_map.contains_key(&t)
+                    {
+                        model.set_arith(t, Rational::from_integer(0.into()));
+                    }
                 }
                 for (i, &b) in cnf.bools.iter().enumerate() {
                     model.set_bool(b, bvals[i]);

@@ -217,9 +217,25 @@ fn push_factor(out: &mut Vec<Polynomial>, f: &Polynomial) {
 }
 
 /// The square-free primitive `p` (degree ≥ 1 in `x`) split further where
-/// cheap (`factor_sqf_pp`).
-fn factor_sqf_pp(p: &Polynomial, x: Var, out: &mut Vec<Polynomial>) {
+/// cheap (`factor_sqf_pp`). A content in another variable (a factor free
+/// of it) is split off first.
+fn factor_sqf_pp(
+    p: &Polynomial,
+    x: Var,
+    out: &mut Vec<Polynomial>,
+    bud: &mut Budget,
+) -> Option<()> {
     let vars = p.vars();
+    for &y in &vars {
+        if y == x {
+            continue;
+        }
+        let c = content(p, y, bud)?;
+        if !c.is_constant() {
+            factor_core(&c, out, bud)?;
+            return factor_core(&p.div_exact(&c)?, out, bud);
+        }
+    }
     if vars.len() == 1 && p.degree_of(x) >= 2 {
         let d = p.degree_of(x);
         let coeffs: Vec<Rational> = (0..=d)
@@ -240,16 +256,17 @@ fn factor_sqf_pp(p: &Polynomial, x: Var, out: &mut Vec<Polynomial>) {
                 .collect();
             push_factor(out, &Polynomial::from_terms(terms));
         }
-        return;
+        return Some(());
     }
     if p.degree_of(x) == 2
         && let Some((f1, f2)) = split_quadratic(p, x)
     {
         push_factor(out, &f1);
         push_factor(out, &f2);
-        return;
+        return Some(());
     }
     push_factor(out, p);
+    Some(())
 }
 
 /// `a·x² + b·x + c = (2ax + b − s)(2ax + b + s) / 4a` when the discriminant
@@ -338,7 +355,7 @@ fn factor_core(p: &Polynomial, out: &mut Vec<Polynomial>, bud: &mut Budget) -> O
     let dp = pp.deriv_var(x);
     let b0 = gcd_core(&pp, &dp, bud)?;
     if b0.is_constant() {
-        factor_sqf_pp(&pp, x, out);
+        factor_sqf_pp(&pp, x, out, bud)?;
         return Some(());
     }
     let mut a = pp.div_exact(&b0)?;
@@ -348,7 +365,7 @@ fn factor_core(p: &Polynomial, out: &mut Vec<Polynomial>, bud: &mut Budget) -> O
         let d = gcd_core(&a, &b, bud)?;
         let cj = a.div_exact(&d)?;
         if !cj.is_constant() {
-            factor_sqf_pp(&cj, x, out);
+            factor_sqf_pp(&cj, x, out, bud)?;
         }
         b = b.div_exact(&d)?;
         a = d;
