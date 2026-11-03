@@ -338,6 +338,23 @@ fn tangent_lemmas(
             out.push(l);
         }
     };
+    // z3's binomial sign order lemmas (`order_lemma_on_binomial_sign`), with
+    // either factor as `x`: for `y > 0`, `x ≤ v → xy ≤ v·y` (`x ≥ v → xy ≥
+    // v·y`), mirrored for `y < 0`, the side the assignment gets wrong.
+    if !va.is_zero() && !vb.is_zero() {
+        let sign = sign(&(vt - &correct));
+        for (x, vx, y, vy) in [(mon.a, va, mon.b, vb), (mon.b, vb, mon.a, va)] {
+            let sy = self::sign(vy);
+            let ly = bld.cmp(y, if sy == 1 { -1 } else { 1 }, &zero);
+            let lx = bld.cmp(x, if sy * sign == 1 { 2 } else { -2 }, vx);
+            let e = bld.sum(&[(rat(1), mon.t), (-vx.clone(), y)]);
+            let lt = e.and_then(|e| bld.cmp(e, if sign == 1 { -1 } else { 1 }, &zero));
+            push(bld.clause(alloc::vec![ly, lx, lt]));
+            if mon.a == mon.b {
+                break;
+            }
+        }
+    }
     // Monotonicity: |fᵢ| ≥ |vᵢ| (same signs) → |t| ≥ |Π vᵢ|, or the dual.
     let fvals: Vec<Rational> = mon.factors.iter().map(|&f| val(model, bld.m, f)).collect();
     let prod = fvals.iter().fold(rat(1), |acc, v| &acc * v);
@@ -409,6 +426,124 @@ fn tangent_lemmas(
     }
 }
 
+/// The bounds the goal's top-level conjuncts put on its constants: `x ⋈ k`
+/// comparisons (strict ones relaxed, or rounded over the integers).
+fn constant_bounds(
+    m: &AstManager,
+    goal: AstId,
+) -> BTreeMap<AstId, (Option<Rational>, Option<Rational>)> {
+    let mut out: BTreeMap<AstId, (Option<Rational>, Option<Rational>)> = BTreeMap::new();
+    let mut stack = alloc::vec![(goal, false)];
+    while let Some((t, neg)) = stack.pop() {
+        if m.is_not(t) {
+            stack.push((m.app_args(t)[0], !neg));
+            continue;
+        }
+        if (m.is_and(t) && !neg) || (m.is_or(t) && neg) {
+            stack.extend(m.app_args(t).iter().map(|&a| (a, neg)));
+            continue;
+        }
+        let Some(op) = m.arith_op(t) else { continue };
+        if !matches!(op, ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt) {
+            continue;
+        }
+        let args = m.app_args(t);
+        if args.len() != 2 {
+            continue;
+        }
+        // `e ≤ 0` (or `e ≥ 0`) for e = lhs − rhs, the relation negated under
+        // `not`.
+        let e = ast_to_lin(m, args[0]).sub(&ast_to_lin(m, args[1]));
+        let mut le = matches!(op, ArithOp::Le | ArithOp::Lt);
+        // Strict unless negated (`not (x ≤ k)` is `x > k`).
+        let strict = matches!(op, ArithOp::Lt | ArithOp::Gt) != neg;
+        if neg {
+            le = !le;
+        }
+        let mut vars = e.terms();
+        let (Some((x, k)), None) = (vars.next(), vars.next()) else {
+            continue;
+        };
+        if !m.is_uninterp_const(x) {
+            continue;
+        }
+        // k·x + c ≤ 0 ⇔ x ≤ −c/k (k > 0), x ≥ −c/k (k < 0).
+        let v = -(e.constant_part() / k);
+        let upper = le == k.is_positive();
+        let int = m.is_int_sort(m.get_sort(x));
+        let entry = out.entry(x).or_insert((None, None));
+        if upper {
+            let v = match (int, strict) {
+                (true, true) => Rational::from_integer(v.ceil().sub(&Int::from(1))),
+                (true, false) => Rational::from_integer(v.floor()),
+                _ => v,
+            };
+            if entry.1.as_ref().is_none_or(|h| v < *h) {
+                entry.1 = Some(v);
+            }
+        } else {
+            let v = match (int, strict) {
+                (true, true) => Rational::from_integer(v.floor().add(&Int::from(1))),
+                (true, false) => Rational::from_integer(v.ceil()),
+                _ => v,
+            };
+            if entry.0.as_ref().is_none_or(|l| v > *l) {
+                entry.0 = Some(v);
+            }
+        }
+    }
+    out
+}
+
+/// The interval of `x^k` for `x ∈ [lo, hi]`.
+fn power_interval(lo: &Rational, hi: &Rational, k: u32) -> (Rational, Rational) {
+    let pow = |r: &Rational| (0..k).fold(rat(1), |acc, _| &acc * r);
+    let (a, b) = (pow(lo), pow(hi));
+    if k.is_multiple_of(2) && lo.is_negative() && hi.is_positive() {
+        (rat(0), if a > b { a } else { b })
+    } else if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// z3's monomial bounds (`nla_monomial_bounds`), from the bounds the goal
+/// puts on the constants: each product of bounded constants lies in the
+/// product of their intervals. The lemmas are consequences of the goal.
+fn monomial_bounds(m: &mut AstManager, goal: AstId, mons: &[Mon]) -> Vec<AstId> {
+    let bounds = constant_bounds(m, goal);
+    let mut out = Vec::new();
+    for mon in mons {
+        let mut powers: BTreeMap<AstId, u32> = BTreeMap::new();
+        for &f in &mon.factors {
+            *powers.entry(f).or_insert(0) += 1;
+        }
+        let mut iv = Some((rat(1), rat(1)));
+        for (f, k) in &powers {
+            let Some((Some(lo), Some(hi))) = bounds.get(f) else {
+                iv = None;
+                break;
+            };
+            let (pl, ph) = power_interval(lo, hi, *k);
+            let (l, h) = iv.expect("bounded so far");
+            let c = [&l * &pl, &l * &ph, &h * &pl, &h * &ph];
+            let lo = c.iter().min().expect("four").clone();
+            let hi = c.iter().max().expect("four").clone();
+            iv = Some((lo, hi));
+        }
+        let Some((lo, hi)) = iv else { continue };
+        let mut bld = Builder { m };
+        if let Some(l) = bld.cmp(mon.t, 1, &lo) {
+            out.push(l);
+        }
+        if let Some(h) = bld.cmp(mon.t, -1, &hi) {
+            out.push(h);
+        }
+    }
+    out
+}
+
 /// Lemmas per refinement round (z3's `nla::core::done`).
 const MAX_LEMMAS: usize = 10;
 
@@ -464,6 +599,11 @@ impl NlaSearch {
         core.eager_equalities();
         core.resume_searches();
         core.assert(m, goal);
+        for b in monomial_bounds(m, goal, &nla.mons) {
+            if nla.asserted.insert(b) {
+                core.assert(m, b);
+            }
+        }
         NlaSearch {
             nla,
             core,
@@ -965,6 +1105,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Products of bounded constants are bounded by the product of their
+    /// intervals: `−2 ≤ x ≤ 3 ∧ 1 ≤ y < 3` gives `−4 ≤ xy ≤ 6` (`y ≤ 2`
+    /// over the integers) and `0 ≤ x² ≤ 9`.
+    #[test]
+    fn monomial_bounds_from_the_goal() {
+        let mut m = AstManager::new();
+        let x = m.mk_int_const("x");
+        let y = m.mk_int_const("y");
+        let (lo, hi) = (m.mk_int(-2), m.mk_int(3));
+        let (one, three) = (m.mk_int(1), m.mk_int(3));
+        let a = m.mk_le(lo, x);
+        let b = m.mk_le(x, hi);
+        let c = m.mk_ge(y, one);
+        let d = m.mk_lt(y, three);
+        let xy = m.mk_mul(&[x, y]);
+        let xx = m.mk_mul(&[x, x]);
+        let zero = m.mk_int(0);
+        let e = m.mk_gt(xy, zero);
+        let f = m.mk_gt(xx, zero);
+        let goal = m.mk_and(&[a, b, c, d, e, f]);
+        let mut nla = Nla {
+            mons: Vec::new(),
+            canon: BTreeMap::new(),
+            defs: Vec::new(),
+            asserted: BTreeSet::new(),
+        };
+        nla.register(&mut m, xy);
+        nla.register(&mut m, xx);
+        let got: BTreeSet<AstId> = monomial_bounds(&mut m, goal, &nla.mons)
+            .into_iter()
+            .collect();
+        let mut want = BTreeSet::new();
+        for (t, l, h) in [(xy, -4, 6), (xx, 0, 9)] {
+            let (l, h) = (m.mk_int(l), m.mk_int(h));
+            want.insert(m.mk_ge(t, l));
+            want.insert(m.mk_le(t, h));
+        }
+        assert_eq!(got, want);
     }
 
     /// The support of an assignment: one true disjunct per disjunction,
