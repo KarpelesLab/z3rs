@@ -539,6 +539,17 @@ pub(crate) fn lift(sample: &[Alg], polys: &[Polynomial], var: Var) -> Option<Vec
 /// only the genuine ones (`sign_at_point(f, sample++β) == 0`). `None` if `f` is
 /// nullified at the sample (the eliminated polynomial is identically zero).
 pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<Alg>> {
+    roots_at_fueled(f, sample, var, &crate::math::fuel::Fuel::unlimited())
+}
+
+/// [`roots_at`] on the budget `fuel` (`None` once it is spent).
+pub(crate) fn roots_at_fueled(
+    f: &Polynomial,
+    sample: &[Alg],
+    var: Var,
+    fuel: &crate::math::fuel::Fuel,
+) -> Option<Vec<Alg>> {
+    use crate::nlsat::realclosure::sign_at_point_fueled as sign_at_point;
     if f.degree_of(var) == 0 {
         return Some(Vec::new()); // no root boundaries from a var-free polynomial
     }
@@ -548,7 +559,7 @@ pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<A
     if f.degree_of(var) == 0 {
         return Some(Vec::new());
     }
-    let g = crate::nlsat::realclosure::eliminate_irrationals(f.clone(), sample)?;
+    let g = crate::nlsat::realclosure::eliminate_irrationals_fueled(f.clone(), sample, fuel)?;
     // `g` is now univariate in `var`.
     let u = poly_to_upoly(&g, var);
     if u.is_zero() {
@@ -564,7 +575,7 @@ pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<A
         let d = f.degree_of(var);
         let mut nullified = true;
         for k in 0..=d {
-            if sign_at_point(&f.coeff_of_var(var, k), sample)? != 0 {
+            if sign_at_point(&f.coeff_of_var(var, k), sample, fuel)? != 0 {
                 nullified = false;
                 break;
             }
@@ -599,7 +610,7 @@ pub(crate) fn roots_at(f: &Polynomial, sample: &[Alg], var: Var) -> Option<Vec<A
         }
         let mut point = sample.to_vec();
         point.push(beta.clone());
-        if sign_at_point(f, &point)? == 0 {
+        if sign_at_point(f, &point, fuel)? == 0 {
             out.push(beta);
         }
     }

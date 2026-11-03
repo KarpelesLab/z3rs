@@ -126,6 +126,12 @@ pub struct SmtCore {
     /// atoms of each kind the SAT solver knows as theory variables.
     resume: bool,
     watched: (usize, usize, usize),
+    /// The work budget of the integer feasibility search of each
+    /// [`SmtCore::check`] (see [`SmtCore::set_work_budget`]).
+    work_budget: u64,
+    /// Whether each final check probes for an integer model itself before
+    /// asking the search for branches (see [`SmtCore::branch_only`]).
+    int_probe: bool,
 }
 
 impl Default for SmtCore {
@@ -156,6 +162,8 @@ impl SmtCore {
             eager_eqs: false,
             resume: false,
             watched: (0, 0, 0),
+            work_budget: BB_WORK_BUDGET,
+            int_probe: true,
         }
     }
 
@@ -166,6 +174,21 @@ impl SmtCore {
     /// model violates in a round of its own.
     pub fn eager_equalities(&mut self) {
         self.eager_eqs = true;
+    }
+
+    /// Bound the integer feasibility search (branch and bound, disequality
+    /// splits) of each [`SmtCore::check`] by `budget` base solves instead of
+    /// the default: an exhausted budget answers `unknown`.
+    pub fn set_work_budget(&mut self, budget: u64) {
+        self.work_budget = budget;
+    }
+
+    /// Leave integer branching to the search, as z3's `theory_lra` final
+    /// check does: a fractional integer value becomes a branch right away,
+    /// instead of first probing for an integer model by branch and bound
+    /// within the check (whose cost a check repeats at every final check).
+    pub fn branch_only(&mut self) {
+        self.int_probe = false;
     }
 
     /// Resume each [`SmtCore::check`] from the assignment the previous one
@@ -333,7 +356,7 @@ impl SmtCore {
         // A single work budget shared across *all* theory checks in this decision, so
         // the whole call terminates in bounded time even when many blocking-clause
         // rounds each face an expensive (blow-up-prone) theory check.
-        let mut budget = BB_WORK_BUDGET;
+        let mut budget = self.work_budget;
         loop {
             rounds += 1;
             if rounds > DPLL_ROUND_LIMIT {
@@ -414,6 +437,7 @@ impl SmtCore {
                 bases,
                 hint.as_ref(),
                 self.euf.is_some(),
+                self.int_probe,
             );
             match tc {
                 // Both theories consistent under this assignment → SAT.
@@ -3293,6 +3317,7 @@ const INTEGER_PROBE_BUDGET: u64 = 50_000;
 fn integer_model(
     sys: &ArithSystem,
     hint: Option<&Assignment>,
+    probe: bool,
 ) -> Result<Assignment, Option<Vec<SplitReq>>> {
     let model = match hint.filter(|h| satisfies(&sys.cons, h)) {
         Some(h) => h.clone(),
@@ -3304,7 +3329,7 @@ fn integer_model(
     }
     // Disequality splits are finitely many; only integer branching can go on
     // forever (parity, divisibility), which the integer search decides first.
-    if splits.iter().all(|s| matches!(s, SplitReq::Diseq { .. })) {
+    if !probe || splits.iter().all(|s| matches!(s, SplitReq::Diseq { .. })) {
         return Err(Some(splits));
     }
     let mut budget = INTEGER_PROBE_BUDGET;
@@ -3389,6 +3414,7 @@ fn theory_check(
     bases: &(ProofEgraph, Egraph),
     hint: Option<&Assignment>,
     euf_online: bool,
+    int_probe: bool,
 ) -> TheoryOutcome {
     // EUF equalities / disequalities implied by the assignment.
     let mut eqs = Vec::new();
@@ -3483,7 +3509,7 @@ fn theory_check(
     // rational model violates, or an integer variable it gives a fractional
     // value, becomes a case split on new bound atoms for the search to decide,
     // instead of a search inside this check.
-    match integer_model(&base, hint) {
+    match integer_model(&base, hint, int_probe) {
         Ok(_) => {}
         Err(Some(splits)) => return TheoryOutcome::Split(splits),
         Err(None) => {
@@ -3738,7 +3764,7 @@ fn model_based_combination(
             return TheoryOutcome::Conflict(out.into_iter().collect());
         }
     }
-    let model = match integer_model(&sys, hint) {
+    let model = match integer_model(&sys, hint, true) {
         Ok(model) => model,
         Err(Some(splits)) => return TheoryOutcome::Split(splits),
         Err(None) => {

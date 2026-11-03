@@ -16,6 +16,7 @@
 //! ## Status: IN PROGRESS — exact polynomial & interval kernels landed
 
 pub mod factor;
+pub mod fuel;
 pub mod interval;
 pub mod polynomial;
 pub mod resultant;

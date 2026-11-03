@@ -18,6 +18,7 @@ pub mod bv;
 pub mod cooper;
 pub mod euf;
 pub mod euf_online;
+pub mod nla;
 pub mod solver;
 
 pub use arith::{

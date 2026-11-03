@@ -44,10 +44,11 @@ use core::cmp::Ordering;
 
 use puremp::{Int, Rational};
 
+use crate::math::fuel::Fuel;
 use crate::math::polynomial::{Monomial, Polynomial, Var};
-use crate::math::resultant::psc_chain;
-use crate::nlsat::cad::roots_at;
-use crate::nlsat::realclosure::{Alg, sign_at_point};
+use crate::math::resultant::psc_chain_fueled;
+use crate::nlsat::cad::roots_at_fueled;
+use crate::nlsat::realclosure::{Alg, sign_at_point_fueled};
 
 mod levelwise;
 mod simplify;
@@ -115,6 +116,10 @@ impl Lit {
         Lit(self.0 ^ 1)
     }
 }
+
+/// The clause visits a limited check allows per unit of work (see
+/// [`check_with_ints_limited`]).
+const LIMITED_VISITS_PER_WORK: u64 = 64;
 
 /// Boolean variable 0 is the constant `true`.
 const TRUE_LIT: Lit = Lit(0);
@@ -718,6 +723,11 @@ struct Solver {
     scope_lvl: usize,
     conflicts: usize,
     max_conflicts: usize,
+    /// Clause visits left before aborting (see [`check_with_ints_limited`]).
+    steps_left: u64,
+    /// The work budget of resultants and root isolation (see
+    /// [`check_with_ints_limited`]).
+    fuel: Fuel,
     rand: RandomGen,
     full_dimensional: bool,
     /// Integer variables (branch and bound on non-integral values).
@@ -774,6 +784,8 @@ impl Solver {
             scope_lvl: 0,
             conflicts: 0,
             max_conflicts: 4000,
+            steps_left: u64::MAX,
+            fuel: Fuel::unlimited(),
             rand: RandomGen(0),
             full_dimensional: false,
             is_int: alloc::vec![false; num_vars],
@@ -938,7 +950,7 @@ impl Solver {
         }
         self.spend(1)?;
         let pt = self.point(mv as usize + 1);
-        let s = sign_at_point(p, &pt).ok_or(Abort)?;
+        let s = sign_at_point_fueled(p, &pt, &self.fuel).ok_or(Abort)?;
         self.sign_cache.insert(key, s);
         Ok(s)
     }
@@ -967,12 +979,13 @@ impl Solver {
 
     fn roots_signs_core(&mut self, p: &Polynomial, x: Var) -> Res<(Vec<Alg>, Vec<i32>)> {
         self.spend(4)?;
+        self.fuel.burn_poly(p).ok_or(Abort)?;
         let pt = self.point(x as usize);
         if p.degree_of(x) == 0 {
             let s = if let Some(c) = p.as_constant() {
                 c.signum()
             } else {
-                sign_at_point(p, &pt).ok_or(Abort)?
+                sign_at_point_fueled(p, &pt, &self.fuel).ok_or(Abort)?
             };
             return Ok((Vec::new(), alloc::vec![s]));
         }
@@ -992,7 +1005,7 @@ impl Solver {
             }
             rs
         } else {
-            roots_at(p, &pt, x).ok_or(Abort)?
+            roots_at_fueled(p, &pt, x, &self.fuel).ok_or(Abort)?
         };
         roots.sort_by(|a, b| a.compare(b));
         // Factors from a partial factorization may share roots.
@@ -1011,7 +1024,7 @@ impl Solver {
         for s in samples {
             let mut q = pt.clone();
             q.push(Alg::Rational(s));
-            signs.push(sign_at_point(p, &q).ok_or(Abort)?);
+            signs.push(sign_at_point_fueled(p, &q, &self.fuel).ok_or(Abort)?);
         }
         Ok((roots, signs))
     }
@@ -1022,6 +1035,9 @@ impl Solver {
             return Ok(fs.clone());
         }
         self.spend(4)?;
+        self.fuel
+            .burn(crate::math::fuel::size(p).saturating_mul(u64::from(p.total_degree()) + 1))
+            .ok_or(Abort)?;
         let fs = crate::math::factor::factors(p);
         self.factor_cache.insert(p.clone(), fs.clone());
         Ok(fs)
@@ -1319,6 +1335,10 @@ impl Solver {
             let a = self.atom(l.var()).cloned().expect("arith literal");
             let curr = self.infeasible_intervals(&a, l)?;
             let xk_set = self.infeasible[x].clone();
+            // Interval-set operations compare algebraic endpoints.
+            self.fuel
+                .burn(4 * (curr.ivs.len() + xk_set.ivs.len()) as u64)
+                .ok_or(Abort)?;
 
             if curr.is_empty() {
                 self.r_propagate(l, None, true);
@@ -1356,6 +1376,10 @@ impl Solver {
     }
 
     fn process_clause(&mut self, c: usize) -> Res<bool> {
+        if self.steps_left == 0 {
+            return Err(Abort);
+        }
+        self.steps_left -= 1;
         if self.is_satisfied_clause(c)? {
             return Ok(true);
         }
@@ -2202,7 +2226,7 @@ impl Solver {
             return Ok(c.clone());
         }
         self.spend(16)?;
-        let chain = psc_chain(p, q, x).ok_or(Abort)?;
+        let chain = psc_chain_fueled(p, q, x, &self.fuel).ok_or(Abort)?;
         self.psc_cache.insert(key, chain.clone());
         Ok(chain)
     }
@@ -2431,6 +2455,23 @@ pub fn check_with_ints(
     clauses: &[Vec<InLit>],
     is_int: &[bool],
 ) -> NlsatResult {
+    check_with_ints_limited(num_vars, num_bools, clauses, is_int, 4000, u64::MAX)
+}
+
+/// [`check_with_ints`] giving up (`Unknown`) after `max_conflicts` conflicts
+/// or `max_work` units of work: polynomial work in resultants and root
+/// isolation (see [`Fuel`]), and [`LIMITED_VISITS_PER_WORK`] clause visits
+/// per unit, as z3 bounds the nlsat calls of its arithmetic solver
+/// (`nra_solver`) by conflicts and its resource limit. `u64::MAX` is no
+/// bound.
+pub fn check_with_ints_limited(
+    num_vars: usize,
+    num_bools: usize,
+    clauses: &[Vec<InLit>],
+    is_int: &[bool],
+    max_conflicts: usize,
+    max_work: u64,
+) -> NlsatResult {
     // Variable order.
     let polys: Vec<&Polynomial> = clauses
         .iter()
@@ -2446,6 +2487,11 @@ pub fn check_with_ints(
         to_internal[v as usize] = k as Var;
     }
     let mut s = Solver::new(num_vars);
+    s.max_conflicts = max_conflicts;
+    if max_work != u64::MAX {
+        s.steps_left = max_work.saturating_mul(LIMITED_VISITS_PER_WORK);
+        s.fuel = Fuel::new(max_work);
+    }
     for (v, &b) in is_int.iter().enumerate() {
         s.is_int[to_internal[v] as usize] = b;
     }
@@ -2506,6 +2552,7 @@ pub fn check_with_ints(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nlsat::realclosure::sign_at_point;
 
     fn r(n: i64) -> Rational {
         rat(n)

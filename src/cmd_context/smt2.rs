@@ -1836,6 +1836,19 @@ enum ZeroDivStatus {
 /// built bottom-up (see [`Context::term_prewarmed`]).
 const TERM_PREWARM_DEPTH: usize = 128;
 
+/// The first stage of [`Context::nla_decide_goal`]: the work of nlsat on the
+/// whole goal, the refinement rounds after it, and the integer search work of
+/// each round. Each stage multiplies the first by 8 and doubles the others.
+const NLA_FIRST_BUDGETS: (u64, usize, u64) = (200_000, 8, 20_000);
+/// The stages of [`Context::nla_decide_goal`].
+const NLA_STAGES: usize = 5;
+/// Every how many refinement rounds nlsat checks the assignment's literals.
+const NLA_NRA_PERIOD: usize = 4;
+/// The `(conflicts, work)` of each of those nlsat checks.
+const NLA_NRA_LIMIT: (usize, u64) = (100, 4_000);
+/// Refuted conjunctions up to this many literals get their core minimized.
+const NLA_CORE_MAX: usize = 40;
+
 /// Whether `s` is an ordinary application `(f a₁ … aₙ)` whose term is built
 /// from the terms of its arguments in the current scope (no binder, annotation,
 /// sort or index syntax, and no operator that inspects its argument syntax).
@@ -37433,6 +37446,9 @@ impl Context {
             }
             let has_coincident_div = divisor_uses.values().any(|&n| n >= 2);
             let untrustworthy_sat = has_opaque_pow || has_coincident_div;
+            if let Some((r, m)) = self.nla_decide_goal(lin, !untrustworthy_sat) {
+                return (r, m.map(|m| full(self, m)));
+            }
             // The conflict-driven nlsat search first: it decides most Boolean
             // combinations of polynomial constraints outright (an exact
             // model, or a refutation) and declines soundly otherwise.
@@ -38084,6 +38100,138 @@ impl Context {
         None
     }
 
+    /// Decide a nonlinear goal over integer (or mixed) variables by z3's
+    /// incremental linearization ([`crate::smt::nla`]), as z3's arithmetic
+    /// solver does with `nla_core`: the search treats each product as a
+    /// variable, refined by valid lemmas until the assignment agrees with
+    /// every product. Every few rounds nlsat decides the conjunction of the
+    /// literals the assignment rests on (z3's `nra_solver`): its model is a
+    /// model of the goal, its refutation (an unsat core of it) a valid
+    /// clause. The refinement alternates with nlsat on the whole goal, both
+    /// on budgets growing geometrically, as neither dominates the other.
+    /// Purely real goals are left to nlsat. `None` when undecided; a `sat`
+    /// only when `sat_ok`.
+    fn nla_decide_goal(&mut self, goal: AstId, sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
+        use crate::smt::nla::NlaSearch;
+        let has_int = self
+            .m
+            .postorder(goal)
+            .iter()
+            .any(|&t| self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t)));
+        if !has_int {
+            return None;
+        }
+        let mut search = Some(NlaSearch::new(&mut self.m, goal));
+        let mut round = 0;
+        let (mut work, mut rounds, mut check) = NLA_FIRST_BUDGETS;
+        for _ in 0..NLA_STAGES {
+            if let Some(r) = self.nlsat_decide_goal_limited(goal, sat_ok, Some((usize::MAX, work)))
+            {
+                return Some(r);
+            }
+            if let Some(s) = search.as_mut() {
+                s.set_work_budget(check);
+                match self.nla_rounds(s, &mut round, rounds, sat_ok) {
+                    Some(Some(r)) => return Some(r),
+                    Some(None) => search = None,
+                    None => {}
+                }
+            }
+            work *= 8;
+            rounds *= 2;
+            check *= 2;
+        }
+        None
+    }
+
+    /// Up to `rounds` rounds of the incremental linearization `search` (see
+    /// [`Context::nla_decide_goal`]), `round` counting them all. `None` when
+    /// still undecided, `Some(None)` when the search gave up.
+    fn nla_rounds(
+        &mut self,
+        search: &mut crate::smt::nla::NlaSearch,
+        round: &mut usize,
+        rounds: usize,
+        sat_ok: bool,
+    ) -> Option<Option<(SmtResult, Option<Model>)>> {
+        use crate::smt::nla::NlaStep;
+        for _ in 0..rounds {
+            *round += 1;
+            let support = match search.step(&mut self.m) {
+                NlaStep::Done(SmtResult::Unsat, _) => {
+                    return Some(Some((SmtResult::Unsat, None)));
+                }
+                NlaStep::Done(SmtResult::Sat, Some(model)) if sat_ok => {
+                    return Some(Some((SmtResult::Sat, Some(*model))));
+                }
+                NlaStep::Done(..) => return Some(None),
+                NlaStep::OutOfBudget => return None,
+                NlaStep::Refined { support } => support,
+            };
+            let Some(support) = support else { continue };
+            if *round % NLA_NRA_PERIOD != 1 || support.is_empty() {
+                continue;
+            }
+            let lits: Vec<AstId> = support
+                .iter()
+                .map(|&(a, v)| if v { a } else { self.m.mk_not(a) })
+                .collect();
+            match self.nra_check(&lits, sat_ok) {
+                Some((SmtResult::Unsat, _)) => {
+                    let core = self.nra_core(&support);
+                    let negs: Vec<AstId> = core.iter().map(|&l| self.m.mk_not(l)).collect();
+                    let block = if negs.len() == 1 {
+                        negs[0]
+                    } else {
+                        self.m.mk_or(&negs)
+                    };
+                    search.add_lemma(&self.m, block);
+                }
+                Some((SmtResult::Sat, Some(model))) if sat_ok => {
+                    return Some(Some((SmtResult::Sat, Some(model))));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// nlsat, on its [`NLA_NRA_LIMIT`] budget, on the conjunction of `lits`.
+    fn nra_check(&mut self, lits: &[AstId], sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
+        let conj = match lits {
+            [] => return None,
+            [l] => *l,
+            _ => self.m.mk_and(lits),
+        };
+        self.nlsat_decide_goal_limited(conj, sat_ok, Some(NLA_NRA_LIMIT))
+    }
+
+    /// An unsat core of the refuted conjunction of the arithmetic literals
+    /// among `support`, by deletion: each literal whose removal keeps the
+    /// rest refuted is dropped.
+    fn nra_core(&mut self, support: &[(AstId, bool)]) -> Vec<AstId> {
+        let mut core: Vec<AstId> = Vec::new();
+        for &(a, v) in support {
+            if !self.m.is_uninterp_const(a) {
+                core.push(if v { a } else { self.m.mk_not(a) });
+            }
+        }
+        if core.len() > NLA_CORE_MAX {
+            return core;
+        }
+        let mut i = 0;
+        while i < core.len() && core.len() > 1 {
+            let mut trial = core.clone();
+            trial.remove(i);
+            if matches!(self.nra_check(&trial, false), Some((SmtResult::Unsat, _))) {
+                core = trial;
+            } else {
+                i += 1;
+            }
+        }
+        core
+    }
+
     /// Decide a nonlinear goal — any Boolean combination of polynomial
     /// constraints — with the nlsat solver ([`crate::nlsat::solver`]). The goal
     /// becomes a CNF (Tseitin variables for nested connectives); integer
@@ -38092,8 +38240,19 @@ impl Context {
     /// only when every arithmetic leaf is a real or integer constant, with
     /// nlsat's exact (possibly irrational) assignment as model.
     fn nlsat_decide_goal(&self, goal: AstId, sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
+        self.nlsat_decide_goal_limited(goal, sat_ok, None)
+    }
+
+    /// [`Context::nlsat_decide_goal`], nlsat giving up after `limit`
+    /// `(conflicts, work)` when given.
+    fn nlsat_decide_goal_limited(
+        &self,
+        goal: AstId,
+        sat_ok: bool,
+        limit: Option<(usize, u64)>,
+    ) -> Option<(SmtResult, Option<Model>)> {
         use crate::nlsat::Rel as NRel;
-        use crate::nlsat::solver::{InLit, Kind, NlsatResult, check_with_ints};
+        use crate::nlsat::solver::{InLit, Kind, NlsatResult, check_with_ints_limited};
         struct Cnf {
             clauses: Vec<Vec<InLit>>,
             bools: Vec<AstId>,
@@ -38266,7 +38425,15 @@ impl Context {
             is_int[v as usize] =
                 self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t));
         }
-        match check_with_ints(cnf.var_map.len(), num_bools, &cnf.clauses, &is_int) {
+        let (max_conflicts, max_work) = limit.unwrap_or((4000, u64::MAX));
+        match check_with_ints_limited(
+            cnf.var_map.len(),
+            num_bools,
+            &cnf.clauses,
+            &is_int,
+            max_conflicts,
+            max_work,
+        ) {
             NlsatResult::Unsat => Some((SmtResult::Unsat, None)),
             NlsatResult::Sat(values, bvals) if sat_ok => {
                 // Only real and integer constants as leaves: then the

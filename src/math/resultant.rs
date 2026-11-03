@@ -19,12 +19,18 @@
 use alloc::vec::Vec;
 
 use crate::math::factor::normalize;
+use crate::math::fuel::Fuel;
 use crate::math::polynomial::{Polynomial, Var};
 
 /// `Res_v(p, q)`: the resultant of `p` and `q` with respect to variable `v`, a
 /// polynomial in the remaining variables. `Res(p, q) = 0` iff `p` and `q` have a
 /// common root in `v` or both leading coefficients (in `v`) vanish.
 pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Option<Polynomial> {
+    resultant_fueled(p, q, v, &Fuel::unlimited())
+}
+
+/// [`resultant`] on the budget `fuel` (`None` once it is spent).
+pub fn resultant_fueled(p: &Polynomial, q: &Polynomial, v: Var, fuel: &Fuel) -> Option<Polynomial> {
     if p.is_zero() || q.is_zero() {
         return Some(Polynomial::zero());
     }
@@ -38,8 +44,11 @@ pub fn resultant(p: &Polynomial, q: &Polynomial, v: Var) -> Option<Polynomial> {
         return Some(q.coeff_of_var(v, 0).pow(m as u32));
     }
     // The subresultant PRS is far cheaper than the determinant.
-    if let Some(r) = resultant_prs(p, q, v) {
+    if let Some(r) = resultant_prs(p, q, v, fuel) {
         return Some(r);
+    }
+    if !fuel.is_unlimited() {
+        return None;
     }
     sylvester_resultant(p, q, v)
 }
@@ -165,10 +174,10 @@ fn xpow(x: Var, j: u32) -> Polynomial {
 
 /// The exact pseudo-remainder `lc(q)^(deg p − deg q + 1) · p mod q` in `x`
 /// (z3's `exact_pseudo_remainder`; requires `deg p ≥ deg q`).
-fn exact_prem(p: &Polynomial, q: &Polynomial, x: Var) -> Polynomial {
+fn exact_prem(p: &Polynomial, q: &Polynomial, x: Var, fuel: &Fuel) -> Option<Polynomial> {
     let db = q.degree_of(x);
     if db == 0 {
-        return Polynomial::zero();
+        return Some(Polynomial::zero());
     }
     let da = p.degree_of(x);
     let lb = lc(q, x);
@@ -182,12 +191,13 @@ fn exact_prem(p: &Polynomial, q: &Polynomial, x: Var) -> Polynomial {
             if d < exact {
                 r = lb.pow(exact - d).mul(&r);
             }
-            return r;
+            return Some(r);
         }
         // Cancel x^dr: r ← lb·(r − lr·x^dr) − lr·x^(dr−db)·rb.
         let lr = r.coeff_of_var(x, dr);
         let red = r.sub(&lr.mul(&xpow(x, dr)));
         r = lb.mul(&red).sub(&lr.mul(&xpow(x, dr - db)).mul(&rb));
+        fuel.burn_poly(&r)?;
         d += 1;
     }
 }
@@ -216,6 +226,7 @@ fn se_lazard(d: u32, lc_s_d: &Polynomial, s_d_1: &Polynomial, x: Var) -> Option<
 }
 
 /// `S_{e−1}` (z3's `optimized_S_e_1`, Ducos' optimization).
+#[allow(clippy::too_many_arguments)]
 fn optimized_s_e_1(
     d: u32,
     e: u32,
@@ -224,6 +235,7 @@ fn optimized_s_e_1(
     s_e: &Polynomial,
     s: &Polynomial,
     x: Var,
+    fuel: &Fuel,
 ) -> Option<Polynomial> {
     let c_d_1 = lc(s_d_1, x);
     let se = lc(s_e, x);
@@ -235,10 +247,12 @@ fn optimized_s_e_1(
         let xhe = xh.coeff_of_var(x, e);
         let t = xhe.mul(s_d_1).div_exact(&c_d_1)?;
         h.push(xh.sub(&t));
+        fuel.burn_poly(&h[h.len() - 1])?;
     }
     let mut dd = Polynomial::zero();
     for (j, hj) in h.iter().enumerate().take(d as usize) {
         dd = dd.add(&a.coeff_of_var(x, j as u32).mul(hj));
+        fuel.burn_poly(&dd)?;
     }
     let dd = dd.div_exact(&lc(a, x))?;
     let xh = xp.mul(&h[d as usize - 1]);
@@ -251,7 +265,7 @@ fn optimized_s_e_1(
 /// the subresultant PRS of [`psc_chain`], up to a nonzero constant factor
 /// (the inputs are scaled to primitive integer coefficients, which keeps the
 /// arithmetic integral). `None` if an exact division fails.
-fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Polynomial> {
+fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var, fuel: &Fuel) -> Option<Polynomial> {
     let (p, q) = (&normalize(p), &normalize(q));
     let (p, q) = if p.degree_of(x) >= q.degree_of(x) {
         (p, q)
@@ -260,7 +274,7 @@ fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Polynomial> {
     };
     let mut s = lc(q, x).pow(p.degree_of(x) - q.degree_of(x));
     let mut a = q.clone();
-    let mut b = exact_prem(p, &q.neg(), x);
+    let mut b = exact_prem(p, &q.neg(), x, fuel)?;
     loop {
         if b.is_zero() {
             return Some(Polynomial::zero());
@@ -275,7 +289,7 @@ fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Polynomial> {
         if e == 0 {
             return Some(c);
         }
-        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x)?;
+        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x, fuel)?;
         s = lc(&c, x);
         a = c;
     }
@@ -288,6 +302,16 @@ fn resultant_prs(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Polynomial> {
 /// `None` if an exact division fails.
 /// Both polynomials must contain `x`.
 pub fn psc_chain(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Vec<Polynomial>> {
+    psc_chain_fueled(p, q, x, &Fuel::unlimited())
+}
+
+/// [`psc_chain`] on the budget `fuel` (`None` once it is spent).
+pub fn psc_chain_fueled(
+    p: &Polynomial,
+    q: &Polynomial,
+    x: Var,
+    fuel: &Fuel,
+) -> Option<Vec<Polynomial>> {
     let (p, q) = (&normalize(p), &normalize(q));
     let (p, q) = if p.degree_of(x) >= q.degree_of(x) {
         (p, q)
@@ -299,7 +323,7 @@ pub fn psc_chain(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Vec<Polynomia
     let deg_q = q.degree_of(x);
     let mut s = lc(q, x).pow(deg_p - deg_q);
     let mut a = q.clone();
-    let mut b = exact_prem(p, &q.neg(), x);
+    let mut b = exact_prem(p, &q.neg(), x, fuel)?;
     loop {
         let d = a.degree_of(x);
         let e = b.degree_of(x);
@@ -323,7 +347,7 @@ pub fn psc_chain(p: &Polynomial, q: &Polynomial, x: Var) -> Option<Vec<Polynomia
         if e == 0 {
             break;
         }
-        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x)?;
+        b = optimized_s_e_1(d, e, &a, &b, &c, &s, x, fuel)?;
         s = lc(&c, x);
         a = c;
     }
@@ -516,7 +540,7 @@ mod tests {
                 continue;
             }
             let fast = psc_chain(&p, &q, 0).expect("exact");
-            let r1 = resultant_prs(&p, &q, 0).expect("exact");
+            let r1 = resultant_prs(&p, &q, 0, &Fuel::unlimited()).expect("exact");
             let r2 = sylvester_resultant(&p, &q, 0).expect("exact");
             if r2.is_zero() {
                 assert!(r1.is_zero());

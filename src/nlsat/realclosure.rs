@@ -18,9 +18,10 @@ use alloc::vec::Vec;
 
 use puremp::Rational;
 
+use crate::math::fuel::Fuel;
 use crate::math::interval::Interval;
 use crate::math::polynomial::{Polynomial, Var};
-use crate::math::resultant::resultant;
+use crate::math::resultant::resultant_fueled;
 use crate::math::upoly::{self, UPoly};
 use crate::nlsat::icp::eval_interval;
 
@@ -60,12 +61,12 @@ pub(crate) fn poly_to_upoly(p: &Polynomial, var: Var) -> UPoly {
 /// eliminating every coordinate: `R(z) = Res(z − p, q_1, …, q_k)` where `q_i` is
 /// the defining polynomial of `point[i]` (rational coordinates are substituted
 /// directly). See the CAD spec §3.3 / realclosure spec §2.5.
-fn eliminate_to_univariate(p: &Polynomial, point: &[Alg]) -> Option<UPoly> {
+fn eliminate_to_univariate(p: &Polynomial, point: &[Alg], fuel: &Fuel) -> Option<UPoly> {
     let n = point.len();
     let z = n as Var; // fresh variable index, above all coordinates
     // f = z - p
     let f = Polynomial::var(z).sub(&subst_rationals(p, point));
-    let f = eliminate_irrationals(f, point)?;
+    let f = eliminate_irrationals_fueled(f, point, fuel)?;
     Some(poly_to_upoly(&f, z))
 }
 
@@ -101,7 +102,16 @@ pub(crate) fn subst_rationals(p: &Polynomial, point: &[Alg]) -> Polynomial {
 /// Eliminate, by resultants with their defining polynomials, the irrational
 /// coordinates of `point` that occur in `f` (lowest defining degree first,
 /// as z3's `var_degree_lt`); `None` on an inexact division.
-pub(crate) fn eliminate_irrationals(mut f: Polynomial, point: &[Alg]) -> Option<Polynomial> {
+pub(crate) fn eliminate_irrationals(f: Polynomial, point: &[Alg]) -> Option<Polynomial> {
+    eliminate_irrationals_fueled(f, point, &Fuel::unlimited())
+}
+
+/// [`eliminate_irrationals`] on the budget `fuel` (`None` once it is spent).
+pub(crate) fn eliminate_irrationals_fueled(
+    mut f: Polynomial,
+    point: &[Alg],
+    fuel: &Fuel,
+) -> Option<Polynomial> {
     let mut vs: Vec<(usize, Var)> = f
         .vars()
         .into_iter()
@@ -114,7 +124,7 @@ pub(crate) fn eliminate_irrationals(mut f: Polynomial, point: &[Alg]) -> Option<
     for (_, v) in vs {
         if let Some(Alg::Irrational { poly, .. }) = point.get(v as usize) {
             let qi = crate::math::factor::normalize(&upoly_to_poly(poly, v));
-            f = crate::math::factor::normalize(&resultant(&f, &qi, v)?);
+            f = crate::math::factor::normalize(&resultant_fueled(&f, &qi, v, fuel)?);
             if f.is_zero() {
                 break;
             }
@@ -224,6 +234,11 @@ pub(crate) fn strict_sign_at_point(p: &Polynomial, point: &[Alg], rounds: usize)
 /// Interval arithmetic decides the easy cases; a resultant certification decides
 /// a suspected zero exactly. Sound and terminating (CAD spec §3.3).
 pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> Option<i32> {
+    sign_at_point_fueled(p, point, &Fuel::unlimited())
+}
+
+/// [`sign_at_point`] on the budget `fuel` (`None` once it is spent).
+pub fn sign_at_point_fueled(p: &Polynomial, point: &[Alg], fuel: &Fuel) -> Option<i32> {
     // Rational coordinates first (z3's `eval_sign_at`): what is left depends
     // on irrational coordinates only, and a single one is decided exactly by
     // its defining polynomial.
@@ -263,7 +278,7 @@ pub fn sign_at_point(p: &Polynomial, point: &[Alg]) -> Option<i32> {
 
     // Phase 2: certify a suspected zero via the resultant lower bound. If the
     // elimination resultant cannot be formed (inexact Bareiss division), decline.
-    let r = eliminate_to_univariate(p, &pt)?;
+    let r = eliminate_to_univariate(p, &pt, fuel)?;
     if r.is_zero() {
         return Some(0); // p is identically zero along this fiber
     }
