@@ -3,7 +3,8 @@
 
 Boogie-style quantified UF/LIA goals without MBQI (z3's `smt.mbqi false`, as in
 crash.smt2), so z3rs refutes them by relevancy-guided E-matching inside one
-search: universals over an uninterpreted sort `U` and `Int` with `:pattern`s,
+search. Half are successor chains (`P x ⇒ P (s x)` and kin) that need several
+rounds; the others random universals over an uninterpreted sort `U` and `Int` with `:pattern`s,
 mixing arithmetic (`f x > 0`, `f (g k) = k + 1`), functions with a Boolean
 argument (`h b`, preprocessed into finite tables), term-level `ite`s (lifted),
 predicates and equalities, plus ground facts. Each file is decided by z3 both as
@@ -95,6 +96,41 @@ def gen(r):
     return "\n".join(out) + "\n(check-sat)\n"
 
 
+def gen_chain(r):
+    """Goals needing several rounds: successor chains `s^k(a)` through
+    guarded universals, with arithmetic and Boolean-argument functions."""
+    out = ["(set-option :auto-config false)", "(set-option :smt.mbqi false)",
+           "(declare-sort U 0)", "(declare-fun s (U) U)", "(declare-fun f (U) Int)",
+           "(declare-fun P (U) Bool)", "(declare-fun Q (U) Bool)",
+           "(declare-fun h (Bool) U)", "(declare-const a U)", "(declare-const b U)",
+           "(declare-const n Int)"]
+
+    def chain(k, t="a"):
+        for _ in range(k):
+            t = f"(s {t})"
+        return t
+    rules = [
+        "(forall ((x U)) (! (=> (P x) (P (s x))) :pattern ((P x))))",
+        "(forall ((x U)) (! (=> (P x) (P (s x))) :pattern ((s x))))",
+        "(forall ((x U)) (! (=> (P x) (> (f (s x)) (f x))) :pattern ((s x))))",
+        "(forall ((x U)) (! (=> (Q x) (= (f (s x)) (+ (f x) 1))) :pattern ((f (s x)))))",
+        "(forall ((x U)) (! (or (P x) (Q x)) :pattern ((f x))))",
+        "(forall ((x U)) (! (=> (P x) (= (h (Q x)) x)) :pattern ((s x))))",
+        "(forall ((x U)) (! (= (P (s x)) (not (Q x))) :pattern ((P (s x)))))",
+        "(forall ((x U) (y U)) (! (=> (= (f x) (f y)) (= x y)) :pattern ((f x) (f y))))",
+    ]
+    for rule in r.sample(rules, r.randint(2, 4)):
+        out.append(f"(assert {rule})")
+    k = r.randint(1, 5)
+    facts = [f"(P {r.choice(['a', 'b'])})", f"(not (P {chain(k)}))", f"(Q {chain(r.randint(0, k))})",
+             f"(> (f a) n)", f"(< (f {chain(k)}) (+ n {r.randint(0, 6)}))",
+             f"(= {chain(r.randint(1, 3))} {r.choice(['a', 'b'])})", f"(not (= (h (P a)) b))",
+             f"(= (f {chain(k)}) (f b))", f"(not (= a b))"]
+    for fact in r.sample(facts, r.randint(2, 5)):
+        out.append(f"(assert {fact})")
+    return "\n".join(out) + "\n(check-sat)\n"
+
+
 def run(cmd, p):
     try:
         o = subprocess.run(cmd + [p], capture_output=True, text=True, timeout=20).stdout
@@ -105,7 +141,8 @@ def run(cmd, p):
 
 def one(i):
     p = f"{OUT}/emo_{i}.smt2"
-    src = gen(random.Random(i))
+    r = random.Random(i)
+    src = gen_chain(r) if r.random() < .5 else gen(r)
     open(p, "w").write(src)
     a = run([RS], p)
     b = run([Z3], p)

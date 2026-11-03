@@ -71,10 +71,10 @@ enum Undo {
         watch_len: usize,
         value: Option<usize>,
     },
-    /// A congruence-table entry was inserted.
-    CgInsert((AstId, Vec<usize>)),
+    /// A congruence-table entry (for the node) was inserted.
+    CgInsert(usize),
     /// A congruence-table entry (for the node) was removed.
-    CgRemove((AstId, Vec<usize>), usize),
+    CgRemove(usize),
 }
 
 /// The backtrackable e-graph plus its link to the SAT trail.
@@ -95,8 +95,10 @@ pub struct IncEgraph {
     value: Vec<Option<usize>>,
     /// Each node's own interpreted value.
     val: Vec<Option<Val>>,
-    /// Congruence table: signature over argument roots → representative.
-    cg: BTreeMap<(AstId, Vec<usize>), usize>,
+    /// Congruence table: the applications by their signature over the
+    /// argument roots, hashed into buckets (at most one per signature).
+    cg: Vec<Vec<usize>>,
+    cg_len: usize,
     /// Proof forest (z3's `m_trans`): `target[n]` and the justification.
     target: Vec<usize>,
     just: Vec<Just>,
@@ -151,7 +153,8 @@ impl IncEgraph {
             watch: Vec::new(),
             value: Vec::new(),
             val: Vec::new(),
-            cg: BTreeMap::new(),
+            cg: alloc::vec![Vec::new(); 64],
+            cg_len: 0,
             target: Vec::new(),
             just: Vec::new(),
             stamp: Vec::new(),
@@ -221,23 +224,21 @@ impl IncEgraph {
         self.stamp.push(0);
         self.term.push(None);
         self.arith.push(false);
-        if let Some((decl, args)) = &sig {
-            let key = (*decl, args.clone());
-            for &a in args {
+        let args: Vec<usize> = sig.as_ref().map(|(_, a)| a.clone()).unwrap_or_default();
+        self.sig.push(sig);
+        if !args.is_empty() {
+            for &a in &args {
                 if !self.parents[a].contains(&id) {
                     self.parents[a].push(id);
                 }
             }
             // Fresh terms have distinct signatures except for hash-consing
             // misses; a clash is merged by congruence at the first pass.
-            match self.cg.get(&key) {
-                Some(&q) => self.pending.push((id, q, Just::Cong(id, q))),
-                None => {
-                    self.cg.insert(key, id);
-                }
+            match self.cg_find(id) {
+                Some(q) => self.pending.push((id, q, Just::Cong(id, q))),
+                None => self.cg_insert(id),
             }
         }
-        self.sig.push(sig);
         id
     }
 
@@ -267,10 +268,62 @@ impl IncEgraph {
         id
     }
 
-    /// The signature of application `p` over the current roots.
-    fn key(&self, p: usize) -> Option<(AstId, Vec<usize>)> {
-        let (decl, args) = self.sig[p].as_ref()?;
-        Some((*decl, args.iter().map(|&a| self.root[a]).collect()))
+    /// The bucket of application `p`'s signature over the current roots.
+    fn cg_bucket(&self, p: usize) -> usize {
+        let (decl, args) = self.sig[p].as_ref().expect("an application");
+        let mut h = crate::util::hash::hash_u(decl.0);
+        for &a in args {
+            h = crate::util::hash::combine_hash(h, self.root[a] as u32);
+        }
+        h as usize & (self.cg.len() - 1)
+    }
+
+    /// Do applications `p` and `q` have one signature over the current roots?
+    fn same_sig(&self, p: usize, q: usize) -> bool {
+        match (&self.sig[p], &self.sig[q]) {
+            (Some((dp, ap)), Some((dq, aq))) => {
+                dp == dq
+                    && ap.len() == aq.len()
+                    && ap
+                        .iter()
+                        .zip(aq)
+                        .all(|(&x, &y)| self.root[x] == self.root[y])
+            }
+            _ => false,
+        }
+    }
+
+    /// The table entry with application `p`'s signature, if any.
+    fn cg_find(&self, p: usize) -> Option<usize> {
+        self.cg[self.cg_bucket(p)]
+            .iter()
+            .copied()
+            .find(|&q| self.same_sig(p, q))
+    }
+
+    /// Enter application `p` (whose signature has no entry yet).
+    fn cg_insert(&mut self, p: usize) {
+        if self.cg_len >= 2 * self.cg.len() {
+            // Grow: every entry's signature is over the current roots.
+            let entries: Vec<usize> = self.cg.iter().flatten().copied().collect();
+            self.cg = alloc::vec![Vec::new(); 4 * self.cg.len()];
+            for q in entries {
+                let b = self.cg_bucket(q);
+                self.cg[b].push(q);
+            }
+        }
+        let b = self.cg_bucket(p);
+        self.cg[b].push(p);
+        self.cg_len += 1;
+    }
+
+    /// Remove the entry of application `p` (present, under the current roots).
+    fn cg_remove(&mut self, p: usize) {
+        let b = self.cg_bucket(p);
+        if let Some(i) = self.cg[b].iter().position(|&q| q == p) {
+            self.cg[b].swap_remove(i);
+            self.cg_len -= 1;
+        }
     }
 
     /// Make `n` the root of its proof tree (z3 `invert_trans`).
@@ -305,11 +358,9 @@ impl IncEgraph {
         // Remove r1's parents from the congruence table.
         let r1_parents = self.parents[r1].clone();
         for &p in &r1_parents {
-            if let Some(key) = self.key(p)
-                && self.cg.get(&key) == Some(&p)
-            {
-                self.cg.remove(&key);
-                self.undo.push(Undo::CgRemove(key, p));
+            if self.cg_find(p) == Some(p) {
+                self.cg_remove(p);
+                self.undo.push(Undo::CgRemove(p));
             }
         }
         // Proof forest: a becomes the root of its tree, then hangs under b.
@@ -338,13 +389,12 @@ impl IncEgraph {
         });
         // Reinsert r1's parents; a signature clash is a new congruence.
         for &p in &r1_parents {
-            let Some(key) = self.key(p) else { continue };
-            match self.cg.get(&key) {
+            match self.cg_find(p) {
                 None => {
-                    self.cg.insert(key.clone(), p);
-                    self.undo.push(Undo::CgInsert(key));
+                    self.cg_insert(p);
+                    self.undo.push(Undo::CgInsert(p));
                 }
-                Some(&q) => {
+                Some(q) => {
                     if self.root[q] != self.root[p] {
                         self.pending.push((p, q, Just::Cong(p, q)));
                     }
@@ -410,12 +460,8 @@ impl IncEgraph {
     fn undo_to(&mut self, len: usize) {
         while self.undo.len() > len {
             match self.undo.pop().unwrap() {
-                Undo::CgInsert(key) => {
-                    self.cg.remove(&key);
-                }
-                Undo::CgRemove(key, p) => {
-                    self.cg.insert(key, p);
-                }
+                Undo::CgInsert(p) => self.cg_remove(p),
+                Undo::CgRemove(p) => self.cg_insert(p),
                 Undo::Merge {
                     r1,
                     r2,

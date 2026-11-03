@@ -896,9 +896,19 @@ impl Context {
                 return Vec::new();
             };
             let mut partials: Vec<BTreeMap<AstId, AstId>> = Vec::new();
+            // Each application of the trigger's function is matched itself:
+            // its class members of that function are in `grounds` too (only
+            // the arguments match modulo the classes).
+            let pa = self.m.app_args(trig);
             for &g in grounds {
+                let ga = self.m.app_args(g);
                 let mut b = BTreeMap::new();
-                if self.ematch(trig, g, vars, &mut b) {
+                if pa.len() == ga.len()
+                    && pa
+                        .iter()
+                        .zip(ga)
+                        .all(|(&p, &q)| self.ematch(p, q, vars, &mut b))
+                {
                     partials.push(b);
                 }
             }

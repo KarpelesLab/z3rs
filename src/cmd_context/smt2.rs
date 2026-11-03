@@ -5492,6 +5492,32 @@ impl Context {
                     } else {
                         (vars, body)
                     };
+                    // A body that mentions no binder (`∀x k. p c`) is ground, and
+                    // one that simplifies to `false` (`p b ∧ ¬p b ∧ …`) is false,
+                    // as z3's rewriter finds (the sorts are non-empty). Only over
+                    // binders the body mentions as themselves (a floating-point
+                    // one is lowered to its bit-vector fields).
+                    let plain = vars.iter().all(|&v| {
+                        let s = self.m.get_sort(v);
+                        self.m.is_arith_sort(s)
+                            || self.m.is_bool_sort(s)
+                            || self.is_plain_uninterp_sort(s)
+                    });
+                    let ground = if !plain {
+                        None
+                    } else if self.m.postorder(body).iter().any(|t| vars.contains(t)) {
+                        let simple = crate::rewriter::simplify(&mut self.m, body);
+                        self.m.is_false(simple).then_some(simple)
+                    } else {
+                        Some(body)
+                    };
+                    if let Some(g) = ground {
+                        self.assertions.push(g);
+                        self.assert_names.push(None);
+                        self.last_model = None;
+                        self.last_verdict = None;
+                        return Ok(None);
+                    }
                     if !pats.is_empty() {
                         self.universal_patterns.insert(body, pats);
                     }
