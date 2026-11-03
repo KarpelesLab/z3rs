@@ -58,7 +58,7 @@ impl LinExpr {
     }
 
     /// Add `k·other` into `self`.
-    fn add_scaled(&mut self, other: &LinExpr, k: &Rational) {
+    pub fn add_scaled(&mut self, other: &LinExpr, k: &Rational) {
         for (v, c) in &other.coeffs {
             let entry = self.coeffs.entry(*v).or_insert_with(zero);
             *entry = &*entry + &(c * k);
@@ -102,6 +102,11 @@ impl LinExpr {
     /// The coefficient of `v` (0 if absent) — public accessor.
     pub fn coeff_of(&self, v: AstId) -> Rational {
         self.coeff(v)
+    }
+
+    /// The number of variables (with nonzero coefficient).
+    pub fn num_vars(&self) -> usize {
+        self.coeffs.len()
     }
 
     /// Is this a constant (no variables)?

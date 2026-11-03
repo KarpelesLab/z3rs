@@ -20,6 +20,7 @@
 use crate::ast::AstId;
 use crate::ast::arith::ArithOp;
 use crate::ast::manager::AstManager;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -843,6 +844,7 @@ fn format_trunc(v: &Rational, precision: u32) -> (bool, String) {
 
 /// A ground real value carried exactly: rational until an irrational root forces
 /// a lift to a full algebraic number.
+#[derive(Clone)]
 enum AlgVal {
     Rat(Rational),
     Alg(Algebraic),
@@ -891,6 +893,31 @@ pub fn fold_real_comparison(m: &AstManager, s: AstId) -> Option<bool> {
 /// unsupported operator / a real root that is not real (e.g. even root of a
 /// negative) / a q-th root of an irrational.
 fn eval_algebraic(m: &AstManager, s: AstId) -> Option<AlgVal> {
+    eval_algebraic_memo(m, s, &mut BTreeMap::new())
+}
+
+/// [`eval_algebraic`] memoized over the term DAG: a shared subterm is valued
+/// once, so a deeply shared ground term (a `let` chain doubling its body)
+/// costs linear rather than exponential time.
+fn eval_algebraic_memo(
+    m: &AstManager,
+    s: AstId,
+    memo: &mut BTreeMap<AstId, Option<AlgVal>>,
+) -> Option<AlgVal> {
+    if let Some(v) = memo.get(&s) {
+        return v.clone();
+    }
+    let v = eval_algebraic_step(m, s, memo);
+    memo.insert(s, v.clone());
+    v
+}
+
+/// One step of [`eval_algebraic_memo`]: the value of `s` from its children's.
+fn eval_algebraic_step(
+    m: &AstManager,
+    s: AstId,
+    memo: &mut BTreeMap<AstId, Option<AlgVal>>,
+) -> Option<AlgVal> {
     if let Some(r) = m.as_numeral(s) {
         return Some(AlgVal::Rat(r));
     }
@@ -908,49 +935,49 @@ fn eval_algebraic(m: &AstManager, s: AstId) -> Option<AlgVal> {
         });
     }
     if let Some((base_t, exp_t)) = power_uf_args(m, s) {
-        let base = eval_algebraic(m, base_t)?;
+        let base = eval_algebraic_memo(m, base_t, memo)?;
         let e = eval_rational(m, exp_t)?;
         return alg_power(base, &e);
     }
     let op = m.arith_op(s)?;
     let args = m.app_args(s);
     match op {
-        ArithOp::ToReal => eval_algebraic(m, *args.first()?),
-        ArithOp::Abs => Some(alg_abs(eval_algebraic(m, *args.first()?)?)),
-        ArithOp::Uminus => Some(alg_neg(eval_algebraic(m, *args.first()?)?)),
+        ArithOp::ToReal => eval_algebraic_memo(m, *args.first()?, memo),
+        ArithOp::Abs => Some(alg_abs(eval_algebraic_memo(m, *args.first()?, memo)?)),
+        ArithOp::Uminus => Some(alg_neg(eval_algebraic_memo(m, *args.first()?, memo)?)),
         ArithOp::Add => {
-            let mut acc = eval_algebraic(m, *args.first()?)?;
+            let mut acc = eval_algebraic_memo(m, *args.first()?, memo)?;
             for &a in &args[1..] {
-                acc = alg_add(acc, eval_algebraic(m, a)?);
+                acc = alg_add(acc, eval_algebraic_memo(m, a, memo)?);
             }
             Some(acc)
         }
         ArithOp::Sub => {
-            let mut acc = eval_algebraic(m, *args.first()?)?;
+            let mut acc = eval_algebraic_memo(m, *args.first()?, memo)?;
             if args.len() == 1 {
                 return Some(alg_neg(acc));
             }
             for &a in &args[1..] {
-                acc = alg_sub(acc, eval_algebraic(m, a)?);
+                acc = alg_sub(acc, eval_algebraic_memo(m, a, memo)?);
             }
             Some(acc)
         }
         ArithOp::Mul => {
-            let mut acc = eval_algebraic(m, *args.first()?)?;
+            let mut acc = eval_algebraic_memo(m, *args.first()?, memo)?;
             for &a in &args[1..] {
-                acc = alg_mul(acc, eval_algebraic(m, a)?);
+                acc = alg_mul(acc, eval_algebraic_memo(m, a, memo)?);
             }
             Some(acc)
         }
         ArithOp::Div => {
-            let mut acc = eval_algebraic(m, *args.first()?)?;
+            let mut acc = eval_algebraic_memo(m, *args.first()?, memo)?;
             for &a in &args[1..] {
-                acc = alg_div(acc, eval_algebraic(m, a)?)?;
+                acc = alg_div(acc, eval_algebraic_memo(m, a, memo)?)?;
             }
             Some(acc)
         }
         ArithOp::Power => {
-            let base = eval_algebraic(m, *args.first()?)?;
+            let base = eval_algebraic_memo(m, *args.first()?, memo)?;
             let e = eval_rational(m, *args.get(1)?)?;
             alg_power(base, &e)
         }

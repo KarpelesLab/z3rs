@@ -2695,6 +2695,46 @@ struct Scope {
     mentions: usize,
 }
 
+/// The active `let`/macro-parameter binding scopes (innermost last), with a
+/// per-name index so a lookup costs O(log n) however deeply the scopes nest
+/// (a linear scan over 10^5 nested `let`s made term building quadratic).
+#[derive(Default)]
+struct BoundScopes {
+    /// The binding frames, innermost last.
+    frames: Vec<Vec<(String, AstId)>>,
+    /// Each bound name's bindings across all frames, innermost last.
+    index: BTreeMap<String, Vec<AstId>>,
+}
+
+impl BoundScopes {
+    /// Open a frame binding `frame`'s names (a later duplicate shadows an earlier).
+    fn push(&mut self, frame: Vec<(String, AstId)>) {
+        for (n, id) in &frame {
+            self.index.entry(n.clone()).or_default().push(*id);
+        }
+        self.frames.push(frame);
+    }
+
+    /// Close the innermost frame.
+    fn pop(&mut self) -> Option<Vec<(String, AstId)>> {
+        let frame = self.frames.pop()?;
+        for (n, _) in frame.iter().rev() {
+            if let Some(v) = self.index.get_mut(n) {
+                v.pop();
+                if v.is_empty() {
+                    self.index.remove(n);
+                }
+            }
+        }
+        Some(frame)
+    }
+
+    /// The innermost binding of `name`, if any.
+    fn lookup(&self, name: &str) -> Option<AstId> {
+        self.index.get(name).and_then(|v| v.last().copied())
+    }
+}
+
 struct Context {
     m: AstManager,
     sorts: BTreeMap<String, AstId>,
@@ -2732,7 +2772,7 @@ struct Context {
     /// Saved scope levels (for `pop` to restore).
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
-    scopes: Vec<Vec<(String, AstId)>>,
+    scopes: BoundScopes,
     /// `define-fun` macros: name → (parameter names, body).
     macros: BTreeMap<String, (Vec<String>, SExpr)>,
     /// Declared constants/functions in declaration order (for `get-model` and
@@ -3971,7 +4011,7 @@ impl Context {
             hi_div0: true,
             declared_sorts: BTreeSet::new(),
             scope_stack: Vec::new(),
-            scopes: Vec::new(),
+            scopes: BoundScopes::default(),
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
             decl_table: DeclTable::default(),
@@ -34845,7 +34885,20 @@ impl Context {
     /// irrational algebraic roots collapse to a Boolean the solver can refute.
     fn fold_ground_algebraic_atoms(&mut self, goal: AstId) -> AstId {
         let mut folds: Vec<(AstId, bool)> = Vec::new();
+        // Subterms over an uninterpreted constant or bound variable never fold;
+        // marking them in one pass keeps this linear on a deep non-ground goal
+        // (each comparison would otherwise re-walk its whole argument chain).
+        let mut open: BTreeSet<AstId> = BTreeSet::new();
         for t in self.m.postorder(goal) {
+            let is_open = if self.m.is_app(t) {
+                self.m.is_uninterp_const(t) || self.m.app_args(t).iter().any(|a| open.contains(a))
+            } else {
+                true
+            };
+            if is_open {
+                open.insert(t);
+                continue;
+            }
             if let Some(b) = super::algebraic_pp::fold_real_comparison(&self.m, t) {
                 folds.push((t, b));
             }
@@ -38639,13 +38692,7 @@ impl Context {
 
     /// Look up a name in the active `let` scopes (innermost first).
     fn lookup_bound(&self, name: &str) -> Option<AstId> {
-        self.scopes.iter().rev().find_map(|scope| {
-            scope
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, id)| *id)
-        })
+        self.scopes.lookup(name)
     }
 
     /// Build the opaque algebraic-constant term for a nested `(root-obj poly
@@ -39836,10 +39883,7 @@ impl Context {
                     "seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli"
                 ) && l.len() >= 3
                     && let SExpr::Atom(fname) = &l[1]
-                    && !self
-                        .scopes
-                        .iter()
-                        .any(|sc| sc.iter().any(|(n, _)| n == fname))
+                    && self.lookup_bound(fname).is_none()
                 {
                     let rest: Vec<AstId> = l[2..]
                         .iter()

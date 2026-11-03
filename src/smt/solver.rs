@@ -3422,48 +3422,133 @@ fn comparison_constraint(op: ArithOp, holds: bool, diff: LinExpr) -> Constraint 
 /// Convert an arithmetic AST term to a linear expression. Non-linear or
 /// non-arithmetic subterms are treated as opaque variables (sound: they become
 /// unconstrained).
+///
+/// Iterative over the term DAG (an explicit work stack, each shared subterm
+/// converted once): a sum nested 10^6 deep cannot overflow the stack, and a
+/// `let` chain doubling its body (`a_{i+1} = a_i + a_i`) costs linear rather
+/// than exponential time.
 pub fn ast_to_lin(m: &AstManager, t: AstId) -> LinExpr {
-    if let Some(r) = m.as_numeral(t) {
-        return LinExpr::constant(r);
+    /// Whether `t` is linear structure to look through (vs a leaf).
+    fn interior(m: &AstManager, t: AstId) -> bool {
+        m.as_numeral(t).is_none()
+            && matches!(
+                m.arith_op(t),
+                Some(
+                    ArithOp::Add | ArithOp::Sub | ArithOp::Uminus | ArithOp::ToReal | ArithOp::Mul
+                )
+            )
     }
-    let Some(op) = m.arith_op(t) else {
-        return LinExpr::var(t); // uninterpreted constant / variable
-    };
-    let args = m.app_args(t);
-    match op {
-        ArithOp::Add => args
-            .iter()
-            .fold(LinExpr::new(), |e, &a| e.add(&ast_to_lin(m, a))),
-        ArithOp::Sub if args.len() == 1 => ast_to_lin(m, args[0]).neg(),
-        ArithOp::Sub => {
-            let mut e = ast_to_lin(m, args[0]);
-            for &a in &args[1..] {
-                e = e.sub(&ast_to_lin(m, a));
-            }
-            e
+    /// A leaf: a numeral, or an opaque variable (an uninterpreted constant,
+    /// `div`/`mod`/…).
+    fn leaf(m: &AstManager, t: AstId) -> LinExpr {
+        match m.as_numeral(t) {
+            Some(r) => LinExpr::constant(r),
+            None => LinExpr::var(t),
         }
-        ArithOp::Uminus => ast_to_lin(m, args[0]).neg(),
-        // to_real preserves the numeric value, so it is the identity map on the
-        // linear representation.
-        ArithOp::ToReal => ast_to_lin(m, args[0]),
-        ArithOp::Mul => {
-            let mut scalar = one();
-            let mut nonconst: Option<LinExpr> = None;
-            for &a in args {
-                let e = ast_to_lin(m, a);
-                match e.as_constant() {
-                    Some(c) => scalar = &scalar * &c,
-                    None if nonconst.is_none() => nonconst = Some(e),
-                    None => return LinExpr::var(t), // nonlinear: two variable factors
+    }
+    if !interior(m, t) {
+        return leaf(m, t);
+    }
+    // Pass 1: the interior nodes in post-order, and how often each is used as
+    // an argument (so a value is moved out on its last use, not cloned).
+    let mut uses: BTreeMap<AstId, u32> = BTreeMap::new();
+    let mut order: Vec<AstId> = Vec::new();
+    let mut done: BTreeSet<AstId> = BTreeSet::new();
+    let mut stack: Vec<(AstId, bool)> = alloc::vec![(t, false)];
+    while let Some((id, expanded)) = stack.pop() {
+        if expanded {
+            if done.insert(id) {
+                order.push(id);
+            }
+            continue;
+        }
+        if done.contains(&id) {
+            continue;
+        }
+        stack.push((id, true));
+        for &c in m.app_args(id) {
+            if interior(m, c) {
+                *uses.entry(c).or_insert(0) += 1;
+                if !done.contains(&c) {
+                    stack.push((c, false));
                 }
             }
-            match nonconst {
-                Some(e) => e.scale(&scalar),
-                None => LinExpr::constant(scalar),
-            }
         }
-        _ => LinExpr::var(t), // to_real/div/mod/… : opaque for now
     }
+    // Pass 2: convert bottom-up.
+    let mut vals: BTreeMap<AstId, LinExpr> = BTreeMap::new();
+    let one = one();
+    let minus_one = -&one;
+    for &id in &order {
+        let args = m.app_args(id);
+        let mut kids: Vec<LinExpr> = Vec::with_capacity(args.len());
+        for &c in args {
+            if !interior(m, c) {
+                kids.push(leaf(m, c));
+                continue;
+            }
+            let u = uses.get_mut(&c).expect("counted in pass 1");
+            *u -= 1;
+            kids.push(if *u == 0 {
+                vals.remove(&c).expect("converted before its parent")
+            } else {
+                vals[&c].clone()
+            });
+        }
+        let e = match m.arith_op(id).expect("interior") {
+            ArithOp::Add => {
+                // Accumulate into the largest summand (moved), so a long chain
+                // of small additions does not copy its growing prefix.
+                let big = (0..kids.len()).max_by_key(|&i| kids[i].num_vars());
+                match big {
+                    None => LinExpr::new(),
+                    Some(b) => {
+                        let mut acc = kids.swap_remove(b);
+                        for k in &kids {
+                            acc.add_scaled(k, &one);
+                        }
+                        acc
+                    }
+                }
+            }
+            ArithOp::Sub | ArithOp::Uminus if kids.len() <= 1 => match kids.pop() {
+                Some(k) => k.scale(&minus_one),
+                None => LinExpr::new(),
+            },
+            ArithOp::Sub | ArithOp::Uminus => {
+                let mut it = kids.into_iter();
+                let mut acc = it.next().expect("non-empty");
+                for k in it {
+                    acc.add_scaled(&k, &minus_one);
+                }
+                acc
+            }
+            ArithOp::ToReal => kids.pop().unwrap_or_default(),
+            ArithOp::Mul => {
+                let mut scalar = one.clone();
+                let mut nonconst: Option<LinExpr> = None;
+                let mut nonlinear = false;
+                for k in kids {
+                    match k.as_constant() {
+                        Some(c) => scalar = &scalar * &c,
+                        None if nonconst.is_none() => nonconst = Some(k),
+                        None => nonlinear = true, // two variable factors
+                    }
+                }
+                if nonlinear {
+                    LinExpr::var(id)
+                } else {
+                    match nonconst {
+                        Some(e) => e.scale(&scalar),
+                        None => LinExpr::constant(scalar),
+                    }
+                }
+            }
+            _ => unreachable!("interior op"),
+        };
+        vals.insert(id, e);
+    }
+    vals.remove(&t).expect("root converted")
 }
 
 fn one() -> puremp::Rational {
