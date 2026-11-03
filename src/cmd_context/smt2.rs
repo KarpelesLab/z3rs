@@ -38446,6 +38446,59 @@ impl Context {
             cnf.memo.insert(t, l.clone());
             Some(l)
         }
+        // The literals of the clause `t` (negated when `neg`): nested
+        // disjunctions, negated conjunctions, implications and double
+        // negations flatten into one clause, as z3's Boolean rewriter
+        // flattens them before nlsat's CNF.
+        fn clause_lits(
+            ctx: &Context,
+            cnf: &mut Cnf,
+            t: AstId,
+            neg: bool,
+            out: &mut Vec<InLit>,
+        ) -> Option<()> {
+            let m = &ctx.m;
+            let args = m.app_args(t).to_vec();
+            if m.is_not(t) {
+                return clause_lits(ctx, cnf, args[0], !neg, out);
+            }
+            if (m.is_or(t) && !neg) || (m.is_and(t) && neg) {
+                for a in args {
+                    clause_lits(ctx, cnf, a, neg, out)?;
+                }
+                return Some(());
+            }
+            if m.is_implies(t) && !neg {
+                clause_lits(ctx, cnf, args[0], true, out)?;
+                return clause_lits(ctx, cnf, args[1], false, out);
+            }
+            let l = lit(ctx, cnf, t)?;
+            out.push(if neg { negate(&l) } else { l });
+            Some(())
+        }
+        // The clauses of `t` (negated when `neg`): conjunctions split into
+        // their conjuncts, each conjunct a flattened clause.
+        fn add_clauses(ctx: &Context, cnf: &mut Cnf, t: AstId, neg: bool) -> Option<()> {
+            let m = &ctx.m;
+            let args = m.app_args(t).to_vec();
+            if m.is_not(t) {
+                return add_clauses(ctx, cnf, args[0], !neg);
+            }
+            if (m.is_and(t) && !neg) || (m.is_or(t) && neg) {
+                for a in args {
+                    add_clauses(ctx, cnf, a, neg)?;
+                }
+                return Some(());
+            }
+            if m.is_implies(t) && neg {
+                add_clauses(ctx, cnf, args[0], false)?;
+                return add_clauses(ctx, cnf, args[1], true);
+            }
+            let mut cl = Vec::new();
+            clause_lits(ctx, cnf, t, neg, &mut cl)?;
+            cnf.clauses.push(cl);
+            Some(())
+        }
         let mut cnf = Cnf {
             clauses: Vec::new(),
             bools: Vec::new(),
@@ -38463,16 +38516,7 @@ impl Context {
             if self.valid_axioms.contains(&c) {
                 continue;
             }
-            let parts: Vec<AstId> = if self.m.is_or(c) {
-                self.m.app_args(c).to_vec()
-            } else {
-                alloc::vec![c]
-            };
-            let mut cl = Vec::with_capacity(parts.len());
-            for p in parts {
-                cl.push(lit(self, &mut cnf, p)?);
-            }
-            cnf.clauses.push(cl);
+            add_clauses(self, &mut cnf, c, false)?;
         }
         if cnf.var_map.is_empty() {
             return None;
