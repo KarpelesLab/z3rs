@@ -6098,6 +6098,14 @@ impl Context {
         let imp_e = self.m.mk_implies(nc, eq_e);
         defs.push(imp_t);
         defs.push(imp_e);
+        // Between numeral branches, the bounds the case split alone would
+        // leave to the search (a sum of `ite(p, w, 0)` penalties is ≥ 0
+        // without enumerating the `p`s).
+        if let (Some(x), Some(y)) = (self.m.as_numeral(a[1]), self.m.as_numeral(a[2])) {
+            let (lo, hi) = if x <= y { (a[1], a[2]) } else { (a[2], a[1]) };
+            defs.push(self.m.mk_ge(k, lo));
+            defs.push(self.m.mk_le(k, hi));
+        }
         k
     }
 
