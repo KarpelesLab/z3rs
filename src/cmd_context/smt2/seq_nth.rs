@@ -115,11 +115,21 @@ impl Context {
                 reads.push((a.args[0], a.args[1], t));
             }
         }
-        if reads.is_empty() {
-            return Vec::new();
-        }
         let consts: alloc::collections::BTreeSet<AstId> =
             self.m.postorder(goal).into_iter().collect();
+        // The reads of symbolic sequences: `nth` is a function of the sequence
+        // and the index, in range or not, so they agree with the reads above
+        // on an equal sequence and index (`a = []` makes `nth a 1` the
+        // out-of-range read of `[]` at 1).
+        let sym: Vec<(AstId, AstId, AstId)> = self
+            .seq_nth_sym
+            .iter()
+            .filter(|(_, c)| consts.contains(c))
+            .map(|(&(s, i), &c)| (s, i, c))
+            .collect();
+        if reads.is_empty() && sym.is_empty() {
+            return Vec::new();
+        }
         let oob: Vec<((AstId, i64), AstId)> = self
             .seq_nth_oob
             .iter()
@@ -131,6 +141,22 @@ impl Context {
             reads.push((s, kv, c));
         }
         let mut ax = Vec::new();
+        // Each symbolic read against the other reads (a bounded number).
+        const MAX_SYM_PAIRS: usize = 256;
+        let mut pairs = 0;
+        for (k, &(s1, i1, v1)) in sym.iter().enumerate() {
+            for &(s2, i2, v2) in reads.iter().chain(&sym[k + 1..]) {
+                if self.m.get_sort(s1) != self.m.get_sort(s2) || pairs == MAX_SYM_PAIRS {
+                    continue;
+                }
+                pairs += 1;
+                let same_seq = self.m.mk_eq(s1, s2);
+                let same_idx = self.m.mk_eq(i1, i2);
+                let hyp = self.m.mk_and(&[same_seq, same_idx]);
+                let concl = self.m.mk_eq(v1, v2);
+                ax.push(self.m.mk_implies(hyp, concl));
+            }
+        }
         for x in 0..reads.len() {
             for y in x + 1..reads.len() {
                 let (s1, i1, v1) = reads[x];
