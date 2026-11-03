@@ -343,6 +343,9 @@ fn render_real(r: &Rational) -> String {
     }
 }
 
+/// The deepest datatype value model-based instantiation builds.
+const MBQI_DT_DEPTH: u32 = 6;
+
 /// A function interpretation as a finite table (see
 /// `Context::fn_table_interps`): `(argument values, result)` entries and the
 /// value elsewhere.
@@ -7305,6 +7308,41 @@ impl Context {
         }
         out.push(')');
         Some(out)
+    }
+
+    /// The value of the datatype or record term `id` under `model` as a
+    /// constructor term (the one [`Self::dt_model_value`] prints), its fields
+    /// value terms; `None` when a field has no value term or the nesting
+    /// exceeds `depth`.
+    fn dt_value_term(&mut self, model: &mut Model, id: AstId, depth: u32) -> Option<AstId> {
+        if depth == 0 {
+            return None;
+        }
+        let sort = self.m.get_sort(id);
+        let (cdecl, sels) = if let Some(ctors) = self.datatypes.get(&sort).cloned() {
+            let chosen = ctors
+                .iter()
+                .find(|(_, _, tdecl)| {
+                    let tester = self.m.mk_app(*tdecl, &[id]);
+                    matches!(model.eval(&self.m, tester), Value::Bool(true))
+                })
+                .or_else(|| ctors.iter().find(|(_, sels, _)| sels.is_empty()))?;
+            (chosen.0, chosen.1.clone())
+        } else {
+            self.records.get(&sort).cloned()?
+        };
+        let mut fields = Vec::with_capacity(sels.len());
+        for sd in sels {
+            let field = self.m.mk_app(sd, &[id]);
+            let fs = self.m.get_sort(field);
+            let v = if self.datatypes.contains_key(&fs) || self.records.contains_key(&fs) {
+                self.dt_value_term(model, field, depth - 1)?
+            } else {
+                self.eval_value_term(model, field)?
+            };
+            fields.push(v);
+        }
+        Some(self.m.mk_app(cdecl, &fields))
     }
 
     /// A `simplify` result in z3's spelling: FP and string literals (fresh
@@ -26537,10 +26575,19 @@ impl Context {
     fn mbqi_theory(&mut self, goal: AstId, model: &mut Model) -> Mbqi {
         const MAX_COMBOS: usize = 16;
         let goal_terms: BTreeSet<AstId> = self.m.postorder(goal).into_iter().collect();
-        let user: BTreeSet<AstId> = self.funcs.values().copied().collect();
+        // (A datatype's constructors, selectors and testers are interpreted.)
+        let members = self.datatype_member_decls();
+        let user: BTreeSet<AstId> = self
+            .funcs
+            .values()
+            .copied()
+            .filter(|d| !members.contains(d))
+            .collect();
         // String constants take the values of a concrete witness of the
         // ground assertions (its pins stay as the model's string witness).
-        if self.string_sort.is_some() && goal_terms.iter().any(|&t| self.is_str_seq_var(t)) {
+        if (self.string_sort.is_some() || !self.seq_sorts.is_empty())
+            && goal_terms.iter().any(|&t| self.is_str_seq_var(t))
+        {
             let saved_u = core::mem::take(&mut self.universals);
             self.complete_str_witness(model);
             let ok = !self.str_model_refuted(model, &[]) && !self.str_model_incomplete(&[]);
@@ -26549,24 +26596,8 @@ impl Context {
                 return Mbqi::Unknown;
             }
         }
-        // The candidate must be a model of the ground goal itself.
-        let Some(fix) = self.mbqi_fix_constants(goal, model, &BTreeSet::new(), &goal_terms) else {
-            return Mbqi::Unknown;
-        };
-        let g = crate::rewriter::substitute(&mut self.m, goal, &fix);
-        let mut g = crate::rewriter::simplify(&mut self.m, g);
-        if !self.m.is_true(g) && self.string_sort.is_some() {
-            // String operations over literals fold through the string folder.
-            g = self.refold_str_markers(g, &mut BTreeMap::new());
-            g = crate::rewriter::simplify(&mut self.m, g);
-            if !self.m.is_true(g) {
-                g = self.str_concretize(g, &[]);
-            }
-        }
-        if !self.m.is_true(g) {
-            return Mbqi::Unknown;
-        }
         let mut fdecls: Vec<AstId> = Vec::new();
+        let mut in_goal_sk = false;
         for (_, body) in self.universals.clone() {
             for t in self.m.postorder(body) {
                 if let Some(app) = self.m.app(t)
@@ -26577,15 +26608,43 @@ impl Context {
                     let skolem = self
                         .decl_name(app.decl)
                         .is_some_and(|n| n.starts_with("!sk!"));
-                    let in_goal = goal_terms
-                        .iter()
-                        .any(|&g| self.m.app(g).is_some_and(|a| a.decl == app.decl));
-                    if !skolem || in_goal {
+                    if !skolem {
                         return Mbqi::Unknown;
                     }
+                    // A Skolem function applied in the ground goal (to the
+                    // instances' terms) takes the same interpretation there.
+                    in_goal_sk |= goal_terms
+                        .iter()
+                        .any(|&g| self.m.app(g).is_some_and(|a| a.decl == app.decl));
                     fdecls.push(app.decl);
                 }
             }
+        }
+        // The candidate must be a model of the ground goal itself. Its
+        // conjuncts over a Skolem function are the universals' instances and
+        // theory axioms, which hold once the universals are valid under the
+        // Skolem functions' interpretation: the others must hold.
+        let ground = if in_goal_sk {
+            let mut conj: Vec<AstId> = Vec::new();
+            let mut stack = alloc::vec![goal];
+            while let Some(t) = stack.pop() {
+                if self.m.is_and(t) {
+                    stack.extend(self.m.app_args(t).iter().copied());
+                } else if !self
+                    .m
+                    .postorder(t)
+                    .iter()
+                    .any(|&u| self.m.app(u).is_some_and(|a| fdecls.contains(&a.decl)))
+                {
+                    conj.push(t);
+                }
+            }
+            self.m.mk_and(&conj)
+        } else {
+            goal
+        };
+        if !self.mbqi_goal_holds(ground, model, &goal_terms) {
+            return Mbqi::Unknown;
         }
         // Candidate interpretations: `Ok(k)` constant, `Err(i)` the i-th argument.
         let mut cands: Vec<Vec<Result<AstId, usize>>> = Vec::new();
@@ -26596,6 +26655,43 @@ impl Context {
             let (range, domain) = (fd.range, fd.domain.clone());
             let mut c: Vec<Result<AstId, usize>> =
                 self.mbqi_sample_values(range).into_iter().map(Ok).collect();
+            // A string result may need to be one of the goal's literals, or
+            // longer than a constant's value.
+            if Some(range) == self.string_sort {
+                for &t in &goal_terms {
+                    if self.str_value(t).is_some() && !c.contains(&Ok(t)) && c.len() < 4 {
+                        c.push(Ok(t));
+                    }
+                }
+                for (_, w) in self.str_witness.clone() {
+                    if let Some(v) = self.str_value(w) {
+                        let mut text: String =
+                            v.iter().filter_map(|&ch| char::from_u32(ch)).collect();
+                        text.push('a');
+                        let l = self.mk_str_lit(&text);
+                        if !c.contains(&Ok(l)) && c.len() < 6 {
+                            c.push(Ok(l));
+                        }
+                    }
+                }
+            }
+            // A user constant of the range sort (its model value).
+            let consts: Vec<AstId> = self
+                .m
+                .postorder_many(&self.universals.iter().map(|u| u.1).collect::<Vec<_>>())
+                .into_iter()
+                .chain(goal_terms.iter().copied())
+                .filter(|&t| {
+                    self.m.get_sort(t) == range
+                        && self.m.is_uninterp_const(t)
+                        && self.is_user_constant_or_bits(t)
+                })
+                .collect();
+            for t in consts {
+                if !c.contains(&Ok(t)) && c.len() < 8 {
+                    c.push(Ok(t));
+                }
+            }
             c.extend((0..domain.len()).filter(|&i| domain[i] == range).map(Err));
             if c.is_empty() {
                 return Mbqi::Unknown;
@@ -26632,6 +26728,36 @@ impl Context {
         }
     }
 
+    /// Does the ground `goal` hold with its constants fixed to their values
+    /// in `model`?
+    fn mbqi_goal_holds(
+        &mut self,
+        goal: AstId,
+        model: &mut Model,
+        goal_terms: &BTreeSet<AstId>,
+    ) -> bool {
+        // Without string witnesses the model is the solver's model of `goal`.
+        if self.str_witness.is_empty()
+            && matches!(model.eval_value(&self.m, goal), Value::Bool(true))
+        {
+            return true;
+        }
+        let Some(fix) = self.mbqi_fix_constants(goal, model, &BTreeSet::new(), goal_terms) else {
+            return false;
+        };
+        let g = crate::rewriter::substitute(&mut self.m, goal, &fix);
+        let mut g = crate::rewriter::simplify(&mut self.m, g);
+        if !self.m.is_true(g) && (self.string_sort.is_some() || !self.seq_sorts.is_empty()) {
+            // String operations over literals fold through the string folder.
+            g = self.refold_str_markers(g, &mut BTreeMap::new());
+            g = crate::rewriter::simplify(&mut self.m, g);
+            if !self.m.is_true(g) {
+                g = self.str_concretize(g, &[]);
+            }
+        }
+        self.m.is_true(g)
+    }
+
     /// One [`Self::mbqi_theory`] pass under the function interpretation
     /// `interp`.
     fn mbqi_theory_round(
@@ -26652,7 +26778,12 @@ impl Context {
                     || self.m.bv_sort_width(s).is_some()
                     || self.fp_format_of(s).is_some()
                     || Some(s) == self.string_sort
-                    || self.seq_elem_sort(s).is_some())
+                    || self.seq_elem_sort(s).is_some()
+                    || self.datatypes.contains_key(&s)
+                    || self.records.contains_key(&s)
+                    || self.m.array_sort_params(s).is_some_and(|(i, e)| {
+                        self.array_model_scalar_sort(i) && self.array_model_scalar_sort(e)
+                    }))
                 {
                     return Mbqi::Unknown;
                 }
@@ -26694,7 +26825,7 @@ impl Context {
                 return Mbqi::Unknown;
             };
             let mut phi = crate::rewriter::substitute(&mut self.m, raw, &fix);
-            if self.string_sort.is_some() {
+            if self.string_sort.is_some() || !self.seq_sorts.is_empty() {
                 // String operations whose arguments became literals fold.
                 phi = self.refold_str_markers(phi, &mut BTreeMap::new());
             }
@@ -26724,6 +26855,18 @@ impl Context {
                 }
                 self.str_witness = saved_w;
             }
+            // An array counterexample: the arrays' interpretations in the
+            // counterexample's model (checked against the negated instance).
+            let mut arr_vals: BTreeMap<AstId, AstId> = BTreeMap::new();
+            if r == SmtResult::Sat
+                && interp.is_empty()
+                && fresh
+                    .iter()
+                    .any(|&x0| self.m.is_array_sort(self.m.get_sort(x0)))
+                && let Some(cm) = cex.as_mut()
+            {
+                arr_vals = self.array_model_values_with(cm, &fresh).unwrap_or_default();
+            }
             self.assertions = saved_a;
             self.universals = saved_u;
             match r {
@@ -26751,6 +26894,16 @@ impl Context {
                         } else if self.is_str_seq_sort(s) {
                             match str_vals.get(&x0) {
                                 Some(&lit) => lit,
+                                None => return Mbqi::Unknown,
+                            }
+                        } else if self.m.is_array_sort(s) {
+                            match arr_vals.get(&x0) {
+                                Some(&t) => t,
+                                None => return Mbqi::Unknown,
+                            }
+                        } else if self.datatypes.contains_key(&s) || self.records.contains_key(&s) {
+                            match self.dt_value_term(&mut cm, x0, MBQI_DT_DEPTH) {
+                                Some(t) => t,
                                 None => return Mbqi::Unknown,
                             }
                         } else {
@@ -26843,6 +26996,21 @@ impl Context {
                 fix.push((n, lit));
                 continue;
             }
+            if self.datatypes.contains_key(&s) || self.records.contains_key(&s) {
+                // Its constructor term.
+                fix.push((n, self.dt_value_term(model, n, MBQI_DT_DEPTH)?));
+                continue;
+            }
+            if self.m.is_array_sort(s) {
+                // Its interpretation (a `store` chain over a constant array)
+                // under the ground assertions: the universals are what the
+                // instantiation checks.
+                let saved_u = core::mem::take(&mut self.universals);
+                let v = self.array_model_values_with(model, &[n]);
+                self.universals = saved_u;
+                fix.push((n, *v?.get(&n)?));
+                continue;
+            }
             let lit = match model.eval(&self.m, n) {
                 Value::Bool(b) if self.m.is_bool_sort(s) => self.mk_bool(b),
                 Value::Num(r, is_int) if self.m.is_arith_sort(s) => self.m.mk_numeral(r, is_int),
@@ -26889,6 +27057,47 @@ impl Context {
             alloc::vec![self.m.mk_bv(0, w), self.m.mk_bv(1, w)]
         } else if Some(sort) == self.string_sort {
             alloc::vec![self.mk_str_lit(""), self.mk_str_lit("a")]
+        } else if self.datatypes.contains_key(&sort) || self.records.contains_key(&sort) {
+            // A value of each constructor, its fields their sorts' first values.
+            let ctors: Vec<(AstId, Vec<AstId>)> = match self.datatypes.get(&sort) {
+                Some(cs) => cs.iter().map(|(c, sels, _)| (*c, sels.clone())).collect(),
+                None => self.records.get(&sort).cloned().into_iter().collect(),
+            };
+            let mut out = Vec::new();
+            for (c, sels) in ctors {
+                let mut fields = Vec::with_capacity(sels.len());
+                for sd in sels {
+                    let fs = self.m.func_decl(sd).map(|d| d.range);
+                    let v = fs.and_then(|fs| {
+                        if fs == sort {
+                            // A recursive field: the first value already built.
+                            out.first().copied()
+                        } else if self.datatypes.contains_key(&fs) || self.records.contains_key(&fs)
+                        {
+                            None
+                        } else {
+                            self.mbqi_sample_values(fs).first().copied()
+                        }
+                    });
+                    match v {
+                        Some(v) => fields.push(v),
+                        None => break,
+                    }
+                }
+                if fields.len() == self.m.func_decl(c).map_or(usize::MAX, |d| d.domain.len()) {
+                    out.push(self.m.mk_app(c, &fields));
+                }
+            }
+            out
+        } else if let Some(elem) = self.seq_elem_sort(sort) {
+            // The empty sequence and a unit of the element sort's first value.
+            let mut out = alloc::vec![self.seq_empty_of(sort)];
+            if let Some(&e) = self.mbqi_sample_values(elem).first()
+                && let Ok(u) = self.seq_op("seq.unit", &[e])
+            {
+                out.push(u);
+            }
+            out
         } else if let Some((eb, sb)) = self.fp_format_of(sort) {
             // +0 and 1.0.
             let one = ((1u64 << (eb - 1)) - 1) << (sb - 1);
@@ -45921,6 +46130,38 @@ mod tests {
         assert_eq!(out[1], "((a \"abab\"))");
         assert_eq!(out[2], "sat");
         assert!(out[3].starts_with("((b \"x"), "{out:?}");
+    }
+
+    #[test]
+    fn mbqi_over_datatype_array_and_string_skolem_binders() {
+        let script = "
+            (declare-const c String)
+            (assert (forall ((x String)) (exists ((y String)) (or (= x c) (= y c)))))
+            (check-sat)
+            (reset)
+            (declare-datatypes ((L 0)) (((nil) (cons (hd Int) (tl L)))))
+            (declare-const c L)
+            (assert (forall ((x L)) (or (= x c) (not ((_ is cons) x)))))
+            (check-sat)
+            (reset)
+            (declare-datatypes ((L 0)) (((nil) (cons (hd Int) (tl L)))))
+            (declare-const c L)
+            (assert (forall ((x L)) (exists ((y L)) (or (< (hd x) (hd c)) (= y c)))))
+            (check-sat)
+            (reset)
+            (declare-const c (Array Int Int))
+            (assert (forall ((x (Array Int Int))) (or (= (store x 0 1) x) (and (= x c) (= (select x 0) 0)))))
+            (check-sat)
+            (reset)
+            (declare-const c (Array Int Int))
+            (assert (exists ((x (Array Int Int))) (forall ((y (Array Int Int)))
+                (or (= (select x 0) 0) (not (= y c))))))
+            (check-sat)
+        ";
+        assert_eq!(
+            run(script).unwrap(),
+            alloc::vec!["sat", "unsat", "sat", "unsat", "sat"]
+        );
     }
 
     #[test]

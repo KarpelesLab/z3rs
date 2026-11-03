@@ -69,7 +69,7 @@ enum Base {
 
 impl Context {
     /// Can values of `s` be index or element values of a printed array?
-    fn array_model_scalar_sort(&self, s: AstId) -> bool {
+    pub(super) fn array_model_scalar_sort(&self, s: AstId) -> bool {
         self.m.is_bool_sort(s)
             || self.m.is_arith_sort(s)
             || self.m.bv_sort_width(s).is_some()
@@ -101,6 +101,18 @@ impl Context {
         if let Some(v) = model.array_values() {
             return v.cloned();
         }
+        let v = self.array_model_values_with(model, &[]);
+        model.set_array_values(v.clone());
+        v
+    }
+
+    /// [`Self::array_model_values`], uncached, also interpreting the
+    /// constants `extra` (fresh constants of the assertions, not declared).
+    pub(super) fn array_model_values_with(
+        &mut self,
+        model: &mut Model,
+        extra: &[AstId],
+    ) -> Option<BTreeMap<AstId, AstId>> {
         // The array equalities the model makes true: the asserted ones and
         // those it assigns; the truth of the others (the solver decided a
         // rewritten form) is guessed, each guess checked.
@@ -120,13 +132,12 @@ impl Context {
             // and last the evaluation of reads the model has no value for
             // (an unconstrained read eliminated before solving).
             for reads in [Reads::Asserted, Reads::Solver, Reads::Evaluated] {
-                v = self.build_array_model_values(model, reads, &holds);
+                v = self.build_array_model_values(model, reads, &holds, extra);
                 if v.is_some() {
                     break 'search;
                 }
             }
         }
-        model.set_array_values(v.clone());
         v
     }
 
@@ -188,6 +199,7 @@ impl Context {
         model: &mut Model,
         reads_from: Reads,
         holds: &BTreeSet<AstId>,
+        extra: &[AstId],
     ) -> Option<BTreeMap<AstId, AstId>> {
         // The declared array constants the assertions mention.
         let mut arrays: Vec<AstId> = Vec::new();
@@ -229,6 +241,19 @@ impl Context {
                 }
                 arrays.push(c);
             } else if self.array_model_scalar_sort(range) {
+                scalars.push(c);
+            }
+        }
+        for &c in extra {
+            let s = self.m.get_sort(c);
+            if let Some((i, e)) = self.m.array_sort_params(s) {
+                if !self.array_model_scalar_sort(i) || !self.array_model_scalar_sort(e) {
+                    return None;
+                }
+                if !arrays.contains(&c) {
+                    arrays.push(c);
+                }
+            } else if self.array_model_scalar_sort(s) && !scalars.contains(&c) {
                 scalars.push(c);
             }
         }
