@@ -77,8 +77,59 @@ enum Objective {
     /// with their weights. Minimizes the total weight of the violated softs.
     Soft {
         id: String,
-        items: Vec<(AstId, i64)>,
+        items: Vec<(AstId, Rational)>,
     },
+}
+
+/// The least common multiple of a soft group's weight denominators: the
+/// group is optimized over its weights times this scale, all integers.
+fn soft_scale(items: &[(AstId, Rational)]) -> Int {
+    items.iter().fold(Int::from(1), |acc, (_, w)| {
+        let d = w.denominator().clone();
+        let g = acc.gcd(&d);
+        acc.mul(&d).div_trunc(&g)
+    })
+}
+
+/// A rendered objective value of a soft group optimized at `scale` times its
+/// weights, as the true weights: every numeral divided by `scale` (the
+/// infinities `oo` and `(* (- 1) oo)` are kept).
+fn rescale_value(v: &str, scale: &Int) -> String {
+    let k = Rational::from_integer(scale.clone());
+    let b = v.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        const NEG_OO: &str = "(* (- 1) oo)";
+        if v[i..].starts_with(NEG_OO) {
+            out.push_str(NEG_OO);
+            i += NEG_OO.len();
+            continue;
+        }
+        let neg = v[i..].starts_with("(- ");
+        let start = if neg { i + 3 } else { i };
+        let prev_ok = i == 0 || !(b[i - 1] as char).is_ascii_alphanumeric();
+        if prev_ok && start < b.len() && b[start].is_ascii_digit() {
+            let mut j = start;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if !neg || b.get(j) == Some(&b')') {
+                let n = Int::from_str_radix(&v[start..j], 10).unwrap_or_default();
+                let mut r = Rational::from_integer(n).div(&k);
+                if neg {
+                    r = r.neg();
+                    j += 1;
+                }
+                out.push_str(&render_rational(&r));
+                i = j;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// The exact optimum of a nonlinear real objective (see
@@ -920,6 +971,7 @@ mod re_len;
 mod seq_bounded;
 mod seq_nth;
 mod simplify_th;
+use simplify_th::PreTerm;
 mod str_uf;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
@@ -2769,6 +2821,37 @@ struct ParseErr {
 
 /// Render an s-expression back to its textual form (used to echo `get-value`
 /// query terms). Iterative, into one buffer (linear in the output size).
+/// `e` with each bit-vector literal `(_ bvN w)` spelled as z3 prints it:
+/// `#x…` when the width is a multiple of four, else `#b…`.
+fn bv_literals_as_z3(e: &SExpr) -> SExpr {
+    let SExpr::List(l) = e else {
+        return e.clone();
+    };
+    if let [SExpr::Atom(u), SExpr::Atom(bvn), SExpr::Atom(w)] = l.as_slice()
+        && u == "_"
+        && let Some(digits) = bvn.strip_prefix("bv")
+        && let (Some(v), Ok(w)) = (Int::from_str_radix(digits, 10).ok(), w.parse::<u32>())
+        && w > 0
+    {
+        let bit = |i: u32| v.bit(u64::from(i));
+        let mut s = String::new();
+        if w.is_multiple_of(4) {
+            s.push_str("#x");
+            for nib in (0..w / 4).rev() {
+                let d = (0..4).fold(0u32, |d, b| d | (u32::from(bit(nib * 4 + b)) << b));
+                s.push(char::from_digit(d, 16).unwrap_or('0'));
+            }
+        } else {
+            s.push_str("#b");
+            for i in (0..w).rev() {
+                s.push(if bit(i) { '1' } else { '0' });
+            }
+        }
+        return SExpr::Atom(s);
+    }
+    SExpr::List(l.iter().map(bv_literals_as_z3).collect())
+}
+
 fn render_sexpr(s: &SExpr) -> String {
     fn atom(a: &str, out: &mut String) {
         // The tokenizer strips `|…|` from a quoted symbol; restore it. String
@@ -3145,6 +3228,9 @@ struct Context {
     universals: Vec<(Vec<AstId>, AstId)>,
     /// Optimization objectives (`maximize`/`minimize`/`assert-soft` groups).
     objectives: Vec<Objective>,
+    /// Each `assert-soft` penalty indicator `p`: the soft formula `F` and the
+    /// hard assertion `F ∨ p` relaxing it.
+    soft_formulas: BTreeMap<AstId, (AstId, AstId)>,
     /// The rendered optimal value of each objective after the last `check-sat`.
     objective_values: Vec<String>,
     /// `box`/`pareto` iteration state across repeated `check-sat`s.
@@ -4353,6 +4439,7 @@ impl Context {
             sort_ctors: BTreeMap::new(),
             universals: Vec::new(),
             objectives: Vec::new(),
+            soft_formulas: BTreeMap::new(),
             objective_values: Vec::new(),
             opt_iter: OptIter::Fresh,
             opt_open_limit: false,
@@ -5701,7 +5788,7 @@ impl Context {
             "maximize" | "minimize" => {
                 let t = self.term(&list[1])?;
                 let maximize = matches!(&list[0], SExpr::Atom(a) if a == "maximize");
-                let text = render_sexpr(&list[1]);
+                let text = render_sexpr(&bv_literals_as_z3(&list[1]));
                 self.objectives.push(Objective::Term {
                     term: t,
                     maximize,
@@ -5715,7 +5802,14 @@ impl Context {
                 // (F ∨ pᵢ) with a fresh penalty bool pᵢ; check-sat minimizes the
                 // total weight of the softs whose pᵢ is forced true.
                 let f = self.term(&list[1])?;
-                let weight = attr_int(list, ":weight").unwrap_or(1);
+                let weight = list
+                    .iter()
+                    .position(|s| matches!(s, SExpr::Atom(a) if a == ":weight"))
+                    .and_then(|pos| match list.get(pos + 1) {
+                        Some(SExpr::Atom(a)) => parse_numeral(a).map(|(r, _)| r),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| Rational::from_integer(Int::from(1)));
                 let id = match list
                     .iter()
                     .position(|s| matches!(s, SExpr::Atom(a) if a == ":id"))
@@ -5730,6 +5824,7 @@ impl Context {
                 let pdecl = self.m.mk_func_decl(Symbol::new(&name), &[], b);
                 let penalty = self.m.mk_const(pdecl);
                 let relaxed = self.m.mk_or(&[f, penalty]);
+                self.soft_formulas.insert(penalty, (f, relaxed));
                 self.assertions.push(relaxed);
                 self.assert_names.push(None);
                 // Softs sharing an `:id` form one objective, placed where the
@@ -28491,11 +28586,12 @@ impl Context {
                 Objective::Term { term, maximize, .. } => objs.push((term, maximize)),
                 Objective::Soft { items, .. } => {
                     let zero = self.m.mk_int(0);
+                    let scale = Rational::from_integer(soft_scale(&items));
                     let terms: Vec<AstId> = items
                         .iter()
-                        .map(|&(p, w)| {
-                            let wv = self.m.mk_int(w);
-                            self.m.mk_ite(p, wv, zero)
+                        .map(|(p, w)| {
+                            let wv = self.m.mk_numeral(w.mul(&scale), true);
+                            self.m.mk_ite(*p, wv, zero)
                         })
                         .collect();
                     let sum = if terms.len() == 1 {
@@ -28519,10 +28615,24 @@ impl Context {
     fn untouched_objective_value(&self, i: usize) -> String {
         match &self.objectives[i] {
             Objective::Soft { items, .. } => {
-                let total: i64 = items.iter().map(|&(_, w)| w).sum();
-                alloc::format!(" (interval 0 {})", render_int(&Int::from(total)))
+                // In the group's scaled weights (see `soft_scale`).
+                let scale = Rational::from_integer(soft_scale(items));
+                let total = items
+                    .iter()
+                    .fold(Rational::from_integer(Int::from(0)), |acc, (_, w)| {
+                        acc.add(&w.mul(&scale))
+                    });
+                alloc::format!(" (interval 0 {})", render_rational(&total))
             }
-            Objective::Term { .. } => " (interval (* (- 1) oo) oo)".to_string(),
+            // A constant objective has its value without any search.
+            Objective::Term { term, .. } => {
+                let lin = crate::smt::solver::ast_to_lin(&self.m, *term);
+                if lin.is_constant() {
+                    render_rational(lin.constant_part())
+                } else {
+                    " (interval (* (- 1) oo) oo)".to_string()
+                }
+            }
         }
     }
 
@@ -28846,6 +28956,13 @@ impl Context {
             *model = self.check_with(fixed).1;
             return (render_int(&v), false);
         }
+        if self.m.is_arith_sort(osort)
+            && let Some(c) = crate::smt::solver::ast_to_lin(&self.m, obj).as_constant()
+        {
+            // A constant objective needs no search (the hard constraints
+            // are already known to be satisfiable).
+            return (render_rational(&c), false);
+        }
         if self.m.is_arith_sort(osort) && !self.m.is_int_sort(osort) {
             // Real objective: Fourier–Motzkin optimum, then verify it.
             return match self.real_optimize(obj, maximize, fixed) {
@@ -29025,7 +29142,41 @@ impl Context {
         } else {
             None
         };
-        let trivially_false = trivially_false || pre.as_ref().is_some_and(|p| p.0);
+        // z3's own preprocessing (simplify, propagate-values, solve-eqs) of
+        // the hard constraints together with the objective terms.
+        // A soft constraint enters as its formula, not as the relaxed hard
+        // assertion standing in for it.
+        let opt_pre = if res == SmtResult::Unsat {
+            let mut relaxed = BTreeSet::new();
+            let terms: Vec<Vec<AstId>> = self
+                .objectives
+                .iter()
+                .map(|o| match o {
+                    Objective::Term { term, .. } => alloc::vec![*term],
+                    Objective::Soft { items, .. } => items
+                        .iter()
+                        .filter_map(|(p, _)| self.soft_formulas.get(p))
+                        .map(|&(f, r)| {
+                            relaxed.insert(r);
+                            f
+                        })
+                        .collect(),
+                })
+                .collect();
+            let hard: Vec<AstId> = self
+                .assertions
+                .iter()
+                .copied()
+                .filter(|a| !relaxed.contains(a))
+                .collect();
+            self.opt_preprocess(&hard, &terms)
+        } else {
+            None
+        };
+        let trivially_false = trivially_false
+            || pre.as_ref().is_some_and(|p| p.0)
+            || opt_pre.as_ref().is_some_and(|p| p.inconsistent);
+        let pre_terms = opt_pre.map(|p| p.terms);
         let v = if trivially_false {
             "0"
         } else if res == SmtResult::Unsat {
@@ -29040,9 +29191,68 @@ impl Context {
         if res == SmtResult::Unsat && !trivially_false {
             let (boxes, pinned) = pre.map(|p| (p.1, p.2)).unwrap_or_default();
             for (i, o) in self.objectives.clone().into_iter().enumerate() {
-                let Objective::Term { term, maximize, .. } = o else {
-                    continue;
+                let pre_i = pre_terms.as_ref().map(|t| &t[i]);
+                let (term, maximize) = match o {
+                    Objective::Term { term, maximize, .. } => (term, maximize),
+                    Objective::Soft { items, .. } => {
+                        // A soft group keeps its initial bounds: the weights
+                        // of the softs preprocessing made `false`, up to the
+                        // total of those it left open (`true` ones drop out).
+                        self.objective_values[i] = match pre_i {
+                            Some(pt) if pt.len() == items.len() => {
+                                let scale = Rational::from_integer(soft_scale(&items));
+                                let zero = Rational::from_integer(Int::from(0));
+                                let (mut lo, mut open) = (zero.clone(), zero);
+                                for ((p, w), t) in items.iter().zip(pt) {
+                                    // `lia2card`'s boxes may decide it too.
+                                    let decided = match t {
+                                        PreTerm::Bool(b) => Some(*b),
+                                        _ => self
+                                            .soft_formulas
+                                            .get(p)
+                                            .and_then(|&(f, _)| self.box_decide(f, &boxes)),
+                                    };
+                                    match decided {
+                                        Some(true) => {}
+                                        Some(false) => lo = lo.add(&w.mul(&scale)),
+                                        None => open = open.add(&w.mul(&scale)),
+                                    }
+                                }
+                                if open.is_zero() {
+                                    render_rational(&lo)
+                                } else {
+                                    alloc::format!(
+                                        " (interval {} {})",
+                                        render_rational(&lo),
+                                        render_rational(&lo.add(&open))
+                                    )
+                                }
+                            }
+                            _ => self.untouched_objective_value(i),
+                        };
+                        continue;
+                    }
                 };
+                // z3 optimizes a bit-vector objective as a weighted MaxSAT
+                // problem over its bits, which keeps the bounds `[0, 2ʷ−1]`
+                // (reversed for `maximize`).
+                if let Some(w) = self.m.bv_sort_width(self.m.get_sort(term)) {
+                    let top = render_int(&Int::from(1).mul_2k(u64::from(w)).sub(&Int::from(1)));
+                    self.objective_values[i] = if maximize {
+                        alloc::format!(" (interval {top} 0)")
+                    } else {
+                        alloc::format!(" (interval 0 {top})")
+                    };
+                    continue;
+                }
+                if let Some([PreTerm::Num(r, int)]) = pre_i.map(|v| v.as_slice()) {
+                    self.objective_values[i] = if *int {
+                        render_int(r.numerator())
+                    } else {
+                        render_rational(r)
+                    };
+                    continue;
+                }
                 let t = crate::rewriter::substitute(&mut self.m, term, &pinned);
                 let t = crate::rewriter::simplify(&mut self.m, t);
                 let int = self.m.is_int_sort(self.m.get_sort(t));
@@ -29300,6 +29510,62 @@ impl Context {
             }
         }
         Some((lo, hi))
+    }
+
+    /// The truth value of the Boolean combination `f` of linear atoms when
+    /// the `lia2card` boxes of its constants decide every atom it needs.
+    fn box_decide(&self, f: AstId, boxes: &BTreeMap<AstId, (Rational, Rational)>) -> Option<bool> {
+        use crate::ast::ArithOp;
+        let m = &self.m;
+        if m.is_true(f) || m.is_false(f) {
+            return Some(m.is_true(f));
+        }
+        let args = m.app_args(f);
+        if m.is_not(f) {
+            return self.box_decide(args[0], boxes).map(|b| !b);
+        }
+        if m.is_or(f) || m.is_and(f) {
+            let unit = m.is_and(f);
+            let mut all = true;
+            for &a in args {
+                match self.box_decide(a, boxes) {
+                    Some(b) if b != unit => return Some(b),
+                    Some(_) => {}
+                    None => all = false,
+                }
+            }
+            return all.then_some(unit);
+        }
+        let op = m.arith_op(f);
+        let arith_eq = m.is_eq(f) && args.len() == 2 && m.is_arith_sort(m.get_sort(args[0]));
+        if !(arith_eq
+            || matches!(
+                op,
+                Some(ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
+            ))
+            || args.len() != 2
+        {
+            return None;
+        }
+        // The range of lhs − rhs.
+        let lin = crate::smt::solver::ast_to_lin(m, args[0])
+            .sub(&crate::smt::solver::ast_to_lin(m, args[1]));
+        let (lo, hi) = Self::box_range(&lin, boxes)?;
+        let zero = Rational::from_integer(Int::from(0));
+        let (yes, no) = match op {
+            _ if arith_eq => (lo == zero && hi == zero, lo > zero || hi < zero),
+            Some(ArithOp::Le) => (hi <= zero, lo > zero),
+            Some(ArithOp::Lt) => (hi < zero, lo >= zero),
+            Some(ArithOp::Ge) => (lo >= zero, hi < zero),
+            _ => (lo > zero, hi <= zero),
+        };
+        if yes {
+            Some(true)
+        } else if no {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     /// Decide the assertions plus `fs` for a `pareto` step. A nonlinear real
@@ -30293,9 +30559,9 @@ impl Context {
         let mut out = String::from("(objectives");
         for (o, val) in self.objectives.iter().zip(&self.objective_values) {
             // A soft group is named by its `:id` (empty when none).
-            let name = match o {
-                Objective::Term { text, .. } => text,
-                Objective::Soft { id, .. } => id,
+            let (name, val) = match o {
+                Objective::Term { text, .. } => (text, val.clone()),
+                Objective::Soft { id, items } => (id, rescale_value(val, &soft_scale(items))),
             };
             out.push_str(&alloc::format!("\n ({name} {val})"));
         }
@@ -47315,6 +47581,52 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out[1], "(objectives\n (g 0)\n (y 2)\n (h 1)\n)");
+    }
+
+    #[test]
+    fn lex_after_unbounded_climbs_with_geometric_steps() {
+        // z3's one-sided search: 16 trials with steps 1, 2, 2, 2, 4, …
+        let out = run(
+            "(declare-const x Int)(declare-const y Int)(assert (>= y 0))\
+             (assert (>= x y))(maximize x)(maximize y)(check-sat)(get-objectives)",
+        )
+        .unwrap();
+        assert_eq!(out[1], "(objectives\n (x oo)\n (y  (interval 110 oo))\n)");
+    }
+
+    #[test]
+    fn soft_weights_may_be_decimals() {
+        let out = run(
+            "(declare-const x Int)(declare-const p Bool)(assert (<= 0 x 3))\
+             (assert-soft (> x 2) :weight 0.5)(assert-soft p :weight 1.25)\
+             (assert-soft (not p) :weight 0.75)(minimize x)(check-sat)(get-objectives)",
+        )
+        .unwrap();
+        assert_eq!(out[1], "(objectives\n ( (/ 3.0 4.0))\n (x 3)\n)");
+    }
+
+    #[test]
+    fn objective_values_after_unsat_follow_preprocessing() {
+        // `x - x` cancels: the hard constraints simplify to false.
+        let out = run("(declare-const x Real)(declare-const y Real)\
+             (assert (< (+ (- x x) 1.0) (- 3.0)))(assert (= y 2.0))\
+             (assert-soft (> y 1.0) :weight 2)(assert-soft (> x 1.0) :weight 3)\
+             (maximize x)(check-sat)(get-objectives)")
+        .unwrap();
+        assert_eq!(out[1], "(objectives\n ( 0)\n (x 0)\n)");
+        // Not decided by preprocessing: `y = 4` is propagated (the first soft
+        // and the objective become constant); a bit-vector objective keeps
+        // its MaxSAT bounds.
+        let out = run("(declare-const x Int)(declare-const y Int)\
+             (assert (> (* x x) 3))(assert (< (* x x) 2))(assert (= y 4))\
+             (assert-soft (> y 2) :weight 2)(assert-soft (> x 2) :weight 3)\
+             (minimize (+ y 1))(declare-const b (_ BitVec 4))(maximize (bvadd b #x1))\
+             (check-sat)(get-objectives)")
+        .unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n (  (interval 0 3))\n ((+ y 1) 5)\n ((bvadd b #x1)  (interval 15 0))\n)"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! arithmetic and uninterpreted symbols over those and declared sorts) are
 //! left to the general `simplify` path.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -572,4 +572,518 @@ fn op_name(op: &Op) -> String {
         _ => "?",
     };
     n.to_string()
+}
+
+/// The outcome of [`Context::opt_preprocess`].
+pub(super) struct OptPre {
+    /// The hard constraints simplified to `false`.
+    pub inconsistent: bool,
+    /// Each objective's terms (one for `minimize`/`maximize`, one per soft
+    /// constraint of a soft group) as preprocessing left them.
+    pub terms: Vec<Vec<PreTerm>>,
+}
+
+/// An objective term after [`Context::opt_preprocess`].
+pub(super) enum PreTerm {
+    /// A numeral (`(value, is_int)`).
+    Num(puremp::Rational, bool),
+    /// `true` or `false`.
+    Bool(bool),
+    /// Anything else.
+    Other,
+}
+
+impl Context {
+    /// Build the z3rs term `t` in the rewriter's arena: numerals, Boolean
+    /// and arithmetic operators, and uninterpreted symbols; `None` outside
+    /// that fragment.
+    fn th_ast(&self, b: &mut Builder, t: AstId, memo: &mut BTreeMap<AstId, T>) -> Option<T> {
+        // Post-order with an explicit stack: assertions may nest deeply.
+        let mut stack = alloc::vec![(t, false)];
+        while let Some((x, done)) = stack.pop() {
+            if memo.contains_key(&x) {
+                continue;
+            }
+            if let Some(r) = self.m.as_numeral(x) {
+                let is_int = self.m.is_int_sort(self.m.get_sort(x));
+                let n = b.s.mk_num(r, is_int);
+                memo.insert(x, n);
+                continue;
+            }
+            if let Some(v) = self.m.bv_numeral_value(x) {
+                let w = self.m.bv_sort_width(self.m.get_sort(x))?;
+                let n = b.s.mk_bv_num(&v, w);
+                memo.insert(x, n);
+                continue;
+            }
+            if self.m.is_true(x) || self.m.is_false(x) {
+                let n = if self.m.is_true(x) {
+                    b.s.mk_true()
+                } else {
+                    b.s.mk_false()
+                };
+                memo.insert(x, n);
+                continue;
+            }
+            let app = self.m.app(x)?;
+            if !done {
+                stack.push((x, true));
+                stack.extend(app.args.iter().map(|&a| (a, false)));
+                continue;
+            }
+            let args: Vec<T> = app.args.iter().map(|a| memo[a]).collect();
+            let fd = self.m.func_decl(app.decl)?;
+            let name = alloc::format!("{}", fd.name);
+            let r = if fd.info.family_id == crate::ast::NULL_FAMILY_ID && args.is_empty() {
+                let s = self.th_sort(fd.range)?;
+                b.s.mk_sorted(Op::Uf(name), Vec::new(), s)
+            } else if self.m.is_ite(x) {
+                self.th_app(b, "ite", args)?
+            } else if self.m.arith_op(x) == Some(crate::ast::arith::ArithOp::Uminus) {
+                self.th_app(b, "-", args)?
+            } else {
+                self.th_app(b, &name, args)?
+            };
+            memo.insert(x, r);
+        }
+        memo.get(&t).copied()
+    }
+
+    /// The part of z3's optimization preprocessing (`opt::context::
+    /// simplify_fmls`: `simplify`, `propagate-values`, `solve-eqs`,
+    /// `simplify` over the hard constraints and the objectives together)
+    /// that decides what `get-objectives` reports when the hard constraints
+    /// are unsatisfiable: whether they simplify to `false` (z3 then never
+    /// reaches its optimizer and reports 0), which objectives become
+    /// numerals, and which soft constraints become `true` or `false`. `objs`
+    /// holds each objective's terms. `None` when a term lies outside the
+    /// supported fragment.
+    pub(super) fn opt_preprocess(&self, fmls: &[AstId], objs: &[Vec<AstId>]) -> Option<OptPre> {
+        let mut b = Builder {
+            s: Simp::new(),
+            scopes: Vec::new(),
+        };
+        let mut memo = BTreeMap::new();
+        let mut goal = Vec::new();
+        for &f in fmls {
+            let t = self.th_ast(&mut b, f, &mut memo)?;
+            goal.push(t);
+        }
+        let mut obj = Vec::new();
+        for &o in objs.iter().flatten() {
+            obj.push(self.th_ast(&mut b, o, &mut memo)?);
+        }
+        let s = &mut b.s;
+        let mut goal: Vec<T> = goal.into_iter().map(|t| s.simplify(t)).collect();
+        let mut obj: Vec<T> = obj.into_iter().map(|t| s.simplify(t)).collect();
+        let mut inconsistent = !normalize_goal(s, &mut goal);
+        // propagate-values: a forward and a backward pass per round, each
+        // formula rewritten with the unit facts of those before it.
+        for _ in 0..4 {
+            if inconsistent {
+                break;
+            }
+            let mut changed = false;
+            for backward in [false, true] {
+                let shared = shared_occs(s, goal.iter().chain(obj.iter()).copied());
+                let mut map: BTreeMap<T, T> = BTreeMap::new();
+                let n = goal.len() + obj.len();
+                for k in 0..n {
+                    // Objectives follow the hard constraints.
+                    let i = if backward { n - 1 - k } else { k };
+                    let slot = if i < goal.len() {
+                        &mut goal[i]
+                    } else {
+                        &mut obj[i - goal.len()]
+                    };
+                    if !map.is_empty() {
+                        let r = substitute(s, *slot, &map);
+                        let r = s.simplify(r);
+                        if r != *slot {
+                            *slot = r;
+                            changed = true;
+                        }
+                    }
+                    if i < goal.len() {
+                        add_unit(s, goal[i], &shared, &mut map);
+                    }
+                }
+                if !normalize_goal(s, &mut goal) {
+                    inconsistent = true;
+                    break;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // solve-eqs: eliminate a variable a top-level equation defines.
+        let mut rounds = 0;
+        while !inconsistent && rounds < 64 {
+            rounds += 1;
+            let solved = (0..goal.len()).find_map(|i| {
+                let f = goal[i];
+                solve_eq(s, f).map(|(x, d)| (i, x, d))
+            });
+            let Some((i, x, def)) = solved.or_else(|| bound_eq(s, &goal)) else {
+                break;
+            };
+            goal.remove(i);
+            let map = BTreeMap::from([(x, def)]);
+            for slot in goal.iter_mut().chain(obj.iter_mut()) {
+                let r = substitute(s, *slot, &map);
+                *slot = s.simplify(r);
+            }
+            inconsistent = !normalize_goal(s, &mut goal);
+        }
+        // The closing `simplify`.
+        if !inconsistent {
+            for slot in goal.iter_mut().chain(obj.iter_mut()) {
+                *slot = s.simplify(*slot);
+            }
+            inconsistent = !normalize_goal(s, &mut goal);
+        }
+        let mut flat = obj.into_iter().map(|o| match s.op(o) {
+            Op::Num(r) => PreTerm::Num(r.clone(), *s.sort(o) == Sort::Int),
+            Op::True => PreTerm::Bool(true),
+            Op::False => PreTerm::Bool(false),
+            _ => PreTerm::Other,
+        });
+        let terms = objs
+            .iter()
+            .map(|o| flat.by_ref().take(o.len()).collect())
+            .collect();
+        Some(OptPre {
+            inconsistent,
+            terms,
+        })
+    }
+}
+
+/// Is `t` a value (`m.is_value`): a numeral or a Boolean constant?
+fn is_value(s: &Simp, t: T) -> bool {
+    matches!(s.op(t), Op::Num(_) | Op::BvNum(_) | Op::True | Op::False)
+}
+
+/// Record the substitution the unit formula `f` justifies (z3's
+/// `propagate_values::add_sub`): `¬a` maps `a` to false, an atom to true,
+/// and `t = v` with `v` a value maps `t` to `v` — each only for a term that
+/// occurs more than once (`shared`), the only ones worth rewriting.
+fn add_unit(s: &mut Simp, f: T, shared: &BTreeSet<T>, map: &mut BTreeMap<T, T>) {
+    if *s.op(f) == Op::Not && shared.contains(&s.args(f)[0]) {
+        let a = s.args(f)[0];
+        let ff = s.mk_false();
+        map.insert(a, ff);
+    }
+    if shared.contains(&f) {
+        let tt = s.mk_true();
+        map.insert(f, tt);
+    }
+    if *s.op(f) == Op::Eq && s.args(f).len() == 2 {
+        let (x, y) = (s.args(f)[0], s.args(f)[1]);
+        if is_value(s, x) && shared.contains(&y) {
+            map.insert(y, x);
+        } else if is_value(s, y) && shared.contains(&x) {
+            map.insert(x, y);
+        }
+    }
+}
+
+/// The terms reached more than once from the roots `fmls` (z3's
+/// `shared_occs`, tracking constants too); values are never shared.
+fn shared_occs(s: &Simp, fmls: impl Iterator<Item = T>) -> BTreeSet<T> {
+    let mut seen = BTreeSet::new();
+    let mut shared = BTreeSet::new();
+    let mut stack: Vec<T> = fmls.collect();
+    stack.reverse();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            if !is_value(s, t) {
+                shared.insert(t);
+            }
+            continue;
+        }
+        stack.extend(s.args(t).iter().copied());
+    }
+    shared
+}
+
+/// Flatten the goal's top-level conjunctions (and negated disjunctions),
+/// drop `true`, and detect `false` or a literal next to its negation as
+/// z3's `goal` does: `false` when the goal is inconsistent.
+fn normalize_goal(s: &mut Simp, goal: &mut Vec<T>) -> bool {
+    let mut out: Vec<T> = Vec::new();
+    let mut pos: BTreeSet<T> = BTreeSet::new();
+    let mut neg: BTreeSet<T> = BTreeSet::new();
+    let mut todo: Vec<T> = goal.iter().rev().copied().collect();
+    while let Some(f) = todo.pop() {
+        match s.op(f) {
+            Op::True => continue,
+            Op::False => return false,
+            Op::And => {
+                todo.extend(s.args(f).iter().rev().copied());
+                continue;
+            }
+            Op::Not if *s.op(s.args(f)[0]) == Op::Or => {
+                let args = s.args(s.args(f)[0]).to_vec();
+                for &a in args.iter().rev() {
+                    let n = s.mk(Op::Not, alloc::vec![a]);
+                    let n = s.simplify(n);
+                    todo.push(n);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let fresh = if *s.op(f) == Op::Not {
+            let a = s.args(f)[0];
+            if pos.contains(&a) {
+                return false;
+            }
+            neg.insert(a)
+        } else {
+            if neg.contains(&f) {
+                return false;
+            }
+            pos.insert(f)
+        };
+        if fresh {
+            out.push(f);
+        }
+    }
+    *goal = out;
+    true
+}
+
+/// `t` with every subterm in `map` replaced (not simplified).
+fn substitute(s: &mut Simp, t: T, map: &BTreeMap<T, T>) -> T {
+    let mut done: BTreeMap<T, T> = BTreeMap::new();
+    let mut stack = alloc::vec![(t, false)];
+    while let Some((x, expanded)) = stack.pop() {
+        if done.contains_key(&x) {
+            continue;
+        }
+        if let Some(&r) = map.get(&x) {
+            done.insert(x, r);
+            continue;
+        }
+        let args = s.args(x).to_vec();
+        if args.is_empty() {
+            done.insert(x, x);
+            continue;
+        }
+        if !expanded {
+            stack.push((x, true));
+            stack.extend(args.iter().map(|&a| (a, false)));
+            continue;
+        }
+        let new: Vec<T> = args.iter().map(|a| done[a]).collect();
+        let r = if new == args {
+            x
+        } else {
+            let (op, sort) = (s.op(x).clone(), s.sort(x).clone());
+            s.mk_sorted(op, new, sort)
+        };
+        done.insert(x, r);
+    }
+    done[&t]
+}
+
+/// Does `x` occur in `t`?
+fn occurs(s: &Simp, x: T, t: T) -> bool {
+    let mut stack = alloc::vec![t];
+    let mut seen = BTreeSet::new();
+    while let Some(u) = stack.pop() {
+        if u == x {
+            return true;
+        }
+        if seen.insert(u) {
+            stack.extend(s.args(u).iter().copied());
+        }
+    }
+    false
+}
+
+/// Is `t` an uninterpreted constant?
+fn is_uconst(s: &Simp, t: T) -> bool {
+    matches!(s.op(t), Op::Uf(_)) && s.args(t).is_empty()
+}
+
+/// A variable the top-level formula `f` defines, with its definition (z3's
+/// `basic_extract_eq` and the linear cases of `arith_extract_eq`): `x = t`,
+/// `x + r = t` (a real `x` may carry any nonzero coefficient, an integer one
+/// only -1) and, over the reals, `x·c = t` for nonzero numerals `c`; `x`
+/// must not occur in its definition.
+fn solve_eq(s: &mut Simp, f: T) -> Option<(T, T)> {
+    if *s.op(f) != Op::Eq || s.args(f).len() != 2 {
+        return None;
+    }
+    let (a, b) = (s.args(f)[0], s.args(f)[1]);
+    for (lhs, rhs) in [(a, b), (b, a)] {
+        if is_uconst(s, lhs) && !occurs(s, lhs, rhs) {
+            return Some((lhs, rhs));
+        }
+    }
+    if !s.sort(a).is_arith_sort() {
+        return None;
+    }
+    for (lhs, rhs) in [(a, b), (b, a)] {
+        if let Some(r) = solve_add(s, lhs, rhs) {
+            return Some(r);
+        }
+    }
+    for (lhs, rhs) in [(a, b), (b, a)] {
+        if let Some(r) = solve_mul(s, lhs, rhs) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// A formula `x ≤ c` of the goal where the goal also bounds `x ≥ c`
+/// (non-strictly), with its index: `x = c` (`arith_extract_eq::get_eqs`
+/// over z3's `bound_manager`, which reads the bounds of the atoms that
+/// compare a constant with a numeral, normalizing strict integer ones).
+fn bound_eq(s: &mut Simp, goal: &[T]) -> Option<(usize, T, T)> {
+    use puremp::Rational as Q;
+    // The best lower bound of each constant: (value, strict).
+    let mut lower: BTreeMap<T, (Q, bool)> = BTreeMap::new();
+    for &f in goal {
+        let (mut atom, mut pos) = (f, true);
+        while *s.op(atom) == Op::Not {
+            atom = s.args(atom)[0];
+            pos = !pos;
+        }
+        let op = s.op(atom).clone();
+        if !matches!(op, Op::Le | Op::Ge | Op::Lt | Op::Gt) || s.args(atom).len() != 2 {
+            continue;
+        }
+        let (l, r) = (s.args(atom)[0], s.args(atom)[1]);
+        // `x ⋈ n` as (is_lower, strict, n).
+        let (v, n, mut lower_kind, mut strict) = match (s.op(l), s.op(r)) {
+            (Op::Uf(_), Op::Num(n)) if s.args(l).is_empty() => (
+                l,
+                n.clone(),
+                matches!(op, Op::Ge | Op::Gt),
+                matches!(op, Op::Lt | Op::Gt),
+            ),
+            (Op::Num(n), Op::Uf(_)) if s.args(r).is_empty() => (
+                r,
+                n.clone(),
+                matches!(op, Op::Le | Op::Lt),
+                matches!(op, Op::Lt | Op::Gt),
+            ),
+            _ => continue,
+        };
+        if !pos {
+            lower_kind = !lower_kind;
+            strict = !strict;
+        }
+        if !lower_kind {
+            continue;
+        }
+        let mut n = n;
+        if strict && *s.sort(v) == Sort::Int {
+            n = Q::from_integer(n.floor()).add(&Q::from_integer(puremp::Int::from(1)));
+            strict = false;
+        }
+        let better = lower
+            .get(&v)
+            .is_none_or(|(m, st)| n > *m || (n == *m && strict && !*st));
+        if better {
+            lower.insert(v, (n, strict));
+        }
+    }
+    goal.iter().enumerate().find_map(|(i, &f)| {
+        if *s.op(f) != Op::Le || s.args(f).len() != 2 {
+            return None;
+        }
+        let (x, c) = (s.args(f)[0], s.args(f)[1]);
+        let Op::Num(hi) = s.op(c) else {
+            return None;
+        };
+        (is_uconst(s, x) && lower.get(&x).is_some_and(|(lo, st)| !st && lo == hi))
+            .then_some((i, x, c))
+    })
+}
+
+/// `x + r = y` (`arith_extract_eq::solve_add`).
+fn solve_add(s: &mut Simp, lhs: T, rhs: T) -> Option<(T, T)> {
+    if *s.op(lhs) != Op::Add {
+        return None;
+    }
+    let args = s.args(lhs).to_vec();
+    for (i, &arg) in args.iter().enumerate() {
+        let (x, coef) = if is_uconst(s, arg) {
+            (arg, None)
+        } else if *s.op(arg) == Op::Mul
+            && s.args(arg).len() == 2
+            && let Op::Num(r) = s.op(s.args(arg)[0]).clone()
+            && is_uconst(s, s.args(arg)[1])
+        {
+            let real = *s.sort(arg) == Sort::Real;
+            if r.is_zero() || (!real && r != puremp::Rational::from(-1i64)) {
+                continue;
+            }
+            (s.args(arg)[1], Some(s.args(arg)[0]))
+        } else {
+            continue;
+        };
+        let mut term = rhs;
+        for (j, &other) in args.iter().enumerate() {
+            if j != i {
+                term = s.mk(Op::Sub, alloc::vec![term, other]);
+            }
+        }
+        if let Some(c) = coef {
+            term = if *s.sort(arg) == Sort::Real {
+                s.mk(Op::Div, alloc::vec![term, c])
+            } else {
+                s.mk(Op::Uminus, alloc::vec![term])
+            };
+        }
+        let term = s.simplify(term);
+        if !occurs(s, x, term) {
+            return Some((x, term));
+        }
+    }
+    None
+}
+
+/// `x·c₁·… = y` over the reals with nonzero numerals `cᵢ`
+/// (`arith_extract_eq::solve_mul`).
+fn solve_mul(s: &mut Simp, lhs: T, rhs: T) -> Option<(T, T)> {
+    if *s.op(lhs) != Op::Mul || *s.sort(lhs) != Sort::Real {
+        return None;
+    }
+    let args = s.args(lhs).to_vec();
+    for (i, &x) in args.iter().enumerate() {
+        if !is_uconst(s, x) {
+            continue;
+        }
+        let nonzero = args
+            .iter()
+            .enumerate()
+            .all(|(j, &a)| j == i || matches!(s.op(a), Op::Num(r) if !r.is_zero()));
+        if !nonzero {
+            continue;
+        }
+        let rest: Vec<T> = args
+            .iter()
+            .enumerate()
+            .filter(|&(j, _)| j != i)
+            .map(|(_, &a)| a)
+            .collect();
+        let d = if rest.len() == 1 {
+            rest[0]
+        } else {
+            s.mk(Op::Mul, rest)
+        };
+        let term = s.mk(Op::Div, alloc::vec![rhs, d]);
+        let term = s.simplify(term);
+        if !occurs(s, x, term) {
+            return Some((x, term));
+        }
+    }
+    None
 }
