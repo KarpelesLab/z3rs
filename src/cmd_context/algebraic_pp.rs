@@ -893,7 +893,50 @@ pub fn fold_real_comparison(m: &AstManager, s: AstId) -> Option<bool> {
 /// unsupported operator / a real root that is not real (e.g. even root of a
 /// negative) / a q-th root of an irrational.
 fn eval_algebraic(m: &AstManager, s: AstId) -> Option<AlgVal> {
-    eval_algebraic_memo(m, s, &mut BTreeMap::new())
+    let mut memo = BTreeMap::new();
+    // Value the operands of `+ - * /`, `to_real`, `abs` bottom-up first (an
+    // explicit stack: constant call depth on a deep term). Every operator
+    // propagates an operand's failure, so the first operand without a value
+    // decides the whole term.
+    let enters = |t: AstId| {
+        m.as_numeral(t).is_none()
+            && matches!(
+                m.arith_op(t),
+                Some(
+                    ArithOp::ToReal
+                        | ArithOp::Abs
+                        | ArithOp::Uminus
+                        | ArithOp::Add
+                        | ArithOp::Sub
+                        | ArithOp::Mul
+                        | ArithOp::Div
+                )
+            )
+    };
+    let mut stack: Vec<(AstId, usize)> = alloc::vec![(s, 0)];
+    while let Some(top) = stack.last_mut() {
+        let (t, i) = *top;
+        let next = if enters(t) {
+            m.app_args(t).get(i).copied()
+        } else {
+            None
+        };
+        match next {
+            Some(c) => {
+                top.1 += 1;
+                if !memo.contains_key(&c) {
+                    stack.push((c, 0));
+                }
+            }
+            None => {
+                stack.pop();
+                if !memo.contains_key(&t) {
+                    eval_algebraic_memo(m, t, &mut memo)?;
+                }
+            }
+        }
+    }
+    memo.remove(&s).flatten()
 }
 
 /// [`eval_algebraic`] memoized over the term DAG: a shared subterm is valued

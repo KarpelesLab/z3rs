@@ -95,3 +95,50 @@ fn drat_frontend_checks_refutation() {
     // A bogus proof is rejected.
     assert!(check_drat_text("p cnf 2 1\n1 2 0\n", "1 0\n0\n").is_err());
 }
+
+/// Run `script` on a thread with an ordinary 8 MiB stack (the library's callers
+/// do not get the CLI's enlarged one).
+fn run_on_default_stack(script: String) -> Vec<String> {
+    std::thread::Builder::new()
+        .stack_size(8 << 20)
+        .spawn(move || run_smt2(&script).unwrap())
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn smt2_deep_nesting_does_not_exhaust_the_stack() {
+    const N: usize = 30_000;
+    let decls = "(declare-fun x () Int)(declare-fun p () Bool)";
+    // A deep conjunction, sum, and `let` chain, each decided and evaluated.
+    let and = format!(
+        "{decls}(assert {}(> x 0){})(check-sat)(eval x)",
+        "(and p ".repeat(N),
+        ")".repeat(N)
+    );
+    assert_eq!(run_on_default_stack(and), vec!["sat", "1"]);
+    let sum = format!(
+        "{decls}(assert (= {}x{} {}))(check-sat)(eval x)",
+        "(+ 1 ".repeat(N),
+        ")".repeat(N),
+        N + 7
+    );
+    assert_eq!(run_on_default_stack(sum), vec!["sat", "7"]);
+    let mut chain = format!("{decls}(assert ");
+    for i in 0..N {
+        let prev = if i == 0 {
+            "x".to_string()
+        } else {
+            format!("a{}", i - 1)
+        };
+        chain += &format!("(let ((a{i} (+ {prev} 1))) ");
+    }
+    chain += &format!(
+        "(= a{} {}){})(check-sat)(eval x)",
+        N - 1,
+        N + 3,
+        ")".repeat(N)
+    );
+    assert_eq!(run_on_default_stack(chain), vec!["sat", "3"]);
+}

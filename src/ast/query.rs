@@ -51,6 +51,47 @@ impl AstManager {
         order
     }
 
+    /// The expressions reachable from `root` through the arguments of the
+    /// applications `enter` accepts, in the left-to-right post-order a
+    /// recursive traversal finishes them (`root` last), each once.
+    ///
+    /// Calling a memoized recursive pass on each listed node in turn before
+    /// calling it on `root` bounds its recursion depth to one level (each call
+    /// finds its arguments memoized) while visiting nodes in the same order, so
+    /// arbitrarily deep terms cannot exhaust the stack.
+    pub fn postorder_ltr(&self, root: AstId, mut enter: impl FnMut(AstId) -> bool) -> Vec<AstId> {
+        let mut order = Vec::new();
+        let mut seen = alloc::collections::BTreeSet::new();
+        seen.insert(root);
+        // Frames: (node, next argument index); a node not entered has no
+        // arguments to visit.
+        let mut stack: Vec<(AstId, usize)> = alloc::vec![(root, 0)];
+        let mut entered: Vec<bool> = alloc::vec![enter(root)];
+        while let Some(top) = stack.last_mut() {
+            let (id, i) = *top;
+            let next = match self.node(id) {
+                AstNode::App(a) if *entered.last().expect("parallel") => a.args.get(i).copied(),
+                _ => None,
+            };
+            match next {
+                Some(c) => {
+                    top.1 += 1;
+                    if seen.insert(c) {
+                        let e = enter(c);
+                        stack.push((c, 0));
+                        entered.push(e);
+                    }
+                }
+                None => {
+                    stack.pop();
+                    entered.pop();
+                    order.push(id);
+                }
+            }
+        }
+        order
+    }
+
     /// All expressions reachable from any of `roots`, in post-order, each once —
     /// one traversal with one `visited` array, so `n` roots cost `O(|AST| + n)`
     /// rather than `n` full-size allocations. Equal to concatenating each root's

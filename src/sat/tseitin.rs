@@ -34,8 +34,28 @@ pub fn encode_tracking(m: &AstManager, root: AstId, s: &mut Solver) -> (Lit, BTr
         true_lit: None,
         atoms: BTreeMap::new(),
     };
+    // Encode inner connectives first, in the order the recursion reaches them
+    // (constant stack on deep formulas; same variable numbering).
+    for t in m.postorder_ltr(root, |t| enc_enters(m, t)) {
+        enc.encode(t);
+    }
     let top = enc.encode(root);
     (top, enc.atoms)
+}
+
+/// Whether [`Tseitin::encode`] encodes `e` from its arguments (a connective)
+/// rather than as an opaque atom.
+fn enc_enters(m: &AstManager, e: AstId) -> bool {
+    // (`=>`, `xor` and `=` read exactly two arguments; any other arity is
+    // left to the recursion.)
+    let binary = || m.app_args(e).len() == 2;
+    m.is_not(e)
+        || m.is_and(e)
+        || m.is_or(e)
+        || (is_implies(m, e) && binary())
+        || (is_xor(m, e) && binary())
+        || (m.is_eq(e) && binary() && m.is_bool(m.app_args(e)[0]))
+        || (m.is_ite(e) && m.is_bool(e))
 }
 
 /// Decide the propositional abstraction of the Boolean formula `root`.

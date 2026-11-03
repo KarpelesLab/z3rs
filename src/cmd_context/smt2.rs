@@ -1388,6 +1388,7 @@ fn unknown_attribute_warnings(form: &SExpr) -> Vec<String> {
         }
         out
     }
+    /// The warnings for the attributes of `e` when it is a `(! …)` annotation.
     fn walk(e: &SExpr, out: &mut Vec<String>) {
         let SExpr::List(l) = e else { return };
         if l.len() >= 2 && matches!(&l[0], SExpr::Atom(h) if h == "!") {
@@ -1410,15 +1411,16 @@ fn unknown_attribute_warnings(form: &SExpr) -> Vec<String> {
                 i += 2;
             }
         }
-        for x in l {
-            walk(x, out);
-        }
     }
     let mut out = Vec::new();
     if let SExpr::List(l) = form
         && !matches!(l.first(), Some(SExpr::Atom(h)) if h == "set-info" || h == "set-option")
     {
-        walk(form, &mut out);
+        // Pre-order, iteratively (an assertion may nest arbitrarily deep).
+        sexpr_any(form, |e| {
+            walk(e, &mut out);
+            false
+        });
     }
     out
 }
@@ -1469,10 +1471,85 @@ struct LiftCtx {
 }
 
 /// An s-expression.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum SExpr {
     Atom(String),
     List(Vec<SExpr>),
+}
+
+impl Clone for SExpr {
+    /// Copy a deeply nested list iteratively (the derived clone recurses).
+    fn clone(&self) -> SExpr {
+        let SExpr::List(root) = self else {
+            let SExpr::Atom(a) = self else { unreachable!() };
+            return SExpr::Atom(a.clone());
+        };
+        // Frames: (source list, next child index, copied children).
+        let mut stack: Vec<(&[SExpr], usize, Vec<SExpr>)> =
+            alloc::vec![(root.as_slice(), 0, Vec::with_capacity(root.len()))];
+        loop {
+            let top = stack.last_mut().expect("a frame");
+            if top.1 == top.0.len() {
+                let (_, _, done) = stack.pop().expect("a frame");
+                let e = SExpr::List(done);
+                match stack.last_mut() {
+                    Some(parent) => parent.2.push(e),
+                    None => return e,
+                }
+                continue;
+            }
+            let child = &top.0[top.1];
+            top.1 += 1;
+            match child {
+                SExpr::Atom(a) => top.2.push(SExpr::Atom(a.clone())),
+                SExpr::List(l) => stack.push((l.as_slice(), 0, Vec::with_capacity(l.len()))),
+            }
+        }
+    }
+}
+
+/// Whether `pred` holds of `e` or of any of its subexpressions (an iterative
+/// pre-order walk, safe on arbitrarily deep input).
+fn sexpr_any(e: &SExpr, mut pred: impl FnMut(&SExpr) -> bool) -> bool {
+    let mut stack = alloc::vec![e];
+    while let Some(x) = stack.pop() {
+        if pred(x) {
+            return true;
+        }
+        if let SExpr::List(l) = x {
+            stack.extend(l.iter().rev());
+        }
+    }
+    false
+}
+
+/// Whether any atom of `e` is one of `names`.
+fn sexpr_has_atom(e: &SExpr, names: &[&str]) -> bool {
+    sexpr_any(
+        e,
+        |x| matches!(x, SExpr::Atom(a) if names.contains(&a.as_str())),
+    )
+}
+
+impl Drop for SExpr {
+    /// Free a deeply nested list iteratively: the derived (recursive) drop
+    /// would use stack proportional to the nesting depth.
+    fn drop(&mut self) {
+        let SExpr::List(l) = self else { return };
+        if l.iter().all(|e| matches!(e, SExpr::Atom(_))) {
+            return;
+        }
+        let mut pending: Vec<Vec<SExpr>> = alloc::vec![core::mem::take(l)];
+        while let Some(mut v) = pending.pop() {
+            for e in v.iter_mut() {
+                if let SExpr::List(inner) = e
+                    && !inner.is_empty()
+                {
+                    pending.push(core::mem::take(inner));
+                }
+            }
+        }
+    }
 }
 
 /// Run an SMT-LIB `script`, returning one response line per `check-sat`
@@ -1626,6 +1703,21 @@ fn supported_logic(s: &str) -> bool {
         || has_fpa
         || has_datatype
         || has_finite_sets
+}
+
+/// [`Context::term`] nesting depth past which deep application chains are
+/// built bottom-up (see [`Context::term_prewarmed`]).
+const TERM_PREWARM_DEPTH: usize = 128;
+
+/// Whether `s` is an ordinary application `(f a₁ … aₙ)` whose term is built
+/// from the terms of its arguments in the current scope (no binder, annotation,
+/// sort or index syntax, and no operator that inspects its argument syntax).
+fn is_plain_application(s: &SExpr) -> bool {
+    let SExpr::List(l) = s else { return false };
+    l.len() >= 2
+        && matches!(&l[0], SExpr::Atom(h) if !matches!(h.as_str(),
+            "let" | "match" | "as" | "!" | "forall" | "exists" | "lambda" | "_" | "root-obj"
+                | "par" | "=" | "seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli"))
 }
 
 /// Whether a command's tokens form `(simplify (root-obj …))` with `root-obj` as
@@ -2265,6 +2357,9 @@ fn rename_free(e: &SExpr, from: &str, to: &str) -> SExpr {
 /// is `∀x y. ite(c, φ, ψ)`, which instantiation handles instead of an opaque
 /// nested quantifier.
 fn prenex_positive(e: &SExpr, pos: bool, extra: &mut Vec<SExpr>, counter: &mut u32) -> SExpr {
+    if !sexpr_has_atom(e, &["forall", "exists"]) {
+        return e.clone();
+    }
     prenex_positive_with(e, pos, extra, counter, false)
 }
 
@@ -2335,13 +2430,10 @@ fn prenex_positive_with(
 
 /// Does `e` contain a body-less `(let (bindings))`?
 fn has_bodyless_let(e: &SExpr) -> bool {
-    match e {
-        SExpr::Atom(_) => false,
-        SExpr::List(l) => {
-            (l.len() == 2 && matches!(&l[0], SExpr::Atom(h) if h == "let"))
-                || l.iter().any(has_bodyless_let)
-        }
-    }
+    sexpr_any(
+        e,
+        |x| matches!(x, SExpr::List(l) if l.len() == 2 && matches!(&l[0], SExpr::Atom(h) if h == "let")),
+    )
 }
 
 /// Replace every body-less `(let ((x₁ t₁) … (xₙ tₙ)))` by `tₙ`, as z3's
@@ -2623,57 +2715,74 @@ fn render_sexpr(s: &SExpr) -> String {
 /// Whether any atom anywhere in `s` contains the substring `needle` (used to
 /// spot a tactic name like `nlsat` inside a `check-sat-using` tactic term).
 fn sexpr_mentions(s: &SExpr, needle: &str) -> bool {
-    match s {
-        SExpr::Atom(a) => a.contains(needle),
-        SExpr::List(l) => l.iter().any(|e| sexpr_mentions(e, needle)),
-    }
+    sexpr_any(s, |x| matches!(x, SExpr::Atom(a) if a.contains(needle)))
 }
 
+/// Parse one s-expression starting at token `*pos`, advancing past it.
+/// Iterative (an explicit stack of open lists), so nesting depth is bounded by
+/// memory rather than the call stack.
 fn parse_one(
     toks: &[String],
     positions: &[(u32, u32)],
     pos: &mut usize,
 ) -> Result<SExpr, ParseErr> {
-    let tok = &toks[*pos];
-    *pos += 1;
-    match tok.as_str() {
-        "(" => {
-            let mut list = Vec::new();
-            loop {
-                if *pos >= toks.len() {
+    // The lists opened so far and not yet closed, innermost last.
+    let mut open: Vec<Vec<SExpr>> = Vec::new();
+    loop {
+        if open.is_empty() {
+            let tok = &toks[*pos];
+            *pos += 1;
+            match tok.as_str() {
+                "(" => open.push(Vec::new()),
+                ")" => {
                     return Err(ParseErr {
-                        msg: "unexpected end of input (missing `)`)".to_string(),
+                        msg: "unexpected `)`".to_string(),
                         recover: false,
                     });
                 }
-                if toks[*pos] == ")" {
-                    *pos += 1;
-                    break;
-                }
-                list.push(parse_one(toks, positions, pos)?);
+                atom => return Ok(SExpr::Atom(atom.to_string())),
             }
-            // A quantifier binds `((<symbol> <sort>)*) <expr>` — exactly one body.
-            // z3 reports a wrong body count at the closing paren and resyncs.
-            if let Some(SExpr::Atom(h)) = list.first()
-                && (h == "forall" || h == "exists" || h == "lambda")
-                && list.len() != 3
-            {
-                let (l, c) = positions.get(*pos - 1).copied().unwrap_or((0, 0));
-                return Err(ParseErr {
-                    msg: alloc::format!(
-                        "(error \"line {l} column {c}: invalid quantified expression, syntax error: \
-                         (forall|exists ((<symbol> <sort>)*) <expr>) expected\")"
-                    ),
-                    recover: true,
-                });
-            }
-            Ok(SExpr::List(list))
+            continue;
         }
-        ")" => Err(ParseErr {
-            msg: "unexpected `)`".to_string(),
-            recover: false,
-        }),
-        atom => Ok(SExpr::Atom(atom.to_string())),
+        if *pos >= toks.len() {
+            return Err(ParseErr {
+                msg: "unexpected end of input (missing `)`)".to_string(),
+                recover: false,
+            });
+        }
+        let tok = &toks[*pos];
+        *pos += 1;
+        match tok.as_str() {
+            "(" => open.push(Vec::new()),
+            ")" => {
+                let list = open.pop().expect("an open list");
+                // A quantifier binds `((<symbol> <sort>)*) <expr>` — exactly one
+                // body. z3 reports a wrong body count at the closing paren and
+                // resyncs.
+                if let Some(SExpr::Atom(h)) = list.first()
+                    && (h == "forall" || h == "exists" || h == "lambda")
+                    && list.len() != 3
+                {
+                    let (l, c) = positions.get(*pos - 1).copied().unwrap_or((0, 0));
+                    return Err(ParseErr {
+                        msg: alloc::format!(
+                            "(error \"line {l} column {c}: invalid quantified expression, syntax error: \
+                             (forall|exists ((<symbol> <sort>)*) <expr>) expected\")"
+                        ),
+                        recover: true,
+                    });
+                }
+                let e = SExpr::List(list);
+                match open.last_mut() {
+                    Some(parent) => parent.push(e),
+                    None => return Ok(e),
+                }
+            }
+            atom => open
+                .last_mut()
+                .expect("an open list")
+                .push(SExpr::Atom(atom.to_string())),
+        }
     }
 }
 
@@ -2773,6 +2882,12 @@ struct Context {
     scope_stack: Vec<Scope>,
     /// Active `let`/macro-parameter binding scopes (innermost last).
     scopes: BoundScopes,
+    /// Nesting depth of [`Self::term`] calls in progress.
+    term_depth: usize,
+    /// Terms already built for s-expression nodes (keyed by node address) of a
+    /// deep application chain being built bottom-up (see [`Self::term`]);
+    /// empty outside such a build.
+    term_memo: BTreeMap<usize, AstId>,
     /// `define-fun` macros: name → (parameter names, body).
     macros: BTreeMap<String, (Vec<String>, SExpr)>,
     /// Declared constants/functions in declaration order (for `get-model` and
@@ -4012,6 +4127,8 @@ impl Context {
             declared_sorts: BTreeSet::new(),
             scope_stack: Vec::new(),
             scopes: BoundScopes::default(),
+            term_depth: 0,
+            term_memo: BTreeMap::new(),
             macros: BTreeMap::new(),
             decl_order: Vec::new(),
             decl_table: DeclTable::default(),
@@ -5246,7 +5363,11 @@ impl Context {
                 // Positive existentials over non-arithmetic sorts nested in a
                 // ground assertion are skolemized rather than left as opaque
                 // sentinels (arithmetic ones are eliminated exactly instead).
-                let asserted = self.skolemize_nonarith(&asserted, true)?;
+                let asserted = if sexpr_has_atom(&asserted, &["forall", "exists"]) {
+                    self.skolemize_nonarith(&asserted, true)?
+                } else {
+                    asserted
+                };
                 // Universals left in positive positions are pulled to the top
                 // (`P ∨ ∀x.φ` is `∀x. P ∨ φ`), so the assertion is a universal the
                 // instantiation engine handles rather than an opaque sentinel.
@@ -5276,7 +5397,11 @@ impl Context {
                         }
                         _ => asserted.clone(),
                     };
-                    let pren = prenex_positive_with(&core, true, &mut extra, &mut counter, true);
+                    let pren = if sexpr_has_atom(&core, &["forall", "exists"]) {
+                        prenex_positive_with(&core, true, &mut extra, &mut counter, true)
+                    } else {
+                        core.clone()
+                    };
                     if !extra.is_empty() {
                         self.fresh_counter = counter;
                         let q = SExpr::List(alloc::vec![
@@ -6115,10 +6240,12 @@ impl Context {
         }
         // Parse the constructor list once; this cannot fail for the literal above.
         if let Ok(forms) = parse("((nil) (insert (head T) (tail (List T))))")
-            && let Some(SExpr::List(ctors)) = forms.into_iter().next()
+            && let Some(SExpr::List(ctors)) = forms.first()
         {
-            self.param_datatypes
-                .insert("List".to_string(), (alloc::vec!["T".to_string()], ctors));
+            self.param_datatypes.insert(
+                "List".to_string(),
+                (alloc::vec!["T".to_string()], ctors.clone()),
+            );
         }
     }
 
@@ -6389,58 +6516,67 @@ impl Context {
     /// defines, `t` not mentioning `x`: what z3's `solve-eqs` eliminates.
     fn note_solved_var(&mut self, t: &SExpr) {
         fn mentions(e: &SExpr, x: &str) -> bool {
-            match e {
-                SExpr::Atom(a) => a == x,
-                SExpr::List(l) => l.iter().any(|y| mentions(y, x)),
-            }
+            sexpr_any(e, |y| matches!(y, SExpr::Atom(a) if a == x))
         }
         // `solve-eqs` keeps definitions with quantifiers or lambdas (a binder,
-        // or a function macro passed as a value).
+        // or a function macro passed as a value; an application's head symbol
+        // is not a value).
         fn binds(ctx: &Context, e: &SExpr) -> bool {
-            match e {
-                SExpr::Atom(a) => ctx.macros.get(a).is_some_and(|(ps, _)| !ps.is_empty()),
-                SExpr::List(l) => {
-                    if matches!(l.first(), Some(SExpr::Atom(h)) if h == "lambda" || h == "forall" || h == "exists")
-                    {
-                        return true;
-                    }
-                    let args = if matches!(l.first(), Some(SExpr::Atom(_))) {
-                        &l[1..]
-                    } else {
-                        &l[..]
-                    };
-                    args.iter().any(|x| binds(ctx, x))
-                }
-            }
-        }
-        let SExpr::List(l) = t else {
-            return;
-        };
-        match l.first() {
-            Some(SExpr::Atom(h)) if h == "and" => {
-                for c in &l[1..] {
-                    self.note_solved_var(c);
-                }
-            }
-            Some(SExpr::Atom(h)) if h == "=" && l.len() == 3 => {
-                for (x, other) in [(&l[1], &l[2]), (&l[2], &l[1])] {
-                    if let SExpr::Atom(x) = x
-                        && self
-                            .funcs
-                            .get(x)
-                            .and_then(|&d| self.m.func_decl(d))
-                            .is_some_and(|f| f.domain.is_empty())
-                        && !mentions(other, x)
-                        && !binds(self, other)
-                    {
-                        if !self.solved_vars.contains(x) {
-                            self.solved_vars.push(x.clone());
+            let mut stack = alloc::vec![e];
+            while let Some(e) = stack.pop() {
+                match e {
+                    SExpr::Atom(a) => {
+                        if ctx.macros.get(a).is_some_and(|(ps, _)| !ps.is_empty()) {
+                            return true;
                         }
-                        return;
+                    }
+                    SExpr::List(l) => {
+                        if matches!(l.first(), Some(SExpr::Atom(h)) if h == "lambda" || h == "forall" || h == "exists")
+                        {
+                            return true;
+                        }
+                        let args = if matches!(l.first(), Some(SExpr::Atom(_))) {
+                            &l[1..]
+                        } else {
+                            &l[..]
+                        };
+                        stack.extend(args.iter().rev());
                     }
                 }
             }
-            _ => {}
+            false
+        }
+        // The top-level conjuncts, left to right (an explicit stack: a
+        // conjunction may nest arbitrarily deep).
+        let mut todo = alloc::vec![t];
+        while let Some(t) = todo.pop() {
+            let SExpr::List(l) = t else {
+                continue;
+            };
+            match l.first() {
+                Some(SExpr::Atom(h)) if h == "and" => {
+                    todo.extend(l[1..].iter().rev());
+                }
+                Some(SExpr::Atom(h)) if h == "=" && l.len() == 3 => {
+                    for (x, other) in [(&l[1], &l[2]), (&l[2], &l[1])] {
+                        if let SExpr::Atom(x) = x
+                            && self
+                                .funcs
+                                .get(x)
+                                .and_then(|&d| self.m.func_decl(d))
+                                .is_some_and(|f| f.domain.is_empty())
+                            && !mentions(other, x)
+                            && !binds(self, other)
+                        {
+                            if !self.solved_vars.contains(x) {
+                                self.solved_vars.push(x.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -15266,6 +15402,10 @@ impl Context {
             }
         }
         let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        // Inner applications first (constant stack on deep goals).
+        for t in self.m.postorder_ltr(goal, |_| true) {
+            self.rdc_rewrite(t, &top, &mut memo);
+        }
         self.rdc_rewrite(goal, &top, &mut memo)
     }
 
@@ -23553,6 +23693,10 @@ impl Context {
             sqrt: BTreeMap::new(),
             lin_facts,
         };
+        // Inner terms first (constant stack on deep goals).
+        for t in self.m.postorder_ltr(base, |_| true) {
+            self.lift_terms(t, &mut ctx);
+        }
         let lifted = self.lift_terms(base, &mut ctx);
         if ctx.defs.is_empty() {
             lifted
@@ -30444,6 +30588,9 @@ impl Context {
                 }
             }
             SExpr::List(out)
+        }
+        if !sexpr_has_atom(e, &["implies", "iff", "if", "if_then_else"]) {
+            return None;
         }
         let mut changed = false;
         let r = walk(self, e, &mut changed);
@@ -39171,7 +39318,71 @@ impl Context {
     }
 
     /// Build a term from an s-expression.
+    ///
+    /// Past [`TERM_PREWARM_DEPTH`] nested calls, an ordinary application first
+    /// builds the ordinary applications nested in its arguments bottom-up (left
+    /// to right, as the recursion would finish them) and memoizes them, so the
+    /// recursion below it is one level deep: a 10^6-deep `(and p (and p …))`
+    /// does not exhaust the stack.
     fn term(&mut self, s: &SExpr) -> Result<AstId, String> {
+        if !self.term_memo.is_empty()
+            && let Some(&id) = self.term_memo.get(&(s as *const SExpr as usize))
+        {
+            return Ok(id);
+        }
+        self.term_depth += 1;
+        let r = if self.term_depth > TERM_PREWARM_DEPTH && is_plain_application(s) {
+            self.term_prewarmed(s)
+        } else {
+            self.term_core(s)
+        };
+        self.term_depth -= 1;
+        r
+    }
+
+    /// [`Self::term`] of the ordinary application `s`, its nested ordinary
+    /// applications (reached through argument positions) built first, from the
+    /// innermost out, and memoized for the duration of the call.
+    fn term_prewarmed(&mut self, s: &SExpr) -> Result<AstId, String> {
+        // Left-to-right post-order over the nested ordinary applications.
+        let mut order: Vec<&SExpr> = Vec::new();
+        let mut stack: Vec<(&SExpr, usize)> = alloc::vec![(s, 1)];
+        while let Some(top) = stack.last_mut() {
+            let (node, i) = *top;
+            let SExpr::List(l) = node else { unreachable!() };
+            if i < l.len() {
+                top.1 += 1;
+                let c = &l[i];
+                if is_plain_application(c)
+                    && !self.term_memo.contains_key(&(c as *const SExpr as usize))
+                {
+                    stack.push((c, 1));
+                }
+            } else {
+                stack.pop();
+                if !core::ptr::eq(node, s) {
+                    order.push(node);
+                }
+            }
+        }
+        let mut keys = Vec::with_capacity(order.len());
+        for n in order {
+            // An error is left for the ordinary build below to report (at the
+            // point the recursion would reach it).
+            let Ok(id) = self.term_core(n) else { break };
+            let k = n as *const SExpr as usize;
+            self.term_memo.insert(k, id);
+            keys.push(k);
+        }
+        let r = self.term_core(s);
+        for k in keys {
+            self.term_memo.remove(&k);
+        }
+        r
+    }
+
+    /// [`Self::term`] without the deep-nesting handling.
+    fn term_core(&mut self, s: &SExpr) -> Result<AstId, String> {
         match s {
             SExpr::Atom(a) => match a.as_str() {
                 "true" => Ok(self.m.mk_true()),
@@ -40446,8 +40657,47 @@ impl Context {
             }
         }
         self.scopes.push(scope);
-        let result = self.term(body);
-        self.scopes.pop();
+        // A `let` body that is itself a `let` is entered in this loop rather
+        // than by recursion, so a long `let` chain uses constant stack.
+        let mut body = body;
+        let mut opened = 1;
+        let mut result = None;
+        while let SExpr::List(l) = body
+            && l.len() == 3
+            && matches!(&l[0], SExpr::Atom(h) if h == "let")
+            && self.lookup_bound("let").is_none()
+        {
+            let SExpr::List(bs) = &l[1] else { break };
+            let mut scope: Vec<(String, AstId)> = Vec::new();
+            for b in bs {
+                match b {
+                    SExpr::List(pair) if pair.len() == 2 => match Self::sym(&pair[0]) {
+                        Ok(name) => {
+                            let name = name.to_string();
+                            match self.term(&pair[1]) {
+                                Ok(val) => scope.push((name, val)),
+                                Err(e) => result = Some(Err(e)),
+                            }
+                        }
+                        Err(e) => result = Some(Err(e)),
+                    },
+                    _ => result = Some(Err("let: expected (name term) bindings".to_string())),
+                }
+                if result.is_some() {
+                    break;
+                }
+            }
+            if result.is_some() {
+                break;
+            }
+            self.scopes.push(scope);
+            opened += 1;
+            body = &l[2];
+        }
+        let result = result.unwrap_or_else(|| self.term(body));
+        for _ in 0..opened {
+            self.scopes.pop();
+        }
         result
     }
 
