@@ -19,6 +19,7 @@
 //! symbolic regex) stays an opaque membership.
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{Context, Model, SmtResult};
@@ -28,6 +29,136 @@ use crate::ast::AstId;
 const MAX_LOOP: usize = 3;
 
 impl Context {
+    /// Is `t` a membership in a constant regex (decided by its automaton,
+    /// not opaque)?
+    fn constant_membership(&self, t: AstId) -> bool {
+        self.m.app(t).is_some_and(|a| {
+            a.args.len() == 2
+                && matches!(
+                    self.str_op_decls.get(&a.decl).map(String::as_str),
+                    Some("str.in_re" | "str.in.re")
+                )
+                && self.regex_of.contains_key(&a.args[1])
+        })
+    }
+
+    /// Refute the assertions without those over opaque string terms (a
+    /// regex over symbolic strings, a symbolic string operation): what
+    /// remains is implied, so its refutation refutes the goal
+    /// (`a ∈ [a] ∧ a = b ∧ b ∈ "b"?` next to `a ≠ substr b 0 2`). `None`
+    /// unless refuted.
+    pub(super) fn check_sat_drop_symbolic_regex(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        if self.in_str_alias
+            || (self.regex_recipe.is_empty() && self.str_symbolic.is_empty())
+            || !self.universals.is_empty()
+        {
+            return None;
+        }
+        let kept: Vec<AstId> = self
+            .assertions
+            .clone()
+            .into_iter()
+            .filter(|&a| {
+                !self.m.postorder(a).iter().any(|&t| {
+                    self.regex_recipe.contains_key(&t)
+                        || (self.str_symbolic.contains(&t) && !self.constant_membership(t))
+                })
+            })
+            .collect();
+        if kept.len() == self.assertions.len() || kept.is_empty() {
+            return None;
+        }
+        let saved = core::mem::replace(&mut self.assertions, kept);
+        self.in_str_alias = true;
+        let r = self.check_sat();
+        let r = if r.0 == SmtResult::Unsat {
+            r
+        } else {
+            self.check_sat_str_alias_inner()
+                .filter(|r| r.0 == SmtResult::Unsat)
+                .unwrap_or((SmtResult::Unknown, None))
+        };
+        self.in_str_alias = false;
+        self.assertions = saved;
+        (r.0 == SmtResult::Unsat).then_some((SmtResult::Unsat, None))
+    }
+
+    /// Decide the assertions with the string and sequence constants a
+    /// top-level equation `x = y` aliases replaced by one representative
+    /// (z3's `solve-eqs`), so the memberships and constraints of both reach
+    /// the procedures together (`b ∈ "b"? ∧ a ∈ [a] ∧ a = b`). Equivalent:
+    /// the equations are kept. `None` without such an equation or when the
+    /// merged goal is undecided.
+    pub(super) fn check_sat_str_alias(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        if self.in_str_alias {
+            return None;
+        }
+        self.in_str_alias = true;
+        let r = self.check_sat_str_alias_inner();
+        self.in_str_alias = false;
+        r
+    }
+
+    /// [`Self::check_sat_str_alias`] without its re-entrancy guard.
+    fn check_sat_str_alias_inner(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        if !self.universals.is_empty() {
+            return None;
+        }
+        let is_var = |me: &Self, x: AstId| me.is_str_seq_var(x) && me.is_user_constant_or_bits(x);
+        let mut rep: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let find = |rep: &BTreeMap<AstId, AstId>, mut x: AstId| {
+            while let Some(&y) = rep.get(&x) {
+                x = y;
+            }
+            x
+        };
+        let mut stack: Vec<AstId> = self.assertions.clone();
+        while let Some(t) = stack.pop() {
+            if self.m.is_and(t) {
+                stack.extend(self.m.app_args(t).iter().copied());
+                continue;
+            }
+            if !self.m.is_eq(t) || self.m.app_args(t).len() != 2 {
+                continue;
+            }
+            let (l, r) = (self.m.app_args(t)[0], self.m.app_args(t)[1]);
+            if l != r && is_var(self, l) && is_var(self, r) {
+                let (a, b) = (find(&rep, l), find(&rep, r));
+                if a != b {
+                    rep.insert(a.max(b), a.min(b));
+                }
+            }
+        }
+        if rep.is_empty() {
+            return None;
+        }
+        let pairs: Vec<(AstId, AstId)> = rep.keys().map(|&x| (x, find(&rep, x))).collect();
+        let mut goal: Vec<AstId> = Vec::new();
+        for a in self.assertions.clone() {
+            let b = self.subst_seq(a, &pairs);
+            let mut memo = BTreeMap::new();
+            let b = self.refold_str_markers(b, &mut memo);
+            let b = crate::rewriter::simplify(&mut self.m, b);
+            if !self.m.is_true(b) {
+                goal.push(b);
+            }
+        }
+        // Without the aliased constants the goal is equisatisfiable: its
+        // refutation is final. A `sat` needs a model of the aliases too, so
+        // the equations join it for that check.
+        let saved = core::mem::replace(&mut self.assertions, goal.clone());
+        let mut r = self.check_sat();
+        if r.0 == SmtResult::Sat {
+            for &(x, y) in &pairs {
+                goal.push(self.m.mk_eq(x, y));
+            }
+            self.assertions = goal;
+            r = self.check_sat();
+        }
+        self.assertions = saved;
+        (r.0 != SmtResult::Unknown).then_some(r)
+    }
+
     /// Decide the assertions with each string constant an asserted equality
     /// `x = "w"` fixes replaced by `"w"` (z3's `solve-eqs`), when a regex
     /// over symbolic strings mentions such a constant: the regex then has a

@@ -18,9 +18,8 @@
 //! next. When the abstraction runs out of length vectors, every one having
 //! been refuted, the goal is `unsat`.
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::boxed::Box;
-use alloc::string::String;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use super::{Context, Model, SmtResult, Value};
@@ -237,6 +236,81 @@ impl Context {
         }
     }
 
+    /// Refute a goal over strings by the same length abstraction (string
+    /// lengths: concatenation sums, clamped `substr`/`at` windows, the
+    /// lengths a constant regex's words can have, equal leading and trailing
+    /// characters of equations). `None` unless refuted.
+    pub(super) fn check_sat_str_lengths_refute(&mut self) -> Option<(SmtResult, Option<Model>)> {
+        let string_sort = self.string_sort?;
+        if !self.universals.is_empty() {
+            return None;
+        }
+        let roots = self.assertions.clone();
+        let mut any = false;
+        for t in self.m.postorder_many(&roots) {
+            if self.m.is_quantifier(t) {
+                return None;
+            }
+            any |= self.m.get_sort(t) == string_sort;
+        }
+        if !any {
+            return None;
+        }
+        let mut abs = Abs {
+            len: BTreeMap::new(),
+            memo: BTreeMap::new(),
+            axioms: Vec::new(),
+        };
+        let mut parts = Vec::with_capacity(roots.len() + 1);
+        for &a in &roots {
+            parts.push(self.seq_abs_term(a, &mut abs)?);
+        }
+        parts.extend(abs.axioms.iter().copied());
+        parts.push(self.m.mk_true());
+        let g = self.m.mk_and(&parts);
+        (self.decide(g).0 == SmtResult::Unsat).then_some((SmtResult::Unsat, None))
+    }
+
+    /// Is `s` a sequence or the string sort?
+    fn seq_like_sort(&self, s: AstId) -> bool {
+        self.seq_elem_sort(s).is_some() || self.string_sort == Some(s)
+    }
+
+    /// The known length of a concrete sequence or string literal.
+    fn seq_like_known_len(&self, t: AstId) -> Option<usize> {
+        self.seq_of
+            .get(&t)
+            .map(Vec::len)
+            .or_else(|| self.str_value(t).map(|v| v.len()))
+    }
+
+    /// The sequence operation `t` applies, string operations under their
+    /// sequence names (`str.substr` is `seq.extract`).
+    fn seq_like_op(&self, t: AstId) -> Option<&'static str> {
+        let d = self.m.app(t)?.decl;
+        if let Some(op) = self.seqop_ops.get(&d) {
+            return Some(match op.as_str() {
+                "seq.++" => "seq.++",
+                "seq.extract" => "seq.extract",
+                "seq.at" => "seq.at",
+                "seq.prefixof" => "seq.prefixof",
+                "seq.suffixof" => "seq.suffixof",
+                "seq.contains" => "seq.contains",
+                _ => "",
+            });
+        }
+        Some(match self.str_op_decls.get(&d)?.as_str() {
+            "str.++" => "seq.++",
+            "str.substr" => "seq.extract",
+            "str.at" => "seq.at",
+            "str.prefixof" => "seq.prefixof",
+            "str.suffixof" => "seq.suffixof",
+            "str.contains" => "seq.contains",
+            "str.in_re" | "str.in.re" => "str.in_re",
+            _ => "",
+        })
+    }
+
     /// The length variable of the sequence term `t`, with its length axioms
     /// (once per term).
     fn seq_abs_len(&mut self, t: AstId, abs: &mut Abs) -> Option<AstId> {
@@ -248,8 +322,8 @@ impl Context {
         abs.len.insert(t, l);
         let zero = self.m.mk_int(0);
         abs.axioms.push(self.m.mk_ge(l, zero));
-        if let Some(elems) = self.seq_of.get(&t) {
-            let n = self.m.mk_int(elems.len() as i64);
+        if let Some(n) = self.seq_like_known_len(t) {
+            let n = self.m.mk_int(n as i64);
             abs.axioms.push(self.m.mk_eq(l, n));
             return Some(l);
         }
@@ -261,13 +335,9 @@ impl Context {
             abs.axioms.push(self.m.mk_eq(l, v));
             return Some(l);
         }
-        let op = self
-            .m
-            .app(t)
-            .and_then(|a| self.seqop_ops.get(&a.decl))
-            .cloned();
+        let op = self.seq_like_op(t);
         let args = self.m.app_args(t).to_vec();
-        match op.as_deref() {
+        match op {
             Some("seq.++") => {
                 let mut sum = Vec::with_capacity(args.len());
                 for &a in &args {
@@ -312,13 +382,20 @@ impl Context {
 
     /// The factors of the sequence term `t`: the elements of its known
     /// units (`Some`) and the other factors (`None`), flattening `seq.++`.
-    fn seq_abs_factors(&self, t: AstId, out: &mut Vec<Option<AstId>>) {
+    fn seq_abs_factors(&mut self, t: AstId, out: &mut Vec<Option<AstId>>) {
         if let Some(elems) = self.seq_of.get(&t) {
             out.extend(elems.iter().map(|&e| Some(e)));
             return;
         }
-        if let Some(app) = self.m.app(t)
-            && self.seqop_ops.get(&app.decl).map(String::as_str) == Some("seq.++")
+        // A string literal's characters, as their code points.
+        if let Some(cps) = self.str_value(t) {
+            for c in cps {
+                out.push(Some(self.m.mk_int(i64::from(c))));
+            }
+            return;
+        }
+        if let Some(app) = self.m.app(t).cloned()
+            && self.seq_like_op(t) == Some("seq.++")
         {
             for &a in &app.args.clone() {
                 self.seq_abs_factors(a, out);
@@ -380,7 +457,7 @@ impl Context {
         let over_seq = |me: &Self, u: AstId| {
             me.m.app_args(u)
                 .iter()
-                .any(|&a| me.seq_elem_sort(me.m.get_sort(a)).is_some())
+                .any(|&a| me.seq_like_sort(me.m.get_sort(a)))
         };
         let r = if !self.m.is_app(t) || self.m.app_args(t).is_empty() {
             t
@@ -389,7 +466,7 @@ impl Context {
             // relation the atom entails.
             let p = self.fresh_const(sort);
             let args = self.m.app_args(t).to_vec();
-            let op = self.seqop_ops.get(&self.m.app_decl(t)).cloned();
+            let op = self.seq_like_op(t);
             let rel = if self.m.is_eq(t) && args.len() == 2 {
                 // An equation with an `ite` side holds as the branch taken.
                 if let Some(k) = (0..2).find(|&k| self.m.is_ite(args[k])) {
@@ -409,7 +486,7 @@ impl Context {
                 );
                 Some(self.m.mk_eq(a, b))
             } else {
-                match op.as_deref() {
+                match op {
                     Some(op @ ("seq.prefixof" | "seq.suffixof")) if args.len() == 2 => {
                         let prefix = op == "seq.prefixof";
                         self.seq_abs_aligned(p, args[0], args[1], prefix, !prefix, abs)?;
@@ -426,6 +503,28 @@ impl Context {
                         );
                         Some(self.m.mk_le(b, a))
                     }
+                    // A membership in a constant regex: the word's length is
+                    // one its words can have (exact up to a bound).
+                    Some("str.in_re") if args.len() == 2 => {
+                        const MAX: usize = 32;
+                        let lens = self.regex_of.get(&args[1]).and_then(|r| r.lengths(MAX));
+                        match lens {
+                            Some(v) => {
+                                let ls = self.seq_abs_len(args[0], abs)?;
+                                let mut ok: Vec<AstId> = (0..=MAX)
+                                    .filter(|&n| v[n])
+                                    .map(|n| {
+                                        let nv = self.m.mk_int(n as i64);
+                                        self.m.mk_eq(ls, nv)
+                                    })
+                                    .collect();
+                                let top = self.m.mk_int(MAX as i64);
+                                ok.push(self.m.mk_gt(ls, top));
+                                Some(self.mk_disjunction(&ok))
+                            }
+                            None => None,
+                        }
+                    }
                     _ => None,
                 }
             };
@@ -434,14 +533,15 @@ impl Context {
             }
             p
         } else if self.m.is_arith_sort(sort)
-            && self.seq_len_decls.contains(&self.m.app_decl(t))
+            && (self.seq_len_decls.contains(&self.m.app_decl(t))
+                || self.str_len_decl == Some(self.m.app_decl(t)))
             && self.m.app_args(t).len() == 1
         {
             let s = self.m.app_args(t)[0];
             self.seq_abs_len(s, abs)?
         } else if over_seq(self, t) {
             // Another term over sequences (`nth`, `indexof`): free.
-            if self.seq_elem_sort(sort).is_some() {
+            if self.seq_like_sort(sort) {
                 return None;
             }
             self.fresh_const(sort)

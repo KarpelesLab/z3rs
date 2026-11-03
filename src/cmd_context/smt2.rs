@@ -3456,6 +3456,8 @@ struct Context {
     seq_cases: bool,
     /// Set while [`Self::check_sat_components`] decides its groups.
     in_check_components: bool,
+    /// Re-entrancy guard of [`Context::check_sat_str_alias`].
+    in_str_alias: bool,
     /// `(as const …)` applications built so far in the current command.
     as_const_seen: u32,
     /// Set while `decide_by_guard_split` decides one case.
@@ -4565,6 +4567,7 @@ impl Context {
             seq_ite_depth: 0,
             seq_cases: true,
             in_check_components: false,
+            in_str_alias: false,
             as_const_seen: 0,
             in_guard_split: false,
             in_seq_len_split: false,
@@ -17545,7 +17548,14 @@ impl Context {
         if refuted || self.str_model_incomplete(extra) {
             let n = self.assertions.len();
             self.assertions.extend_from_slice(extra);
-            let r = self.check_sat_seq_lengths();
+            let r = self.check_sat_seq_lengths().or_else(|| {
+                // An alias merge, decided as a refutation only here (its
+                // model would need the witness search again).
+                self.check_sat_str_alias()
+                    .filter(|r| r.0 == SmtResult::Unsat)
+                    .or_else(|| self.check_sat_drop_symbolic_regex())
+                    .or_else(|| self.check_sat_str_lengths_refute())
+            });
             self.assertions.truncate(n);
             return match r {
                 Some((SmtResult::Sat, Some(mut m))) => {
@@ -23548,6 +23558,12 @@ impl Context {
                 // The empty sequence is a prefix and a suffix of every one.
                 Ok(self.m.mk_true())
             }
+            // Every sequence is its own prefix, suffix and subsequence.
+            "seq.prefixof" | "seq.suffixof" | "seq.contains"
+                if args.len() == 2 && args[0] == args[1] =>
+            {
+                Ok(self.m.mk_true())
+            }
             "seq.len" => {
                 if let Some(l) = self.seq_of.get(&args[0]) {
                     return Ok(self.m.mk_int(l.len() as i64));
@@ -25055,6 +25071,24 @@ impl Context {
         // Sequences of unbounded length through their length abstraction.
         if r.0 == SmtResult::Unknown
             && let Some(r2) = self.check_sat_seq_lengths()
+        {
+            return r2;
+        }
+        // String constants an equation aliases, merged.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_str_alias()
+        {
+            return r2;
+        }
+        // Refuted without the memberships in symbolic regexes.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_drop_symbolic_regex()
+        {
+            return r2;
+        }
+        // Refuted by the strings' length abstraction.
+        if r.0 == SmtResult::Unknown
+            && let Some(r2) = self.check_sat_str_lengths_refute()
         {
             return r2;
         }
