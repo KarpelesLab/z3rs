@@ -878,6 +878,7 @@ mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
+mod re_len;
 mod seq_nth;
 mod simplify_th;
 mod str_uf;
@@ -24568,6 +24569,10 @@ impl Context {
             if let Some(r) = self.check_sat_str_uf() {
                 return r;
             }
+            // Regex and length constraints on independent string variables.
+            if let Some(r) = self.check_sat_regex_vars() {
+                return r;
+            }
         }
         let r = self.check_sat_split();
         if r.0 == SmtResult::Unknown
@@ -44143,6 +44148,36 @@ mod tests {
         assert_eq!(out[0], "unsat");
         assert_ne!(out[1], "sat");
         assert_ne!(out[2], "sat");
+    }
+
+    #[test]
+    fn regex_and_length_constraints_decided_per_variable() {
+        // A word outside `[a-c]+ ∪ [a-c]{3}` of length ≥ 7 exists ...
+        let out = run("(declare-const b String)\
+             (assert (not (str.in_re b (re.union (re.+ (re.range \"a\" \"c\")) \
+                 ((_ re.loop 3 3) (re.range \"a\" \"c\"))))))\
+             (assert (>= (str.len b) 7))(check-sat)")
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat"]);
+        // ... but no word of (ab)* has odd length.
+        let out = run("(declare-const b String)\
+             (assert (str.in_re b (re.* (str.to_re \"ab\"))))\
+             (assert (= (str.len b) 9))(check-sat)")
+        .unwrap();
+        assert_eq!(out, alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn selector_equations_are_not_definitions() {
+        // ∀x:L. hd(x) = 5 is false (x = cons(4, nil)): the ground instance at
+        // `c` must not make the universal look saturated.
+        let out = run(
+            "(declare-datatypes ((L 0)) (((nil) (cons (hd Int) (tl L)))))\
+             (declare-const c L)(assert (forall ((x L)) (= (hd x) 5)))\
+             (assert (= (hd c) 5))(check-sat)",
+        )
+        .unwrap();
+        assert_ne!(out, alloc::vec!["sat"]);
     }
 
     #[test]
