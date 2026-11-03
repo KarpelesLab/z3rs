@@ -3244,6 +3244,10 @@ struct Context {
     /// How many more sequence-valued `ite`s the distribution in progress in
     /// `seq_op` may split on (negative: exhausted).
     seq_ite_left: i64,
+    /// How each `RegLan` constant without a known structure was built
+    /// (operation, arguments, loop bounds), to rebuild it once its strings
+    /// are concrete.
+    regex_recipe: BTreeMap<AstId, (String, Vec<AstId>, Vec<usize>)>,
     /// The nesting of the distribution in progress.
     seq_ite_depth: u32,
     /// Whether `seq_op` expands reads of concrete sequences at symbolic
@@ -4344,6 +4348,7 @@ impl Context {
             in_components: false,
             in_bv_bool: false,
             seq_ite_left: 0,
+            regex_recipe: BTreeMap::new(),
             seq_ite_depth: 0,
             seq_cases: true,
             in_check_components: false,
@@ -15212,6 +15217,33 @@ impl Context {
     /// substitution would leave stale — a witness for `a` then checked, and
     /// printed, the sequence against `a`'s old value.
     fn subst_seq(&mut self, t: AstId, subst: &[(AstId, AstId)]) -> AstId {
+        // A regex built over the substituted strings is rebuilt over their
+        // values (its arguments are held in its recipe, not as subterms).
+        let mut subst = alloc::borrow::Cow::Borrowed(subst);
+        if !subst.is_empty() && !self.regex_recipe.is_empty() {
+            let mut extra: Vec<(AstId, AstId)> = Vec::new();
+            for u in self.m.postorder(t) {
+                if self.regex_recipe.contains_key(&u) {
+                    let base = subst.to_vec();
+                    let mut rf = |me: &mut Self, a: AstId| {
+                        let a2 = crate::rewriter::substitute(&mut me.m, a, &base);
+                        let mut memo = BTreeMap::new();
+                        let a3 = me.refold_str_markers(a2, &mut memo);
+                        crate::rewriter::simplify(&mut me.m, a3)
+                    };
+                    let r = self.regex_refold(u, &mut rf);
+                    if r != u {
+                        extra.push((u, r));
+                    }
+                }
+            }
+            if !extra.is_empty() {
+                let mut all = subst.to_vec();
+                all.extend(extra);
+                subst = alloc::borrow::Cow::Owned(all);
+            }
+        }
+        let subst: &[(AstId, AstId)] = &subst;
         if subst.is_empty() || self.seq_of.is_empty() {
             return crate::rewriter::substitute(&mut self.m, t, subst);
         }
@@ -15298,6 +15330,15 @@ impl Context {
     /// [`Self::refold_str_markers`] proper.
     fn refold_str_markers_rec(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
         if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        if self.regex_recipe.contains_key(&t) {
+            let mut rf = |me: &mut Self, a: AstId| {
+                let r = me.refold_str_markers_rec(a, memo);
+                crate::rewriter::simplify(&mut me.m, r)
+            };
+            let r = self.regex_refold(t, &mut rf);
+            memo.insert(t, r);
             return r;
         }
         let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
@@ -23710,10 +23751,86 @@ impl Context {
         let term = self.m.mk_const(d);
         if let Some(r) = structure {
             self.regex_of.insert(term, r);
-        } else if matches!(op, "str.to_re" | "str.to.re") {
-            self.regex_to_re_arg.insert(term, args[0]);
+        } else {
+            if matches!(op, "str.to_re" | "str.to.re") {
+                self.regex_to_re_arg.insert(term, args[0]);
+            }
+            self.regex_recipe
+                .insert(term, (op.to_string(), args.to_vec(), Vec::new()));
         }
         Ok(term)
+    }
+
+    /// `((_ re.loop lo hi) r)` (`hi` absent: at least `lo` repetitions, also
+    /// `((_ re.^ n) r)` as `lo = hi = n`): a fresh `RegLan` constant with its
+    /// structure when `r`'s is known, else with its recipe.
+    fn regex_loop(&mut self, rt: AstId, lo: usize, hi: Option<usize>) -> AstId {
+        let sort = self.reglan_sort();
+        let t = self.fresh_const(sort);
+        let Some(r) = self.regex_of.get(&rt).cloned() else {
+            let idx = match hi {
+                Some(h) => alloc::vec![lo, h],
+                None => alloc::vec![lo],
+            };
+            self.regex_recipe
+                .insert(t, ("re.loop".to_string(), alloc::vec![rt], idx));
+            return t;
+        };
+        let looped = match hi {
+            None => {
+                let mut acc = Regex::Star(Box::new(r.clone()));
+                for _ in 0..lo {
+                    acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                }
+                acc
+            }
+            // SMT-LIB: `(_ re.loop n1 n2)` with n1 > n2 denotes the empty
+            // language (no repetition count is valid).
+            Some(hi) if lo > hi => Regex::None,
+            Some(hi) => {
+                let mut alts: Vec<Regex> = Vec::new();
+                for k in lo..=hi {
+                    let mut acc = Regex::Lit(Vec::new());
+                    for _ in 0..k {
+                        acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
+                    }
+                    alts.push(acc);
+                }
+                fold_regex(alts, |a, b| Regex::Union(Box::new(a), Box::new(b)))
+            }
+        };
+        self.regex_of.insert(t, looped);
+        t
+    }
+
+    /// The regex `t` rebuilt from its recipe with its arguments re-folded
+    /// (`refold`), so a regex over strings that became literals gets its
+    /// structure; `t` itself without a recipe or a change.
+    fn regex_refold(
+        &mut self,
+        t: AstId,
+        refold: &mut dyn FnMut(&mut Self, AstId) -> AstId,
+    ) -> AstId {
+        let Some((op, args, idx)) = self.regex_recipe.get(&t).cloned() else {
+            return t;
+        };
+        let nargs: Vec<AstId> = args
+            .iter()
+            .map(|&a| {
+                if self.regex_recipe.contains_key(&a) {
+                    self.regex_refold(a, refold)
+                } else {
+                    refold(self, a)
+                }
+            })
+            .collect();
+        if nargs == args {
+            return t;
+        }
+        if op == "re.loop" {
+            return self.regex_loop(nargs[0], idx[0], idx.get(1).copied());
+        }
+        self.regex_op(&op, &nargs).unwrap_or(t)
     }
 
     /// A fresh Boolean atom recorded as symbolic so the goal is answered
@@ -41595,16 +41712,7 @@ impl Context {
                             .parse()
                             .map_err(|_| "re.loop: bad lower bound".to_string())?;
                         let rt = self.term(&l[1])?;
-                        let sort = self.reglan_sort();
-                        let t = self.fresh_const(sort);
-                        if let Some(r) = self.regex_of.get(&rt).cloned() {
-                            let mut acc = Regex::Star(Box::new(r.clone()));
-                            for _ in 0..lo {
-                                acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
-                            }
-                            self.regex_of.insert(t, acc);
-                        }
-                        return Ok(t);
+                        return Ok(self.regex_loop(rt, lo, None));
                     }
                     if (qid.len() == 4
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
@@ -41626,29 +41734,7 @@ impl Context {
                             lo
                         };
                         let rt = self.term(&l[1])?;
-                        if let Some(r) = self.regex_of.get(&rt).cloned() {
-                            // SMT-LIB: `(_ re.loop n1 n2)` with n1 > n2 denotes the
-                            // empty language (no repetition count is valid).
-                            let looped = if lo > hi {
-                                Regex::None
-                            } else {
-                                let mut alts: Vec<Regex> = Vec::new();
-                                for k in lo..=hi {
-                                    let mut acc = Regex::Lit(Vec::new());
-                                    for _ in 0..k {
-                                        acc = Regex::Concat(Box::new(r.clone()), Box::new(acc));
-                                    }
-                                    alts.push(acc);
-                                }
-                                fold_regex(alts, |a, b| Regex::Union(Box::new(a), Box::new(b)))
-                            };
-                            let sort = self.reglan_sort();
-                            let t = self.fresh_const(sort);
-                            self.regex_of.insert(t, looped);
-                            return Ok(t);
-                        }
-                        let sort = self.reglan_sort();
-                        return Ok(self.fresh_const(sort));
+                        return Ok(self.regex_loop(rt, lo, Some(hi)));
                     }
                     if qid.len() == 3
                         && matches!(&qid[0], SExpr::Atom(a) if a == "_")
@@ -43878,6 +43964,32 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn regexes_over_string_variables_are_rebuilt_for_witnesses() {
+        let script = "
+            (declare-const a String)
+            (declare-const b String)
+            (assert (str.in_re a (re.* (str.to_re b))))
+            (assert (= b \"ab\"))
+            (assert (= (str.len a) 4))
+            (check-sat)
+            (get-value (a))
+            (reset)
+            (declare-const a String)
+            (declare-const b String)
+            (assert (str.in_re b ((_ re.loop 2 2) (str.to_re a))))
+            (assert (= (str.len b) 4))
+            (assert (str.prefixof \"x\" a))
+            (check-sat)
+            (get-value (b))
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "((a \"abab\"))");
+        assert_eq!(out[2], "sat");
+        assert!(out[3].starts_with("((b \"x"), "{out:?}");
     }
 
     #[test]
