@@ -482,6 +482,82 @@ impl NlaSearch {
         self.core.set_work_budget(budget);
     }
 
+    /// z3's patching (`nla_patcher`) at the level of models: the
+    /// assignment's values of the goal's constants, every product (and every
+    /// atom) then evaluated from them, as a model of the goal; failing that,
+    /// the same with one constant changed so that one violated product takes
+    /// the value the assignment gave it (`patch_monomial` on a factor). The
+    /// goal is evaluated in each candidate, so a model returned is a model.
+    fn patched_model(
+        &self,
+        m: &AstManager,
+        model: &mut Model,
+        viol: &[Violation],
+    ) -> Option<Model> {
+        let mut nums: BTreeMap<AstId, Rational> = BTreeMap::new();
+        let mut bools: BTreeMap<AstId, bool> = BTreeMap::new();
+        for t in m.postorder(self.goal) {
+            if !m.is_uninterp_const(t) {
+                continue;
+            }
+            let s = m.get_sort(t);
+            if m.is_arith_sort(s) {
+                let v = val(model, m, t);
+                if m.is_int_sort(s) && !v.is_integer() {
+                    return None;
+                }
+                nums.insert(t, v);
+            } else if m.is_bool_sort(s) {
+                let Value::Bool(b) = model.eval_value(m, t) else {
+                    return None;
+                };
+                bools.insert(t, b);
+            } else {
+                return None;
+            }
+        }
+        let holds = |nums: &BTreeMap<AstId, Rational>| {
+            let mut out = Model::from_bv(BTreeMap::new());
+            for (&t, v) in nums {
+                out.set_arith(t, v.clone());
+            }
+            for (&t, &b) in &bools {
+                out.set_bool(t, b);
+            }
+            matches!(out.eval_value(m, self.goal), Value::Bool(true)).then_some(out)
+        };
+        if let Some(out) = holds(&nums) {
+            return Some(out);
+        }
+        for v in viol.iter().take(MAX_LEMMAS) {
+            let fs = &self.nla.mons[v.mon].factors;
+            for (i, &f) in fs.iter().enumerate() {
+                if !nums.contains_key(&f) || fs.iter().filter(|&&g| g == f).count() > 1 {
+                    continue;
+                }
+                let mut rest = rat(1);
+                for (k, &g) in fs.iter().enumerate() {
+                    if k != i {
+                        rest = &rest * &val(model, m, g);
+                    }
+                }
+                if rest.is_zero() {
+                    continue;
+                }
+                let nv = &v.vt / &rest;
+                if m.is_int_sort(m.get_sort(f)) && !nv.is_integer() {
+                    continue;
+                }
+                let mut cand = nums.clone();
+                cand.insert(f, nv);
+                if let Some(out) = holds(&cand) {
+                    return Some(out);
+                }
+            }
+        }
+        None
+    }
+
     /// Assert the valid formula `lemma`; `false` when it already was.
     pub fn add_lemma(&mut self, m: &AstManager, lemma: AstId) -> bool {
         if !self.nla.asserted.insert(lemma) {
@@ -521,6 +597,12 @@ impl NlaSearch {
                 Value::Bool(true) => NlaStep::Done(SmtResult::Sat, Some(Box::new(model))),
                 _ => NlaStep::Done(SmtResult::Unknown, None),
             };
+        }
+        // z3's patching (`nla_patcher`), in its simplest form: the
+        // assignment's values of the constants may satisfy the goal once
+        // every product takes its true value.
+        if let Some(patched) = self.patched_model(m, &mut model, &viol) {
+            return NlaStep::Done(SmtResult::Sat, Some(Box::new(patched)));
         }
         let n = viol.len();
         let shift = self.round % n;
