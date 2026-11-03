@@ -1542,3 +1542,601 @@ impl Context {
         Some(self.raw_goal_display(&raw, &goal, depth))
     }
 }
+
+/// A value of the model converter's evaluation.
+#[derive(Clone, PartialEq, Debug)]
+pub(super) enum RVal {
+    Bool(bool),
+    /// A numeral, and whether it is an integer.
+    Num(Rational, bool),
+    /// A bit-vector value and width.
+    Bv(Int, u32),
+}
+
+/// The model the converter works on: values, and the constants in the order
+/// of z3's `model_core::m_const_decls`.
+struct RModel {
+    vals: BTreeMap<RId, RVal>,
+    order: Vec<RId>,
+}
+
+impl RModel {
+    /// `register_decl`: a new constant goes last, a known one keeps its place.
+    fn register(&mut self, c: RId, v: RVal) {
+        if self.vals.insert(c, v).is_none() {
+            self.order.push(c);
+        }
+    }
+
+    /// `unregister_decl`: the last constant takes the removed one's place.
+    fn unregister(&mut self, c: RId) {
+        if self.vals.remove(&c).is_some()
+            && let Some(i) = self.order.iter().position(|&o| o == c)
+        {
+            self.order.swap_remove(i);
+        }
+    }
+}
+
+fn two_pow(k: u32) -> Int {
+    Int::from(1).mul_2k(u64::from(k))
+}
+
+/// The two's-complement value of a `w`-bit vector.
+fn signed(v: &Int, w: u32) -> Int {
+    if *v >= two_pow(w - 1) {
+        v - &two_pow(w)
+    } else {
+        v.clone()
+    }
+}
+
+fn bv(v: Int, w: u32) -> RVal {
+    RVal::Bv(v.mod_2k(u64::from(w)), w)
+}
+
+/// Evaluate `t` in `md` with model completion (`model_evaluator`): a
+/// constant without a value gets its sort's default, registered in the
+/// model; an `ite` evaluates only the branch its condition selects. `None`
+/// for terms the converter does not evaluate here (uninterpreted functions,
+/// quantifiers, arithmetic division by zero).
+fn eval(ctx: &Context, raw: &Raw, md: &mut RModel, t: RId) -> Option<RVal> {
+    let node = &raw.nodes[t];
+    match &node.op {
+        ROp::True => return Some(RVal::Bool(true)),
+        ROp::False => return Some(RVal::Bool(false)),
+        ROp::Num(r, i) => return Some(RVal::Num(r.clone(), *i)),
+        ROp::Bv(v, w) => return Some(RVal::Bv(v.clone(), *w)),
+        ROp::Const(_) | ROp::Fresh(_) => {
+            if let Some(v) = md.vals.get(&t) {
+                return Some(v.clone());
+            }
+            let s = node.sort;
+            let v = if s == raw.bool_sort {
+                RVal::Bool(false)
+            } else if let Some(w) = ctx.m.bv_sort_width(s) {
+                RVal::Bv(Int::from(0), w)
+            } else if ctx.m.is_arith_sort(s) {
+                RVal::Num(Rational::from(0), ctx.m.is_int_sort(s))
+            } else {
+                return None;
+            };
+            md.register(t, v.clone());
+            return Some(v);
+        }
+        ROp::Var(_) | ROp::Uf(_) | ROp::Quant(..) => return None,
+        ROp::Op(..) => {}
+    }
+    let ROp::Op(name, idx) = &node.op else {
+        return None;
+    };
+    let args = &node.args;
+    if name == "ite" {
+        let RVal::Bool(c) = eval(ctx, raw, md, args[0])? else {
+            return None;
+        };
+        return eval(ctx, raw, md, if c { args[1] } else { args[2] });
+    }
+    let mut vs = Vec::with_capacity(args.len());
+    for &a in args {
+        vs.push(eval(ctx, raw, md, a)?);
+    }
+    let bools = || -> Option<Vec<bool>> {
+        vs.iter()
+            .map(|v| match v {
+                RVal::Bool(b) => Some(*b),
+                _ => None,
+            })
+            .collect()
+    };
+    let nums = || -> Option<Vec<Rational>> {
+        vs.iter()
+            .map(|v| match v {
+                RVal::Num(r, _) => Some(r.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let bvs = || -> Option<Vec<Int>> {
+        vs.iter()
+            .map(|v| match v {
+                RVal::Bv(x, _) => Some(x.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let is_int = ctx.m.is_int_sort(node.sort);
+    let num = |r: Rational| Some(RVal::Num(r, is_int));
+    let b = |x: bool| Some(RVal::Bool(x));
+    let w = ctx.m.bv_sort_width(node.sort).unwrap_or(0);
+    // The width of the (bit-vector) arguments.
+    let aw = match vs.first() {
+        Some(RVal::Bv(_, w)) => *w,
+        _ => 0,
+    };
+    match name.as_str() {
+        "not" => b(!bools()?[0]),
+        "and" => b(bools()?.iter().all(|&x| x)),
+        "or" => b(bools()?.iter().any(|&x| x)),
+        "=>" => {
+            let x = bools()?;
+            b(!x[0] || x[1])
+        }
+        "xor" => {
+            let x = bools()?;
+            b(x[0] != x[1])
+        }
+        "=" => b(vs[0] == vs[1]),
+        "distinct" => b((0..vs.len()).all(|i| (i + 1..vs.len()).all(|j| vs[i] != vs[j]))),
+        "+" => num(nums()?.iter().fold(Rational::from(0), |a, x| a.add(x))),
+        "*" => num(nums()?.iter().fold(Rational::from(1), |a, x| a.mul(x))),
+        "-" if vs.len() == 1 => num(nums()?[0].neg()),
+        "-" => {
+            let x = nums()?;
+            num(x[0].sub(&x[1]))
+        }
+        "/" => {
+            let x = nums()?;
+            if x[1].is_zero() {
+                return None;
+            }
+            num(x[0].div(&x[1]))
+        }
+        "div" | "mod" | "rem" => {
+            let x = nums()?;
+            let (p, q) = (x[0].numerator().clone(), x[1].numerator().clone());
+            if q.is_zero() {
+                return None;
+            }
+            // SMT-LIB: `div` rounds so that `mod` is non-negative.
+            let (d, m) = p.div_rem_euclid(&q);
+            num(Rational::from_integer(match name.as_str() {
+                "div" => d,
+                "mod" => m,
+                // `rem` takes the divisor's sign.
+                _ if q.is_negative() => m.neg(),
+                _ => m,
+            }))
+        }
+        "abs" => num(nums()?[0].abs()),
+        "to_real" => Some(RVal::Num(nums()?[0].clone(), false)),
+        "to_int" => Some(RVal::Num(Rational::from_integer(nums()?[0].floor()), true)),
+        "is_int" => b(nums()?[0].is_integer()),
+        "<=" | "<" | ">=" | ">" => {
+            let x = nums()?;
+            b(match name.as_str() {
+                "<=" => x[0] <= x[1],
+                "<" => x[0] < x[1],
+                ">=" => x[0] >= x[1],
+                _ => x[0] > x[1],
+            })
+        }
+        "bvadd" => Some(bv(bvs()?.iter().fold(Int::from(0), |a, x| &a + x), w)),
+        "bvmul" => Some(bv(bvs()?.iter().fold(Int::from(1), |a, x| &a * x), w)),
+        "bvand" | "bvor" | "bvxor" | "bvxnor" | "bvnand" | "bvnor" => {
+            let x = bvs()?;
+            let mut r = x[0].clone();
+            for y in &x[1..] {
+                r = match name.as_str() {
+                    "bvand" | "bvnand" => r.bitand(y),
+                    "bvor" | "bvnor" => r.bitor(y),
+                    _ => r.bitxor(y),
+                };
+            }
+            if matches!(name.as_str(), "bvxnor" | "bvnand" | "bvnor") {
+                r = r.bitnot(w);
+            }
+            Some(bv(r, w))
+        }
+        "bvnot" => Some(bv(bvs()?[0].bitnot(w), w)),
+        "bvneg" => Some(bv(bvs()?[0].neg(), w)),
+        "bvsub" => {
+            let x = bvs()?;
+            Some(bv(&x[0] - &x[1], w))
+        }
+        "bvudiv" | "bvurem" => {
+            let x = bvs()?;
+            Some(if x[1].is_zero() {
+                if name == "bvudiv" {
+                    bv(two_pow(w) - Int::from(1), w)
+                } else {
+                    bv(x[0].clone(), w)
+                }
+            } else {
+                let (d, m) = x[0].div_rem_euclid(&x[1]);
+                bv(if name == "bvudiv" { d } else { m }, w)
+            })
+        }
+        "bvsdiv" | "bvsrem" | "bvsmod" => {
+            let x = bvs()?;
+            let (p, q) = (signed(&x[0], w), signed(&x[1], w));
+            Some(bv(
+                match name.as_str() {
+                    "bvsdiv" if q.is_zero() => {
+                        if p.is_negative() {
+                            Int::from(1)
+                        } else {
+                            Int::from(-1)
+                        }
+                    }
+                    _ if q.is_zero() => p,
+                    "bvsdiv" => p.div_trunc(&q),
+                    "bvsrem" => p.rem_trunc(&q),
+                    // bvsmod: the remainder with the divisor's sign.
+                    _ => {
+                        let r = p.rem_euclid(&q);
+                        if q.is_negative() && !r.is_zero() {
+                            &r + &q
+                        } else {
+                            r
+                        }
+                    }
+                },
+                w,
+            ))
+        }
+        "bvshl" | "bvlshr" | "bvashr" => {
+            let x = bvs()?;
+            let k = x[1].to_u64().filter(|&k| k < u64::from(w));
+            Some(match (name.as_str(), k) {
+                ("bvshl", Some(k)) => bv(x[0].mul_2k(k), w),
+                ("bvlshr", Some(k)) => bv(x[0].div_2k_floor(k), w),
+                ("bvashr", Some(k)) => bv(signed(&x[0], w).div_2k_floor(k), w),
+                ("bvashr", None) if signed(&x[0], w).is_negative() => bv(Int::from(-1), w),
+                _ => bv(Int::from(0), w),
+            })
+        }
+        "bvcomp" => {
+            let x = bvs()?;
+            Some(bv(Int::from(i64::from(x[0] == x[1])), 1))
+        }
+        "concat" => {
+            let mut r = Int::from(0);
+            for v in &vs {
+                let RVal::Bv(x, xw) = v else { return None };
+                r = &r.mul_2k(u64::from(*xw)) + x;
+            }
+            Some(bv(r, w))
+        }
+        "extract" => Some(bv(bvs()?[0].div_2k_floor(u64::from(idx[1])), w)),
+        "zero_extend" => Some(bv(bvs()?[0].clone(), w)),
+        "sign_extend" => Some(bv(signed(&bvs()?[0], aw), w)),
+        "repeat" => {
+            let x = bvs()?;
+            let mut r = Int::from(0);
+            for _ in 0..idx[0] {
+                r = &r.mul_2k(u64::from(aw)) + &x[0];
+            }
+            Some(bv(r, w))
+        }
+        "rotate_left" | "rotate_right" => {
+            let x = bvs()?;
+            let k = idx[0] % w;
+            let k = if name == "rotate_left" {
+                k
+            } else {
+                (w - k) % w
+            };
+            let hi = x[0].mul_2k(u64::from(k));
+            let lo = x[0].div_2k_floor(u64::from(w - k));
+            Some(bv(&hi + &lo, w))
+        }
+        "bvule" | "bvult" | "bvuge" | "bvugt" | "bvsle" | "bvslt" | "bvsge" | "bvsgt" => {
+            let x = bvs()?;
+            let (p, q) = if name.starts_with("bvs") {
+                (signed(&x[0], aw), signed(&x[1], aw))
+            } else {
+                (x[0].clone(), x[1].clone())
+            };
+            b(match &name[3..] {
+                "le" => p <= q,
+                "lt" => p < q,
+                "ge" => p >= q,
+                _ => p > q,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A value printed in a model, as the converter's value of sort `s`.
+fn parse_value(ctx: &Context, e: &SExpr, s: AstId, bool_sort: AstId) -> Option<RVal> {
+    if s == bool_sort {
+        return match e {
+            SExpr::Atom(a) if a == "true" => Some(RVal::Bool(true)),
+            SExpr::Atom(a) if a == "false" => Some(RVal::Bool(false)),
+            _ => None,
+        };
+    }
+    if let Some(w) = ctx.m.bv_sort_width(s) {
+        let SExpr::Atom(a) = e else { return None };
+        let (v, lw) = parse_bv_literal(a)?;
+        return (lw == w).then_some(RVal::Bv(v, w));
+    }
+    if !ctx.m.is_arith_sort(s) {
+        return None;
+    }
+    fn rat(e: &SExpr) -> Option<Rational> {
+        match e {
+            SExpr::Atom(a) => parse_numeral(a).map(|(r, _)| r),
+            SExpr::List(l) => match l.as_slice() {
+                [SExpr::Atom(h), x] if h == "-" => Some(rat(x)?.neg()),
+                [SExpr::Atom(h), x, y] if h == "/" => {
+                    let d = rat(y)?;
+                    (!d.is_zero()).then(|| rat(x).map(|n| n.div(&d)))?
+                }
+                _ => None,
+            },
+        }
+    }
+    Some(RVal::Num(rat(e)?, ctx.m.is_int_sort(s)))
+}
+
+impl Context {
+    /// The names of the constants `consts` of the residual `goal` that remain
+    /// once it is simplified (the fresh ones declared for the parse only).
+    fn uncnstr_live_consts(
+        &mut self,
+        raw: &Raw,
+        goal: &[RId],
+        consts: &[RId],
+    ) -> Option<BTreeSet<String>> {
+        let mut added: Vec<String> = Vec::new();
+        for &c in consts {
+            if let ROp::Fresh(k) = raw.op(c) {
+                let n = alloc::format!("k!{k}");
+                let d = self
+                    .m
+                    .mk_func_decl(crate::util::symbol::Symbol::new(&n), &[], raw.sort(c));
+                self.funcs.insert(n.clone(), d);
+                added.push(n);
+            }
+        }
+        let mut live = Some(BTreeSet::new());
+        for &f in goal {
+            let parsed = super::parse(&self.raw_pp(raw, f, 0)).ok();
+            let Some([e]) = parsed.as_deref() else {
+                live = None;
+                break;
+            };
+            let Ok(t) = self.term(e) else {
+                live = None;
+                break;
+            };
+            let s = crate::rewriter::simplify(&mut self.m, t);
+            for u in self.m.postorder(s) {
+                if self.m.is_uninterp_const(u)
+                    && let Some(n) = self.decl_name(self.m.app_decl(u))
+                    && let Some(l) = live.as_mut()
+                {
+                    l.insert(n);
+                }
+            }
+        }
+        for n in added {
+            self.funcs.remove(&n);
+        }
+        live
+    }
+
+    /// For a `check-sat-using` chain of `elim-uncnstr` (with `skip`) ended by
+    /// `smt`: run the tactic on the goal (advancing the fresh counter as z3
+    /// does). Returns the raw arena and the tactic's result, `None` when the
+    /// chain is another one or the goal is not modelled.
+    pub(super) fn uncnstr_check_goal(&mut self, t: &SExpr) -> Option<(Raw, ElimResult)> {
+        let leaves = tactic_chain(t)?;
+        let (last, init) = leaves.split_last()?;
+        if last != "smt"
+            || !init.iter().any(|l| l == "elim-uncnstr")
+            || !init.iter().all(|l| l == "elim-uncnstr" || l == "skip")
+        {
+            return None;
+        }
+        let bs = self.m.mk_bool_sort();
+        let mut raw = Raw::new(bs);
+        let mut goal = self.raw_goal(&mut raw)?;
+        let mut depth = 0;
+        let mut mc = Vec::new();
+        for l in init {
+            if l == "elim-uncnstr" {
+                let r = self.elim_uncnstr(&mut raw, goal);
+                goal = r.goal;
+                depth += r.depth;
+                mc.extend(r.mc);
+            }
+        }
+        Some((raw, ElimResult { goal, depth, mc }))
+    }
+
+    /// The model z3 reports after `(then elim-uncnstr smt)`: the residual
+    /// goal's model (decided by a fresh context), converted back by the
+    /// tactic's model converter. The constants, in z3's model order, with
+    /// their values pinned in `model`; `None` when the conversion is not
+    /// modelled.
+    pub(super) fn uncnstr_convert_model(
+        &mut self,
+        raw: &Raw,
+        res: &ElimResult,
+        model: &mut crate::smt::Model,
+    ) -> Option<Vec<String>> {
+        use super::super::ast_hash::{decl_hash, obj_map_slot_order, skolem_info_hash};
+        if res.mc.is_empty() || self.z3_state.last_poly.is_some() {
+            return None;
+        }
+        // The residual goal's constants in first-occurrence order.
+        let mut consts: Vec<RId> = Vec::new();
+        let mut seen: BTreeSet<RId> = BTreeSet::new();
+        for &f in &res.goal {
+            let mut stack = vec![f];
+            while let Some(t) = stack.pop() {
+                if !seen.insert(t) {
+                    continue;
+                }
+                match raw.op(t) {
+                    ROp::Const(_) | ROp::Fresh(_) => consts.push(t),
+                    ROp::Uf(_) | ROp::Quant(..) | ROp::Var(_) => return None,
+                    _ => stack.extend(raw.args(t).iter().rev()),
+                }
+            }
+        }
+        let name_of = |t: RId| match raw.op(t) {
+            ROp::Const(c) => c.clone(),
+            ROp::Fresh(k) => alloc::format!("k!{k}"),
+            _ => String::new(),
+        };
+        // Decide the residual goal in a fresh context.
+        let mut script = String::new();
+        if let Some(l) = &self.logic {
+            script.push_str(&alloc::format!("(set-logic {l})\n"));
+        }
+        for &c in &consts {
+            if let ROp::Const(n) = raw.op(c)
+                && n.starts_with("k!")
+            {
+                return None;
+            }
+            script.push_str(&alloc::format!(
+                "(declare-const {} {})\n",
+                smt2_symbol(&name_of(c)),
+                self.sort_display(raw.sort(c))
+            ));
+        }
+        for &f in &res.goal {
+            script.push_str(&alloc::format!("(assert {})\n", self.raw_pp(raw, f, 0)));
+        }
+        script.push_str("(check-sat-using smt)\n(get-model)\n");
+        let out = super::run(&script).ok()?;
+        if out.first().map(String::as_str) != Some("sat") {
+            return None;
+        }
+        let forms = super::parse(out.get(1)?).ok()?;
+        let [SExpr::List(defs)] = forms.as_slice() else {
+            return None;
+        };
+        let mut vals: BTreeMap<String, &SExpr> = BTreeMap::new();
+        for d in defs {
+            let SExpr::List(p) = d else { return None };
+            let [SExpr::Atom(h), SExpr::Atom(n), SExpr::List(ps), _, v] = p.as_slice() else {
+                return None;
+            };
+            if h != "define-fun" || !ps.is_empty() {
+                return None;
+            }
+            vals.insert(n.trim_matches('|').to_string(), v);
+        }
+        // The solver's model interprets the constants its own simplification
+        // of the goal leaves: Booleans registered first, then the others,
+        // listed by the slot order of their `obj_map`.
+        let live = self.uncnstr_live_consts(raw, &res.goal, &consts)?;
+        consts.retain(|c| live.contains(&name_of(*c)));
+        let mut first: Vec<RId> = consts
+            .iter()
+            .copied()
+            .filter(|&c| raw.sort(c) == raw.bool_sort)
+            .collect();
+        let n_bool = first.len();
+        first.extend(
+            consts
+                .iter()
+                .copied()
+                .filter(|&c| raw.sort(c) != raw.bool_sort),
+        );
+        let mut hashes = Vec::with_capacity(first.len());
+        for &c in &first {
+            let sh = self.z3_sort_hash(raw.sort(c))?;
+            let info = if matches!(raw.op(c), ROp::Fresh(_)) {
+                skolem_info_hash()
+            } else {
+                0
+            };
+            hashes.push(decl_hash(&name_of(c), &[], sh, info));
+        }
+        let mut md = RModel {
+            vals: BTreeMap::new(),
+            order: Vec::new(),
+        };
+        for k in obj_map_slot_order(&hashes, first.len() > n_bool) {
+            let c = first[k];
+            let v = parse_value(self, vals.get(&name_of(c))?, raw.sort(c), raw.bool_sort)?;
+            md.register(c, v);
+        }
+        // The generic model converter, last entry first.
+        for e in res.mc.iter().rev() {
+            match *e {
+                McEntry::Hide(v) => md.unregister(v),
+                McEntry::Add(v, def) => {
+                    let val = eval(self, raw, &mut md, def)?;
+                    md.register(v, val);
+                }
+            }
+        }
+        let mut pins = Vec::with_capacity(md.order.len());
+        for &c in &md.order {
+            let ROp::Const(n) = raw.op(c) else { continue };
+            let d = *self.funcs.get(n)?;
+            let v = match md.vals[&c].clone() {
+                RVal::Bool(b) => crate::smt::Value::Bool(b),
+                RVal::Num(r, i) => crate::smt::Value::Num(r, i),
+                RVal::Bv(x, w) => crate::smt::Value::Bv(x, w),
+            };
+            pins.push((n.clone(), d, v));
+        }
+        // The other declared constants are not in z3's model: `get-model`
+        // completes them with their sort's default value.
+        for n in self.decl_order.clone() {
+            if pins.iter().any(|p| p.0 == n) {
+                continue;
+            }
+            let Some(&d) = self.funcs.get(&n) else {
+                continue;
+            };
+            let Some(fd) = self.m.func_decl(d) else {
+                continue;
+            };
+            if !fd.domain.is_empty() {
+                continue;
+            }
+            let s = fd.range;
+            let v = if self.m.is_bool_sort(s) {
+                crate::smt::Value::Bool(false)
+            } else if let Some(w) = self.m.bv_sort_width(s) {
+                crate::smt::Value::Bv(Int::from(0), w)
+            } else if self.m.is_arith_sort(s) {
+                crate::smt::Value::Num(Rational::from(0), self.m.is_int_sort(s))
+            } else {
+                continue;
+            };
+            let t = self.m.mk_const(d);
+            model.unassign(t);
+            model.pin_value(t, v);
+        }
+        let mut names = Vec::with_capacity(pins.len());
+        for (n, d, v) in pins {
+            let t = self.m.mk_const(d);
+            model.unassign(t);
+            model.pin_value(t, v);
+            names.push(n);
+        }
+        Some(names)
+    }
+}

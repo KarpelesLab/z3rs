@@ -3353,7 +3353,7 @@ struct Context {
     uncnstr_fresh: u32,
     /// After a `check-sat-using` whose model `elim-uncnstr`'s converter
     /// rebuilt: the model's constants in the order z3 lists them.
-    uncnstr_model_order: Option<Vec<AstId>>,
+    uncnstr_model_order: Option<Vec<String>>,
     /// Solver options set via `(set-option …)`, retrievable by `(get-option …)`.
     params: crate::util::Params,
     /// Uninterpreted sort *constructors* of arity ≥ 1 from `(declare-sort P n)`.
@@ -5657,6 +5657,12 @@ impl Context {
                 self.reason_unknown = None;
                 self.str_witness.clear();
                 self.trig_basis.clear();
+                self.uncnstr_model_order = None;
+                let uncnstr = if is_using {
+                    list.get(1).and_then(|t| self.uncnstr_check_goal(t))
+                } else {
+                    None
+                };
                 let plain = is_using || list.len() <= 1;
                 self.z3_note_check(!is_using && (self.inc_mode || !plain));
                 let purify = is_using
@@ -5725,7 +5731,13 @@ impl Context {
                     model = Some(md);
                 }
                 let extra: Vec<AstId> = self.last_assumptions.iter().map(|&(_, t)| t).collect();
-                let (res, model) = self.finish_str_model(res, model, &extra);
+                let (res, mut model) = self.finish_str_model(res, model, &extra);
+                // `(then elim-uncnstr smt)`: z3's model is the residual goal's,
+                // converted back by the tactic's model converter.
+                if let (SmtResult::Sat, Some(md), Some((raw, er))) = (res, model.as_mut(), &uncnstr)
+                {
+                    self.uncnstr_model_order = self.uncnstr_convert_model(raw, er, md);
+                }
                 self.z3_note_result(res);
                 self.check_sat_done = true;
                 if !plain {
@@ -5744,6 +5756,7 @@ impl Context {
                 };
                 let mut terms = Vec::with_capacity(assumptions.len());
                 self.last_assumptions.clear();
+                self.uncnstr_model_order = None;
                 for a in &assumptions {
                     let id = self.term(a)?;
                     self.last_assumptions.push((render_sexpr(a), id));
@@ -39028,6 +39041,14 @@ impl Context {
         is_bool: impl Fn(&T) -> bool,
         hash: impl Fn(&T) -> Option<Option<u32>>,
     ) -> Vec<T> {
+        // After `(then elim-uncnstr smt)`: the converted model's order.
+        if let Some(ord) = &self.uncnstr_model_order {
+            let pos = |d: &T| ord.iter().position(|n| n == name(d));
+            let (mut first, rest): (Vec<T>, Vec<T>) =
+                decls.into_iter().partition(|d| pos(d).is_some());
+            first.sort_by_key(|d| pos(d));
+            return self.append_declared_rest(first, rest, &name);
+        }
         let used = self.asserted_names();
         let (mut first, rest): (Vec<T>, Vec<T>) = decls
             .into_iter()
@@ -39052,6 +39073,18 @@ impl Context {
         if self.z3_state.last_inc {
             first = self.z3_model_slot_order(first, &is_bool, &hash);
         }
+        self.append_declared_rest(first, rest, &name)
+    }
+
+    /// `first`, then the declarations of `rest` as
+    /// `cmd_context::add_declared_functions` appends them: in the slot order
+    /// of z3's declaration dictionary.
+    fn append_declared_rest<T>(
+        &self,
+        mut first: Vec<T>,
+        rest: Vec<T>,
+        name: &impl Fn(&T) -> &String,
+    ) -> Vec<T> {
         let mut rest: Vec<Option<T>> = rest.into_iter().map(Some).collect();
         for n in self.decl_table.names() {
             if let Some(slot) = rest
@@ -47299,6 +47332,28 @@ mod tests {
         ";
         let out = run(script).unwrap();
         assert_eq!(out, alloc::vec!["sat", "((p true))", "sat", "((p true))"]);
+    }
+
+    #[test]
+    fn elim_uncnstr_model_is_converted_back() {
+        // The residual goal `k!1` is decided, then the converter rebuilds
+        // `k!0 := ite(k!1, #x42, ~#x42)`, `z, y := 1`, `x := k!0`, the hidden
+        // constants' slots taken over as z3's model does.
+        let script = "
+            (declare-const x (_ BitVec 8))
+            (declare-const y (_ BitVec 8))
+            (declare-const z (_ BitVec 8))
+            (assert (= (bvmul x y z) #x42))
+            (check-sat-using (then elim-uncnstr smt))
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(
+            out[1],
+            "(\n  (define-fun x () (_ BitVec 8)\n    #x42)\n  \
+             (define-fun z () (_ BitVec 8)\n    #x01)\n  \
+             (define-fun y () (_ BitVec 8)\n    #x01)\n)"
+        );
     }
 
     #[test]
