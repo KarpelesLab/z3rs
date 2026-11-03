@@ -3327,6 +3327,9 @@ struct Context {
     seq_at_sym: BTreeMap<(AstId, AstId), AstId>,
     /// `seq.unit e` markers, cached by element so equal-element units are one term.
     seq_unit_cache: BTreeMap<AstId, AstId>,
+    /// Concrete sequences of two or more elements, cached by element list so
+    /// equal-content sequences are one term (see [`Context::mk_seq`]).
+    seq_lit_cache: BTreeMap<Vec<AstId>, AstId>,
     /// Symbolic `str.at x i` markers, cached by `(x, i)` so repeated reads at the
     /// same position are congruent — `str.at x i = "a" ∧ str.at x i = "b"` refutes.
     str_at_sym: BTreeMap<(AstId, AstId), AstId>,
@@ -4354,6 +4357,7 @@ impl Context {
             seq_nth_sym: BTreeMap::new(),
             seq_at_sym: BTreeMap::new(),
             seq_unit_cache: BTreeMap::new(),
+            seq_lit_cache: BTreeMap::new(),
             str_at_sym: BTreeMap::new(),
             fp_r2i_sym: BTreeMap::new(),
             seqop_ops: BTreeMap::new(),
@@ -11120,7 +11124,8 @@ impl Context {
                     // Only pin symbolic parts (a concrete part either matches or
                     // conflicts, handled elsewhere).
                     if !self.seq_of.contains_key(&p) {
-                        let sv = self.mk_seq(cv[off..off + plen].to_vec());
+                        let sv =
+                            self.mk_seq_sorted(self.m.get_sort(p), cv[off..off + plen].to_vec());
                         ax.push(self.m.mk_eq(p, sv));
                     }
                     off += plen;
@@ -11555,10 +11560,10 @@ impl Context {
                     }
                 }
                 if has_sym && ulen == Some(concrete_sum) {
-                    let sv = self.mk_seq(val);
+                    let sv = self.mk_seq_sorted(self.m.get_sort(u), val);
                     ax.push(self.m.mk_eq(u, sv));
                 } else if has_sym && all_concrete_or_empty {
-                    let sv = self.mk_seq(val2);
+                    let sv = self.mk_seq_sorted(self.m.get_sort(u), val2);
                     ax.push(self.m.mk_eq(u, sv));
                 }
             }
@@ -12859,7 +12864,7 @@ impl Context {
                     && let Some(disj) = markers
                     && !disj.is_empty()
                 {
-                    let d = self.m.mk_or(&disj);
+                    let d = self.mk_disjunction(&disj);
                     ax.push(self.m.mk_implies(t, d));
                 }
             }
@@ -12902,7 +12907,7 @@ impl Context {
                 }
             }
             if !disj.is_empty() {
-                let d = self.m.mk_or(&disj);
+                let d = self.mk_disjunction(&disj);
                 ax.push(self.m.mk_implies(t, d));
             }
         }
@@ -14201,7 +14206,7 @@ impl Context {
                 }
             }
             if !disj.is_empty() {
-                let d = self.m.mk_or(&disj);
+                let d = self.mk_disjunction(&disj);
                 ax.push(self.m.mk_implies(t, d));
             }
         }
@@ -14339,7 +14344,7 @@ impl Context {
             if let Some(disj) = markers
                 && !disj.is_empty()
             {
-                let d = self.m.mk_or(&disj);
+                let d = self.mk_disjunction(&disj);
                 ax.push(self.m.mk_implies(t, d));
             }
         }
@@ -15235,6 +15240,14 @@ impl Context {
                     .collect();
                 self.seq_op(&op, &sa)
                     .unwrap_or_else(|_| self.m.mk_app(decl, &args))
+            } else if self.m.is_ite(t)
+                && let Some(c) = Some(crate::rewriter::simplify(&mut self.m, args[0]))
+                && (self.m.is_true(c) || self.m.is_false(c))
+            {
+                // A decided `ite` (its condition folds once the sequences are
+                // concrete) is its branch, so an equality over it above still
+                // sees the concrete sequence.
+                if self.m.is_true(c) { args[1] } else { args[2] }
             } else if self.m.is_eq(t) && args.len() == 2 {
                 // Fold an equality of two now-concrete sequences (or strings) by
                 // content: `substitute` rebuilt this node without re-folding, and
@@ -16921,7 +16934,9 @@ impl Context {
         if let Some(m2) = self.pin_str_witness(&mut md, extra) {
             return (res, Some(m2));
         }
-        if refuted {
+        // Refuted, or still open: no string/sequence values confirm the
+        // `sat` of the abstraction.
+        if refuted || self.str_model_incomplete(extra) {
             return (SmtResult::Unknown, None);
         }
         (res, Some(md))
@@ -22736,7 +22751,8 @@ impl Context {
             "seq.++" => {
                 if let Some(parts) = lists {
                     let joined: Vec<AstId> = parts.into_iter().flatten().collect();
-                    return Ok(self.mk_seq(joined));
+                    let s = self.m.get_sort(args[0]);
+                    return Ok(self.mk_seq_sorted(s, joined));
                 }
                 self.symbolic_seq(op, args)
             }
@@ -22783,12 +22799,11 @@ impl Context {
                 if let (Some(l), Some(i)) =
                     (self.seq_of.get(&args[0]).cloned(), self.int_arg(args[1]))
                 {
-                    let out = if i >= 0 && (i as usize) < l.len() {
-                        alloc::vec![l[i as usize]]
-                    } else {
-                        Vec::new()
-                    };
-                    return Ok(self.mk_seq(out));
+                    if i >= 0 && (i as usize) < l.len() {
+                        return Ok(self.mk_seq(alloc::vec![l[i as usize]]));
+                    }
+                    let s = self.m.get_sort(args[0]);
+                    return Ok(self.seq_empty_of(s));
                 }
                 // Symbolic `seq.at s i`: reuse one congruent marker per (s, i) so
                 // `s = u ⇒ at(s,i) = at(u,i)` can be emitted against the goal's marker.
@@ -22899,7 +22914,8 @@ impl Context {
             // to avoid contradicting the oracle.
             "seq.replace" => {
                 if let Some(ps) = &lists {
-                    return Ok(self.mk_seq(replace_first_seq(&ps[0], &ps[1], &ps[2])));
+                    let s = self.m.get_sort(args[0]);
+                    return Ok(self.mk_seq_sorted(s, replace_first_seq(&ps[0], &ps[1], &ps[2])));
                 }
                 self.symbolic_seq(op, args)
             }
@@ -23408,16 +23424,48 @@ impl Context {
         Ok(app)
     }
 
-    /// A fresh sequence constant with the given element list recorded.
+    /// The sequence constant with the given element list recorded, interned
+    /// by content (one term per list, the `seq.unit` term for a single
+    /// element) so that equal concrete sequences are equal terms. An empty
+    /// list has no element to read the sort from: callers that know the sort
+    /// use [`Self::seq_empty_of`].
     fn mk_seq(&mut self, elems: Vec<AstId>) -> AstId {
         let elem_sort = elems
             .first()
             .map(|&e| self.m.get_sort(e))
             .unwrap_or_else(|| self.m.mk_int_sort());
         let sort = self.seq_sort(elem_sort);
+        match elems.len() {
+            0 => return self.seq_empty_of(sort),
+            1 => {
+                if let Some(&c) = self.seq_unit_cache.get(&elems[0]) {
+                    return c;
+                }
+            }
+            _ => {
+                if let Some(&c) = self.seq_lit_cache.get(&elems) {
+                    return c;
+                }
+            }
+        }
         let t = self.fresh_const(sort);
+        if elems.len() == 1 {
+            self.seq_unit_cache.insert(elems[0], t);
+        } else {
+            self.seq_lit_cache.insert(elems.clone(), t);
+        }
         self.seq_of.insert(t, elems);
         t
+    }
+
+    /// [`Self::mk_seq`] for a sequence of sort `sort`, which an empty `elems`
+    /// cannot tell.
+    fn mk_seq_sorted(&mut self, sort: AstId, elems: Vec<AstId>) -> AstId {
+        if elems.is_empty() {
+            self.seq_empty_of(sort)
+        } else {
+            self.mk_seq(elems)
+        }
     }
 
     /// The interned `RegLan` sort (registered on first use).
@@ -29703,7 +29751,7 @@ impl Context {
                 disj.push(crate::rewriter::simplify(&mut self.m, g));
             }
         }
-        let d = self.m.mk_or(&disj);
+        let d = self.mk_disjunction(&disj);
         Some(crate::rewriter::simplify(&mut self.m, d))
     }
 
@@ -32367,7 +32415,7 @@ impl Context {
                 {
                     let zero = self.m.mk_int(0);
                     let disj: Vec<AstId> = vars.iter().map(|&v| self.m.mk_eq(v, zero)).collect();
-                    let d = self.m.mk_or(&disj);
+                    let d = self.mk_disjunction(&disj);
                     ax.push(d);
                     break;
                 }
@@ -35178,7 +35226,7 @@ impl Context {
             for (i, &p) in parts.iter().enumerate() {
                 if self.m.is_uninterp_const(p) && !bound.contains(&p) {
                     let (lo, hi) = ranges[i];
-                    let pv = self.mk_seq(cv[lo..hi].to_vec());
+                    let pv = self.mk_seq_sorted(self.m.get_sort(p), cv[lo..hi].to_vec());
                     subst.push((p, pv));
                     bound.insert(p);
                 }
@@ -42873,6 +42921,65 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
+    }
+
+    #[test]
+    fn concrete_sequences_are_interned_by_content() {
+        // `seq.at` past the end is the empty sequence itself, not a fresh
+        // constant the solver may keep apart from `seq.empty`.
+        let script = "
+            (declare-const a (Seq Int))
+            (assert (distinct a (seq.at (seq.unit 2) 2)))
+            (assert (= a (as seq.empty (Seq Int))))
+            (check-sat)
+            (reset)
+            (declare-const i Int)
+            (declare-const p Bool)
+            (assert (= (seq.unit 2) (ite p (ite (= 2 0) (seq.unit 1) (seq.unit 1)) (seq.unit i))))
+            (assert (= i 0))
+            (check-sat)
+            (reset)
+            (declare-const b (Seq Int))
+            (declare-const i Int)
+            (assert (= (seq.unit 2) (ite (= i (- (seq.len b) 1))
+                (ite (= 2 0) (seq.unit 1) (seq.unit 1)) (seq.++ (seq.unit 0) (seq.unit i)))))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_ne!(out[1], "sat");
+        assert_ne!(out[2], "sat");
+    }
+
+    #[test]
+    fn open_string_witness_is_not_sat() {
+        // No concrete strings confirm the abstraction's `sat`: never print
+        // `String!val!k` values.
+        let script = "
+            (declare-const a String)
+            (declare-const b String)
+            (declare-const d String)
+            (assert (not (= (str.++ a d) (str.++ b d))))
+            (assert (> (str.len d) 4))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(script).unwrap();
+        assert!(out.iter().all(|l| !l.contains("!val!")), "{out:?}");
+    }
+
+    #[test]
+    fn string_axioms_single_disjunct() {
+        let script = "
+            (declare-const a String)
+            (declare-const b String)
+            (assert (= (str.len a) 2))
+            (assert (str.contains (str.++ (str.++ \"\" \"ba\") \"\") a))
+            (assert (= (str.indexof (str.++ (str.replace \"aab\" \"ba\" \"ab\")
+                (str.at b (str.len a))) b 0) 2))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
