@@ -24869,6 +24869,7 @@ impl Context {
                 _ => return None,
             };
             let mut fresh = false;
+            let mut bounded = true;
             for (ui, (vs, body)) in universals.iter().enumerate() {
                 // The binder values to instantiate: the product of each
                 // binder's falsifier range.
@@ -24895,9 +24896,17 @@ impl Context {
                                 vals.extend(lo..=hi);
                             }
                             // Unbounded in this model (a binder-free part is
-                            // false): one instance inside refines it.
-                            (Some(v), None) | (None, Some(v)) => vals.push(v),
-                            (None, None) => vals.push(0),
+                            // false): one instance inside refines it, but this
+                            // model satisfies the universal only if a later
+                            // round finds it bounded.
+                            (Some(v), None) | (None, Some(v)) => {
+                                bounded = false;
+                                vals.push(v)
+                            }
+                            (None, None) => {
+                                bounded = false;
+                                vals.push(0)
+                            }
                         }
                     }
                     vals.sort_unstable();
@@ -24933,6 +24942,12 @@ impl Context {
                 }
             }
             if !fresh {
+                // Every instance is in, yet some universal is still unbounded
+                // in this model: its falsifiers outside the instantiated
+                // points are not ruled out.
+                if !bounded {
+                    return None;
+                }
                 // Confirm with the probes pinned to the values the ranges were
                 // read from (a model may not carry an eliminated constant).
                 let mut pinned = parts.clone();
@@ -31853,6 +31868,9 @@ impl Context {
                         if by_sort.entry(self.m.get_sort(t)).or_default().insert(t) {
                             fresh_term = true;
                         }
+                        if self.m.is_app(t) && user_decls.contains(&self.m.app_decl(t)) {
+                            by_decl.entry(self.m.app_decl(t)).or_default().insert(t);
+                        }
                     }
                     if instances.len() >= max_total {
                         return (instances, false); // capped: not saturated
@@ -31863,19 +31881,80 @@ impl Context {
                 // Enumeration fixpoint; overall completeness also needs the
                 // E-matching phase to have reached its own fixpoint AND no
                 // infinite-domain (datatype) binder to have been enumerated.
-                return (
-                    instances,
-                    ematch_saturated
-                        && !enum_capped
-                        && !dt_enumerated
-                        && !arith_enumerated
-                        && !seed_enumerated
-                        && !arith_constrained
-                        && !theory_constrained,
-                );
+                let mut saturated = ematch_saturated
+                    && !enum_capped
+                    && !dt_enumerated
+                    && !arith_enumerated
+                    && !seed_enumerated
+                    && !arith_constrained
+                    && !theory_constrained;
+                // The enumerated instances may bring applications the triggers
+                // of the E-matched universals match (`∀u v. f u = f v ⇒ u = v`
+                // enumerated yields `f a1` for `∀y. f y < 3`): the E-matching
+                // fixpoint no longer holds, and those instances are missing.
+                if saturated {
+                    let missing = self.ematch_missing_instances(
+                        &universals,
+                        &trigs,
+                        &by_decl,
+                        &instances,
+                        &seen,
+                    );
+                    if !missing.is_empty() {
+                        instances.extend(missing);
+                        saturated = false;
+                    }
+                }
+                return (instances, saturated);
             }
         }
         (instances, false) // ran out of rounds: not saturated
+    }
+
+    /// The E-matching instances of `universals` (each with its trigger sets
+    /// `trigs`) over the applications `by_decl` that are not among `seen`,
+    /// with the equivalence classes rebuilt over the assertions and
+    /// `instances`.
+    fn ematch_missing_instances(
+        &mut self,
+        universals: &[(Vec<AstId>, AstId)],
+        trigs: &[Vec<Vec<AstId>>],
+        by_decl: &BTreeMap<AstId, BTreeSet<AstId>>,
+        instances: &[AstId],
+        seen: &BTreeSet<AstId>,
+    ) -> Vec<AstId> {
+        let mut roots = self.assertions.clone();
+        roots.extend(instances.iter().copied());
+        self.ematch_rebuild_classes(&roots);
+        let mut out: Vec<AstId> = Vec::new();
+        for (ui, (vars, body)) in universals.iter().enumerate() {
+            let vs: BTreeSet<AstId> = vars.iter().copied().collect();
+            for set in &trigs[ui] {
+                for binding in self.ematch_set(set, &vs, by_decl) {
+                    let subst: Vec<(AstId, AstId)> =
+                        vars.iter().map(|&v| (v, binding[&v])).collect();
+                    let subst = self.with_fp_bits(subst);
+                    let mut raw = substitute(&mut self.m, *body, &subst);
+                    if !self.fp_deferred_decls.is_empty() {
+                        raw = self.fpa_blast(raw);
+                        raw = substitute(&mut self.m, raw, &subst);
+                    }
+                    let mut inst = crate::rewriter::simplify(&mut self.m, raw);
+                    for _ in 0..3 {
+                        let folded = self.dt_fold(inst);
+                        let next = crate::rewriter::simplify(&mut self.m, folded);
+                        if next == inst {
+                            break;
+                        }
+                        inst = next;
+                    }
+                    if !seen.contains(&inst) && !out.contains(&inst) {
+                        out.push(inst);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Extend a binder substitution with each FP binder's bit-vector image:
@@ -42760,6 +42839,40 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn range_universal_unbounded_in_model_is_not_sat() {
+        // The binder-free disjunct is false, so the range of `q1` is unbounded:
+        // instantiating one point proves nothing (`q1` large refutes it).
+        let script = "
+            (declare-const c Int)
+            (declare-const d Int)
+            (assert (< (- 1) (* 4 c)))
+            (assert (forall ((q1 Int)) (=> (and (> c (+ (* (- 3) q1) c))
+                (> (* q1 q1) (+ (+ c q1) (+ 3 c)))) (distinct d d))))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn enumerated_instances_feed_ematch_saturation() {
+        // Enumerating injectivity brings `A2int a1`, `A2int a2`, which the
+        // E-matched `∀y. 1 ≤ A2int y < 3` must also be instantiated at.
+        let script = "
+            (declare-sort A 0)
+            (declare-fun A2int (A) Int)
+            (declare-const a0 A)
+            (declare-const a1 A)
+            (declare-const a2 A)
+            (assert (forall ((u A) (v A)) (=> (= (A2int u) (A2int v)) (= u v))))
+            (assert (distinct a0 a1 a2))
+            (assert (<= (A2int a0) 4))
+            (assert (forall ((y2 A)) (and (< (A2int y2) 3) (<= 1 (A2int y2)))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
