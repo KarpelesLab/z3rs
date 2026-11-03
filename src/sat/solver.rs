@@ -6,6 +6,7 @@
 //! heuristic, and Luby restarts. Learnt-clause DB reduction and in-processing
 //! come later.
 
+use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -30,6 +31,12 @@ pub static DECIDE_FALSE_FIRST: core::sync::atomic::AtomicBool =
 
 /// Sentinel `reason`: a decision literal or a top-level fact (no antecedent).
 const REASON_NONE: i32 = -1;
+
+/// Chronological backtracking: a conflict whose backjump would undo more
+/// than this many decision levels backtracks one level instead, the
+/// asserting literal taking its level out of order (Nadel & Ryvchin, "Chronological
+/// Backtracking", SAT 2018; as in CaDiCaL's `chrono`).
+const CHRONO_LEVELS: u32 = 100;
 
 /// Value of literal `l` under the raw per-variable assignment `assign` — the
 /// free-function form of [`Solver::lit_value`], so a [`TheoryHook`] closure can
@@ -140,7 +147,39 @@ pub struct Solver {
     /// [`TheoryCtx::stable`] low-water mark, lowered by every backtrack).
     theory_stable: usize,
 
+    /// Clauses added above decision level 0 in resumable mode (see
+    /// [`Solver::set_resumable`]), not yet attached: the search attaches each
+    /// against the assignment it meets, backjumping where it is unit or
+    /// conflicting.
+    pending: VecDeque<Vec<Lit>>,
+    /// Keep the assignment across searches and add clauses mid-search, and
+    /// backtrack chronologically (see [`CHRONO_LEVELS`]): the trail is then
+    /// ordered by assignment, not by level, and an implied literal's level is
+    /// its antecedent's highest.
+    resumable: bool,
+    /// When set, the variables a theory watches (see
+    /// [`Solver::watch_theory_var`]): a theory pass is skipped while the trail
+    /// gained none of them and lost nothing.
+    theory_vars: Option<Vec<bool>>,
+    /// The trail length at the last theory pass.
+    theory_seen: usize,
+    /// The backjump distance past which a conflict backtracks
+    /// chronologically ([`CHRONO_LEVELS`]).
+    chrono_levels: u32,
+
     ok: bool,
+}
+
+/// What attaching a pending clause did (see [`Solver::attach_pending`]).
+enum PendingStep {
+    /// Every pending clause is attached, none unit or conflicting.
+    Idle,
+    /// A literal was enqueued (after a backjump): propagate it.
+    Progress,
+    /// A clause is false at the current level: analyze it.
+    Conflict(usize),
+    /// A clause is false at level 0.
+    Unsat,
 }
 
 impl Default for Solver {
@@ -174,6 +213,11 @@ impl Solver {
             trail_lim: Vec::new(),
             qhead: 0,
             theory_stable: 0,
+            pending: VecDeque::new(),
+            resumable: false,
+            theory_vars: None,
+            theory_seen: 0,
+            chrono_levels: CHRONO_LEVELS,
             ok: true,
         }
     }
@@ -239,10 +283,69 @@ impl Solver {
         self.lit_value(l) == LBool::True
     }
 
+    /// Keep the assignment of a search for the next one, as z3's and
+    /// MiniSat's incremental searches do: a clause added above decision level
+    /// 0 is queued instead of backtracking to level 0, and the next search
+    /// resumes from the current assignment, attaching each queued clause where
+    /// it stands — backjumping to the level where it becomes unit (and
+    /// propagating it) or conflicting (and analyzing it).
+    pub fn set_resumable(&mut self) {
+        self.resumable = true;
+    }
+
+    /// Declare `v` a variable the theory of [`Solver::solve_with_theory`]
+    /// watches. Once any is declared, the theory is consulted only when the
+    /// trail gained a declared variable or was backtracked since its last
+    /// pass (z3 calls a theory only on its own atoms' assignments).
+    pub fn watch_theory_var(&mut self, v: Var) {
+        self.ensure_var(v);
+        let tv = self.theory_vars.get_or_insert_with(Vec::new);
+        if tv.len() <= v as usize {
+            tv.resize(v as usize + 1, false);
+        }
+        tv[v as usize] = true;
+    }
+
+    /// Make the next theory pass see the whole trail as new (a theory rebuilt
+    /// from scratch asserts it again).
+    pub fn reset_theory(&mut self) {
+        self.theory_stable = 0;
+        self.theory_seen = usize::MAX;
+    }
+
+    /// Does the next theory pass have anything to see: a watched variable
+    /// assigned, or an assignment retracted, since the last one?
+    fn theory_due(&self) -> bool {
+        let Some(tv) = &self.theory_vars else {
+            return true;
+        };
+        self.theory_stable < self.theory_seen
+            || self.trail[self.theory_stable.min(self.trail.len())..]
+                .iter()
+                .any(|l| tv.get(l.var() as usize).copied().unwrap_or(false))
+    }
+
     /// Add a clause. Duplicate literals are merged, tautologies dropped, and an
     /// empty clause makes the problem unsatisfiable.
     pub fn add_clause(&mut self, lits: &[Lit]) {
         if !self.ok {
+            return;
+        }
+        if self.resumable && self.decision_level() > 0 {
+            for &l in lits {
+                self.ensure_var(l.var());
+            }
+            let mut ps: Vec<Lit> = lits.to_vec();
+            ps.sort_by_key(|l| l.index());
+            ps.dedup();
+            if ps.windows(2).any(|w| w[0].var() == w[1].var()) {
+                return;
+            }
+            if ps.is_empty() {
+                self.ok = false;
+            } else {
+                self.pending.push_back(ps);
+            }
             return;
         }
         // Clauses are added at decision level 0. After a prior `solve()` the trail
@@ -336,19 +439,93 @@ impl Solver {
     }
 
     /// Assign `l` true with the given antecedent. Returns `false` on conflict.
+    /// Backtracking chronologically, an implied literal takes the highest level
+    /// of its antecedent's other literals.
     fn enqueue(&mut self, l: Lit, reason: i32) -> bool {
+        let level = if self.resumable && reason >= 0 {
+            self.clauses[reason as usize]
+                .iter()
+                .filter(|&&q| q != l)
+                .map(|q| self.level[q.var() as usize])
+                .max()
+                .unwrap_or(0)
+        } else {
+            self.decision_level()
+        };
+        self.enqueue_at(l, reason, level)
+    }
+
+    /// Assign `l` true at decision level `level` with the given antecedent.
+    /// Returns `false` on conflict.
+    fn enqueue_at(&mut self, l: Lit, reason: i32, level: u32) -> bool {
         match self.lit_value(l) {
             LBool::True => true,
             LBool::False => false,
             LBool::Undef => {
                 let v = l.var() as usize;
                 self.assign[v] = LBool::from_bool(!l.sign());
-                self.level[v] = self.decision_level();
+                self.level[v] = level;
                 self.reason[v] = reason;
                 self.trail.push(l);
                 true
             }
         }
+    }
+
+    /// Attach the pending clauses (see [`Solver::set_resumable`]) in order,
+    /// against the current assignment, each watching its best two literals.
+    /// A unit clause is implied where it stands, at the level of its highest
+    /// false literal (backtracking chronologically, no backjump is needed),
+    /// and a false clause is a conflict for the search to analyze at its
+    /// level.
+    fn attach_pending(&mut self) -> PendingStep {
+        while let Some(mut c) = self.pending.pop_front() {
+            // True literals first (lowest level first), then unassigned ones,
+            // then false ones by decreasing level.
+            let key = |s: &Solver, l: Lit| -> (u8, i64) {
+                let lv = i64::from(s.level[l.var() as usize]);
+                match s.lit_value(l) {
+                    LBool::True => (0, lv),
+                    LBool::Undef => (1, 0),
+                    LBool::False => (2, -lv),
+                }
+            };
+            c.sort_by_key(|&l| key(self, l));
+            let v0 = self.lit_value(c[0]);
+            if c.len() == 1 {
+                // A unit clause is a level-0 fact.
+                let v = c[0].var() as usize;
+                match v0 {
+                    LBool::True => {
+                        self.level[v] = 0;
+                        self.reason[v] = REASON_NONE;
+                        continue;
+                    }
+                    LBool::False if self.level[v] == 0 => {
+                        self.ok = false;
+                        return PendingStep::Unsat;
+                    }
+                    LBool::False => self.cancel_until(self.level[v] - 1),
+                    LBool::Undef => {}
+                }
+                self.enqueue_at(c[0], REASON_NONE, 0);
+                return PendingStep::Progress;
+            }
+            let v1 = self.lit_value(c[1]);
+            let cref = self.clauses.len();
+            if v0 == LBool::True || v1 != LBool::False {
+                self.attach_clause(c, false);
+            } else if v0 == LBool::Undef {
+                let unit = c[0];
+                self.attach_clause(c, false);
+                self.enqueue(unit, cref as i32);
+                return PendingStep::Progress;
+            } else {
+                self.attach_clause(c, false);
+                return PendingStep::Conflict(cref);
+            }
+        }
+        PendingStep::Idle
     }
 
     /// Propagate all queued assignments. Returns the conflicting clause, if any.
@@ -505,6 +682,38 @@ impl Solver {
         }
     }
 
+    /// The highest level of the all-false clause `cref` and whether a single
+    /// literal has it (then moved to the front, and watched); `None` at level
+    /// 0. Backtracking chronologically, a conflict can lie below the current
+    /// level.
+    fn conflict_level(&mut self, cref: usize) -> Option<(u32, bool)> {
+        let c = &self.clauses[cref];
+        let lv = |q: &Lit| self.level[q.var() as usize];
+        let top = c.iter().map(lv).max().unwrap_or(0);
+        if top == 0 {
+            return None;
+        }
+        let at: Vec<usize> = (0..c.len()).filter(|&i| lv(&c[i]) == top).collect();
+        if at.len() > 1 {
+            return Some((top, false));
+        }
+        let k = at[0];
+        if k >= 2 {
+            // Watch the literal at `k` instead of the one at 1.
+            let old = (!self.clauses[cref][1]).index() as usize;
+            if let Some(i) = self.watches[old].iter().position(|&w| w == cref) {
+                self.watches[old].swap_remove(i);
+            }
+            self.clauses[cref].swap(1, k);
+            let new = (!self.clauses[cref][1]).index() as usize;
+            self.watches[new].push(cref);
+        }
+        if k != 0 {
+            self.clauses[cref].swap(0, 1);
+        }
+        Some((top, true))
+    }
+
     /// 1-UIP conflict analysis. Returns the learnt clause (asserting literal at
     /// index 0) and the level to backjump to.
     fn analyze(&mut self, confl: usize) -> (Vec<Lit>, u32) {
@@ -536,7 +745,10 @@ impl Solver {
             }
             // Next literal to resolve: the most recent `seen` one on the trail.
             index -= 1;
-            while !seen[self.trail[index].var() as usize] {
+            while {
+                let v = self.trail[index].var() as usize;
+                !seen[v] || self.level[v] < cur_level
+            } {
                 index -= 1;
             }
             let pl = self.trail[index];
@@ -579,14 +791,22 @@ impl Solver {
             return;
         }
         let target = self.trail_lim[level as usize];
+        // Backtracking chronologically, literals of a level `≤ level` sit
+        // above the cut too: they stay assigned, in their order.
+        let mut keep: Vec<Lit> = Vec::new();
         while self.trail.len() > target {
             let l = self.trail.pop().unwrap();
             let v = l.var() as usize;
+            if self.level[v] <= level && self.resumable {
+                keep.push(l);
+                continue;
+            }
             self.assign[v] = LBool::Undef;
             self.polarity[v] = l.sign(); // phase saving
             self.reason[v] = REASON_NONE;
             self.heap_insert(v as Var);
         }
+        self.trail.extend(keep.into_iter().rev());
         self.qhead = target;
         self.theory_stable = self.theory_stable.min(target);
         self.trail_lim.truncate(level as usize);
@@ -681,6 +901,7 @@ impl Solver {
             assign: &self.assign,
         });
         self.theory_stable = self.trail.len();
+        self.theory_seen = self.trail.len();
         if let Some(c) = prop.conflict {
             let neg: Vec<Lit> = c.iter().map(|&l| !l).collect();
             if let Some(cref) = self.attach_conflict_clause(neg) {
@@ -743,11 +964,14 @@ impl Solver {
         if !self.ok {
             return Some(SatResult::Unsat);
         }
-        self.cancel_until(0);
-        // Re-propagate level 0 against the full clause DB. Clauses added since the
-        // last solve (e.g. theory blocking clauses) may be unit or falsified under
-        // the existing level-0 assignment; resetting qhead forces them to be seen.
-        self.qhead = 0;
+        if !(self.resumable && assumptions.is_empty() && self.decision_level() > 0) {
+            self.cancel_until(0);
+            // Re-propagate level 0 against the full clause DB. Clauses added
+            // since the last solve (e.g. theory blocking clauses) may be unit or
+            // falsified under the existing level-0 assignment; resetting qhead
+            // forces them to be seen.
+            self.qhead = 0;
+        }
         for &l in assumptions {
             self.ensure_var(l.var());
         }
@@ -763,9 +987,18 @@ impl Solver {
             // first, then — only at the Boolean fixpoint with all assumptions
             // placed — one online theory-propagation pass (port of z3
             // `propagate_core`/`should_propagate`, `sat_solver.cpp:1002,1847`).
-            let confl: Option<usize> = if let Some(c) = self.propagate() {
+            let step = if self.pending.is_empty() {
+                PendingStep::Idle
+            } else {
+                self.attach_pending()
+            };
+            let confl: Option<usize> = if let PendingStep::Conflict(c) = step {
                 Some(c)
-            } else if self.decision_level() >= n_assump {
+            } else if let PendingStep::Unsat = step {
+                return Some(SatResult::Unsat);
+            } else if let Some(c) = self.propagate() {
+                Some(c)
+            } else if self.decision_level() >= n_assump && self.theory_due() {
                 match theory.as_deref_mut() {
                     Some(th) => match self.theory_pass(th) {
                         TheoryPass::Conflict(c) => Some(c),
@@ -780,6 +1013,25 @@ impl Solver {
             };
 
             if let Some(confl) = confl {
+                let chrono = self.resumable && n_assump == 0;
+                if chrono {
+                    // The conflict's own level: below it nothing is false.
+                    match self.conflict_level(confl) {
+                        None => {
+                            self.ok = false;
+                            return Some(SatResult::Unsat);
+                        }
+                        Some((lvl, true)) => {
+                            // One literal of that level: the clause is unit
+                            // just below it.
+                            self.cancel_until(lvl - 1);
+                            let unit = self.clauses[confl][0];
+                            self.enqueue(unit, confl as i32);
+                            continue;
+                        }
+                        Some((lvl, false)) => self.cancel_until(lvl),
+                    }
+                }
                 if self.decision_level() == 0 {
                     self.ok = false;
                     return Some(SatResult::Unsat);
@@ -790,10 +1042,15 @@ impl Solver {
                     self.cancel_until(0);
                     return Some(SatResult::Unsat);
                 }
-                self.cancel_until(btlevel);
+                let dl = self.decision_level();
+                if chrono && dl - btlevel > self.chrono_levels {
+                    self.cancel_until(dl - 1);
+                } else {
+                    self.cancel_until(btlevel);
+                }
                 let asserting = learnt[0];
                 if learnt.len() == 1 {
-                    self.enqueue(asserting, REASON_NONE);
+                    self.enqueue_at(asserting, REASON_NONE, 0);
                 } else {
                     let cref = self.clauses.len();
                     self.attach_clause(learnt, true);
@@ -1193,6 +1450,101 @@ mod tests {
         assert_eq!(s.solve(), SatResult::Sat);
         assert!(s.model_holds(Lit::pos(0)), "a must hold");
         assert!(s.model_holds(Lit::pos(1)), "lemma must force b");
+    }
+
+    /// Mock online theory: each listed pair of literals is inconsistent.
+    struct PairsHook {
+        bad: Vec<(Lit, Lit)>,
+    }
+    impl TheoryHook for PairsHook {
+        fn propagate(&mut self, ctx: &TheoryCtx<'_>) -> TheoryProp {
+            let val = |l| ctx.value(l);
+            let mut implied = Vec::new();
+            for &(a, b) in &self.bad {
+                match (val(a), val(b)) {
+                    (LBool::True, LBool::True) => {
+                        return TheoryProp {
+                            implied: Vec::new(),
+                            conflict: Some(alloc::vec![a, b]),
+                        };
+                    }
+                    (LBool::True, LBool::Undef) => implied.push((!b, alloc::vec![a])),
+                    _ => {}
+                }
+            }
+            TheoryProp {
+                implied,
+                conflict: None,
+            }
+        }
+    }
+
+    #[test]
+    fn resumable_search_matches_fresh_search() {
+        // Random 3-SAT plus theory pairs, the clauses added in batches between
+        // resumed searches (mid-search, with chronological backtracking past
+        // one level), against a fresh search over the same clauses.
+        let mut seed = 12345u64;
+        let mut rnd = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for _ in 0..2000 {
+            let nv = 8 + rnd(120) as i32;
+            let nc = (nv as u64 * (15 + rnd(30))) / 10;
+            let mut clauses: Vec<Vec<i32>> = Vec::new();
+            for _ in 0..nc {
+                let len = if rnd(10) == 0 { 1 } else { 2 + rnd(3) as usize };
+                let c: Vec<i32> = (0..len)
+                    .map(|_| {
+                        let v = 1 + rnd(nv as u64) as i32;
+                        if rnd(2) == 0 { v } else { -v }
+                    })
+                    .collect();
+                clauses.push(c);
+            }
+            let bad: Vec<(Lit, Lit)> = (0..rnd(6))
+                .map(|_| {
+                    let a = lits(&[1 + rnd(nv as u64) as i32])[0];
+                    let b = lits(&[-(1 + rnd(nv as u64) as i32)])[0];
+                    (a, b)
+                })
+                .filter(|(a, b)| a.var() != b.var())
+                .collect();
+            let mut live = Solver::new();
+            live.set_resumable();
+            live.chrono_levels = 1;
+            live.ensure_var(nv as Var);
+            let mut hook = PairsHook { bad: bad.clone() };
+            let mut verdict = SatResult::Sat;
+            let mut added = 0;
+            while added < clauses.len() {
+                let step = 1 + rnd(8) as usize;
+                for c in &clauses[added..(added + step).min(clauses.len())] {
+                    live.add_clause(&lits(c));
+                }
+                added = (added + step).min(clauses.len());
+                verdict = live.solve_with_theory(&mut hook);
+                if verdict == SatResult::Unsat {
+                    break;
+                }
+                for c in &clauses[..added] {
+                    assert!(lits(c).iter().any(|&l| live.model_holds(l)), "model");
+                }
+                for &(a, b) in &bad {
+                    assert!(!(live.model_holds(a) && live.model_holds(b)), "theory");
+                }
+            }
+            let mut fresh = Solver::new();
+            fresh.ensure_var(nv as Var);
+            for c in &clauses {
+                fresh.add_clause(&lits(c));
+            }
+            let mut hook = PairsHook { bad };
+            assert_eq!(fresh.solve_with_theory(&mut hook), verdict);
+        }
     }
 
     #[test]

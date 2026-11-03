@@ -195,6 +195,39 @@ impl IncEgraph {
         g
     }
 
+    /// Watch more terms and atoms (as [`Self::new`] does): the e-graph first
+    /// goes back to its permanent state, then asserts the whole trail again
+    /// at the next pass, so the new nodes are never undone.
+    pub fn extend(
+        &mut self,
+        m: &AstManager,
+        roots: &[AstId],
+        eqs: &[(Lit, AstId, AstId)],
+        preds: &[(Lit, AstId)],
+    ) {
+        let base = self.marks.first().map_or(self.undo.len(), |&(_, len)| len);
+        self.undo_to(base);
+        self.marks.clear();
+        self.processed = 0;
+        self.eq_log.clear();
+        self.eq_log_low = 0;
+        self.pending.clear();
+        for t in m.postorder_many(roots) {
+            self.intern(m, t);
+        }
+        for &(lit, a, b) in eqs {
+            let (x, y) = (self.intern(m, a), self.intern(m, b));
+            self.add_atom(lit, Atom::Eq(lit, x, y), &[x, y]);
+        }
+        for &(lit, t) in preds {
+            let x = self.intern(m, t);
+            self.add_atom(lit, Atom::Pred(lit, x), &[x]);
+        }
+        self.drain(&|_| LBool::Undef);
+        self.implied.clear();
+        self.conflict = None;
+    }
+
     fn add_atom(&mut self, lit: Lit, atom: Atom, nodes: &[usize]) {
         let id = self.atoms.len();
         self.atoms.push(atom);

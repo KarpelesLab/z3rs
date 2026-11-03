@@ -111,6 +111,9 @@ pub struct SmtCore {
     /// The online congruence closure (rebuilt when the atoms grow) and simplex.
     euf: Option<IncEgraph>,
     euf_stale: bool,
+    /// How many roots, equality atoms and predicate atoms the online
+    /// congruence closure watches.
+    euf_synced: (usize, usize, usize),
     arith: Option<ArithOnline>,
     /// The arithmetic atoms the online simplex does not watch yet.
     arith_new: usize,
@@ -119,6 +122,10 @@ pub struct SmtCore {
     /// Axiomatize each arithmetic equality atom when it is internalized
     /// (see [`SmtCore::eager_equalities`]).
     eager_eqs: bool,
+    /// Resumable searches (see [`SmtCore::resume_searches`]), and how many
+    /// atoms of each kind the SAT solver knows as theory variables.
+    resume: bool,
+    watched: (usize, usize, usize),
 }
 
 impl Default for SmtCore {
@@ -142,10 +149,13 @@ impl SmtCore {
             eq_pairs: BTreeSet::new(),
             euf: None,
             euf_stale: false,
+            euf_synced: (0, 0, 0),
             arith: None,
             arith_new: 0,
             eqs: Vec::new(),
             eager_eqs: false,
+            resume: false,
+            watched: (0, 0, 0),
         }
     }
 
@@ -156,6 +166,38 @@ impl SmtCore {
     /// model violates in a round of its own.
     pub fn eager_equalities(&mut self) {
         self.eager_eqs = true;
+    }
+
+    /// Resume each [`SmtCore::check`] from the assignment the previous one
+    /// ended with, the formulas asserted since joining the search where they
+    /// stand (see [`Solver::set_resumable`]), instead of searching again from
+    /// level 0.
+    pub fn resume_searches(&mut self) {
+        self.sat.set_resumable();
+        self.resume = true;
+    }
+
+    /// Declare the atoms' variables added since the last call as the
+    /// theories' (see [`Solver::watch_theory_var`]), in resumable mode.
+    fn watch_atoms(&mut self) {
+        if !self.resume {
+            return;
+        }
+        let (e, a, p) = self.watched;
+        for &(l, _, _) in &self.euf_eq[e..] {
+            self.sat.watch_theory_var(l.var());
+        }
+        for atom in &self.arith_atoms[a..] {
+            self.sat.watch_theory_var(atom.lit.var());
+        }
+        for &(l, _) in &self.pred_atoms[p..] {
+            self.sat.watch_theory_var(l.var());
+        }
+        self.watched = (
+            self.euf_eq.len(),
+            self.arith_atoms.len(),
+            self.pred_atoms.len(),
+        );
     }
 
     /// The clause `lit ∨ d < 0 ∨ d > 0` for the arithmetic equality atom
@@ -243,12 +285,15 @@ impl SmtCore {
             if let Some(a) = self.arith.as_mut() {
                 a.retract_all();
             }
-            self.euf = Some(IncEgraph::new(
+            sync_euf(
                 m,
+                &mut self.euf,
+                &mut self.euf_synced,
                 &self.euf_roots,
                 &self.euf_eq,
                 &self.pred_atoms,
-            ));
+            );
+            self.sat.reset_theory();
         }
         self.euf_stale = false;
         if self.arith_new < self.arith_atoms.len() {
@@ -294,6 +339,7 @@ impl SmtCore {
             if rounds > DPLL_ROUND_LIMIT {
                 return (SmtResult::Unknown, None);
             }
+            self.watch_atoms();
             let solved = if self.euf.is_none() && self.arith.is_none() {
                 self.sat.solve()
             } else {
@@ -466,7 +512,15 @@ impl SmtCore {
                         if let Some(a) = self.arith.as_mut() {
                             a.retract_all();
                         }
-                        self.euf = Some(IncEgraph::new(m, euf_roots, euf_eq, pred_atoms));
+                        sync_euf(
+                            m,
+                            &mut self.euf,
+                            &mut self.euf_synced,
+                            euf_roots,
+                            euf_eq,
+                            pred_atoms,
+                        );
+                        self.sat.reset_theory();
                     }
                     for (lit, d) in axioms {
                         self.equality_axiom(m, lit, &d);
@@ -499,6 +553,24 @@ impl SmtCore {
             }
         }
     }
+}
+
+/// Bring the online congruence closure `euf` up to the roots and atoms
+/// (`synced` counting those it watches): extended in place, or built.
+fn sync_euf(
+    m: &AstManager,
+    euf: &mut Option<IncEgraph>,
+    synced: &mut (usize, usize, usize),
+    roots: &[AstId],
+    eqs: &[(Lit, AstId, AstId)],
+    preds: &[(Lit, AstId)],
+) {
+    let (r, e, p) = *synced;
+    match euf.as_mut() {
+        Some(g) => g.extend(m, &roots[r..], &eqs[e..], &preds[p..]),
+        None => *euf = Some(IncEgraph::new(m, roots, eqs, preds)),
+    }
+    *synced = (roots.len(), eqs.len(), preds.len());
 }
 
 /// The online theories of [`check_model`]'s search: congruence closure and

@@ -213,6 +213,7 @@ impl Context {
         };
         let mut core = SmtCore::new();
         core.eager_equalities();
+        core.resume_searches();
         let goal = self.online_preprocess(base, &mut pre);
         let goal = self.with_axioms(goal);
         core.assert(&self.m, goal);
