@@ -31893,6 +31893,16 @@ impl Context {
                     if !had_ground {
                         seeded_sorts.insert(s);
                     }
+                } else if let Some(seeds) = self.theory_sort_seeds(s) {
+                    // A sort with a fixed interpretation (strings, sequences,
+                    // arrays, datatypes, rounding modes): a few distinct
+                    // values as refutation candidates, like z3's model-based
+                    // instantiation finds them. Its domain is not exhausted.
+                    let had_ground = by_sort.get(&s).is_some_and(|e| !e.is_empty());
+                    by_sort.entry(s).or_default().extend(seeds);
+                    if !had_ground {
+                        seeded_sorts.insert(s);
+                    }
                 } else if by_sort.get(&s).is_none_or(BTreeSet::is_empty) {
                     let rep = self.fresh_const(s);
                     by_sort.entry(s).or_default().insert(rep);
@@ -32194,6 +32204,83 @@ impl Context {
             }
         }
         out
+    }
+
+    /// A few distinct values of a sort with a fixed interpretation, as
+    /// instantiation candidates: the empty and a one-character string, the
+    /// empty and a unit sequence, two constant arrays, the nullary
+    /// constructors and a default value of a datatype, every rounding mode.
+    /// `None` for other sorts.
+    fn theory_sort_seeds(&mut self, s: AstId) -> Option<Vec<AstId>> {
+        if Some(s) == self.string_sort {
+            return Some(alloc::vec![self.mk_str_lit(""), self.mk_str_lit("a")]);
+        }
+        if Some(s) == self.rm_sort {
+            return Some(self.rm_modes.clone());
+        }
+        if let Some(e) = self.seq_elem_sort(s) {
+            let empty = self.seq_empty_of(s);
+            let mut out = alloc::vec![empty];
+            if let Some(d) = self.default_value_of_sort(e, 0)
+                && self.m.is_app(d)
+                && self.m.app_args(d).is_empty()
+                && let Ok(u) = self.seq_op("seq.unit", &[d])
+            {
+                out.push(u);
+            }
+            return Some(out);
+        }
+        if let Some((_, range)) = self.m.array_sort_params(s) {
+            let mut out = Vec::new();
+            for v in [0i64, 1] {
+                let elem = if self.m.is_int_sort(range) {
+                    Some(self.m.mk_int(v))
+                } else if self.m.is_bool_sort(range) {
+                    Some(self.mk_bool(v == 1))
+                } else {
+                    None
+                };
+                if let Some(e) = elem {
+                    out.push(self.m.mk_const_array(s, e));
+                }
+            }
+            return (!out.is_empty()).then_some(out);
+        }
+        if let Some(ctors) = self.datatypes.get(&s).cloned() {
+            let mut out = Vec::new();
+            for (cdecl, sels, _) in &ctors {
+                if sels.is_empty() {
+                    out.push(self.m.mk_app(*cdecl, &[]));
+                }
+            }
+            // A constructor application of default (nullary) arguments.
+            for (cdecl, sels, _) in &ctors {
+                if sels.is_empty() {
+                    continue;
+                }
+                let mut args = Vec::with_capacity(sels.len());
+                for &sd in sels {
+                    let fs = self.m.func_decl(sd)?.range;
+                    let a = if fs == s {
+                        out.first().copied()
+                    } else if self.m.is_int_sort(fs) || self.m.is_bool_sort(fs) {
+                        self.default_value_of_sort(fs, 0)
+                    } else {
+                        None
+                    };
+                    match a {
+                        Some(a) => args.push(a),
+                        None => break,
+                    }
+                }
+                if args.len() == sels.len() {
+                    out.push(self.m.mk_app(*cdecl, &args));
+                    break;
+                }
+            }
+            return (!out.is_empty()).then_some(out);
+        }
+        None
     }
 
     /// Extend a binder substitution with each FP binder's bit-vector image:
@@ -43754,6 +43841,27 @@ mod tests {
         assert_eq!(out[2], "sat");
         assert_eq!(out[3], "unsat");
         assert_eq!(&out[4..], &["sat", "false", "1", "unsat"]);
+    }
+
+    #[test]
+    fn universals_over_theory_sorts_are_refuted_by_seed_values() {
+        let script = "
+            (assert (forall ((x String)) (str.contains x \"b\")))
+            (check-sat)
+            (reset)
+            (declare-const c (Seq Int))
+            (assert (forall ((x (Seq Int))) (= x c)))
+            (check-sat)
+            (reset)
+            (declare-datatypes ((L 0)) (((nil) (cons (hd Int) (tl L)))))
+            (assert (forall ((x L)) ((_ is cons) x)))
+            (check-sat)
+            (reset)
+            (declare-const c (Array Int Int))
+            (assert (forall ((x (Array Int Int))) (= x c)))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"; 4]);
     }
 
     #[test]
