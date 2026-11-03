@@ -29240,13 +29240,19 @@ impl Context {
                 .copied()
                 .filter(|a| !relaxed.contains(a))
                 .collect();
-            self.opt_preprocess(&hard, &terms)
+            self.opt_preprocess(&hard, &terms, pre.is_some())
         } else {
             None
         };
+        // `lia2card` runs on what the rest of the preprocessing left; its
+        // replica over the original assertions only stands in when that
+        // preprocessing is outside the supported fragment.
         let trivially_false = trivially_false
-            || pre.as_ref().is_some_and(|p| p.0)
-            || opt_pre.as_ref().is_some_and(|p| p.inconsistent);
+            || match &opt_pre {
+                Some(p) => p.inconsistent,
+                None => pre.as_ref().is_some_and(|p| p.0),
+            };
+        let replayed = opt_pre.is_some();
         let pre_terms = opt_pre.map(|p| p.terms);
         let v = if trivially_false {
             "0"
@@ -29274,14 +29280,10 @@ impl Context {
                                 let scale = Rational::from_integer(soft_scale(&items));
                                 let zero = Rational::from_integer(Int::from(0));
                                 let (mut lo, mut open) = (zero.clone(), zero);
-                                for ((p, w), t) in items.iter().zip(pt) {
-                                    // `lia2card`'s boxes may decide it too.
+                                for ((_, w), t) in items.iter().zip(pt) {
                                     let decided = match t {
                                         PreTerm::Bool(b) => Some(*b),
-                                        _ => self
-                                            .soft_formulas
-                                            .get(p)
-                                            .and_then(|&(f, _)| self.box_decide(f, &boxes)),
+                                        _ => None,
                                     };
                                     match decided {
                                         Some(true) => {}
@@ -29322,6 +29324,19 @@ impl Context {
                     } else {
                         render_rational(r)
                     };
+                    continue;
+                }
+                if replayed {
+                    // The range of its Boolean encoding (the extreme it
+                    // improves towards first), else unrestricted.
+                    if let Some([PreTerm::Range(lo, hi)]) = pre_i.map(|v| v.as_slice()) {
+                        let (a, b) = if maximize { (hi, lo) } else { (lo, hi) };
+                        self.objective_values[i] = alloc::format!(
+                            " (interval {} {})",
+                            render_int(a.numerator()),
+                            render_int(b.numerator())
+                        );
+                    }
                     continue;
                 }
                 let t = crate::rewriter::substitute(&mut self.m, term, &pinned);
@@ -29581,62 +29596,6 @@ impl Context {
             }
         }
         Some((lo, hi))
-    }
-
-    /// The truth value of the Boolean combination `f` of linear atoms when
-    /// the `lia2card` boxes of its constants decide every atom it needs.
-    fn box_decide(&self, f: AstId, boxes: &BTreeMap<AstId, (Rational, Rational)>) -> Option<bool> {
-        use crate::ast::ArithOp;
-        let m = &self.m;
-        if m.is_true(f) || m.is_false(f) {
-            return Some(m.is_true(f));
-        }
-        let args = m.app_args(f);
-        if m.is_not(f) {
-            return self.box_decide(args[0], boxes).map(|b| !b);
-        }
-        if m.is_or(f) || m.is_and(f) {
-            let unit = m.is_and(f);
-            let mut all = true;
-            for &a in args {
-                match self.box_decide(a, boxes) {
-                    Some(b) if b != unit => return Some(b),
-                    Some(_) => {}
-                    None => all = false,
-                }
-            }
-            return all.then_some(unit);
-        }
-        let op = m.arith_op(f);
-        let arith_eq = m.is_eq(f) && args.len() == 2 && m.is_arith_sort(m.get_sort(args[0]));
-        if !(arith_eq
-            || matches!(
-                op,
-                Some(ArithOp::Le | ArithOp::Lt | ArithOp::Ge | ArithOp::Gt)
-            ))
-            || args.len() != 2
-        {
-            return None;
-        }
-        // The range of lhs − rhs.
-        let lin = crate::smt::solver::ast_to_lin(m, args[0])
-            .sub(&crate::smt::solver::ast_to_lin(m, args[1]));
-        let (lo, hi) = Self::box_range(&lin, boxes)?;
-        let zero = Rational::from_integer(Int::from(0));
-        let (yes, no) = match op {
-            _ if arith_eq => (lo == zero && hi == zero, lo > zero || hi < zero),
-            Some(ArithOp::Le) => (hi <= zero, lo > zero),
-            Some(ArithOp::Lt) => (hi < zero, lo >= zero),
-            Some(ArithOp::Ge) => (lo >= zero, hi < zero),
-            _ => (lo > zero, hi <= zero),
-        };
-        if yes {
-            Some(true)
-        } else if no {
-            Some(false)
-        } else {
-            None
-        }
     }
 
     /// Decide the assertions plus `fs` for a `pareto` step. A nonlinear real
@@ -50350,6 +50309,25 @@ mod tests {
             "(objectives\n (x0  (interval 1 0))\n (x0  (interval 0 1))\n \
              (x1  (interval (* (- 1) oo) oo))\n ((+ x0 (- x0) 7) 7)\n)"
         );
+        // lia2card sees the bounds solve-eqs left: `x = y + 1` empties both
+        // boxes, so `x ≠ -4` stays open; `¬q` (from `q → x + y = 2`) is
+        // solved to `q := false`, deciding the soft `q`.
+        let after_solve = "
+            (declare-const x Int)
+            (declare-const y Int)
+            (declare-const q Bool)
+            (assert (<= 0 x 1))
+            (assert (<= 1 y 4))
+            (assert (= (- x y) 1))
+            (assert (or (not q) (= (+ x y y) 2)))
+            (assert-soft (not (= x (- 4))) :id a)
+            (assert-soft q :id b)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(after_solve).unwrap();
+        assert_eq!(out[0], "unsat");
+        assert_eq!(out[1], "(objectives\n (a  (interval 0 1))\n (b 1)\n)");
     }
 
     #[test]

@@ -589,6 +589,9 @@ pub(super) enum PreTerm {
     Num(puremp::Rational, bool),
     /// `true` or `false`.
     Bool(bool),
+    /// An integer term over `lia2card`'s Boolean-encoded constants only,
+    /// with its range `(lo, hi)`.
+    Range(puremp::Rational, puremp::Rational),
     /// Anything else.
     Other,
 }
@@ -656,9 +659,15 @@ impl Context {
     /// are unsatisfiable: whether they simplify to `false` (z3 then never
     /// reaches its optimizer and reports 0), which objectives become
     /// numerals, and which soft constraints become `true` or `false`. `objs`
-    /// holds each objective's terms. `None` when a term lies outside the
-    /// supported fragment.
-    pub(super) fn opt_preprocess(&self, fmls: &[AstId], objs: &[Vec<AstId>]) -> Option<OptPre> {
+    /// holds each objective's terms; `elim_01` adds the `lia2card` step that
+    /// runs without a logic, assumptions or `opt.incremental`. `None` when a
+    /// term lies outside the supported fragment.
+    pub(super) fn opt_preprocess(
+        &self,
+        fmls: &[AstId],
+        objs: &[Vec<AstId>],
+        elim_01: bool,
+    ) -> Option<OptPre> {
         let mut b = Builder {
             s: Simp::new(),
             scopes: Vec::new(),
@@ -718,6 +727,8 @@ impl Context {
             }
         }
         // solve-eqs: eliminate a variable a top-level equation defines.
+        // Its `bound_manager` reads the bounds once, before the first round.
+        let lower = goal_lower_bounds(s, &goal);
         let mut rounds = 0;
         while !inconsistent && rounds < 64 {
             rounds += 1;
@@ -725,7 +736,7 @@ impl Context {
                 let f = goal[i];
                 solve_eq(s, f).map(|(x, d)| (i, x, d))
             });
-            let Some((i, x, def)) = solved.or_else(|| bound_eq(s, &goal)) else {
+            let Some((i, x, def)) = solved.or_else(|| bound_eq(s, &goal, &lower)) else {
                 break;
             };
             goal.remove(i);
@@ -743,11 +754,23 @@ impl Context {
             }
             inconsistent = !normalize_goal(s, &mut goal);
         }
+        // `opt.elim_01`: `lia2card` and the `simplify` after it.
+        let mut boxes = BTreeMap::new();
+        if elim_01 && !inconsistent {
+            boxes = lia2card(s, &mut goal, &mut obj);
+            // Only a formula rewritten to `false` refutes the goal: an atom
+            // it left open is a pseudo-Boolean constraint now, so a literal
+            // and its negation no longer face each other syntactically.
+            inconsistent = goal.iter().any(|&g| *s.op(g) == Op::False);
+        }
         let mut flat = obj.into_iter().map(|o| match s.op(o) {
             Op::Num(r) => PreTerm::Num(r.clone(), *s.sort(o) == Sort::Int),
             Op::True => PreTerm::Bool(true),
             Op::False => PreTerm::Bool(false),
-            _ => PreTerm::Other,
+            _ => match box_range(s, o, &boxes) {
+                Some((lo, hi)) => PreTerm::Range(lo, hi),
+                None => PreTerm::Other,
+            },
         });
         let terms = objs
             .iter()
@@ -913,8 +936,17 @@ fn is_uconst(s: &Simp, t: T) -> bool {
 /// `basic_extract_eq` and the linear cases of `arith_extract_eq`): `x = t`,
 /// `x + r = t` (a real `x` may carry any nonzero coefficient, an integer one
 /// only -1) and, over the reals, `x·c = t` for nonzero numerals `c`; `x`
-/// must not occur in its definition.
+/// must not occur in its definition. A Boolean constant `p` or `¬p` is
+/// `p := true` / `p := false`.
 fn solve_eq(s: &mut Simp, f: T) -> Option<(T, T)> {
+    // A Boolean constant asserted (`p := true`) or negated (`p := false`).
+    if is_uconst(s, f) && *s.sort(f) == Sort::Bool {
+        return Some((f, s.mk_true()));
+    }
+    if *s.op(f) == Op::Not && is_uconst(s, s.args(f)[0]) {
+        let x = s.args(f)[0];
+        return Some((x, s.mk_false()));
+    }
     if *s.op(f) != Op::Eq || s.args(f).len() != 2 {
         return None;
     }
@@ -940,13 +972,11 @@ fn solve_eq(s: &mut Simp, f: T) -> Option<(T, T)> {
     None
 }
 
-/// A formula `x ≤ c` of the goal where the goal also bounds `x ≥ c`
-/// (non-strictly), with its index: `x = c` (`arith_extract_eq::get_eqs`
-/// over z3's `bound_manager`, which reads the bounds of the atoms that
-/// compare a constant with a numeral, normalizing strict integer ones).
-fn bound_eq(s: &mut Simp, goal: &[T]) -> Option<(usize, T, T)> {
+/// The best lower bound `(value, strict)` of each constant among the
+/// goal's atoms that compare a constant with a numeral (z3's
+/// `bound_manager`, normalizing strict integer bounds).
+fn goal_lower_bounds(s: &Simp, goal: &[T]) -> BTreeMap<T, (puremp::Rational, bool)> {
     use puremp::Rational as Q;
-    // The best lower bound of each constant: (value, strict).
     let mut lower: BTreeMap<T, (Q, bool)> = BTreeMap::new();
     for &f in goal {
         let (mut atom, mut pos) = (f, true);
@@ -994,6 +1024,17 @@ fn bound_eq(s: &mut Simp, goal: &[T]) -> Option<(usize, T, T)> {
             lower.insert(v, (n, strict));
         }
     }
+    lower
+}
+
+/// A formula `x ≤ c` of the goal where `lower` (the bounds `solve-eqs` read
+/// before its first round, [`goal_lower_bounds`]) bounds `x ≥ c`
+/// non-strictly, with its index: `x = c` (`arith_extract_eq::get_eqs`).
+fn bound_eq(
+    s: &mut Simp,
+    goal: &[T],
+    lower: &BTreeMap<T, (puremp::Rational, bool)>,
+) -> Option<(usize, T, T)> {
     goal.iter().enumerate().find_map(|(i, &f)| {
         if *s.op(f) != Op::Le || s.args(f).len() != 2 {
             return None;
@@ -1005,6 +1046,263 @@ fn bound_eq(s: &mut Simp, goal: &[T]) -> Option<(usize, T, T)> {
         (is_uconst(s, x) && lower.get(&x).is_some_and(|(lo, st)| !st && lo == hi))
             .then_some((i, x, c))
     })
+}
+
+/// The integer bounds z3's `bound_manager` reads off the goal's literals:
+/// `x ⋈ n` / `n ⋈ x` (negations flipped, strict ones rounded), `x = n`, and
+/// a disjunction `x = n₁ ∨ … ∨ x = nₖ` (bounded by the least and largest
+/// `nᵢ`). Each constant's tightest `(lower, upper)`.
+fn goal_int_bounds(s: &Simp, goal: &[T]) -> BTreeMap<T, (Option<Int>, Option<Int>)> {
+    use puremp::Rational as Q;
+    let mut out: BTreeMap<T, (Option<Int>, Option<Int>)> = BTreeMap::new();
+    let int_const = |t: T| is_uconst(s, t) && *s.sort(t) == Sort::Int;
+    let num = |t: T| match s.op(t) {
+        Op::Num(n) if n.is_integer() => Some(n.numerator().clone()),
+        _ => None,
+    };
+    let mut add = |v: T, lo: Option<Int>, hi: Option<Int>| {
+        let e = out.entry(v).or_insert((None, None));
+        if let Some(l) = lo {
+            e.0 = Some(e.0.take().map_or(l.clone(), |o| if l > o { l } else { o }));
+        }
+        if let Some(h) = hi {
+            e.1 = Some(e.1.take().map_or(h.clone(), |o| if h < o { h } else { o }));
+        }
+    };
+    // `x = n` with `x` an integer constant (either side).
+    let eq_bound = |f: T| -> Option<(T, Int)> {
+        if *s.op(f) != Op::Eq || s.args(f).len() != 2 {
+            return None;
+        }
+        let (a, b) = (s.args(f)[0], s.args(f)[1]);
+        if int_const(a) {
+            Some((a, num(b)?))
+        } else if int_const(b) {
+            Some((b, num(a)?))
+        } else {
+            None
+        }
+    };
+    for &f in goal {
+        if *s.op(f) == Op::Or && !s.args(f).is_empty() {
+            let eqs: Option<Vec<(T, Int)>> = s.args(f).iter().map(|&e| eq_bound(e)).collect();
+            if let Some(eqs) = eqs
+                && eqs.iter().all(|(v, _)| *v == eqs[0].0)
+            {
+                let lo = eqs.iter().map(|(_, n)| n.clone()).min();
+                let hi = eqs.iter().map(|(_, n)| n.clone()).max();
+                add(eqs[0].0, lo, hi);
+            }
+            continue;
+        }
+        if let Some((v, n)) = eq_bound(f) {
+            add(v, Some(n.clone()), Some(n));
+            continue;
+        }
+        let (mut atom, mut pos) = (f, true);
+        while *s.op(atom) == Op::Not {
+            atom = s.args(atom)[0];
+            pos = !pos;
+        }
+        let op = s.op(atom).clone();
+        if !matches!(op, Op::Le | Op::Ge | Op::Lt | Op::Gt) || s.args(atom).len() != 2 {
+            continue;
+        }
+        let (l, r) = (s.args(atom)[0], s.args(atom)[1]);
+        // `v ⋈ n` as (is_lower, strict).
+        let (v, n, mut lower, mut strict) = match (s.op(l), s.op(r)) {
+            (_, Op::Num(n)) if int_const(l) => (
+                l,
+                n.clone(),
+                matches!(op, Op::Ge | Op::Gt),
+                matches!(op, Op::Lt | Op::Gt),
+            ),
+            (Op::Num(n), _) if int_const(r) => (
+                r,
+                n.clone(),
+                matches!(op, Op::Le | Op::Lt),
+                matches!(op, Op::Lt | Op::Gt),
+            ),
+            _ => continue,
+        };
+        if !pos {
+            lower = !lower;
+            strict = !strict;
+        }
+        let one = Q::from_integer(Int::from(1));
+        let n = match (lower, strict) {
+            (true, false) => n.ceil(),
+            (true, true) => n.add(&one).ceil(),
+            (false, false) => n.floor(),
+            (false, true) => n.sub(&one).floor(),
+        };
+        if lower {
+            add(v, Some(n), None);
+        } else {
+            add(v, None, Some(n));
+        }
+    }
+    out
+}
+
+/// `t` as a linear form over integer constants (`None` outside `+`, `-`,
+/// numeral products and numerals).
+fn int_lin(s: &Simp, t: T) -> Option<(BTreeMap<T, puremp::Rational>, puremp::Rational)> {
+    use puremp::Rational as Q;
+    let mut coeffs: BTreeMap<T, Q> = BTreeMap::new();
+    let mut k = Q::from_integer(Int::from(0));
+    let mut stack = alloc::vec![(t, Q::from_integer(Int::from(1)))];
+    while let Some((u, c)) = stack.pop() {
+        match s.op(u) {
+            Op::Num(n) => k = k.add(&c.mul(n)),
+            Op::Uf(_) if s.args(u).is_empty() && *s.sort(u) == Sort::Int => {
+                let e = coeffs
+                    .entry(u)
+                    .or_insert_with(|| Q::from_integer(Int::from(0)));
+                *e = e.add(&c);
+            }
+            Op::Add => stack.extend(s.args(u).iter().map(|&a| (a, c.clone()))),
+            Op::Sub => {
+                let a = s.args(u);
+                stack.push((a[0], c.clone()));
+                stack.extend(a[1..].iter().map(|&b| (b, c.neg())));
+            }
+            Op::Uminus => stack.push((s.args(u)[0], c.neg())),
+            Op::Mul => {
+                let a = s.args(u);
+                let mut c = c;
+                let mut rest = None;
+                for &x in a {
+                    match s.op(x) {
+                        Op::Num(n) => c = c.mul(n),
+                        _ if rest.is_none() => rest = Some(x),
+                        _ => return None,
+                    }
+                }
+                match rest {
+                    Some(x) => stack.push((x, c)),
+                    None => k = k.add(&c),
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some((coeffs, k))
+}
+
+/// z3's `lia2card` step of the optimizer preprocessing: every integer
+/// constant the goal bounds by `0 ≤ lo ≤ x ≤ hi` with `hi − lo ≤ 100`
+/// becomes a sum of Booleans, so a comparison of a linear term over such
+/// constants only is decided as soon as their ranges decide it. Rewrites
+/// the goal and the objective terms with those decisions; returns the
+/// converted constants' ranges.
+fn lia2card(
+    s: &mut Simp,
+    goal: &mut [T],
+    obj: &mut [T],
+) -> BTreeMap<T, (puremp::Rational, puremp::Rational)> {
+    use puremp::Rational as Q;
+    let boxes: BTreeMap<T, (Q, Q)> = goal_int_bounds(s, goal)
+        .into_iter()
+        .filter_map(|(v, (lo, hi))| {
+            let (lo, hi) = (lo?, hi?);
+            (lo >= Int::from(0) && hi >= lo && hi.clone().sub(&lo) <= Int::from(100))
+                .then(|| (v, (Q::from_integer(lo), Q::from_integer(hi))))
+        })
+        .collect();
+    if boxes.is_empty() {
+        return boxes;
+    }
+    // Every comparison over boxed constants only, decided by its range.
+    let mut map: BTreeMap<T, T> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    let mut stack: Vec<T> = goal.iter().chain(obj.iter()).copied().collect();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        stack.extend(s.args(t).iter().copied());
+        let op = s.op(t).clone();
+        if !matches!(op, Op::Le | Op::Ge | Op::Lt | Op::Gt | Op::Eq) || s.args(t).len() != 2 {
+            continue;
+        }
+        let (a, b) = (s.args(t)[0], s.args(t)[1]);
+        if !s.sort(a).is_arith_sort() {
+            continue;
+        }
+        let (Some((ca, ka)), Some((cb, kb))) = (int_lin(s, a), int_lin(s, b)) else {
+            continue;
+        };
+        // The range of a − b.
+        let (mut lo, mut hi) = (ka.sub(&kb), ka.sub(&kb));
+        let mut boxed = true;
+        let terms = ca
+            .into_iter()
+            .chain(cb.into_iter().map(|(v, c)| (v, c.neg())));
+        for (v, c) in terms {
+            let Some((l, h)) = boxes.get(&v) else {
+                boxed = false;
+                break;
+            };
+            let (x, y) = (c.mul(l), c.mul(h));
+            let (x, y) = if x <= y { (x, y) } else { (y, x) };
+            lo = lo.add(&x);
+            hi = hi.add(&y);
+        }
+        if !boxed {
+            continue;
+        }
+        let zero = Q::from_integer(Int::from(0));
+        let value = match op {
+            Op::Eq if lo > zero || hi < zero => Some(false),
+            Op::Eq if lo == zero && hi == zero => Some(true),
+            Op::Le if lo > zero => Some(false),
+            Op::Le if hi <= zero => Some(true),
+            Op::Lt if lo >= zero => Some(false),
+            Op::Lt if hi < zero => Some(true),
+            Op::Ge if hi < zero => Some(false),
+            Op::Ge if lo >= zero => Some(true),
+            Op::Gt if hi <= zero => Some(false),
+            Op::Gt if lo > zero => Some(true),
+            _ => None,
+        };
+        if let Some(v) = value {
+            let c = if v { s.mk_true() } else { s.mk_false() };
+            map.insert(t, c);
+        }
+    }
+    if !map.is_empty() {
+        for slot in goal.iter_mut().chain(obj.iter_mut()) {
+            let r = substitute(s, *slot, &map);
+            *slot = s.simplify(r);
+        }
+    }
+    boxes
+}
+
+/// The range of the integer term `t` over `boxes` when it is linear in
+/// boxed constants only (at least one).
+fn box_range(
+    s: &Simp,
+    t: T,
+    boxes: &BTreeMap<T, (puremp::Rational, puremp::Rational)>,
+) -> Option<(puremp::Rational, puremp::Rational)> {
+    if *s.sort(t) != Sort::Int {
+        return None;
+    }
+    let (coeffs, k) = int_lin(s, t)?;
+    if coeffs.is_empty() {
+        return None;
+    }
+    let (mut lo, mut hi) = (k.clone(), k);
+    for (v, c) in coeffs {
+        let (l, h) = boxes.get(&v)?;
+        let (x, y) = (c.mul(l), c.mul(h));
+        let (x, y) = if x <= y { (x, y) } else { (y, x) };
+        lo = lo.add(&x);
+        hi = hi.add(&y);
+    }
+    Some((lo, hi))
 }
 
 /// `x + r = y` (`arith_extract_eq::solve_add`).
