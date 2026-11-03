@@ -1567,6 +1567,17 @@ impl Model {
         if let Some(v) = m.bv_numeral_value(t) {
             return v.mod_2k(u64::from(width));
         }
+        // The `(_ int2bv n)` bridge over a symbolic integer: its argument's
+        // value modulo 2ⁿ (not a free term, which would read as zero).
+        if let Some(app) = m.app(t).filter(|a| a.args.len() == 1)
+            && m.func_decl(app.decl).and_then(|d| d.name.as_str()) == Some("int2bv")
+            && m.is_int_sort(m.get_sort(app.args[0]))
+            && let Some(v) = self
+                .eval_num_full(m, app.args[0])
+                .and_then(|r| r.to_integer())
+        {
+            return v.mod_2k(u64::from(width));
+        }
         if m.is_ite(t) {
             let a = m.app_args(t).to_vec();
             return if self.eval_bool_full(m, a[0]) {
