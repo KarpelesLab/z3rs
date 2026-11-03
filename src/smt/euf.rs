@@ -73,6 +73,14 @@ impl Egraph {
         id
     }
 
+    /// [`Self::find`] without path compression.
+    fn root(&self, mut x: usize) -> usize {
+        while self.parent[x] != x {
+            x = self.parent[x];
+        }
+        x
+    }
+
     fn find(&mut self, mut x: usize) -> usize {
         while self.parent[x] != x {
             self.parent[x] = self.parent[self.parent[x]]; // path halving
@@ -141,8 +149,40 @@ impl Egraph {
     /// are equal share it). Interns `t` if unseen. Meaningful after a call to
     /// `is_consistent` has applied the equalities.
     pub fn class_of(&mut self, m: &AstManager, t: AstId) -> usize {
+        let old = self.terms.len();
         let i = self.intern(m, t);
+        // A term first seen now joins the class of a congruent application
+        // already present (children are interned before their parents).
+        for k in old..self.terms.len() {
+            let Some((decl, args)) = self.app[k].clone() else {
+                continue;
+            };
+            let key: Vec<usize> = args.iter().map(|&a| self.find(a)).collect();
+            let same = (0..old).find(|&j| {
+                self.app[j].as_ref().is_some_and(|(d, a)| {
+                    *d == decl
+                        && a.len() == key.len()
+                        && a.iter().zip(&key).all(|(&x, &y)| self.root(x) == y)
+                })
+            });
+            if let Some(j) = same {
+                self.union(k, j);
+            }
+        }
         self.find(i)
+    }
+
+    /// The interned terms that are applications of `decl`.
+    pub fn apps_of(&self, decl: AstId) -> Vec<AstId> {
+        (0..self.terms.len())
+            .filter(|&i| self.app[i].as_ref().is_some_and(|(d, _)| *d == decl))
+            .map(|i| self.terms[i])
+            .collect()
+    }
+
+    /// Has `t` been interned?
+    pub fn contains(&self, t: AstId) -> bool {
+        self.ids.contains_key(&t)
     }
 
     /// Are the `equalities` (with congruence) consistent with the

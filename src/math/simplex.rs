@@ -136,6 +136,10 @@ pub struct Simplex {
     /// length at each open [`push`](Simplex::push).
     undo: Vec<(usize, bool, Option<Bound>)>,
     scopes: Vec<usize>,
+    /// The basic variables that may violate a bound: every one whose value
+    /// changed or whose bound tightened since [`check`](Simplex::check) last
+    /// found it within its bounds (a superset of the violated ones).
+    dirty: BTreeSet<usize>,
 }
 
 impl Simplex {
@@ -190,6 +194,7 @@ impl Simplex {
         self.rows.push(Row { basic: s, coeffs });
         self.row_of[s] = Some(r);
         self.value[s] = val;
+        self.dirty.insert(s);
         s
     }
 
@@ -205,6 +210,9 @@ impl Simplex {
         }
         if self.row_of[v].is_none() && self.value[v] < val {
             self.update(v, val.clone());
+        }
+        if self.row_of[v].is_some() {
+            self.dirty.insert(v);
         }
         let old = self.lower[v].replace(Bound { val, tag });
         if !self.scopes.is_empty() {
@@ -225,6 +233,9 @@ impl Simplex {
         }
         if self.row_of[v].is_none() && self.value[v] > val {
             self.update(v, val.clone());
+        }
+        if self.row_of[v].is_some() {
+            self.dirty.insert(v);
         }
         let old = self.upper[v].replace(Bound { val, tag });
         if !self.scopes.is_empty() {
@@ -262,6 +273,7 @@ impl Simplex {
             let a = &row.coeffs[&v];
             let b = row.basic;
             self.value[b].add_scaled(&delta, a);
+            self.dirty.insert(b);
         }
         self.value[v] = val;
     }
@@ -288,14 +300,17 @@ impl Simplex {
     /// undecided.
     pub fn check(&mut self, budget: &mut u64) -> Check {
         loop {
-            // Leaving variable: the smallest-index basic variable out of bounds.
-            let Some(xi) = self
-                .rows
-                .iter()
-                .map(|r| r.basic)
-                .filter(|&b| self.below_lower(b) || self.above_upper(b))
-                .min()
-            else {
+            // Leaving variable: the smallest-index basic variable out of bounds
+            // (the dirty ones found within their bounds are cleaned on the way).
+            let mut leaving = None;
+            while let Some(&b) = self.dirty.first() {
+                if self.row_of[b].is_some() && (self.below_lower(b) || self.above_upper(b)) {
+                    leaving = Some(b);
+                    break;
+                }
+                self.dirty.pop_first();
+            }
+            let Some(xi) = leaving else {
                 return Check::Sat;
             };
             let r = self.row_of[xi].unwrap();
@@ -397,6 +412,7 @@ impl Simplex {
         self.rows[r] = Row { basic: xj, coeffs };
         self.row_of[xi] = None;
         self.row_of[xj] = Some(r);
+        self.dirty.insert(xj);
     }
 
     /// Concrete rational values for every variable, with `δ` instantiated small

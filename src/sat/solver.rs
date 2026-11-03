@@ -21,6 +21,13 @@ pub enum SatResult {
     Unsat,
 }
 
+/// When set, fresh variables are first decided `false` (z3's default
+/// phase, `smt.phase_selection` with a `false` initial phase) instead of
+/// `true`. Set around the searches whose models only steer quantifier
+/// instantiation, so the models of other checks are unchanged.
+pub static DECIDE_FALSE_FIRST: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Sentinel `reason`: a decision literal or a top-level fact (no antecedent).
 const REASON_NONE: i32 = -1;
 
@@ -183,7 +190,8 @@ impl Solver {
         self.assign.push(LBool::Undef);
         self.level.push(0);
         self.reason.push(REASON_NONE);
-        self.polarity.push(false);
+        self.polarity
+            .push(DECIDE_FALSE_FIRST.load(core::sync::atomic::Ordering::Relaxed));
         self.activity.push(0.0);
         self.heap_pos.push(-1);
         self.seen.push(false);

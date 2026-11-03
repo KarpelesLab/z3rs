@@ -863,6 +863,8 @@ fn render_int(v: &Int) -> String {
     }
 }
 use super::decl_table::DeclTable;
+
+mod ematch_search;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -2941,6 +2943,13 @@ struct Context {
     quant_pred_exact: BTreeMap<AstId, usize>,
     /// User `:pattern` trigger sets of top-level universals, by body.
     universal_patterns: BTreeMap<AstId, Vec<Vec<AstId>>>,
+    /// User `:no-pattern` terms of universals (top-level ones and the
+    /// definitions of quantifier abstractions), by body.
+    universal_no_patterns: BTreeMap<AstId, Vec<AstId>>,
+    /// User `:pattern` trigger sets of the definitions of quantifier
+    /// abstractions (see [`Self::quant_definition`]), by body; used by the
+    /// relevancy-guided E-matching only.
+    def_patterns: BTreeMap<AstId, Vec<Vec<AstId>>>,
     /// Arrays the last satisfiable check read as functions (array constant →
     /// function), see [`Self::arrays_as_functions`].
     array_fns: BTreeMap<AstId, AstId>,
@@ -4147,6 +4156,8 @@ impl Context {
             in_quant_defs: false,
             quant_pred_exact: BTreeMap::new(),
             universal_patterns: BTreeMap::new(),
+            universal_no_patterns: BTreeMap::new(),
+            def_patterns: BTreeMap::new(),
             array_fns: BTreeMap::new(),
             ematch_class: BTreeMap::new(),
             ematch_members: Vec::new(),
@@ -5299,6 +5310,7 @@ impl Context {
                     let inner = self.skolemize_body(&inner, &univ, true)?;
                     let (vars, body) = self.parse_quantifier(&binders, &inner)?;
                     let pats = self.user_patterns(&binders, &vars, &ql[2]);
+                    let no_pats = self.user_no_patterns(&binders, &vars, &ql[2]);
                     // As z3's rewriter: destructive equality resolution unless
                     // there are patterns, then binders mentioned neither by the
                     // body nor a pattern are dropped (sorts are non-empty); with
@@ -5336,6 +5348,9 @@ impl Context {
                     };
                     if !pats.is_empty() {
                         self.universal_patterns.insert(body, pats);
+                    }
+                    if !no_pats.is_empty() {
+                        self.universal_no_patterns.insert(body, no_pats);
                     }
                     if let Some(expanded) = self.expand_finite_forall(&vars, body) {
                         // Every bound sort is finite → the ground conjunction over
@@ -24546,6 +24561,15 @@ impl Context {
         // uninterpreted sort — and exhibiting one settles `sat` outright.
         // Without MBQI, z3's final check gives up on any candidate model of a
         // formula that keeps a quantifier.
+        // Relevancy-guided E-matching rounds may still refute what the
+        // one-shot instantiation could not.
+        if res != SmtResult::Unsat
+            && (gated_sat || res == SmtResult::Unknown || !mbqi_on)
+            && !self.universals.is_empty()
+            && self.relevant_ematch_refute() == Some(SmtResult::Unsat)
+        {
+            return (SmtResult::Unsat, None);
+        }
         if !mbqi_on && !self.universals.is_empty() {
             return if res == SmtResult::Unsat {
                 (res, model)
@@ -30893,6 +30917,46 @@ impl Context {
                 && !set.is_empty()
             {
                 out.push(set);
+            }
+        }
+        self.scopes.pop();
+        out
+    }
+
+    /// The user `:no-pattern` terms of a quantifier body `(! φ :no-pattern t
+    /// …)` over `binders` (bound to `vars`). Terms that fail to parse are
+    /// skipped.
+    fn user_no_patterns(
+        &mut self,
+        binders: &SExpr,
+        vars: &[AstId],
+        annotated: &SExpr,
+    ) -> Vec<AstId> {
+        let SExpr::List(l) = annotated else {
+            return Vec::new();
+        };
+        if !matches!(l.first(), Some(SExpr::Atom(h)) if h == "!") {
+            return Vec::new();
+        }
+        let Ok(bs) = as_list(binders) else {
+            return Vec::new();
+        };
+        let mut scope = Vec::new();
+        for (b, &v) in bs.iter().zip(vars) {
+            if let Ok(pair) = as_list(b)
+                && let Ok(n) = Self::sym(&pair[0])
+            {
+                scope.push((n.to_string(), v));
+            }
+        }
+        self.scopes.push(scope);
+        let mut out = Vec::new();
+        for w in l[2..].windows(2) {
+            if let [SExpr::Atom(k), t] = w
+                && k == ":no-pattern"
+                && let Ok(t) = self.term(t)
+            {
+                out.push(t);
             }
         }
         self.scopes.pop();
@@ -39158,6 +39222,16 @@ impl Context {
         let scope: Vec<(String, AstId)> = names.iter().map(|(n, i)| (n.clone(), fs[*i])).collect();
         self.scopes.push(scope);
         let generic = self.parse_quantifier(&l[1], body);
+        let annotations = match &generic {
+            Ok((xs, _)) => {
+                let xs = xs.clone();
+                (
+                    self.user_patterns(&l[1], &xs, body),
+                    self.user_no_patterns(&l[1], &xs, body),
+                )
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
         let mut sk_scope = Vec::new();
         let mut ok = true;
         for b in binders {
@@ -39196,6 +39270,13 @@ impl Context {
             let mut vars = fs.clone();
             vars.extend(xs);
             let ax = self.m.mk_implies(guard, phi);
+            let (pats, no_pats) = annotations;
+            if is_forall && !pats.is_empty() {
+                self.def_patterns.insert(ax, pats);
+            }
+            if is_forall && !no_pats.is_empty() {
+                self.universal_no_patterns.insert(ax, no_pats);
+            }
             self.quant_defs.push((vars, ax));
         }
         // The skolemized direction: `¬P ⇒ ¬φ[sk]` (`P ⇒ φ[sk]` for `∃`).

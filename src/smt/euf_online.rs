@@ -127,6 +127,9 @@ pub struct IncEgraph {
     /// arithmetic theory (`z3`'s `new_eq_eh`): `(trail position, a, b,
     /// explanation)`, kept in position order for the asserted trail prefix.
     pub eq_log: Vec<(usize, AstId, AstId, Vec<Lit>)>,
+    /// The shortest length [`Self::eq_log`] was truncated to since its reader
+    /// last reset this to `usize::MAX`: the entries below it are unchanged.
+    pub eq_log_low: usize,
 }
 
 impl IncEgraph {
@@ -167,6 +170,7 @@ impl IncEgraph {
             arith: Vec::new(),
             cur_pos: 0,
             eq_log: Vec::new(),
+            eq_log_low: usize::MAX,
         };
         g.t_node = g.add_node(None, Some(Val::Bool(true)));
         g.f_node = g.add_node(None, Some(Val::Bool(false)));
@@ -537,6 +541,7 @@ impl TheoryHook for IncEgraph {
             self.processed = ctx.stable;
             let keep = self.eq_log.partition_point(|e| e.0 < ctx.stable);
             self.eq_log.truncate(keep);
+            self.eq_log_low = self.eq_log_low.min(keep);
         }
         self.pending.clear();
         self.implied.clear();
@@ -572,6 +577,7 @@ impl TheoryHook for IncEgraph {
             self.pending.clear();
             let keep = self.eq_log.partition_point(|e| e.0 < start);
             self.eq_log.truncate(keep);
+            self.eq_log_low = self.eq_log_low.min(keep);
         }
         let implied = if conflict.is_some() {
             Vec::new()

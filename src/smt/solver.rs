@@ -343,15 +343,13 @@ impl TheoryHook for Online<'_> {
         if let Some(a) = self.arith.as_mut() {
             // Mirror the congruence log (positions retracted there are retracted
             // here, new entries compiled once).
+            // Entries below the log's low-water mark are the ones mirrored.
+            let low = self
+                .euf
+                .as_mut()
+                .map_or(0, |g| core::mem::replace(&mut g.eq_log_low, usize::MAX));
             let log = self.euf.as_ref().map_or(&[][..], |g| &g.eq_log[..]);
-            let mut same = 0;
-            while same < self.eqs.len()
-                && same < log.len()
-                && self.eqs[same].0 == log[same].0
-                && self.eqs[same].2 == log[same].3
-            {
-                same += 1;
-            }
+            let same = self.eqs.len().min(log.len()).min(low);
             self.eqs.truncate(same);
             for (pos, u, v, why) in &log[same..] {
                 let c = Constraint::eq(ast_to_lin(self.m, *u).sub(&ast_to_lin(self.m, *v)));
@@ -852,6 +850,18 @@ impl Model {
                 None => Value::Num(ast_to_lin(m, t).eval(&self.arith), is_int),
             }
         } else {
+            // An application with a Boolean argument the e-graph never saw
+            // (`f(g(x))` for Boolean `g(x)`): Booleans are no e-graph classes,
+            // so find an interned application with the same argument values.
+            if !self.euf.contains(t)
+                && let Some(app) = m.app(t)
+                && app.args.iter().any(|&a| m.is_bool_sort(m.get_sort(a)))
+            {
+                let decl = app.decl;
+                if let Some(k) = self.congruent_assigned(m, t, |s| s.euf.apps_of(decl)) {
+                    return Value::Uninterp(s, self.euf.class_of(m, k));
+                }
+            }
             Value::Uninterp(s, self.euf.class_of(m, t))
         }
     }
