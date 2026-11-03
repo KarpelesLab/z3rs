@@ -24905,6 +24905,16 @@ impl Context {
         // formula that keeps a quantifier.
         // Relevancy-guided E-matching rounds may still refute what the
         // one-shot instantiation could not.
+        // A finite model settles `sat`, which no refutation can then follow,
+        // and finding one is cheap next to E-matching rounds that cannot end
+        // on a satisfiable goal: try it first.
+        if mbqi_on
+            && (gated_sat || res == SmtResult::Unknown)
+            && !self.universals.is_empty()
+            && let Some(m) = self.try_finite_model_find()
+        {
+            return (SmtResult::Sat, Some(m));
+        }
         if res != SmtResult::Unsat
             && (gated_sat || res == SmtResult::Unknown || !mbqi_on)
             && !self.universals.is_empty()
@@ -24918,12 +24928,6 @@ impl Context {
             } else {
                 (SmtResult::Unknown, None)
             };
-        }
-        if (gated_sat || res == SmtResult::Unknown)
-            && !self.universals.is_empty()
-            && let Some(m) = self.try_finite_model_find()
-        {
-            return (SmtResult::Sat, Some(m));
         }
         if gated_sat {
             (SmtResult::Unknown, None)

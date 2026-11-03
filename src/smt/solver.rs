@@ -2118,23 +2118,40 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // Diophantine witness solve it (the dark shadow's interval widening would
     // otherwise reject the exact bound). Sound: the equality is entailed.
     {
-        let zero = Rational::from_integer(Int::from(0));
         let les: Vec<usize> = cons
             .iter()
             .enumerate()
             .filter(|(_, c)| c.rel == Rel::Le)
             .map(|(i, _)| i)
             .collect();
-        let mut implied: Vec<LinExpr> = Vec::new();
-        for a in 0..les.len() {
-            for b in (a + 1)..les.len() {
-                let (ea, eb) = (&cons[les[a]].expr, &cons[les[b]].expr);
-                if !ea.is_constant() && ea.add(eb).as_constant() == Some(zero.clone()) {
-                    implied.push(ea.clone());
-                }
+        // The opposite pairs `(a, b)`, `a < b`, found by their terms: `e_b`'s
+        // terms are `e_a`'s negated and the constants cancel.
+        type Terms = Vec<(AstId, Rational)>;
+        let mut by_terms: BTreeMap<Terms, Vec<(usize, Rational)>> = BTreeMap::new();
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        for (b, &ib) in les.iter().enumerate() {
+            let eb = &cons[ib].expr;
+            if eb.is_constant() {
+                continue;
             }
+            let neg: Terms = eb.terms().map(|(v, c)| (v, -c.clone())).collect();
+            let want = -eb.constant_part().clone();
+            if let Some(prev) = by_terms.get(&neg) {
+                pairs.extend(
+                    prev.iter()
+                        .filter(|(_, k)| *k == want)
+                        .map(|&(a, _)| (a, b)),
+                );
+            }
+            let own: Terms = eb.terms().map(|(v, c)| (v, c.clone())).collect();
+            by_terms
+                .entry(own)
+                .or_default()
+                .push((b, eb.constant_part().clone()));
         }
-        for e in implied {
+        pairs.sort_unstable();
+        for (a, _) in pairs {
+            let e = cons[les[a]].expr.clone();
             cons.push(Constraint::eq(e));
         }
     }

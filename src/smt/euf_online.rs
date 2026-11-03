@@ -661,10 +661,9 @@ impl TheoryHook for IncEgraph {
         let implied = if conflict.is_some() {
             Vec::new()
         } else {
+            // An empty explanation is a valid literal: an equality between
+            // terms congruent by construction (`y = y`).
             core::mem::take(&mut self.implied)
-                .into_iter()
-                .filter(|(_, why)| !why.is_empty())
-                .collect()
         };
         TheoryProp { implied, conflict }
     }

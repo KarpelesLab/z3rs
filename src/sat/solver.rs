@@ -106,6 +106,8 @@ enum TheoryPass {
     Progress,
     /// Nothing to do — safe to branch.
     Idle,
+    /// A valid literal is false at level 0.
+    Unsat,
 }
 
 /// A CDCL SAT solver.
@@ -913,6 +915,20 @@ impl Solver {
             self.ensure_var(p.var());
             match lit_value_from(&self.assign, p) {
                 LBool::True => {}
+                LBool::False if r.is_empty() => {
+                    // A valid literal assigned false: undo that assignment and
+                    // assert it as a level-0 fact.
+                    let lv = self.level[p.var() as usize];
+                    if lv == 0 {
+                        self.ok = false;
+                        return TheoryPass::Unsat;
+                    }
+                    self.cancel_until(lv - 1);
+                    if self.lit_value(p) == LBool::Undef {
+                        self.enqueue_at(p, REASON_NONE, 0);
+                    }
+                    return TheoryPass::Progress;
+                }
                 LBool::False => {
                     let mut clause = alloc::vec![p];
                     clause.extend(r.iter().map(|&l| !l));
@@ -1005,6 +1021,7 @@ impl Solver {
                         // Enqueued implications: re-run Boolean propagation.
                         TheoryPass::Progress => continue,
                         TheoryPass::Idle => None,
+                        TheoryPass::Unsat => return Some(SatResult::Unsat),
                     },
                     None => None,
                 }
