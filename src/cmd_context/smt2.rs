@@ -29589,11 +29589,12 @@ impl Context {
         // `lia2card` runs on what the rest of the preprocessing left; its
         // replica over the original assertions only stands in when that
         // preprocessing is outside the supported fragment.
-        let trivially_false = trivially_false
-            || match &opt_pre {
-                Some(p) => p.inconsistent,
-                None => pre.as_ref().is_some_and(|p| p.0),
-            };
+        // The replica decides alone when it applies: its first `simplify`
+        // multiplies sums out (`som`), which the plain one does not.
+        let trivially_false = match &opt_pre {
+            Some(p) => p.inconsistent,
+            None => trivially_false || pre.as_ref().is_some_and(|p| p.0),
+        };
         let replayed = opt_pre.is_some();
         let pre_terms = opt_pre.map(|p| p.terms);
         let v = if trivially_false {
@@ -30832,8 +30833,30 @@ impl Context {
             {
                 return RealOpt::Unknown;
             }
-            // The cube's optimum, exactly by its LP.
-            let r = self.real_optimize_in(&real_cube, cube_obj, maximize, None);
+            // The cube's optimum, exactly by its LP, or by CAD when it is
+            // nonlinear (a rational optimum only).
+            let mut r = self.real_optimize_in(&real_cube, cube_obj, maximize, None);
+            if matches!(r, RealOpt::Unknown) {
+                let saved = core::mem::replace(&mut self.assertions, real_cube);
+                let n = self.nra_optimize(cube_obj, maximize, &[]);
+                self.assertions = saved;
+                let rational = |a: &crate::nlsat::realclosure::Alg| match a {
+                    crate::nlsat::realclosure::Alg::Rational(q) => Some(q.clone()),
+                    _ => None,
+                };
+                r = match n {
+                    Some(NraOpt::Unbounded) => RealOpt::Unbounded,
+                    Some(NraOpt::Attained { value, .. }) => match rational(&value) {
+                        Some(q) => RealOpt::Attained(q),
+                        None => RealOpt::Unknown,
+                    },
+                    Some(NraOpt::Limit(v, k)) => match rational(&v) {
+                        Some(q) => RealOpt::Supremum(q, k),
+                        None => RealOpt::Unknown,
+                    },
+                    _ => RealOpt::Unknown,
+                };
+            }
             let (v, attained) = match r {
                 RealOpt::Attained(ref v) => (v.clone(), true),
                 RealOpt::Supremum(ref v, _) => (v.clone(), false),
@@ -51537,6 +51560,46 @@ mod tests {
         let out = run(src).unwrap();
         assert_eq!(out[1], "(objectives\n (g 2)\n (x 3)\n)");
         assert_eq!(out[3], "(objectives\n (g 0)\n ((- x) (- 3))\n)");
+    }
+
+    #[test]
+    fn nonlinear_cubes_and_som_preprocessing() {
+        // Each model's cube is nonlinear: optimized by CAD.
+        let cubes = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (declare-const q Bool)
+            (assert (<= (- 5.0) x 5.0))
+            (assert (<= (- 5.0) y 5.0))
+            (assert (or (< (+ (* (- 1.0) x y) (* 2.0 y)) 1.0) q))
+            (minimize (+ (* (- 1.0) x) (* 1.0 y)))
+            (assert-soft (< (+ (* (- 2.0) x y) (* 2.0 x)) 1.0) :weight 2)
+            (assert-soft (>= (+ (* (- 1.0) x) (* 2.0 y)) 4.0) :weight 3)
+            (assert-soft (< y 0.0) :weight 1)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(cubes).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((+ (* (- 1.0) x) (* 1.0 y)) (- 10))\n ( 5)\n)"
+        );
+        // z3's optimizer simplifies with `som`: the square of a sum is
+        // multiplied out, so `(x+y)² ≤ -4` is not rewritten to false and the
+        // unsat values stay unrestricted.
+        let som = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (assert (<= (* (+ x y) (+ x y)) (- 4.0)))
+            (minimize (+ y x))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(som).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((+ y x)  (interval (* (- 1) oo) oo))\n)"
+        );
     }
 
     #[test]

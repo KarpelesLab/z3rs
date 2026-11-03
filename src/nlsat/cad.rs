@@ -35,8 +35,9 @@ const MAX_PROJ: usize = 500;
 const MAX_CELLS: usize = 40_000;
 /// Cap on the product of a sample point's coordinate degrees when lifting.
 const MAX_POINT_DEGREE: usize = 256;
-/// Cap on the total lifting work (Σ point degree per lifted sample).
-const MAX_LIFT_WORK: usize = 20_000;
+/// Cap on the total lifting work: Σ (point degree)² over the lifted samples
+/// with an irrational coordinate.
+const MAX_LIFT_WORK: usize = 1_000_000;
 
 /// Does sign `σ` satisfy `⋈ 0`?
 pub fn rel_holds(sigma: i32, rel: Rel) -> bool {
@@ -217,7 +218,12 @@ pub fn cad_optimize(
                             Alg::Irrational { poly, .. } => poly.degree(),
                         })
                         .product();
-                    work += deg;
+                    // Rational samples are cheap (their count is capped by
+                    // `MAX_CELLS`); exact signs at an algebraic one cost about
+                    // the square of its degree.
+                    if deg > 1 {
+                        work += deg * deg;
+                    }
                     if deg > MAX_POINT_DEGREE || work > MAX_LIFT_WORK {
                         return None;
                     }

@@ -683,8 +683,23 @@ impl Context {
             obj.push(self.th_ast(&mut b, o, &mut memo)?);
         }
         let s = &mut b.s;
-        let mut goal: Vec<T> = goal.into_iter().map(|t| s.simplify(t)).collect();
-        let mut obj: Vec<T> = obj.into_iter().map(|t| s.simplify(t)).collect();
+        // The first `simplify` runs with `som` (sum of monomials): products
+        // of sums are multiplied out before the rewriter sees them.
+        let mut memo = BTreeMap::new();
+        let mut goal: Vec<T> = goal
+            .into_iter()
+            .map(|t| {
+                let e = som_expand(s, t, &mut memo);
+                s.simplify(e)
+            })
+            .collect();
+        let mut obj: Vec<T> = obj
+            .into_iter()
+            .map(|t| {
+                let e = som_expand(s, t, &mut memo);
+                s.simplify(e)
+            })
+            .collect();
         let mut inconsistent = !normalize_goal(s, &mut goal);
         // propagate-values: a forward and a backward pass per round, each
         // formula rewritten with the unit facts of those before it.
@@ -781,6 +796,82 @@ impl Context {
             terms,
         })
     }
+}
+
+/// `t` with every arithmetic product of sums multiplied out (z3's `som`
+/// rewriting) where that does not multiply the number of terms by more
+/// than ten (`som_blowup`).
+fn som_expand(s: &mut Simp, t: T, memo: &mut BTreeMap<T, T>) -> T {
+    /// The summands of `t` with their signs.
+    fn summands(s: &mut Simp, t: T) -> Vec<T> {
+        match s.op(t) {
+            Op::Add => s.args(t).to_vec(),
+            Op::Sub => {
+                let a = s.args(t).to_vec();
+                let mut out = alloc::vec![a[0]];
+                for &b in &a[1..] {
+                    let m1 = s.mk_num(
+                        puremp::Rational::from_integer(Int::from(-1)),
+                        *s.sort(t) == Sort::Int,
+                    );
+                    out.push(s.mk(Op::Mul, alloc::vec![m1, b]));
+                }
+                out
+            }
+            _ => alloc::vec![t],
+        }
+    }
+    if let Some(&r) = memo.get(&t) {
+        return r;
+    }
+    let args: Vec<T> = s.args(t).to_vec();
+    let new_args: Vec<T> = args.iter().map(|&a| som_expand(s, a, memo)).collect();
+    let rebuilt = if new_args == args {
+        t
+    } else {
+        let op = s.op(t).clone();
+        let srt = s.sort(t).clone();
+        s.mk_sorted(op, new_args.clone(), srt)
+    };
+    let r = if *s.op(rebuilt) == Op::Mul
+        && s.sort(rebuilt).is_arith_sort()
+        && new_args
+            .iter()
+            .any(|&a| matches!(s.op(a), Op::Add | Op::Sub))
+    {
+        let factors: Vec<Vec<T>> = new_args.iter().map(|&a| summands(s, a)).collect();
+        let size: usize = factors.iter().map(|f| f.len()).product();
+        let input: usize = factors.iter().map(|f| f.len()).sum();
+        if size > 10 * input {
+            rebuilt
+        } else {
+            let mut products: Vec<Vec<T>> = alloc::vec![Vec::new()];
+            for f in &factors {
+                let mut next = Vec::with_capacity(products.len() * f.len());
+                for p in &products {
+                    for &x in f {
+                        let mut q = p.clone();
+                        q.push(x);
+                        next.push(q);
+                    }
+                }
+                products = next;
+            }
+            let terms: Vec<T> = products
+                .into_iter()
+                .map(|p| if p.len() == 1 { p[0] } else { s.mk(Op::Mul, p) })
+                .collect();
+            if terms.len() == 1 {
+                terms[0]
+            } else {
+                s.mk(Op::Add, terms)
+            }
+        }
+    } else {
+        rebuilt
+    };
+    memo.insert(t, r);
+    r
 }
 
 /// Is `t` a value (`m.is_value`): a numeral or a Boolean constant?
