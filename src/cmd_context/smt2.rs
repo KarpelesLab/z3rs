@@ -36497,6 +36497,12 @@ impl Context {
             }
             let has_coincident_div = divisor_uses.values().any(|&n| n >= 2);
             let untrustworthy_sat = has_opaque_pow || has_coincident_div;
+            // The conflict-driven nlsat search first: it decides most Boolean
+            // combinations of polynomial constraints outright (an exact
+            // model, or a refutation) and declines soundly otherwise.
+            if let Some((r, m)) = self.nlsat_decide_goal(lin, !untrustworthy_sat) {
+                return (r, m.map(|m| full(self, m)));
+            }
             // A genuinely nonlinear residual in a *single* variable is decided
             // exactly by the univariate procedure (real-root isolation over the
             // reals; integer-root enumeration over the integers) — this is a
@@ -37144,13 +37150,14 @@ impl Context {
 
     /// Decide a nonlinear goal — any Boolean combination of polynomial
     /// constraints — with the nlsat solver ([`crate::nlsat::solver`]). The goal
-    /// becomes a CNF (Tseitin variables for nested connectives). An `unsat` is
-    /// always sound (opaque terms and integer variables only relax the
-    /// problem); a `sat` is reported only when every arithmetic leaf is a real
-    /// constant, with nlsat's exact (possibly irrational) assignment as model.
+    /// becomes a CNF (Tseitin variables for nested connectives); integer
+    /// constants are branched on by nlsat. An `unsat` is always sound (opaque
+    /// terms, as real variables, only relax the problem); a `sat` is reported
+    /// only when every arithmetic leaf is a real or integer constant, with
+    /// nlsat's exact (possibly irrational) assignment as model.
     fn nlsat_decide_goal(&self, goal: AstId, sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
         use crate::nlsat::Rel as NRel;
-        use crate::nlsat::solver::{InLit, Kind, NlsatResult, check};
+        use crate::nlsat::solver::{InLit, Kind, NlsatResult, check_with_ints};
         struct Cnf {
             clauses: Vec<Vec<InLit>>,
             bools: Vec<AstId>,
@@ -37311,13 +37318,18 @@ impl Context {
             c.iter_mut().for_each(fix);
         }
         let num_bools = (nb + cnf.num_tseitin) as usize;
-        match check(cnf.var_map.len(), num_bools, &cnf.clauses) {
+        // Integer constants range over the integers (nlsat's branch and bound).
+        let mut is_int = alloc::vec![false; cnf.var_map.len()];
+        for (&t, &v) in &cnf.var_map {
+            is_int[v as usize] =
+                self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t));
+        }
+        match check_with_ints(cnf.var_map.len(), num_bools, &cnf.clauses, &is_int) {
             NlsatResult::Unsat => Some((SmtResult::Unsat, None)),
             NlsatResult::Sat(values, bvals) if sat_ok => {
-                // Only real constants as leaves: then the assignment is a model.
-                let exact = cnf.var_map.keys().all(|&t| {
-                    self.m.is_uninterp_const(t) && !self.m.is_int_sort(self.m.get_sort(t))
-                });
+                // Only real and integer constants as leaves: then the
+                // assignment is a model.
+                let exact = cnf.var_map.keys().all(|&t| self.m.is_uninterp_const(t));
                 if !exact {
                     return None;
                 }

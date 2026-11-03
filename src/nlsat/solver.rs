@@ -16,15 +16,19 @@
 //! conflict persists. CDCL-style resolution of these lemmas then either
 //! backjumps to a lower stage or derives the empty clause.
 //!
+//! Projection polynomials are replaced by their factors (`math::factor`, a
+//! partial factorization). Integer variables are handled as z3's
+//! `search_check` does: branch and bound on a non-integral value of a
+//! satisfying assignment.
+//!
 //! Every answer is exact: `Unsat` means the empty clause was derived from valid
 //! lemmas; `Sat` comes with an assignment satisfying every clause (each clause
 //! has a literal evaluated true at the exact algebraic sample). Any inexact
 //! primitive (an inexact resultant, an unresolved root comparison) or an
 //! exhausted budget yields `Unknown`.
 //!
-//! Not ported: factorization of projection polynomials (`factor` only makes
-//! lemmas smaller), core simplification by equalities and core minimization,
-//! the levelwise projection, the Thom encoding of quadratic roots, restarts and
+//! Not ported: core simplification by equalities and core minimization, the
+//! levelwise projection, the Thom encoding of quadratic roots, restarts and
 //! reordering during search, and lazy-mode clause skipping.
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -34,7 +38,7 @@ use core::cmp::Ordering;
 use puremp::{Int, Rational};
 
 use crate::math::polynomial::{Monomial, Polynomial, Var};
-use crate::math::resultant::principal_subresultant_coeffs;
+use crate::math::resultant::psc_chain;
 use crate::nlsat::cad::roots_at;
 use crate::nlsat::realclosure::{Alg, sign_at_point};
 
@@ -572,6 +576,29 @@ impl ISet {
     }
 }
 
+/// `⌊a⌋`.
+fn alg_floor(a: &Alg) -> Int {
+    match a {
+        Alg::Rational(r) => r.floor(),
+        Alg::Irrational { .. } => {
+            let mut k = a.approx().floor();
+            loop {
+                let kr = Alg::Rational(Rational::from_integer(k.clone()));
+                if a.compare(&kr) == Ordering::Less {
+                    k = k.sub(&Int::from(1));
+                    continue;
+                }
+                let k1 = Alg::Rational(Rational::from_integer(k.add(&Int::from(1))));
+                if a.compare(&k1) != Ordering::Less {
+                    k = k.add(&Int::from(1));
+                    continue;
+                }
+                return k;
+            }
+        }
+    }
+}
+
 /// The smallest integer strictly above `a` (z3's `int_gt`).
 fn int_gt(a: &Alg) -> Rational {
     match a {
@@ -674,6 +701,8 @@ struct Solver {
     max_conflicts: usize,
     rand: RandomGen,
     full_dimensional: bool,
+    /// Integer variables (branch and bound on non-integral values).
+    is_int: Vec<bool>,
     // Explanation state.
     todo: Vec<Polynomial>,
     todo_extracted: BTreeSet<Polynomial>,
@@ -685,6 +714,11 @@ struct Solver {
     lemma: Vec<Lit>,
     /// Work budget (polynomial operations); exhausted ⇒ abort.
     budget: u64,
+    /// Root isolations at the current assignment, by `(x, p)`: valid while
+    /// the variables below `x` keep their values.
+    root_cache: BTreeMap<(Var, Polynomial), (Vec<Alg>, Vec<i32>)>,
+    /// Signs at the current assignment, by `(max_var(p), p)`.
+    sign_cache: BTreeMap<(Var, Polynomial), i32>,
 }
 
 impl Solver {
@@ -711,6 +745,7 @@ impl Solver {
             max_conflicts: 4000,
             rand: RandomGen(0),
             full_dimensional: false,
+            is_int: alloc::vec![false; num_vars],
             todo: Vec::new(),
             todo_extracted: BTreeSet::new(),
             result: Vec::new(),
@@ -719,6 +754,8 @@ impl Solver {
             num_marks: 0,
             lemma: Vec::new(),
             budget: 2_000_000,
+            root_cache: BTreeMap::new(),
+            sign_cache: BTreeMap::new(),
         }
     }
 
@@ -849,16 +886,41 @@ impl Solver {
         if let Some(c) = p.as_constant() {
             return Ok(c.signum());
         }
+        let mv = max_var(p).expect("non-constant");
+        let key = (mv, p.clone());
+        if let Some(&s) = self.sign_cache.get(&key) {
+            return Ok(s);
+        }
         self.spend(1)?;
-        let n = max_var(p).expect("non-constant") as usize + 1;
-        let pt = self.point(n);
-        sign_at_point(p, &pt).ok_or(Abort)
+        let pt = self.point(mv as usize + 1);
+        let s = sign_at_point(p, &pt).ok_or(Abort)?;
+        self.sign_cache.insert(key, s);
+        Ok(s)
+    }
+
+    /// Set (or clear) the value of `x`, dropping the cached roots and signs
+    /// that depend on it.
+    fn set_value(&mut self, x: usize, v: Option<Alg>) {
+        self.assignment[x] = v;
+        let y = x as Var;
+        self.root_cache.retain(|(z, _), _| *z <= y);
+        self.sign_cache.retain(|(z, _), _| *z < y);
     }
 
     /// The real roots of `p` in `x` at the assignment of the variables below
     /// `x`, and the sign of `p` on each sector (`isolate_roots(p, x2v, roots,
     /// signs)`; a polynomial vanishing identically has no roots and sign 0).
     fn roots_signs(&mut self, p: &Polynomial, x: Var) -> Res<(Vec<Alg>, Vec<i32>)> {
+        let key = (x, p.clone());
+        if let Some(r) = self.root_cache.get(&key) {
+            return Ok(r.clone());
+        }
+        let r = self.roots_signs_core(p, x)?;
+        self.root_cache.insert(key, r.clone());
+        Ok(r)
+    }
+
+    fn roots_signs_core(&mut self, p: &Polynomial, x: Var) -> Res<(Vec<Alg>, Vec<i32>)> {
         self.spend(4)?;
         let pt = self.point(x as usize);
         if p.degree_of(x) == 0 {
@@ -1092,7 +1154,7 @@ impl Solver {
                 Some(0) => self.xk = None,
                 Some(x) => {
                     self.xk = Some(x - 1);
-                    self.assignment[x - 1] = None;
+                    self.set_value(x - 1, None);
                 }
                 None => {}
             },
@@ -1253,7 +1315,7 @@ impl Solver {
         let x = self.xk.expect("arith stage");
         let s = self.infeasible[x].clone();
         let w = self.pick_in_complement(&s)?;
-        self.assignment[x] = Some(w);
+        self.set_value(x, Some(w));
         Ok(())
     }
 
@@ -1381,6 +1443,52 @@ impl Solver {
                 Some(_) => {}
             }
         }
+    }
+
+    /// Undo the whole trail: back to the Boolean stage at level 0.
+    fn undo_all(&mut self) {
+        while self.undo_one() {}
+    }
+
+    /// `search`, then branch and bound on the integer variables
+    /// (`search_check`): a satisfying assignment giving an integer variable
+    /// `x` a non-integral value `v` adds the valid (over the integers) clause
+    /// `x ≤ ⌊v⌋ ∨ x ≥ ⌊v⌋ + 1` and searches again.
+    fn search_check(&mut self) -> Res<bool> {
+        for _ in 0..1000 {
+            if !self.search()? {
+                return Ok(false);
+            }
+            let mut bounds = Vec::new();
+            for x in 0..self.num_vars {
+                if !self.is_int[x] {
+                    continue;
+                }
+                let v = self.assignment[x].clone().expect("assigned");
+                if matches!(&v, Alg::Rational(r) if r.is_integer()) {
+                    continue;
+                }
+                bounds.push((x, alg_floor(&v)));
+            }
+            if bounds.is_empty() {
+                return Ok(true);
+            }
+            self.undo_all();
+            for (x, lo) in bounds {
+                let xp = Polynomial::var(x as Var);
+                let lo_r = Rational::from_integer(lo.clone());
+                let hi_r = Rational::from_integer(lo.add(&Int::from(1)));
+                // ¬(x − lo > 0) ∨ ¬(x − (lo + 1) < 0)
+                let l1 = self
+                    .mk_ineq_literal(Kind::Gt, &xp.sub(&Polynomial::constant(lo_r)))
+                    .complement();
+                let l2 = self
+                    .mk_ineq_literal(Kind::Lt, &xp.sub(&Polynomial::constant(hi_r)))
+                    .complement();
+                self.mk_clause(alloc::vec![l1, l2], true);
+            }
+        }
+        Err(Abort)
     }
 
     // ----- conflict resolution ---------------------------------------------
@@ -1637,9 +1745,18 @@ impl Solver {
         if p.is_constant() {
             return Ok(());
         }
-        let (p, _) = normalize(&p);
-        if !self.todo_extracted.contains(&p) && !self.in_todo(&p) {
-            self.todo.push(p);
+        // The irreducible factors replace `p`: the same zero set, smaller
+        // projections.
+        self.spend(4)?;
+        for f in crate::math::factor::factors(&p) {
+            let f = self.elim_vanishing(f)?;
+            if f.is_constant() {
+                continue;
+            }
+            let (f, _) = normalize(&f);
+            if !self.todo_extracted.contains(&f) && !self.in_todo(&f) {
+                self.todo.push(f);
+            }
         }
         Ok(())
     }
@@ -1853,15 +1970,15 @@ impl Solver {
     /// in `x` (`psc`).
     fn psc(&mut self, p: &Polynomial, q: &Polynomial, x: Var) -> Result<(), ExplainErr> {
         self.spend(16)?;
-        let chain = principal_subresultant_coeffs(p, q, x).ok_or(Abort)?;
-        let nonzero: Vec<Polynomial> = chain.into_iter().filter(|s| !s.is_zero()).collect();
-        if nonzero.is_empty() {
+        let chain = psc_chain(p, q, x).ok_or(Abort)?;
+        let s = chain[0].clone();
+        if s.is_zero() {
+            // `p` and `q` share a common factor: project all coefficients.
             if self.add_all_coeffs {
                 return Ok(());
             }
             return Err(ExplainErr::Restart);
         }
-        let s = nonzero[0].clone();
         if s.is_constant() {
             return Ok(());
         }
@@ -2058,6 +2175,18 @@ fn rename(p: &Polynomial, map: &[Var]) -> Polynomial {
 /// Decide a CNF over polynomial constraints in `num_vars` real variables and
 /// `num_bools` Boolean variables.
 pub fn check(num_vars: usize, num_bools: usize, clauses: &[Vec<InLit>]) -> NlsatResult {
+    check_with_ints(num_vars, num_bools, clauses, &[])
+}
+
+/// [`check`] where the input variables `v` with `is_int[v]` range over the
+/// integers (branch and bound; a `Sat` assignment gives them integer values,
+/// `Unsat` is over the integers for them).
+pub fn check_with_ints(
+    num_vars: usize,
+    num_bools: usize,
+    clauses: &[Vec<InLit>],
+    is_int: &[bool],
+) -> NlsatResult {
     // Variable order.
     let polys: Vec<&Polynomial> = clauses
         .iter()
@@ -2073,6 +2202,9 @@ pub fn check(num_vars: usize, num_bools: usize, clauses: &[Vec<InLit>]) -> Nlsat
         to_internal[v as usize] = k as Var;
     }
     let mut s = Solver::new(num_vars);
+    for (v, &b) in is_int.iter().enumerate() {
+        s.is_int[to_internal[v] as usize] = b;
+    }
     let bools: Vec<u32> = (0..num_bools).map(|_| s.mk_bool_var()).collect();
     for c in clauses {
         let mut lits = Vec::new();
@@ -2104,7 +2236,7 @@ pub fn check(num_vars: usize, num_bools: usize, clauses: &[Vec<InLit>]) -> Nlsat
     }
     s.full_dimensional = s.is_full_dimensional();
     s.sort_watched_clauses();
-    let verdict = s.search().and_then(|sat| {
+    let verdict = s.search_check().and_then(|sat| {
         if sat {
             s.verify_model()?;
         }
