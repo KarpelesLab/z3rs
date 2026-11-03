@@ -3241,6 +3241,14 @@ struct Context {
     /// Set while a bit-vector goal reduced by bit-blasting into the Boolean
     /// structure is decided (see `bv_bool`), so the reduction does not recurse.
     in_bv_bool: bool,
+    /// How many more sequence-valued `ite`s the distribution in progress in
+    /// `seq_op` may split on (negative: exhausted).
+    seq_ite_left: i64,
+    /// The nesting of the distribution in progress.
+    seq_ite_depth: u32,
+    /// Whether `seq_op` expands reads of concrete sequences at symbolic
+    /// positions by cases (off while re-folding a witness).
+    seq_cases: bool,
     /// Set while [`Self::check_sat_components`] decides its groups.
     in_check_components: bool,
     /// `(as const …)` applications built so far in the current command.
@@ -4335,6 +4343,9 @@ impl Context {
             disj_witness_depth: 0,
             in_components: false,
             in_bv_bool: false,
+            seq_ite_left: 0,
+            seq_ite_depth: 0,
+            seq_cases: true,
             in_check_components: false,
             as_const_seen: 0,
             in_guard_split: false,
@@ -15258,12 +15269,25 @@ impl Context {
         if let Some(&r) = memo.get(&t) {
             return r;
         }
+        // A re-fold leaves the symbolic reads of concrete sequences to the
+        // position splits of the witness search.
+        let cases = core::mem::replace(&mut self.seq_cases, false);
+        let r = self.refold_str_markers_rec(t, memo);
+        self.seq_cases = cases;
+        r
+    }
+
+    /// [`Self::refold_str_markers`] proper.
+    fn refold_str_markers_rec(&mut self, t: AstId, memo: &mut BTreeMap<AstId, AstId>) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
         let out = if self.m.is_app(t) && !self.m.app_args(t).is_empty() {
             let decl = self.m.app_decl(t);
             let raw_args = self.m.app_args(t).to_vec();
             let args: Vec<AstId> = raw_args
                 .iter()
-                .map(|&a| self.refold_str_markers(a, memo))
+                .map(|&a| self.refold_str_markers_rec(a, memo))
                 .collect();
             let is_len = self.str_len_decl == Some(decl) || self.seq_len_decls.contains(&decl);
             if is_len && args.len() == 1 {
@@ -15271,6 +15295,10 @@ impl Context {
                     self.m.mk_int(v.len() as i64)
                 } else if let Some(l) = self.seq_of.get(&args[0]) {
                     self.m.mk_int(l.len() as i64)
+                } else if self.seq_len_decls.contains(&decl) && self.m.is_ite(args[0]) {
+                    // The length of a choice between sequences, by cases.
+                    self.seq_op("seq.len", &args)
+                        .unwrap_or_else(|_| self.m.mk_app(decl, &args))
                 } else {
                     self.m.mk_app(decl, &args)
                 }
@@ -15335,7 +15363,7 @@ impl Context {
             let out: Vec<AstId> = elems
                 .iter()
                 .map(|&e| {
-                    let r = self.refold_str_markers(e, memo);
+                    let r = self.refold_str_markers_rec(e, memo);
                     if r == e {
                         e
                     } else {
@@ -22805,6 +22833,41 @@ impl Context {
     /// known element list (`seq.unit`/`++`/`empty`) fold exactly; a symbolic
     /// sequence operation is marked so the goal is answered `unknown`.
     fn seq_op(&mut self, op: &str, args: &[AstId]) -> Result<AstId, String> {
+        // A sequence operation distributes over a sequence-valued `ite`
+        // argument, so each branch folds on its own structure — within a
+        // bound on the size of the case split (else the operation stays over
+        // the `ite` whole).
+        if op != "seq.unit"
+            && let Some(k) = args
+                .iter()
+                .position(|&a| self.m.is_ite(a) && self.seq_elem_sort(self.m.get_sort(a)).is_some())
+        {
+            const MAX_SPLIT: i64 = 64;
+            let top = self.seq_ite_depth == 0;
+            if top {
+                self.seq_ite_left = MAX_SPLIT;
+            }
+            if self.seq_ite_left > 0 {
+                self.seq_ite_left -= 1;
+                self.seq_ite_depth += 1;
+                let ite = self.m.app_args(args[k]).to_vec();
+                let mut ta = args.to_vec();
+                ta[k] = ite[1];
+                let mut ea = args.to_vec();
+                ea[k] = ite[2];
+                let t = self.seq_op(op, &ta);
+                let e = self.seq_op(op, &ea);
+                self.seq_ite_depth -= 1;
+                if let (Ok(t), Ok(e)) = (t, e)
+                    && (!top || self.seq_ite_left > 0)
+                {
+                    return Ok(self.m.mk_ite(ite[0], t, e));
+                }
+            } else {
+                // Exhausted: the top-level split is abandoned.
+                self.seq_ite_left = -1;
+            }
+        }
         // Known element list of each argument (if all are structural sequences).
         let lists: Option<Vec<Vec<AstId>>> =
             args.iter().map(|a| self.seq_of.get(a).cloned()).collect();
@@ -22885,6 +22948,12 @@ impl Context {
                     let s = self.m.get_sort(args[0]);
                     return Ok(self.seq_empty_of(s));
                 }
+                // A concrete sequence at a symbolic index: by cases.
+                if let Some(l) = self.seq_of.get(&args[0]).cloned()
+                    && let Some(t) = self.seq_at_cases(args[0], &l, args[1])
+                {
+                    return Ok(t);
+                }
                 // Symbolic `seq.at s i`: reuse one congruent marker per (s, i) so
                 // `s = u ⇒ at(s,i) = at(u,i)` can be emitted against the goal's marker.
                 if let Some(&c) = self.seq_at_sym.get(&(args[0], args[1])) {
@@ -22921,6 +22990,13 @@ impl Context {
                 {
                     let s = self.m.get_sort(args[0]);
                     return Ok(self.seq_empty_of(s));
+                }
+                // A concrete sequence at a symbolic offset or length: by cases.
+                if self.seq_cases
+                    && let Some(l) = self.seq_of.get(&args[0]).cloned()
+                    && let Some(t) = self.seq_extract_cases(args[0], &l, args[1], args[2])
+                {
+                    return Ok(t);
                 }
                 self.symbolic_seq(op, args)
             }
@@ -43512,6 +43588,39 @@ mod tests {
         assert_eq!(out[1], "1");
         assert_eq!(out[2], "unsat");
         assert_ne!(out[3], "sat");
+    }
+
+    #[test]
+    fn seq_at_extract_and_ite_by_cases() {
+        let script = "
+            (declare-const i Int)
+            (declare-const n Int)
+            (assert (= (seq.at (seq.++ (seq.unit 4) (seq.unit 5)) i) (seq.unit 5)))
+            (check-sat)
+            (eval i)
+            (assert (= (seq.extract (seq.++ (seq.unit 1) (seq.unit 2) (seq.unit 3)) i n)
+                (seq.++ (seq.unit 2) (seq.unit 3))))
+            (check-sat)
+            (assert (= (seq.extract (seq.++ (seq.unit 1) (seq.unit 2) (seq.unit 3)) i n)
+                (seq.unit 3)))
+            (check-sat)
+            (reset)
+            (declare-const p Bool)
+            (declare-const i Int)
+            (assert (= (seq.nth (seq.++ (seq.unit 7) (ite p (seq.unit 1) (seq.unit 2))) i) 2))
+            (assert (<= 0 i 1))
+            (check-sat)
+            (eval p)
+            (eval i)
+            (assert p)
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "1");
+        assert_eq!(out[2], "sat");
+        assert_eq!(out[3], "unsat");
+        assert_eq!(&out[4..], &["sat", "false", "1", "unsat"]);
     }
 
     #[test]

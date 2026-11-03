@@ -40,6 +40,63 @@ impl Context {
         Some(r)
     }
 
+    /// `seq.at s i` for the concrete sequence `s` (elements `elems`) and a
+    /// symbolic index `i`: the unit of the element at `i` in range, else the
+    /// empty sequence.
+    pub(super) fn seq_at_cases(&mut self, s: AstId, elems: &[AstId], i: AstId) -> Option<AstId> {
+        if elems.len() > MAX_LEN || self.int_arg(i).is_some() {
+            return None;
+        }
+        let sort = self.m.get_sort(s);
+        let mut r = self.seq_empty_of(sort);
+        for (k, &e) in elems.iter().enumerate().rev() {
+            let kv = self.m.mk_int(k as i64);
+            let at_k = self.m.mk_eq(i, kv);
+            let u = self.seq_op("seq.unit", &[e]).ok()?;
+            r = self.m.mk_ite(at_k, u, r);
+        }
+        Some(r)
+    }
+
+    /// `seq.extract s i n` for the concrete sequence `s` (elements `elems`)
+    /// with a symbolic offset or length: the slice from `i` of length
+    /// `min(n, |s| − i)` for each offset in range and each positive length,
+    /// else the empty sequence.
+    pub(super) fn seq_extract_cases(
+        &mut self,
+        s: AstId,
+        elems: &[AstId],
+        i: AstId,
+        n: AstId,
+    ) -> Option<AstId> {
+        const MAX_EXTRACT: usize = 8;
+        let len = elems.len();
+        if len > MAX_EXTRACT || (self.int_arg(i).is_some() && self.int_arg(n).is_some()) {
+            return None;
+        }
+        let sort = self.m.get_sort(s);
+        let mut r = self.seq_empty_of(sort);
+        for k in (0..len).rev() {
+            let kv = self.m.mk_int(k as i64);
+            let at_k = self.m.mk_eq(i, kv);
+            // Lengths 1 … len − k: exactly m below the rest, at least it at the rest.
+            let rest = len - k;
+            let mut by_len = self.seq_empty_of(sort);
+            for m in (1..=rest).rev() {
+                let mv = self.m.mk_int(m as i64);
+                let cond = if m == rest {
+                    self.m.mk_ge(n, mv)
+                } else {
+                    self.m.mk_eq(n, mv)
+                };
+                let slice = self.mk_seq(elems[k..k + m].to_vec());
+                by_len = self.m.mk_ite(cond, slice, by_len);
+            }
+            r = self.m.mk_ite(at_k, by_len, r);
+        }
+        Some(r)
+    }
+
     /// Congruence of the out-of-range reads in `goal` by content: equal
     /// sequence values and indices give equal `nth_u` values, also against
     /// the out-of-range reads at constant indices (`seq_nth_oob`).
