@@ -880,6 +880,7 @@ mod ematch_search;
 mod fp_real;
 mod seq_nth;
 mod simplify_th;
+mod str_uf;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -3118,6 +3119,11 @@ struct Context {
     string_sort: Option<AstId>,
     /// String literal text → its distinct constant of the `String` sort.
     str_lits: BTreeMap<String, AstId>,
+    /// The string values of the String-valued user-function applications of
+    /// the last check decided by purification (`smt2/str_uf.rs`).
+    str_uf_vals: BTreeMap<AstId, String>,
+    /// A purified check is running (no nested purification).
+    str_uf_active: bool,
     /// The `str.len : String → Int` function declaration, once used.
     str_len_decl: Option<AstId>,
     /// Symbolic (non-constant-folded) string-producing operations. A goal that
@@ -4313,6 +4319,8 @@ impl Context {
             reason_unknown: None,
             string_sort: None,
             str_lits: BTreeMap::new(),
+            str_uf_vals: BTreeMap::new(),
+            str_uf_active: false,
             str_len_decl: None,
             str_symbolic: BTreeSet::new(),
             str_witness: Vec::new(),
@@ -6733,6 +6741,10 @@ impl Context {
         if Some(self.m.get_sort(id)) != self.string_sort {
             return None;
         }
+        if let Some(text) = self.str_uf_vals.get(&id) {
+            let cps: Vec<u32> = text.chars().map(|ch| ch as u32).collect();
+            return Some(smt_string_literal(&cps));
+        }
         for (text, &c) in &self.str_lits {
             if c == id || model.terms_equal(&self.m, id, c) {
                 let cps: Vec<u32> = text.chars().map(|ch| ch as u32).collect();
@@ -6743,6 +6755,19 @@ impl Context {
         // unconstrained; z3's model gives it the empty string.
         if !self.occurs_in_assertions(id) {
             return Some(smt_string_literal(&[]));
+        }
+        // A string-valued application (e.g. of a user function) equal to no
+        // literal: only equalities constrain its class, so any string apart
+        // from every literal is a value for it — z3's fresh `!k!`.
+        if !self.m.is_uninterp_const(id)
+            && let Value::Uninterp(_, k) = model.eval_value(&self.m, id)
+        {
+            let mut text = alloc::format!("!{k}!");
+            while self.str_lits.contains_key(&text) {
+                text.push('!');
+            }
+            let cps: Vec<u32> = text.chars().map(|ch| ch as u32).collect();
+            return Some(smt_string_literal(&cps));
         }
         None
     }
@@ -24468,6 +24493,13 @@ impl Context {
     }
 
     fn check_sat(&mut self) -> (SmtResult, Option<Model>) {
+        if !self.str_uf_active {
+            self.str_uf_vals.clear();
+            // String-valued user functions are decided by purification.
+            if let Some(r) = self.check_sat_str_uf() {
+                return r;
+            }
+        }
         let r = self.check_sat_split();
         if r.0 == SmtResult::Unknown
             && let Some(r2) = self.check_sat_components()
@@ -40717,6 +40749,9 @@ impl Context {
     /// collapses to the numeral `10`. Returns `None` for sorts we cannot render
     /// as a self-contained term (uninterpreted, string, floating-point, …).
     fn eval_value_term(&mut self, model: &mut Model, t: AstId) -> Option<AstId> {
+        if let Some(text) = self.str_uf_vals.get(&t).cloned() {
+            return Some(self.mk_str_lit(&text));
+        }
         let s = self.m.get_sort(t);
         if self.m.is_bool_sort(s) {
             let b = matches!(model.eval_value(&self.m, t), Value::Bool(true));
@@ -40840,6 +40875,17 @@ impl Context {
         let assertions = self.assertions.clone();
         for a in assertions {
             let sub = self.subst_all(a, csub, &fsub);
+            // String constants take their witness values.
+            if !self.str_witness.is_empty() {
+                let w = self.str_witness.clone();
+                let c = self.str_concretize(sub, &w);
+                if self.m.is_false(c) {
+                    return false;
+                }
+                if self.m.is_true(c) {
+                    continue;
+                }
+            }
             if self.model_value_str(model, sub) != "true" {
                 return false;
             }
@@ -40865,6 +40911,17 @@ impl Context {
         let assertions = self.assertions.clone();
         for a in assertions {
             let sub = self.subst_all(a, csub, &fsub);
+            // String constants take their witness values.
+            if !self.str_witness.is_empty() {
+                let w = self.str_witness.clone();
+                let c = self.str_concretize(sub, &w);
+                if self.m.is_false(c) {
+                    return false;
+                }
+                if self.m.is_true(c) {
+                    continue;
+                }
+            }
             if self.model_value_str(model, sub) != "true" {
                 return false;
             }
@@ -43902,6 +43959,35 @@ mod tests {
         assert_eq!(out[0], "unsat");
         assert_ne!(out[1], "sat");
         assert_ne!(out[2], "sat");
+    }
+
+    #[test]
+    fn string_valued_functions_are_purified() {
+        // Each application of a String-valued function is a string variable
+        // (with congruence between applications): decided, and the function
+        // gets a literal interpretation.
+        let sat = "
+            (declare-const s String)
+            (declare-const i Int)
+            (declare-fun g (Int) String)
+            (assert (or (str.suffixof s \"ab\") (< 1 i)))
+            (assert (str.contains (str.++ s \"ba\") (g i)))
+            (check-sat)
+            (get-model)
+        ";
+        let out = run(sat).unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(out.iter().any(|l| l.contains("define-fun g")), "{out:?}");
+        assert!(out.iter().all(|l| !l.contains("!val!")), "{out:?}");
+        let unsat = "
+            (declare-fun g (Int) String)
+            (declare-const i Int)
+            (assert (= i 3))
+            (assert (= (g 3) \"a\"))
+            (assert (= (g i) \"b\"))
+            (check-sat)
+        ";
+        assert_eq!(run(unsat).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
