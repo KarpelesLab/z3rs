@@ -25589,6 +25589,11 @@ impl Context {
         Some(match model.eval_value(&self.m, t) {
             Value::Bool(b) => self.mk_bool(b),
             Value::Bv(v, w) => self.m.mk_bv_numeral(v, w),
+            // A runaway value (each round's counterexample squaring the last
+            // one's magnitude) ends the refinement undecided.
+            Value::Num(r, _) if r.numerator().bit_len() + r.denominator().bit_len() > 512 => {
+                return None;
+            }
             Value::Num(r, is_int) => self.m.mk_numeral(r, is_int),
             Value::Uninterp(..) => return None,
         })
