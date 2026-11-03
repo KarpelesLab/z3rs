@@ -38857,6 +38857,8 @@ impl Context {
         let mut claimed: BTreeSet<String> = BTreeSet::new();
         let mut kept: Vec<AstId> = Vec::new();
         let mut defs: Vec<(AstId, AstId)> = Vec::new();
+        // Per assertion: `Some(itself)` when it is an eliminated definition.
+        let mut def_of: Vec<Option<AstId>> = Vec::new();
         for a in self.assertions.clone() {
             let defined = if !self.inc_mode && self.m.is_eq(a) {
                 let args = self.m.app_args(a).to_vec();
@@ -38875,9 +38877,49 @@ impl Context {
                 Some((n, c, t)) => {
                     claimed.insert(n);
                     defs.push((c, t));
+                    def_of.push(Some(a));
                 }
-                None => kept.push(a),
+                None => {
+                    kept.push(a);
+                    def_of.push(None);
+                }
             }
+        }
+        // A definition dividing by a possibly-zero term whose constant occurs
+        // elsewhere stays an assertion: substituting it would put a division
+        // by an unknown inside another one.
+        let all = self.assertions.clone();
+        let mut keep_def = alloc::vec![false; defs.len()];
+        for (i, &(c, t)) in defs.iter().enumerate() {
+            let divides = self
+                .m
+                .postorder(t)
+                .into_iter()
+                .any(|u| self.m.is_app(u) && kind_of(self, u).is_some());
+            let used = all
+                .iter()
+                .zip(&def_of)
+                .any(|(&a, d)| *d != Some(a) && self.m.postorder(a).contains(&c));
+            keep_def[i] = divides && used;
+        }
+        if keep_def.iter().any(|&k| k) {
+            let mut di = 0;
+            kept.clear();
+            let mut new_defs = Vec::new();
+            for (&a, d) in all.iter().zip(&def_of) {
+                match d {
+                    Some(_) => {
+                        if keep_def[di] {
+                            kept.push(a);
+                        } else {
+                            new_defs.push(defs[di]);
+                        }
+                        di += 1;
+                    }
+                    None => kept.push(a),
+                }
+            }
+            defs = new_defs;
         }
         // The other assertions see each eliminated constant as its definition.
         for i in 0..defs.len() {
