@@ -32958,6 +32958,7 @@ impl Context {
     }
 
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
+        let lifted = self.name_nested_maps(lifted);
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
         axioms.extend(self.rm_axioms(lifted));
@@ -33184,6 +33185,121 @@ impl Context {
             }
         }
         axioms
+    }
+
+    /// `goal` with every `(_ map f)` array used other than as a side of an
+    /// array equality (inside a `store`, an `ite`, a function argument, or a
+    /// map operand in such a position) named by a fresh array constant `A`
+    /// with the defining equality `A = map` conjoined — z3's
+    /// `theory_array_full` treats a map as a term with its pointwise axioms
+    /// wherever it occurs, which the equality's instances supply here (see
+    /// [`Self::maps_only_in_equalities`]). Equisatisfiable; `goal` itself
+    /// when no map needs a name.
+    fn name_nested_maps(&mut self, goal: AstId) -> AstId {
+        if self.maps.is_empty() {
+            return goal;
+        }
+        let mut eqs: Vec<AstId> = Vec::new();
+        let mut names: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let mut memo: BTreeMap<AstId, AstId> = BTreeMap::new();
+        let g = self.name_maps_in(goal, &mut eqs, &mut names, &mut memo);
+        if eqs.is_empty() {
+            return goal;
+        }
+        eqs.push(g);
+        self.m.mk_and(&eqs)
+    }
+
+    /// [`Self::name_nested_maps`] over the subterms of `t`.
+    fn name_maps_in(
+        &mut self,
+        t: AstId,
+        eqs: &mut Vec<AstId>,
+        names: &mut BTreeMap<AstId, AstId>,
+        memo: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if let Some(&r) = memo.get(&t) {
+            return r;
+        }
+        let Some(app) = self.m.app(t).cloned() else {
+            return t;
+        };
+        if app.args.is_empty() {
+            return t;
+        }
+        let array_eq = self.m.is_eq(t) && self.m.is_array_sort(self.m.get_sort(app.args[0]));
+        let mut args = Vec::with_capacity(app.args.len());
+        for &a in &app.args {
+            let r = if self.maps.contains_key(&a) {
+                let m2 = self.name_map_operands(a, eqs, names, memo);
+                if array_eq {
+                    m2
+                } else {
+                    self.map_name(m2, eqs, names)
+                }
+            } else {
+                self.name_maps_in(a, eqs, names, memo)
+            };
+            args.push(r);
+        }
+        let r = if args == app.args {
+            t
+        } else {
+            self.m.mk_app(app.decl, &args)
+        };
+        memo.insert(t, r);
+        r
+    }
+
+    /// The map `m` with its operands' nested maps named (a new map term
+    /// when an operand changes).
+    fn name_map_operands(
+        &mut self,
+        m: AstId,
+        eqs: &mut Vec<AstId>,
+        names: &mut BTreeMap<AstId, AstId>,
+        memo: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if let Some(&r) = memo.get(&m) {
+            return r;
+        }
+        let Some((fname, ops)) = self.maps.get(&m).cloned() else {
+            return m;
+        };
+        let mut nops = Vec::with_capacity(ops.len());
+        for &o in &ops {
+            nops.push(if self.maps.contains_key(&o) {
+                self.name_map_operands(o, eqs, names, memo)
+            } else {
+                self.name_maps_in(o, eqs, names, memo)
+            });
+        }
+        let r = if nops == ops {
+            m
+        } else {
+            let t = self.fresh_const(self.m.get_sort(m));
+            self.maps.insert(t, (fname, nops));
+            t
+        };
+        memo.insert(m, r);
+        r
+    }
+
+    /// The fresh array constant naming the map `m`, its definition `A = m`
+    /// recorded in `eqs`.
+    fn map_name(
+        &mut self,
+        m: AstId,
+        eqs: &mut Vec<AstId>,
+        names: &mut BTreeMap<AstId, AstId>,
+    ) -> AstId {
+        if let Some(&a) = names.get(&m) {
+            return a;
+        }
+        let a = self.fresh_const(self.m.get_sort(m));
+        eqs.push(self.m.mk_eq(a, m));
+        names.insert(m, a);
+        a
     }
 
     /// Does every functional array constant in `goal` stand for a
@@ -43271,6 +43387,23 @@ mod tests {
         assert_eq!(out[2], "unsat");
         assert_eq!(out[3], "sat");
         assert_eq!(out[5], "true");
+    }
+
+    #[test]
+    fn maps_inside_stores_are_named() {
+        // A map under a `store` is named by an array constant equal to it.
+        let script = "
+            (declare-const y (Array Int Bool))
+            (declare-const z (Array Int Bool))
+            (declare-const i Int)
+            (assert (= y (store ((_ map not) z) i true)))
+            (assert (select z 3))
+            (check-sat)
+            (assert (select y 3))
+            (assert (distinct i 3))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
     }
 
     #[test]
