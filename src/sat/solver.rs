@@ -7,8 +7,10 @@
 //! come later.
 
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sat::literal::{Lit, Var};
 use crate::util::lbool::LBool;
@@ -22,12 +24,32 @@ pub enum SatResult {
     Unsat,
 }
 
-/// When set, fresh variables are first decided `false` (z3's default
+/// The initial decision phase of fresh variables, shared by the solvers of one
+/// context: when set, fresh variables are first decided `false` (z3's default
 /// phase, `smt.phase_selection` with a `false` initial phase) instead of
-/// `true`. Set around the searches whose models only steer quantifier
-/// instantiation, so the models of other checks are unchanged.
-pub static DECIDE_FALSE_FIRST: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+/// `true`. A context sets it around the searches whose models only steer
+/// quantifier instantiation, so the models of other checks are unchanged.
+///
+/// Every [`Solver`] built with [`Solver::with_initial_phase`] from the same
+/// handle reads its current value when it allocates a variable; solvers of
+/// other contexts (other threads) keep their own handles and are unaffected.
+#[derive(Clone, Debug, Default)]
+pub struct InitialPhase(Arc<AtomicBool>);
+
+impl InitialPhase {
+    /// Whether fresh variables are first decided `false`.
+    #[inline]
+    pub fn decide_false_first(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Set whether fresh variables are first decided `false`, returning the
+    /// previous setting (for the caller to restore).
+    #[inline]
+    pub fn set_decide_false_first(&self, value: bool) -> bool {
+        self.0.swap(value, Ordering::Relaxed)
+    }
+}
 
 /// Sentinel `reason`: a decision literal or a top-level fact (no antecedent).
 const REASON_NONE: i32 = -1;
@@ -118,6 +140,8 @@ pub struct Solver {
     reason: Vec<i32>,
     /// Saved polarity for phase saving.
     polarity: Vec<bool>,
+    /// The initial phase of fresh variables (see [`InitialPhase`]).
+    initial_phase: InitialPhase,
     activity: Vec<f64>,
     var_inc: f64,
     /// Decision order: a binary max-heap of variables by (activity desc, index
@@ -199,6 +223,14 @@ impl Default for Solver {
 }
 
 impl Solver {
+    /// A new, empty solver whose fresh variables follow `phase` (shared with
+    /// the other solvers of a context; see [`InitialPhase`]).
+    pub fn with_initial_phase(phase: InitialPhase) -> Solver {
+        let mut s = Solver::new();
+        s.initial_phase = phase;
+        s
+    }
+
     /// A new, empty solver.
     pub fn new() -> Solver {
         Solver {
@@ -206,6 +238,7 @@ impl Solver {
             level: Vec::new(),
             reason: Vec::new(),
             polarity: Vec::new(),
+            initial_phase: InitialPhase::default(),
             activity: Vec::new(),
             var_inc: 1.0,
             heap: Vec::new(),
@@ -244,8 +277,7 @@ impl Solver {
         self.assign.push(LBool::Undef);
         self.level.push(0);
         self.reason.push(REASON_NONE);
-        self.polarity
-            .push(DECIDE_FALSE_FIRST.load(core::sync::atomic::Ordering::Relaxed));
+        self.polarity.push(self.initial_phase.decide_false_first());
         self.activity.push(0.0);
         self.heap_pos.push(-1);
         self.seen.push(false);

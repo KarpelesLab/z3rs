@@ -5996,16 +5996,14 @@ impl Context {
                 } else if self.objectives.is_empty() {
                     // A tactic ending in `smt` decides with z3's SMT kernel,
                     // whose case splits try `false` first.
-                    use core::sync::atomic::Ordering::Relaxed;
                     let smt_kernel = is_using
                         && list
                             .get(1)
                             .and_then(elim_uncnstr::tactic_chain)
                             .is_some_and(|c| c.last().is_some_and(|l| l == "smt"));
-                    let phase = &crate::sat::solver::DECIDE_FALSE_FIRST;
-                    let saved_phase = phase.load(Relaxed);
+                    let saved_phase = self.m.initial_phase().decide_false_first();
                     if smt_kernel {
-                        phase.store(true, Relaxed);
+                        self.m.initial_phase().set_decide_false_first(true);
                     }
                     // The opaque `sin`/`cos` already decide many goals (`unsat`);
                     // only an open one is purified.
@@ -6015,7 +6013,7 @@ impl Context {
                             .unwrap_or((SmtResult::Unknown, None)),
                         r => r,
                     };
-                    phase.store(saved_phase, Relaxed);
+                    self.m.initial_phase().set_decide_false_first(saved_phase);
                     r
                 } else {
                     self.optimize(&[])
@@ -38541,7 +38539,7 @@ impl Context {
             // The linear abstraction of a nonlinear goal (products as
             // variables) only settles `unsat`: a bounded search, branching
             // left to the search as in the incremental linearization.
-            let mut core = crate::smt::SmtCore::new();
+            let mut core = crate::smt::SmtCore::for_manager(&self.m);
             core.branch_only();
             core.set_work_budget(NL_ABSTRACTION_BUDGET.0);
             core.set_round_limit(NL_ABSTRACTION_BUDGET.1);

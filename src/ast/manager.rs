@@ -18,6 +18,7 @@ use crate::ast::node::{
     SortData, VarData,
 };
 use crate::ast::{AstId, AstKind, FamilyId, SortSize};
+use crate::sat::solver::InitialPhase;
 use crate::util::hash::fnv_hash;
 use crate::util::symbol::Symbol;
 
@@ -34,6 +35,9 @@ pub struct AstManager {
     mask: usize,
     /// Registered theory families; the index is the [`FamilyId`].
     families: Vec<Symbol>,
+    /// The initial decision phase of the SAT searches over this manager's
+    /// terms (per context, never process-global; see [`InitialPhase`]).
+    initial_phase: InitialPhase,
 }
 
 impl Default for AstManager {
@@ -51,7 +55,16 @@ impl AstManager {
             buckets: vec![Vec::new(); INIT_BUCKETS],
             mask: INIT_BUCKETS - 1,
             families: vec![Symbol::new("basic")],
+            initial_phase: InitialPhase::default(),
         }
+    }
+
+    /// The initial decision phase shared by the SAT searches of this context:
+    /// a solver built from it ([`crate::sat::solver::Solver::with_initial_phase`])
+    /// reads its current setting for every fresh variable.
+    #[inline]
+    pub fn initial_phase(&self) -> &InitialPhase {
+        &self.initial_phase
     }
 
     // --- theory families --------------------------------------------------

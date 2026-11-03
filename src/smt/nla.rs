@@ -594,7 +594,7 @@ impl NlaSearch {
                 nla.register(m, t);
             }
         }
-        let mut core = SmtCore::new();
+        let mut core = SmtCore::for_manager(m);
         core.branch_only();
         core.eager_equalities();
         core.resume_searches();

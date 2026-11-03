@@ -105,7 +105,7 @@ fn enc_enters(m: &AstManager, e: AstId) -> bool {
 
 /// Decide the propositional abstraction of the Boolean formula `root`.
 pub fn check_skeleton(m: &AstManager, root: AstId) -> SatResult {
-    let mut s = Solver::new();
+    let mut s = Solver::with_initial_phase(m.initial_phase().clone());
     let l = encode(m, root, &mut s);
     s.add_clause(&[l]);
     s.solve()

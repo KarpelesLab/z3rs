@@ -100,7 +100,7 @@ struct BitBlaster<'a> {
 
 impl<'a> BitBlaster<'a> {
     fn new(m: &'a AstManager) -> BitBlaster<'a> {
-        let mut sat = Solver::new();
+        let mut sat = Solver::with_initial_phase(m.initial_phase().clone());
         let t = Lit::pos(sat.mk_var());
         sat.add_clause(&[t]); // force it true
         BitBlaster {

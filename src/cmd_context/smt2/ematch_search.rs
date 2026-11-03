@@ -279,7 +279,7 @@ impl Context {
             },
             table_decls,
         };
-        let mut core = SmtCore::new();
+        let mut core = SmtCore::for_manager(&self.m);
         core.eager_equalities();
         core.resume_searches();
         let goal = self.online_preprocess(base, &mut pre);
@@ -288,8 +288,7 @@ impl Context {
         let mut st = Rounds::default();
         // Decide `false` first, as z3 does: an atom left open by the search
         // then keeps what it guards irrelevant.
-        use core::sync::atomic::Ordering::Relaxed;
-        let saved_phase = crate::sat::solver::DECIDE_FALSE_FIRST.swap(true, Relaxed);
+        let saved_phase = self.m.initial_phase().set_decide_false_first(true);
         let mut verdict = None;
         let mut work = 0;
         for _ in 0..MAX_ROUNDS {
@@ -335,7 +334,7 @@ impl Context {
                 break;
             }
         }
-        crate::sat::solver::DECIDE_FALSE_FIRST.store(saved_phase, Relaxed);
+        self.m.initial_phase().set_decide_false_first(saved_phase);
         Some(verdict)
     }
 
@@ -505,10 +504,9 @@ impl Context {
             }
             // Decide `false` first, as z3 does: an atom left open by the
             // search then keeps what it guards irrelevant.
-            use core::sync::atomic::Ordering::Relaxed;
-            let saved_phase = crate::sat::solver::DECIDE_FALSE_FIRST.swap(true, Relaxed);
+            let saved_phase = self.m.initial_phase().set_decide_false_first(true);
             let (res, model, _) = self.decide_combined(goal);
-            crate::sat::solver::DECIDE_FALSE_FIRST.store(saved_phase, Relaxed);
+            self.m.initial_phase().set_decide_false_first(saved_phase);
             match res {
                 SmtResult::Unsat => return Some(SmtResult::Unsat),
                 SmtResult::Unknown => break,

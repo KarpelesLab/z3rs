@@ -80,7 +80,7 @@ pub fn check(m: &AstManager, formula: AstId) -> SmtResult {
 /// satisfiable (`None` when unsat). The model can evaluate terms via
 /// [`Model::eval`], backing `(get-value …)` / `(get-model)`.
 pub fn check_model(m: &AstManager, formula: AstId) -> (SmtResult, Option<Model>) {
-    let mut core = SmtCore::new();
+    let mut core = SmtCore::for_manager(m);
     core.assert(m, formula);
     core.check(m)
 }
@@ -144,6 +144,14 @@ impl Default for SmtCore {
 }
 
 impl SmtCore {
+    /// An empty search over `m`'s terms, deciding with the context's initial
+    /// phase ([`AstManager::initial_phase`]).
+    pub fn for_manager(m: &AstManager) -> SmtCore {
+        let mut core = SmtCore::new();
+        core.sat = Solver::with_initial_phase(m.initial_phase().clone());
+        core
+    }
+
     /// An empty search (no formula asserted: satisfiable).
     pub fn new() -> SmtCore {
         SmtCore {
