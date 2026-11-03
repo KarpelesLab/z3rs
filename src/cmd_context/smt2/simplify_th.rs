@@ -767,7 +767,7 @@ impl Context {
             Op::Num(r) => PreTerm::Num(r.clone(), *s.sort(o) == Sort::Int),
             Op::True => PreTerm::Bool(true),
             Op::False => PreTerm::Bool(false),
-            _ => match box_range(s, o, &boxes) {
+            _ => match pb_range(s, o).or_else(|| box_range(s, o, &boxes)) {
                 Some((lo, hi)) => PreTerm::Range(lo, hi),
                 None => PreTerm::Other,
             },
@@ -1210,10 +1210,8 @@ fn lia2card(
                 .then(|| (v, (Q::from_integer(lo), Q::from_integer(hi))))
         })
         .collect();
-    if boxes.is_empty() {
-        return boxes;
-    }
-    // Every comparison over boxed constants only, decided by its range.
+    // Every comparison of pseudo-Boolean sums (numerals, numeral `ite`s
+    // and boxed constants), decided by its range.
     let mut map: BTreeMap<T, T> = BTreeMap::new();
     let mut seen = BTreeSet::new();
     let mut stack: Vec<T> = goal.iter().chain(obj.iter()).copied().collect();
@@ -1230,28 +1228,12 @@ fn lia2card(
         if !s.sort(a).is_arith_sort() {
             continue;
         }
-        let (Some((ca, ka)), Some((cb, kb))) = (int_lin(s, a), int_lin(s, b)) else {
+        // The range of a − b.
+        let one = Q::from_integer(Int::from(1));
+        let Some((lo, hi, _)) = pb_bounds(s, &[(a, one.clone()), (b, one.neg())], &boxes, true)
+        else {
             continue;
         };
-        // The range of a − b.
-        let (mut lo, mut hi) = (ka.sub(&kb), ka.sub(&kb));
-        let mut boxed = true;
-        let terms = ca
-            .into_iter()
-            .chain(cb.into_iter().map(|(v, c)| (v, c.neg())));
-        for (v, c) in terms {
-            let Some((l, h)) = boxes.get(&v) else {
-                boxed = false;
-                break;
-            };
-            let (x, y) = (c.mul(l), c.mul(h));
-            let (x, y) = if x <= y { (x, y) } else { (y, x) };
-            lo = lo.add(&x);
-            hi = hi.add(&y);
-        }
-        if !boxed {
-            continue;
-        }
         let zero = Q::from_integer(Int::from(0));
         let value = match op {
             Op::Eq if lo > zero || hi < zero => Some(false),
@@ -1278,6 +1260,114 @@ fn lia2card(
         }
     }
     boxes
+}
+
+/// The bounds `(c, c + Σ wᵢ)` of `Σ mᵢ·tᵢ` over `roots` as `lia2card`'s
+/// `get_pb_sum` reads it: a sum of numerals, `ite`s with numeral branches (one level deep)
+/// and the `boxes`' constants (each `lo + Σ [bitᵢ]`), i.e.
+/// `c + Σ wᵢ·[condᵢ]` with every `wᵢ > 0` (a negative `w·[d]` is
+/// `w + |w|·[¬d]`); the conditions are taken independently. The flag
+/// tells whether `t` has a condition or boxed constant at all. `None`
+/// outside that form.
+fn pb_bounds(
+    s: &Simp,
+    roots: &[(T, puremp::Rational)],
+    boxes: &BTreeMap<T, (puremp::Rational, puremp::Rational)>,
+    merge: bool,
+) -> Option<(puremp::Rational, puremp::Rational, bool)> {
+    use puremp::Rational as Q;
+    let zero = || Q::from_integer(Int::from(0));
+    let (mut coeff, mut total) = (zero(), zero());
+    let mut any = false;
+    // With `merge`, the weights of each condition and of its negation, as
+    // the pseudo-Boolean rewriter combines `x·[c] + y·[¬c]`.
+    let mut by_cond: BTreeMap<T, (Q, Q)> = BTreeMap::new();
+    // One weight `p` under a condition.
+    let weigh = |p: Q, coeff: &mut Q, total: &mut Q| {
+        if p.is_negative() {
+            *coeff = coeff.add(&p);
+            *total = total.sub(&p);
+        } else {
+            *total = total.add(&p);
+        }
+    };
+    // (term, multiplier, ite nesting, under a condition)
+    let mut stack: Vec<(T, Q, u32, bool)> = roots
+        .iter()
+        .map(|(t, m)| (*t, m.clone(), 0u32, false))
+        .collect();
+    while let Some((u, mul, nesting, cond)) = stack.pop() {
+        if let Op::Num(r) = s.op(u) {
+            let p = mul.mul(r);
+            if cond {
+                weigh(p, &mut coeff, &mut total);
+            } else {
+                coeff = coeff.add(&p);
+            }
+            continue;
+        }
+        if nesting > 1 {
+            return None;
+        }
+        if let Some((lo, hi)) = boxes.get(&u) {
+            // `lo + Σ ite(bᵢ, 1, 0)`: its bits sit one level deeper.
+            if nesting > 0 {
+                return None;
+            }
+            any = true;
+            coeff = coeff.add(&mul.mul(lo));
+            let bits = hi.sub(lo);
+            weigh(mul.mul(&bits), &mut coeff, &mut total);
+            continue;
+        }
+        let a = s.args(u);
+        match s.op(u) {
+            Op::Add => stack.extend(a.iter().map(|&x| (x, mul.clone(), nesting, cond))),
+            Op::Sub => {
+                stack.push((a[0], mul.clone(), nesting, cond));
+                stack.extend(a[1..].iter().map(|&x| (x, mul.neg(), nesting, cond)));
+            }
+            Op::Uminus => stack.push((a[0], mul.neg(), nesting, cond)),
+            Op::ToReal => stack.push((a[0], mul, nesting, cond)),
+            Op::Mul if a.len() == 2 => match (s.op(a[0]), s.op(a[1])) {
+                (Op::Num(r), _) => stack.push((a[1], mul.mul(r), nesting, cond)),
+                (_, Op::Num(r)) => stack.push((a[0], mul.mul(r), nesting, cond)),
+                _ => return None,
+            },
+            Op::Ite => {
+                any = true;
+                let numeral = |x: T| match s.op(x) {
+                    Op::Num(r) => Some(r.clone()),
+                    _ => None,
+                };
+                if let (true, Some(th), Some(el)) = (merge, numeral(a[1]), numeral(a[2])) {
+                    let e = by_cond.entry(a[0]).or_insert_with(|| (zero(), zero()));
+                    e.0 = e.0.add(&mul.mul(&th));
+                    e.1 = e.1.add(&mul.mul(&el));
+                    continue;
+                }
+                stack.push((a[1], mul.clone(), nesting + 1, true));
+                stack.push((a[2], mul, nesting + 1, true));
+            }
+            _ => return None,
+        }
+    }
+    for (_, (th, el)) in by_cond {
+        // `el + (th − el)·[c]`.
+        coeff = coeff.add(&el);
+        weigh(th.sub(&el), &mut coeff, &mut total);
+    }
+    let hi = coeff.add(&total);
+    Some((coeff, hi, any))
+}
+
+/// An objective z3's optimizer turns into a MaxSAT problem
+/// (`opt::context::is_maxsat` over `get_pb_sum`, see [`pb_bounds`]): its
+/// bounds before any search.
+fn pb_range(s: &Simp, t: T) -> Option<(puremp::Rational, puremp::Rational)> {
+    let one = puremp::Rational::from_integer(Int::from(1));
+    let (lo, hi, any) = pb_bounds(s, &[(t, one)], &BTreeMap::new(), false)?;
+    any.then_some((lo, hi))
 }
 
 /// The range of the integer term `t` over `boxes` when it is linear in

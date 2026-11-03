@@ -28924,7 +28924,7 @@ impl Context {
                     None => {}
                 }
                 let above_lo = |v: &Rational| lo.as_ref().is_none_or(|l| v > l);
-                if let Some(Value::Num(v, _)) = witness.map(|mut m| m.eval(&self.m, g))
+                if let Some(Value::Num(v, _)) = witness.map(|mut m| m.eval_value(&self.m, g))
                     && above_lo(&v)
                 {
                     cand = Some(v);
@@ -29025,7 +29025,7 @@ impl Context {
         }
         let usort = self.m.get_sort(u);
         if self.m.is_int_sort(usort) {
-            let v0 = match model.as_mut().map(|m| m.eval(&self.m, u)) {
+            let v0 = match model.as_mut().map(|m| m.eval_value(&self.m, u)) {
                 Some(Value::Num(r, _)) => r.numerator().clone(),
                 _ => return None,
             };
@@ -29157,7 +29157,7 @@ impl Context {
         if !self.m.is_int_sort(osort) {
             return unknown(); // only Int/Real/BV objectives are optimized
         }
-        let v0 = match model.as_mut().map(|m| m.eval(&self.m, obj)) {
+        let v0 = match model.as_mut().map(|m| m.eval_value(&self.m, obj)) {
             Some(Value::Num(r, _)) => r.numerator().clone(),
             _ => return unknown(),
         };
@@ -29214,7 +29214,7 @@ impl Context {
                     }
                     continue;
                 }
-                match model.eval(&self.m, o) {
+                match model.eval_value(&self.m, o) {
                     v @ (Value::Num(..) | Value::Bv(..)) => vals.push((v, None)),
                     _ => return (SmtResult::Unknown, None),
                 }
@@ -30508,6 +30508,10 @@ impl Context {
                 _ => return RealOpt::Unknown,
             };
             let mut cube = Vec::new();
+            // The objective on this cube: its `ite`s at the model's branches.
+            let Some(cube_obj) = self.opt_resolve_ites(obj, &mut model, &mut cube) else {
+                return RealOpt::Unknown;
+            };
             let roots: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
             for f in roots {
                 // A formula over no real constant leaves them free (its
@@ -30549,14 +30553,14 @@ impl Context {
             }
             if self
                 .m
-                .postorder(obj)
+                .postorder(cube_obj)
                 .into_iter()
                 .any(|t| self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t)))
             {
                 return RealOpt::Unknown;
             }
             // The cube's optimum, exactly by its LP.
-            let r = self.real_optimize_in(&real_cube, obj, maximize, None);
+            let r = self.real_optimize_in(&real_cube, cube_obj, maximize, None);
             let (v, attained) = match r {
                 RealOpt::Attained(ref v) => (v.clone(), true),
                 RealOpt::Supremum(ref v, _) => (v.clone(), false),
@@ -30592,6 +30596,37 @@ impl Context {
             guard.push(bound);
         }
         RealOpt::Unknown
+    }
+
+    /// `t` with its term-level `ite`s replaced, innermost first, by the
+    /// branches `model` selects; the literals of their conditions are pushed
+    /// onto `out` (see [`opt_implicant`](Self::opt_implicant)).
+    fn opt_resolve_ites(
+        &mut self,
+        t: AstId,
+        model: &mut Model,
+        out: &mut Vec<AstId>,
+    ) -> Option<AstId> {
+        let mut t = t;
+        for _ in 0..256 {
+            let Some(ite) = self
+                .m
+                .postorder(t)
+                .into_iter()
+                .find(|&u| self.m.is_ite(u) && !self.m.is_bool_sort(self.m.get_sort(u)))
+            else {
+                return Some(t);
+            };
+            let a = self.m.app_args(ite).to_vec();
+            let c = match model.eval_value(&self.m, a[0]) {
+                Value::Bool(b) => b,
+                _ => return None,
+            };
+            self.opt_implicant(a[0], c, model, out)?;
+            let branch = if c { a[1] } else { a[2] };
+            t = crate::rewriter::substitute(&mut self.m, t, &[(ite, branch)]);
+        }
+        None
     }
 
     /// Push onto `out` arithmetic literals and Boolean constant literals,
@@ -30683,23 +30718,7 @@ impl Context {
         if !arith_atom {
             return None;
         }
-        // Resolve the term-level `ite`s, innermost first.
-        let mut atom = f;
-        for _ in 0..256 {
-            let Some(ite) = self
-                .m
-                .postorder(atom)
-                .into_iter()
-                .find(|&t| self.m.is_ite(t) && !is_bool(self, t))
-            else {
-                break;
-            };
-            let a = self.m.app_args(ite).to_vec();
-            let c = holds(self, model, a[0])?;
-            self.opt_implicant(a[0], c, model, out)?;
-            let branch = if c { a[1] } else { a[2] };
-            atom = crate::rewriter::substitute(&mut self.m, atom, &[(ite, branch)]);
-        }
+        let atom = self.opt_resolve_ites(f, model, out)?;
         if pos {
             out.push(atom);
             return Some(());
@@ -30997,7 +31016,7 @@ impl Context {
             let mut ex = fixed.to_vec();
             ex.push(c);
             Some(match ctx.check_with(&ex) {
-                (SmtResult::Sat, Some(mut model)) => match model.eval(&ctx.m, obj) {
+                (SmtResult::Sat, Some(mut model)) => match model.eval_value(&ctx.m, obj) {
                     Value::Num(r, _)
                         if r.is_integer()
                             && (if maximize {
@@ -51004,6 +51023,68 @@ mod tests {
         let out = run(src).unwrap();
         assert_eq!(out[1], "(objectives\n (g 2)\n (x 3)\n)");
         assert_eq!(out[3], "(objectives\n (g 0)\n ((- x) (- 3))\n)");
+    }
+
+    #[test]
+    fn objectives_with_term_ites() {
+        // The objective's `ite` is evaluated, not read as an opaque 0.
+        let int = "
+            (declare-const x Int)
+            (assert (or (= (* (- 3) x) 4) (>= x (- 1))))
+            (assert (or (< x (- 1)) (> x 5)))
+            (maximize (ite (>= x 1) (- 2) (- 1)))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(int).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((ite (>= x 1) (- 2) (- 1)) (- 2))\n)"
+        );
+        // A real objective with an `ite`, over a disjunction.
+        let real = "
+            (declare-const x Real)
+            (declare-const y Real)
+            (assert (<= (- 1.0) x 6.0))
+            (assert (<= (- 5.0) y 4.0))
+            (assert (or (< (* 3.0 x) 3.0) (> (+ x y) 2.0)))
+            (minimize (+ (* (- 2.0) x) (* (- 3.0) y) (ite (< x 1.0) (- 3.0) 3.0)))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(real).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((+ (* (- 2.0) x) (* (- 3.0) y) (ite (< x 1.0) (- 3.0) 3.0)) (- 21))\n)"
+        );
+        // Unsat: a sum of numeral `ite`s is a MaxSAT objective in z3, with
+        // bounds (c, c + Σ w); a comparison of such sums decided by its
+        // range refutes the goal (values 0).
+        let pb = "
+            (declare-const x Int)
+            (declare-const y Int)
+            (assert (> x 2))
+            (assert (< x 1))
+            (maximize (ite (< y 2) 3 5))
+            (minimize (+ 1 (ite (< y 2) (- 3) 5) (ite (> y 7) 2 0)))
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(pb).unwrap();
+        assert_eq!(
+            out[1],
+            "(objectives\n ((ite (< y 2) 3 5)  (interval 8 0))\n \
+             ((+ 1 (ite (< y 2) (- 3) 5) (ite (> y 7) 2 0))  (interval (- 2) 8))\n)"
+        );
+        let refuted = "
+            (declare-const x Int)
+            (assert (< (ite (< x 2) 0 (- 1)) (- 1)))
+            (minimize x)
+            (check-sat)
+            (get-objectives)
+        ";
+        let out = run(refuted).unwrap();
+        assert_eq!(out[1], "(objectives\n (x 0)\n)");
     }
 
     #[test]
