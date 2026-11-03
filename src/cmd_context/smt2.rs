@@ -19459,6 +19459,11 @@ impl Context {
                     if r.is_empty_lang() {
                         return Ok(self.m.mk_false());
                     }
+                    // A universal language (its complement is empty, decided on
+                    // the derivative automaton): membership holds for every `s`.
+                    if Regex::Comp(Box::new(r.clone())).language_is_empty() == Some(true) {
+                        return Ok(self.m.mk_true());
+                    }
                     // If s is a literal and r a constant regex, match directly.
                     if let Some(s) = self.str_value(raw[0]) {
                         let hit = r.matches(&s);
@@ -43862,6 +43867,17 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["unsat"; 4]);
+    }
+
+    #[test]
+    fn membership_in_a_universal_regex_holds() {
+        let script = "
+            (declare-const a String)
+            (assert (not (str.in_re a (re.opt (re.union re.all
+                (re.inter (str.to_re \"ab\") (str.to_re \"b\")))))))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["unsat"]);
     }
 
     #[test]
