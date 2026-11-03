@@ -6692,6 +6692,54 @@ impl Context {
         count > 1
     }
 
+    /// The datatype constants z3's `elim_uncnstr` eliminates before solving
+    /// (outside incremental mode): a constant whose only occurrence in the
+    /// assertions is as the argument of a selector, `(sel x)`. z3 replaces
+    /// `(sel x)` by a fresh variable `v` and defines `x` as the selector's
+    /// constructor with `v` in that field. Maps each such constant's
+    /// declaration to its selector application.
+    fn uncnstr_selector_args(&self) -> BTreeMap<AstId, AstId> {
+        let mut out = BTreeMap::new();
+        if self.inc_mode || self.datatypes.is_empty() {
+            return out;
+        }
+        let mut roots = self.assertions.clone();
+        roots.extend(self.universals.iter().map(|&(_, b)| b));
+        // Per datatype constant: its distinct parent applications.
+        let mut parents: BTreeMap<AstId, BTreeSet<AstId>> = BTreeMap::new();
+        let all = self.m.postorder_many(&roots);
+        for &t in &all {
+            if let Some(app) = self.m.app(t) {
+                for &a in &app.args {
+                    if self.m.app(a).is_some_and(|x| x.args.is_empty())
+                        && self.datatypes.contains_key(&self.m.get_sort(a))
+                    {
+                        parents.entry(a).or_default().insert(t);
+                    }
+                }
+            }
+        }
+        let in_universal: BTreeSet<AstId> = self
+            .m
+            .postorder_many(&self.universals.iter().map(|&(_, b)| b).collect::<Vec<_>>())
+            .into_iter()
+            .collect();
+        for (x, ps) in parents {
+            let [p] = ps.into_iter().collect::<Vec<_>>()[..] else {
+                continue;
+            };
+            let Some(app) = self.m.app(p) else { continue };
+            let is_sel = self.datatypes[&self.m.get_sort(x)]
+                .iter()
+                .any(|(_, sels, _)| sels.contains(&app.decl));
+            let is_root = self.assertions.contains(&x);
+            if is_sel && app.args.len() == 1 && !is_root && !in_universal.contains(&x) {
+                out.insert(self.m.app_decl(x), p);
+            }
+        }
+        out
+    }
+
     /// If `id` has a datatype (or record) sort, render its model value as the
     /// constructor term z3 prints: `(node 21 (as nil (TreeList Int)))`. The
     /// constructor is found from its tester's value under `model`; each field is
@@ -6704,11 +6752,22 @@ impl Context {
         // is unconstrained (no tester forced), fall back to a nullary constructor
         // (z3's datatype factory likewise completes with a base constructor).
         if let Some(ctors) = self.datatypes.get(&sort).cloned() {
+            // A constant elim-uncnstr eliminated through a selector is that
+            // selector's constructor, whatever the solver's model chose.
+            let sel = self
+                .m
+                .app(id)
+                .filter(|a| a.args.is_empty())
+                .and_then(|a| self.uncnstr_selector_args().get(&a.decl).copied())
+                .map(|s| self.m.app_decl(s));
             let chosen = ctors
                 .iter()
-                .find(|(_, _, tdecl)| {
-                    let tester = self.m.mk_app(*tdecl, &[id]);
-                    matches!(model.eval(&self.m, tester), Value::Bool(true))
+                .find(|(_, sels, _)| sel.is_some_and(|s| sels.contains(&s)))
+                .or_else(|| {
+                    ctors.iter().find(|(_, _, tdecl)| {
+                        let tester = self.m.mk_app(*tdecl, &[id]);
+                        matches!(model.eval(&self.m, tester), Value::Bool(true))
+                    })
                 })
                 .or_else(|| ctors.iter().find(|(_, sels, _)| sels.is_empty()));
             let (cdecl, sels, _) = chosen?;
@@ -38296,7 +38355,17 @@ impl Context {
         let fn_bodies: BTreeMap<AstId, String> =
             chosen.into_iter().map(|(d, r, _)| (d, r)).collect();
 
-        let decls = self.model_listing_order(decls, |d| &d.name, |d| self.m.is_bool_sort(d.range));
+        // A constant elim-uncnstr eliminated takes the place of the fresh
+        // variable that replaced its selector application.
+        let uncnstr = self.uncnstr_selector_args();
+        let decls = self.model_listing_order(
+            decls,
+            |d| &d.name,
+            |d| match uncnstr.get(&d.d) {
+                Some(&sel) => self.m.is_bool_sort(self.m.get_sort(sel)),
+                None => self.m.is_bool_sort(d.range),
+            },
+        );
         // z3 prints the model's constants before its functions.
         let (consts, funs): (Vec<Decl>, Vec<Decl>) =
             decls.into_iter().partition(|d| d.domain.is_empty());
@@ -43903,6 +43972,27 @@ mod tests {
             out[1].contains(
                 "  (define-fun q ((x!0 Int) (x!1 Int)) Bool\n    \
                  (ite (and (= x!0 2) (= x!1 1)) false\n      true))\n"
+            ),
+            "{}",
+            out[1]
+        );
+    }
+
+    #[test]
+    fn uncnstr_selector_argument_is_its_constructor() {
+        // `t` occurs only under `value`: z3's elim-uncnstr makes it a `node`
+        // and lists it first, in the place of the fresh Boolean.
+        let out = run(
+            "(declare-datatypes (T) ((Tree leaf (node (value T) (children TreeList)))\
+             (TreeList nil (cons (car Tree) (cdr TreeList)))))\
+             (declare-const u (Tree Int))(declare-const t (Tree Bool))\
+             (assert (> (value u) 3))(assert (not (value t)))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(out[0], "sat");
+        assert!(
+            out[1].starts_with(
+                "(\n  (define-fun t () (Tree Bool)\n    (node false (as nil (TreeList Bool))))"
             ),
             "{}",
             out[1]
