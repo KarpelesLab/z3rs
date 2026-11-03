@@ -879,6 +879,7 @@ mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
 mod seq_nth;
+mod simplify_th;
 use crate::util::symbol::{Symbol, smt2_symbol};
 
 /// Parse an SMT-LIB numeral: `42` → `(Int, 42)`, `1.5` → `(Real, 3/2)`.
@@ -4894,6 +4895,13 @@ impl Context {
                 // (simplify term [:opt v …]) — return the simplified term.
                 // A regular-expression term goes through z3's regex rewriter.
                 if let Some(out) = self.simplify_regex(&list[1]) {
+                    return Ok(Some(out));
+                }
+                // Terms in the theory rewriter port's fragment take z3's rules
+                // and printing verbatim.
+                if list.len() == 2
+                    && let Some(out) = self.simplify_th(&list[1])
+                {
                     return Ok(Some(out));
                 }
                 let t = self.term(&list[1])?;

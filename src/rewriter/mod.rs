@@ -26,6 +26,7 @@ pub mod bv_rewriter;
 pub mod nnf;
 pub mod subst;
 pub mod th_rewriter;
+pub mod th_simp;
 
 pub use nnf::to_nnf;
 pub use subst::{substitute, substitute_vars};
