@@ -18,6 +18,7 @@
 pub mod factor;
 pub mod fuel;
 pub mod interval;
+pub mod lar;
 pub mod polynomial;
 pub mod resultant;
 pub mod simplex;

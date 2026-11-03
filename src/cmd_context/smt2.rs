@@ -1019,6 +1019,7 @@ mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
+mod lra_conj;
 mod re_len;
 mod re_sym;
 mod seq_bounded;
@@ -5980,6 +5981,8 @@ impl Context {
                 self.str_witness.clear();
                 self.trig_basis.clear();
                 self.uncnstr_model_order = None;
+                let first_check =
+                    !self.check_sat_done && !self.inc_mode && self.scope_stack.is_empty();
                 let uncnstr = if is_using {
                     list.get(1).and_then(|t| self.uncnstr_check_goal(t))
                 } else {
@@ -6074,6 +6077,16 @@ impl Context {
                     && let Some(Ok(md)) = self.nra_witness(&[], &mut None)
                 {
                     model = Some(md);
+                }
+                // A linear real conjunction: z3's `lar_solver` vertex.
+                if plain
+                    && !is_using
+                    && first_check
+                    && res == SmtResult::Sat
+                    && self.objectives.is_empty()
+                    && let Some(md) = model.as_mut()
+                {
+                    self.apply_z3_lra_conj_model(md);
                 }
                 let extra: Vec<AstId> = self.last_assumptions.iter().map(|&(_, t)| t).collect();
                 let (res, mut model) = self.finish_str_model(res, model, &extra);
@@ -46138,6 +46151,19 @@ mod tests {
         assert_eq!(out[0], "unsat");
         assert_ne!(out[1], "sat");
         assert_ne!(out[2], "sat");
+    }
+
+    #[test]
+    fn linear_real_conjunction_takes_z3s_vertex() {
+        // z3's `lar_solver` makes `c` basic for `-2c + d > 2·δ…` and takes
+        // `δ = 1`; for `a + b = 2` it moves `a`.
+        let out = run("(declare-const c Real)(declare-const d Real)\
+             (assert (< (+ (* (- 2) c) d 2) 0))(check-sat)(get-value (c d))\
+             (reset)(declare-const a Real)(declare-const b Real)\
+             (assert (= (+ a b 6) 8))(check-sat)(get-value (a b))")
+        .unwrap();
+        assert_eq!(out[1], "((c (/ 3.0 2.0))\n (d 0.0))");
+        assert_eq!(out[3], "((a 2.0)\n (b 0.0))");
     }
 
     #[test]
