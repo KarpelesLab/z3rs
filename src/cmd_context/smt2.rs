@@ -32959,6 +32959,13 @@ impl Context {
 
     fn with_axioms(&mut self, lifted: AstId) -> AstId {
         let lifted = self.name_nested_maps(lifted);
+        // Arrays over `Bool` are pairs: read pointwise before the array
+        // axioms, so their equalities need no extensionality instances.
+        let lifted = if self.has_bool_indexed_array(lifted) {
+            self.eliminate_bool_indices(lifted).unwrap_or(lifted)
+        } else {
+            lifted
+        };
         let mut axioms = self.array_axioms(lifted);
         axioms.extend(self.enum_axioms(lifted));
         axioms.extend(self.rm_axioms(lifted));
@@ -43401,6 +43408,31 @@ mod tests {
             (check-sat)
             (assert (select y 3))
             (assert (distinct i 3))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
+    }
+
+    #[test]
+    fn bool_indexed_arrays_are_pairs_before_the_array_axioms() {
+        let script = "
+            (declare-const p Bool)
+            (declare-const q Bool)
+            (declare-const s Bool)
+            (declare-const x Int)
+            (declare-const y Int)
+            (declare-const A (Array Bool Int))
+            (declare-const B (Array Bool Int))
+            (declare-const P (Array Bool Bool))
+            (assert (= 2 (select (store B s (select B p)) true)))
+            (assert (=> (distinct (ite (< y 0) B B) (store B q x)
+                (ite (< x 0) (store ((as const (Array Bool Int)) 2) (< y 3) (select B q))
+                ((as const (Array Bool Int)) 2)))
+                (=> (distinct ((as const (Array Bool Int)) 3) (store B false x) A)
+                    (select P p))))
+            (check-sat)
+            (assert (= A (store A p 4)))
+            (assert (= A ((as const (Array Bool Int)) 3)))
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat", "unsat"]);
