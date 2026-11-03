@@ -2980,6 +2980,49 @@ fn build_arith_system(m: &AstManager, atoms: &[ArithAtom], sat: &Solver) -> Arit
 /// Decide feasibility of an [`ArithSystem`] (LRA relaxation + integer B&B, with
 /// the gcd/divisibility precheck for all-integer equalities). `budget` bounds
 /// total work (shared with any surrounding [`theory_check`]).
+/// The gcd test on the all-integer equalities after eliminating each
+/// variable a unit coefficient defines (z3's `solve_eqs` before the gcd
+/// test): `e = 3 ∧ e + 2a = 2c` has no integer solution although each
+/// equality alone has. Substituting `x = −(e − x)` for a unit `x` keeps the
+/// integer solutions, so a remaining equality failing the test is a proof.
+fn integer_equalities_infeasible(sys: &ArithSystem) -> bool {
+    const MAX_EQS: usize = 64;
+    let mut eqs: Vec<LinExpr> = sys
+        .cons
+        .iter()
+        .filter(|c| {
+            c.rel == Rel::Eq
+                && c.expr.vars().all(|v| sys.int_set.contains(&v))
+                && c.expr.terms().all(|(_, a)| a.is_integer())
+                && c.expr.constant_part().is_integer()
+        })
+        .map(|c| c.expr.clone())
+        .take(MAX_EQS)
+        .collect();
+    if eqs.len() < 2 {
+        return false;
+    }
+    let one = Rational::from_integer(Int::from(1));
+    while let Some((k, x)) = eqs
+        .iter()
+        .enumerate()
+        .find_map(|(k, e)| e.terms().find(|(_, a)| a.abs() == one).map(|(x, _)| (k, x)))
+    {
+        let e = eqs.swap_remove(k);
+        let a = e.coeff_of(x);
+        // a·x + r = 0 ⇒ x = −r / a (a = ±1).
+        let r = e.sub(&LinExpr::var(x).scale(&a));
+        let x_expr = r.scale(&a.neg().recip());
+        for f in eqs.iter_mut() {
+            *f = substitute_lin(f, x, &x_expr);
+        }
+        if eqs.iter().any(|f| f.integer_equality_infeasible()) {
+            return true;
+        }
+    }
+    false
+}
+
 fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
     // Sound necessary condition: an all-integer equality with no integer
     // solution (by the gcd/divisibility test) is infeasible — this decides
@@ -2991,6 +3034,9 @@ fn arith_feasible(sys: &ArithSystem, budget: &mut u64) -> Feas {
         {
             return Feas::Unsat;
         }
+    }
+    if integer_equalities_infeasible(sys) {
+        return Feas::Unsat;
     }
     // Integer strict-inequality tightening: `expr < 0` over integer variables is
     // `expr ≤ -1`. This lets Fourier–Motzkin decide many QF_LIA systems directly
