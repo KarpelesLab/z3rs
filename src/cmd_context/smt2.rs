@@ -45529,6 +45529,22 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_sequences_by_short_values() {
+        // No length bound: a model among short values (the extract at a
+        // symbolic length read by cases).
+        let script = "
+            (declare-const a (Seq Int))
+            (declare-const b (Seq Int))
+            (declare-const i Int)
+            (assert (= a (seq.unit i)))
+            (assert (distinct (seq.++ (seq.extract a (seq.len a) i) a) (seq.extract a 1 1)))
+            (assert (distinct (seq.nth (seq.++ (seq.++ b (seq.unit i)) a) 1) 2))
+            (check-sat)
+        ";
+        assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
     fn to_int_and_from_int_digit_facts() {
         // `str.to_int` is at least -1; `str.from_int` is a digit string (or
         // empty), so it never starts with "b" nor contains "a"; a positive

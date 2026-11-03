@@ -1,14 +1,16 @@
 //! Sequence variables of bounded length, decided by their elements.
 //!
 //! When the assertions bound the length of every sequence variable to a
-//! small range (`lo <= seq.len s <= hi` at the top level), each combination
+//! small range (`lo <= seq.len s <= hi` at the top level, or a bound the
+//! solver proves by refuting every longer value), each combination
 //! of lengths is tried: a variable of length `n` becomes the concrete
 //! sequence of `n` fresh element constants, the sequence operations fold
 //! over it (reads at symbolic positions by cases, out-of-range reads through
 //! z3's `seq.nth_u`), and the element problem is decided. Some combination
 //! `sat` gives a model (the elements' values, confirmed on the original
 //! assertions); every combination `unsat` refutes the goal, the lengths being
-//! exhausted.
+//! exhausted. A variable with no bound is tried at short lengths only, for a
+//! model: then only `sat` is concluded.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -21,10 +23,16 @@ use crate::ast::arith::ArithOp;
 const MAX_COMBOS: usize = 64;
 /// The longest sequence built.
 const MAX_LEN: i64 = 8;
+/// The length bound tried for a variable without an asserted one.
+const MAX_DERIVED: i64 = 4;
+/// The longest value tried for a variable without a length bound (for a
+/// model only).
+const MAX_SHORT: i64 = 2;
 
 impl Context {
-    /// Decide goals whose sequence variables all have small asserted length
-    /// bounds. `None` outside that fragment or when undecided.
+    /// Decide goals whose sequence variables all have small length bounds
+    /// (or find a model with short values). `None` outside that fragment or
+    /// when undecided.
     pub(super) fn check_sat_seq_bounded(&mut self) -> Option<(SmtResult, Option<Model>)> {
         if self.seq_sorts.is_empty() {
             return None;
@@ -61,27 +69,76 @@ impl Context {
                 b.1 = b.1.min(hi);
             }
         }
-        let mut ranges: Vec<(AstId, i64, i64)> = Vec::new();
-        let mut combos: usize = 1;
-        for (&v, &(lo, hi)) in &bounds {
-            if hi > MAX_LEN {
-                return None;
+        // A variable without an asserted bound may still have one: when the
+        // assertions refute every longer value (the solver's length
+        // reasoning), the bound is proven.
+        for v in vars.clone() {
+            let b = bounds[&v];
+            if b.1 <= MAX_LEN {
+                continue;
             }
+            if b.0 > MAX_DERIVED {
+                continue;
+            }
+            let len = self.seq_op("seq.len", &[v]).ok()?;
+            let k = self.m.mk_int(MAX_DERIVED);
+            let longer = self.m.mk_gt(len, k);
+            let mut goal = roots.clone();
+            goal.push(longer);
+            let saved = core::mem::replace(&mut self.assertions, goal);
+            let (r, _) = self.check_sat_split();
+            self.assertions = saved;
+            if r == SmtResult::Unsat {
+                bounds.get_mut(&v)?.1 = MAX_DERIVED;
+            }
+        }
+        let mut ranges: Vec<(AstId, i64, i64)> = Vec::new();
+        let mut exact = true;
+        for (&v, &(lo, hi)) in &bounds {
             if hi < lo {
                 return Some((SmtResult::Unsat, None));
             }
-            combos = combos.saturating_mul((hi - lo + 1) as usize);
-            ranges.push((v, lo, hi));
+            if hi > MAX_LEN {
+                // Unbounded: only short values are tried, for a model.
+                if lo > MAX_SHORT {
+                    return None;
+                }
+                exact = false;
+                ranges.push((v, lo, MAX_SHORT));
+            } else {
+                ranges.push((v, lo, hi));
+            }
         }
+        let combos = ranges.iter().fold(1usize, |c, &(_, lo, hi)| {
+            c.saturating_mul((hi - lo + 1) as usize)
+        });
         if combos > MAX_COMBOS {
             return None;
         }
+        let r = self.seq_bounded_search(&roots, &universals, &vars, &ranges)?;
+        (exact || r.0 == SmtResult::Sat).then_some(r)
+    }
+
+    /// Try every combination of the lengths `ranges` of the sequence
+    /// variables `vars`: `sat` (a confirmed model) at the first combination
+    /// that has one, `unsat` when none has, `None` when one is undecided.
+    #[allow(clippy::type_complexity)]
+    fn seq_bounded_search(
+        &mut self,
+        roots: &[AstId],
+        universals: &[(Vec<AstId>, AstId)],
+        vars: &[AstId],
+        ranges: &[(AstId, i64, i64)],
+    ) -> Option<(SmtResult, Option<Model>)> {
+        let combos = ranges.iter().fold(1usize, |c, &(_, lo, hi)| {
+            c.saturating_mul((hi - lo + 1) as usize)
+        });
         let mut undecided = false;
         for idx in 0..combos {
             let mut rem = idx;
             let mut pairs: Vec<(AstId, AstId)> = Vec::new();
             let mut elems: Vec<(AstId, Vec<AstId>)> = Vec::new();
-            for &(v, lo, hi) in &ranges {
+            for &(v, lo, hi) in ranges {
                 let span = (hi - lo + 1) as usize;
                 let n = lo as usize + rem % span;
                 rem /= span;
@@ -94,16 +151,18 @@ impl Context {
             }
             let mut goal = Vec::with_capacity(roots.len());
             let mut memo = BTreeMap::new();
-            for &a in &roots {
+            for &a in roots {
                 let g = crate::rewriter::substitute(&mut self.m, a, &pairs);
-                let g = self.refold_str_markers(g, &mut memo);
+                // Reads at symbolic positions of the now concrete sequences
+                // by cases.
+                let g = self.refold_str_markers_rec(g, &mut memo);
                 goal.push(crate::rewriter::simplify(&mut self.m, g));
             }
             if goal.iter().any(|&g| self.m.is_false(g)) {
                 continue;
             }
             let mut univ = Vec::with_capacity(universals.len());
-            for (vs, b) in &universals {
+            for (vs, b) in universals {
                 let g = crate::rewriter::substitute(&mut self.m, *b, &pairs);
                 let g = self.refold_str_markers(g, &mut memo);
                 univ.push((vs.clone(), crate::rewriter::simplify(&mut self.m, g)));
