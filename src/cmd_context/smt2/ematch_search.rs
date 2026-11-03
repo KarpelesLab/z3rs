@@ -65,6 +65,10 @@ impl Context {
     pub(super) fn relevant_ematch_refute(&mut self) -> Option<SmtResult> {
         const MAX_ROUNDS: usize = 40;
         const MAX_INSTANCES: usize = 6000;
+        // Each round decides the whole goal afresh, so the rounds together
+        // cost about the sum of the goals' sizes: past this many nodes the
+        // search gives up (a sound `unknown`) rather than run unboundedly.
+        const MAX_WORK: usize = 100_000;
         if self.universals.is_empty() || !self.fp_deferred_decls.is_empty() {
             return None;
         }
@@ -91,6 +95,7 @@ impl Context {
         // like z3's fingerprints, a binding is new only modulo the classes.
         let mut done: Vec<(usize, Vec<AstId>)> = Vec::new();
         let mut verdict = None;
+        let mut work = 0;
         for _ in 0..MAX_ROUNDS {
             let goal = if instances.is_empty() {
                 base
@@ -99,6 +104,10 @@ impl Context {
                 conj.extend(instances.iter().copied());
                 self.m.mk_and(&conj)
             };
+            work += self.m.postorder(goal).len();
+            if work > MAX_WORK {
+                break;
+            }
             // Decide `false` first, as z3 does: an atom left open by the
             // search then keeps what it guards irrelevant.
             use core::sync::atomic::Ordering::Relaxed;
