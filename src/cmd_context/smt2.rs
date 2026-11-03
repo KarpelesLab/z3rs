@@ -22486,6 +22486,9 @@ impl Context {
                     };
                     return Ok(self.fp_real_unspec(eb, sb, class));
                 }
+                if let Some(t) = self.fp_to_real_bits(args[0]) {
+                    return Ok(t);
+                }
                 self.symbolic_fp(op, args)
             }
             "fp.to_ieee_bv" if args.len() == 1 => {
@@ -22679,6 +22682,78 @@ impl Context {
     /// (2) in format `(eb, sb)`: `0` under `:rewriter.hi_fp_unspecified`,
     /// otherwise an unspecified real, fixed per format and class (z3 applies
     /// one uninterpreted function to the NaN-normalised argument).
+    /// `fp.to_real x` of a symbolic float, as z3's `fpa2bv` reads it off the
+    /// bits: `(-1)^s · (hidden + sig) · 2^(e − bias − (sb − 1))`, by cases on
+    /// the exponent field (so the value is linear in the significand), and
+    /// the unspecified values of NaN and the infinities
+    /// ([`Self::fp_real_unspec`]). `None` for a float without a bit-vector
+    /// image or an exponent too wide to enumerate.
+    fn fp_to_real_bits(&mut self, x: AstId) -> Option<AstId> {
+        const MAX_EB: u32 = 8;
+        let (eb, sb) = self.fp_format_of(self.m.get_sort(x))?;
+        if eb > MAX_EB || sb < 2 {
+            return None;
+        }
+        let bv = self.fp_to_bv(x)?;
+        let w = eb + sb;
+        let sign = self.m.mk_bv_extract(w - 1, w - 1, bv);
+        let exp = self.m.mk_bv_extract(w - 2, sb - 1, bv);
+        let sig = self.m.mk_bv_extract(sb - 2, 0, bv);
+        let int = self.m.mk_int_sort();
+        let sig_sort = self.m.get_sort(sig);
+        let b2n = self.m.mk_func_decl(Symbol::new("bv2nat"), &[sig_sort], int);
+        let sig_int = self.m.mk_app(b2n, &[sig]);
+        let sigv = self.m.mk_to_real(sig_int);
+        let bias = (1i64 << (eb - 1)) - 1;
+        let hidden = Rational::from_integer(pow2(sb - 1));
+        let two = Rational::from_integer(Int::from(2));
+        let pow = |k: i64| -> Rational {
+            let mut r = Rational::from_integer(Int::from(1));
+            for _ in 0..k.unsigned_abs() {
+                r = if k > 0 { &r * &two } else { &r / &two };
+            }
+            r
+        };
+        // The magnitude for each finite exponent field value, the largest last.
+        let top = (1i64 << eb) - 2;
+        let mut mag: Option<AstId> = None;
+        for k in (0..=top).rev() {
+            let scale = pow(k.max(1) - bias - (sb as i64 - 1));
+            let base = if k == 0 {
+                Rational::from_integer(Int::from(0))
+            } else {
+                &scale * &hidden
+            };
+            let c = self.m.mk_numeral(scale, false);
+            let scaled = self.m.mk_mul(&[c, sigv]);
+            let b = self.m.mk_numeral(base, false);
+            let mk = self.m.mk_add(&[b, scaled]);
+            mag = Some(match mag {
+                None => mk,
+                Some(rest) => {
+                    let kv = self.m.mk_bv_numeral(Int::from(k), eb);
+                    let is_k = self.m.mk_eq(exp, kv);
+                    self.m.mk_ite(is_k, mk, rest)
+                }
+            });
+        }
+        let mag = mag?;
+        let neg = self.m.mk_uminus(mag);
+        let one = self.m.mk_bv(1, 1);
+        let is_neg = self.m.mk_eq(sign, one);
+        let val = self.m.mk_ite(is_neg, neg, mag);
+        let ones = self.m.mk_bv_numeral(pow2(eb) - Int::from(1), eb);
+        let special = self.m.mk_eq(exp, ones);
+        let zero_sig = self.m.mk_bv(0, sb - 1);
+        let is_inf_sig = self.m.mk_eq(sig, zero_sig);
+        let nan = self.fp_real_unspec(eb, sb, 0);
+        let pinf = self.fp_real_unspec(eb, sb, 1);
+        let ninf = self.fp_real_unspec(eb, sb, 2);
+        let inf = self.m.mk_ite(is_neg, ninf, pinf);
+        let spec = self.m.mk_ite(is_inf_sig, inf, nan);
+        Some(self.m.mk_ite(special, spec, val))
+    }
+
     fn fp_real_unspec(&mut self, eb: u32, sb: u32, class: u8) -> AstId {
         if let Some(&t) = self.fp_real_unspec.get(&(eb, sb, class)) {
             return t;
@@ -43158,6 +43233,30 @@ mod tests {
         assert_eq!(out[0], "sat");
         assert_eq!(out[1], "#x3");
         assert_ne!(out[2], "sat");
+    }
+
+    #[test]
+    fn fp_to_real_of_a_symbolic_float() {
+        // The value read off the bits: (fp #b0 #b110 #b11) is 2^3 · 1.75.
+        let script = "
+            (declare-const f (_ FloatingPoint 3 3))
+            (declare-const q Real)
+            (assert (= q (fp.to_real f)))
+            (assert (> q 12.0))
+            (assert (fp.isNormal f))
+            (assert (fp.lt f ((_ to_fp 3 3) RNE 15.0)))
+            (check-sat)
+            (get-value (q f))
+            (reset)
+            (declare-const f (_ FloatingPoint 3 3))
+            (assert (fp.isNormal f))
+            (assert (< 2.5 (fp.to_real f) 3.0))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "((q 14.0)\n (f (fp #b0 #b110 #b11)))");
+        assert_eq!(out[2], "unsat");
     }
 
     #[test]
