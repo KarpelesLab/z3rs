@@ -8,6 +8,8 @@ z3rs prints:
 
   BADMODEL    the model's `define-fun`s, asserted back with the assertions,
               are unsatisfiable under z3 (a soundness bug)
+              — or a declared symbol z3's model interprets is missing from
+              it (z3 prints every declared symbol it interprets)
   INCOMPLETE  a declared symbol has no interpretation in the model
   MATCH       the output is byte-for-byte z3's
   DIFF        a complete, valid model that differs from z3's
@@ -97,6 +99,10 @@ def one(i):
     v = run(Z3, chk).split("\n")[0]
     if v != "sat":
         return "BADMODEL", p
+    if b.startswith("sat\n"):
+        z3_defined = set(re.findall(r"\(define-fun (\S+) ", b))
+        if z3_defined - defined:
+            return "BADMODEL", p
     if missing:
         return "INCOMPLETE", p
     return ("MATCH" if a == b else "DIFF"), p

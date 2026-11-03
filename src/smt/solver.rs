@@ -387,6 +387,7 @@ impl SmtCore {
                     zero_div_ready: false,
                     enum_ctors: BTreeMap::new(),
                     fn_defaults_ready: false,
+                    euf_nums_ready: false,
                 };
                 return (SmtResult::Sat, Some(model));
             }
@@ -437,6 +438,7 @@ impl SmtCore {
                         zero_div_ready: false,
                         enum_ctors: BTreeMap::new(),
                         fn_defaults_ready: false,
+                        euf_nums_ready: false,
                     };
                     return (SmtResult::Sat, Some(model));
                 }
@@ -851,6 +853,9 @@ pub struct Model {
     /// Whether the front end has completed the functions' default values
     /// (see [`Model::mark_fn_defaults_ready`]).
     fn_defaults_ready: bool,
+    /// Whether the e-graph's unvalued arithmetic applications have been
+    /// given values (see [`Model::complete_euf_nums`]).
+    euf_nums_ready: bool,
 }
 
 /// Which of z3's division-by-zero functions: `div0` (integer `div`), `mod0`
@@ -924,6 +929,7 @@ impl Model {
             zero_div_ready: false,
             enum_ctors: BTreeMap::new(),
             fn_defaults_ready: false,
+            euf_nums_ready: false,
         }
     }
 
@@ -1471,6 +1477,215 @@ impl Model {
         Int::from(0)
     }
 
+    /// Is `t` an application of an uninterpreted function with an arithmetic
+    /// range?
+    fn is_uf_num_app(m: &AstManager, t: AstId) -> bool {
+        m.app(t).is_some_and(|app| {
+            !app.args.is_empty()
+                && m.func_decl(app.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+                && m.is_arith_sort(m.get_sort(t))
+        })
+    }
+
+    /// The value of an uninterpreted arithmetic application `t` the solver's
+    /// e-graph holds: the value its class is assigned, after
+    /// [`Self::complete_euf_nums`] has given one to every class the solver
+    /// left without (a term only ever used as a function argument, like `f(1)`
+    /// in `f(f(1))`, is no point a function's default covers).
+    fn euf_class_num(&mut self, m: &AstManager, t: AstId) -> Option<Rational> {
+        if !Self::is_uf_num_app(m, t) || !self.euf.contains(t) {
+            return None;
+        }
+        self.complete_euf_nums(m);
+        self.euf
+            .class_members(t)
+            .iter()
+            .find_map(|k| self.arith.get(k))
+            .cloned()
+    }
+
+    /// Value the e-graph's uninterpreted arithmetic applications whose class
+    /// has no arithmetic value (once per model), as z3's model-based theory
+    /// combination does: an application whose arguments evaluate to those of
+    /// an already valued application of the same function takes its value
+    /// (congruence on the model's values), any other gets a value no assigned
+    /// term or numeral has, since the solver kept its class apart from the
+    /// others. Applications are completed bottom-up (arguments first), after
+    /// the valued applications whose arguments need no completion.
+    fn complete_euf_nums(&mut self, m: &AstManager) {
+        if self.euf_nums_ready {
+            return;
+        }
+        self.euf_nums_ready = true;
+        let apps: Vec<AstId> = self
+            .euf
+            .terms()
+            .iter()
+            .copied()
+            .filter(|&t| Self::is_uf_num_app(m, t))
+            .collect();
+        let class_value = |s: &Self, t: AstId| {
+            s.euf
+                .class_members(t)
+                .iter()
+                .find_map(|k| s.arith.get(k))
+                .cloned()
+        };
+        let unvalued: BTreeSet<AstId> = apps
+            .iter()
+            .copied()
+            .filter(|&t| class_value(self, t).is_none())
+            .collect();
+        if unvalued.is_empty() {
+            return;
+        }
+        // Term heights (arguments before their applications), over the
+        // applications and the atoms, whose arguments' values and numerals a
+        // fresh value must avoid (it must not make two applications congruent
+        // that the solver kept apart).
+        let mut height: BTreeMap<AstId, usize> = BTreeMap::new();
+        let mut used: BTreeSet<Rational> = self.arith.values().cloned().collect();
+        let mut depends: BTreeSet<AstId> = BTreeSet::new();
+        let roots: Vec<AstId> = apps.iter().chain(self.bools.keys()).copied().collect();
+        let mut args_seen: Vec<AstId> = Vec::new();
+        for t in roots {
+            for x in m.postorder(t) {
+                if height.contains_key(&x) {
+                    continue;
+                }
+                let args = m.app(x).map_or(&[][..], |a| &a.args[..]);
+                let h = args.iter().map(|a| height[a] + 1).max().unwrap_or(0);
+                if args
+                    .iter()
+                    .any(|a| unvalued.contains(a) || depends.contains(a))
+                {
+                    depends.insert(x);
+                }
+                height.insert(x, h);
+                if let Some(r) = m.as_numeral(x) {
+                    used.insert(r);
+                }
+                if m.app(x).is_some_and(|a| {
+                    m.func_decl(a.decl)
+                        .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+                }) {
+                    args_seen.extend(args.iter().copied().filter(|&a| {
+                        m.is_arith_sort(m.get_sort(a))
+                            && !unvalued.contains(&a)
+                            && !depends.contains(&a)
+                    }));
+                }
+            }
+        }
+        for a in args_seen {
+            if let Value::Num(r, _) = self.eval_full(m, a) {
+                used.insert(r);
+            }
+        }
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Key {
+            B(bool),
+            N(Rational),
+            U(AstId, usize),
+            V(Int, u32),
+        }
+        let key_of = |s: &mut Self, t: AstId| -> (AstId, Vec<Key>) {
+            let decl = m.app_decl(t);
+            let args = m.app_args(t).to_vec();
+            let key = args
+                .iter()
+                .map(|&a| match s.eval_full(m, a) {
+                    Value::Bool(b) => Key::B(b),
+                    Value::Num(r, _) => Key::N(r),
+                    Value::Uninterp(srt, c) => Key::U(srt, c),
+                    Value::Bv(v, w) => Key::V(v, w),
+                })
+                .collect();
+            (decl, key)
+        };
+        let mut table: BTreeMap<(AstId, Vec<Key>), Rational> = BTreeMap::new();
+        for &t in &apps {
+            if !unvalued.contains(&t) && !depends.contains(&t) {
+                let v = class_value(self, t).unwrap();
+                let k = key_of(self, t);
+                table.entry(k).or_insert(v);
+            }
+        }
+        // The rest, as their arguments become valued: a valued application
+        // enters the table, an unvalued one takes the value of the table entry
+        // it matches. Only when none can, the lowest unvalued application
+        // whose arguments are valued gets a fresh value.
+        let mut pending: Vec<AstId> = apps
+            .iter()
+            .copied()
+            .filter(|t| unvalued.contains(t) || depends.contains(t))
+            .collect();
+        pending.sort_by_key(|t| height[t]);
+        let below: BTreeMap<AstId, Vec<AstId>> = pending
+            .iter()
+            .map(|&t| {
+                let mut under: Vec<AstId> = Vec::new();
+                for &a in m.app_args(t) {
+                    under.extend(m.postorder(a).into_iter().filter(|x| unvalued.contains(x)));
+                }
+                (t, under)
+            })
+            .collect();
+        let mut open = unvalued;
+        while !pending.is_empty() {
+            let ready: Vec<AstId> = pending
+                .iter()
+                .copied()
+                .filter(|t| below[t].iter().all(|x| !open.contains(x)))
+                .collect();
+            let mut fresh_for = None;
+            let mut done: Vec<AstId> = Vec::new();
+            for t in ready {
+                let k = key_of(self, t);
+                let v = match class_value(self, t) {
+                    Some(v) => {
+                        table.entry(k).or_insert(v);
+                        done.push(t);
+                        continue;
+                    }
+                    None => match table.get(&k) {
+                        Some(v) => v.clone(),
+                        None => {
+                            fresh_for.get_or_insert((t, k));
+                            continue;
+                        }
+                    },
+                };
+                self.pin_class(m, t, &v, &mut open);
+                done.push(t);
+            }
+            if done.is_empty() {
+                let Some((t, k)) = fresh_for else { break };
+                let mut n = 0i64;
+                while used.contains(&Rational::from_integer(Int::from(n))) {
+                    n += 1;
+                }
+                let v = Rational::from_integer(Int::from(n));
+                used.insert(v.clone());
+                table.insert(k, v.clone());
+                self.pin_class(m, t, &v, &mut open);
+                done.push(t);
+            }
+            pending.retain(|t| !done.contains(t));
+        }
+    }
+
+    /// Assign `v` to the arithmetic terms of `t`'s class, which leave `open`.
+    fn pin_class(&mut self, m: &AstManager, t: AstId, v: &Rational, open: &mut BTreeSet<AstId>) {
+        for x in self.euf.class_members(t) {
+            open.remove(&x);
+            if m.is_arith_sort(m.get_sort(x)) {
+                self.arith.insert(x, v.clone());
+            }
+        }
+    }
+
     /// Fold an arithmetic term to a concrete rational, or `None` if some leaf is
     /// not resolvable by pure folding (the caller then falls back to the linear
     /// evaluator over the model assignment).
@@ -1533,6 +1748,10 @@ impl Model {
                 };
                 return Some(Rational::from_integer(v));
             }
+        }
+        // An application in the solver's e-graph: its class's value.
+        if let Some(r) = self.euf_class_num(m, t) {
+            return Some(r);
         }
         // An uninterpreted application the assignment does not mention: the
         // value of an assigned application of the same function whose arguments

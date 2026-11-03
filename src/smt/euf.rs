@@ -191,6 +191,24 @@ impl Egraph {
         self.terms[class]
     }
 
+    /// Every interned term, in interning order (children before parents).
+    pub fn terms(&self) -> &[AstId] {
+        &self.terms
+    }
+
+    /// The interned terms of `t`'s class (`t` included); empty when `t` has
+    /// not been interned.
+    pub fn class_members(&self, t: AstId) -> Vec<AstId> {
+        let Some(&i) = self.ids.get(&t) else {
+            return Vec::new();
+        };
+        let r = self.root(i);
+        (0..self.terms.len())
+            .filter(|&j| self.root(j) == r)
+            .map(|j| self.terms[j])
+            .collect()
+    }
+
     /// Is the interned term `t` alone in its class?
     pub fn is_singleton(&self, t: AstId) -> bool {
         let Some(&i) = self.ids.get(&t) else {
