@@ -435,6 +435,9 @@ pub struct NlaSearch {
     nla: Nla,
     core: SmtCore,
     goal: AstId,
+    /// The formulas whose support [`NlaStep::Refined`] reports (see
+    /// [`NlaSearch::set_support_roots`]).
+    roots: Vec<AstId>,
     round: usize,
 }
 
@@ -461,8 +464,16 @@ impl NlaSearch {
             nla,
             core,
             goal,
+            roots: alloc::vec![goal],
             round: 0,
         }
+    }
+
+    /// Report the support of these formulas instead of the goal's: the
+    /// goal's conjuncts other than valid ones, whose literals the goal does
+    /// not rest on.
+    pub fn set_support_roots(&mut self, roots: Vec<AstId>) {
+        self.roots = roots;
     }
 
     /// Bound the integer search of each round by `budget` (see
@@ -550,7 +561,10 @@ impl NlaSearch {
         let assigned = self.core.assigned();
         let mut support = Vec::new();
         let mut memo = BTreeMap::new();
-        let ok = justify(m, self.goal, true, &assigned, &mut memo, &mut support);
+        let ok = self
+            .roots
+            .iter()
+            .all(|&r| justify(m, r, true, &assigned, &mut memo, &mut support));
         support.sort();
         support.dedup();
         NlaStep::Refined {

@@ -1873,10 +1873,17 @@ const TERM_PREWARM_DEPTH: usize = 128;
 const NLA_FIRST_BUDGETS: (u64, usize, u64) = (200_000, 8, 20_000);
 /// The stages of [`Context::nla_decide_goal`].
 const NLA_STAGES: usize = 5;
-/// Every how many refinement rounds nlsat checks the assignment's literals.
-const NLA_NRA_PERIOD: usize = 4;
-/// The `(conflicts, work)` of each of those nlsat checks.
+/// The `(conflicts, work)` of the nlsat check of the literals an assignment
+/// rests on, in each refinement round.
 const NLA_NRA_LIMIT: (usize, u64) = (100, 4_000);
+/// The conflicts of an nlsat check of [`NLA_NRA_LIMIT`]-scaled `work`.
+fn nra_conflicts(work: u64) -> usize {
+    let (c, w) = NLA_NRA_LIMIT;
+    c.saturating_mul((work / w).max(1) as usize)
+}
+/// The most work of an nlsat check of a support that came back undecided
+/// (each try quadruples it).
+const NLA_NRA_MAX_WORK: u64 = 1_000_000;
 /// Refuted conjunctions up to this many literals get their core minimized.
 const NLA_CORE_MAX: usize = 40;
 
@@ -38143,7 +38150,7 @@ impl Context {
     /// incremental linearization ([`crate::smt::nla`]), as z3's arithmetic
     /// solver does with `nla_core`: the search treats each product as a
     /// variable, refined by valid lemmas until the assignment agrees with
-    /// every product. Every few rounds nlsat decides the conjunction of the
+    /// every product. Each round nlsat decides the conjunction of the
     /// literals the assignment rests on (z3's `nra_solver`): its model is a
     /// model of the goal, its refutation (an unsat core of it) a valid
     /// clause. The refinement alternates with nlsat on the whole goal, both
@@ -38160,8 +38167,16 @@ impl Context {
         if !has_int {
             return None;
         }
-        let mut search = Some(NlaSearch::new(&mut self.m, goal));
+        let mut search = NlaSearch::new(&mut self.m, goal);
+        // The valid axioms (product signs, squares) hold at every point: the
+        // goal does not rest on their literals.
+        let mut conj = Vec::new();
+        self.icp_flatten_and(goal, &mut conj);
+        conj.retain(|c| !self.valid_axioms.contains(c));
+        search.set_support_roots(conj);
+        let mut search = Some(search);
         let mut round = 0;
+        let mut tried = BTreeMap::new();
         let (mut work, mut rounds, mut check) = NLA_FIRST_BUDGETS;
         for _ in 0..NLA_STAGES {
             if let Some(r) = self.nlsat_decide_goal_limited(goal, sat_ok, Some((usize::MAX, work)))
@@ -38170,7 +38185,7 @@ impl Context {
             }
             if let Some(s) = search.as_mut() {
                 s.set_work_budget(check);
-                match self.nla_rounds(s, &mut round, rounds, sat_ok) {
+                match self.nla_rounds(s, &mut round, rounds, sat_ok, &mut tried) {
                     Some(Some(r)) => return Some(r),
                     Some(None) => search = None,
                     None => {}
@@ -38192,6 +38207,7 @@ impl Context {
         round: &mut usize,
         rounds: usize,
         sat_ok: bool,
+        tried: &mut BTreeMap<Vec<(AstId, bool)>, u64>,
     ) -> Option<Option<(SmtResult, Option<Model>)>> {
         use crate::smt::nla::NlaStep;
         for _ in 0..rounds {
@@ -38208,14 +38224,21 @@ impl Context {
                 NlaStep::Refined { support } => support,
             };
             let Some(support) = support else { continue };
-            if *round % NLA_NRA_PERIOD != 1 || support.is_empty() {
+            if support.is_empty() {
                 continue;
             }
+            // A support nlsat could not decide gets a larger budget when it
+            // comes back.
+            let work = tried.get(&support).map_or(NLA_NRA_LIMIT.1, |w| w * 4);
+            if work > NLA_NRA_MAX_WORK {
+                continue;
+            }
+            tried.insert(support.clone(), work);
             let lits: Vec<AstId> = support
                 .iter()
                 .map(|&(a, v)| if v { a } else { self.m.mk_not(a) })
                 .collect();
-            match self.nra_check(&lits, sat_ok) {
+            match self.nra_check(&lits, sat_ok, work) {
                 Some((SmtResult::Unsat, _)) => {
                     let core = self.nra_core(&support);
                     let negs: Vec<AstId> = core.iter().map(|&l| self.m.mk_not(l)).collect();
@@ -38235,14 +38258,19 @@ impl Context {
         None
     }
 
-    /// nlsat, on its [`NLA_NRA_LIMIT`] budget, on the conjunction of `lits`.
-    fn nra_check(&mut self, lits: &[AstId], sat_ok: bool) -> Option<(SmtResult, Option<Model>)> {
+    /// nlsat, on `work` (see [`NLA_NRA_LIMIT`]), on the conjunction of `lits`.
+    fn nra_check(
+        &mut self,
+        lits: &[AstId],
+        sat_ok: bool,
+        work: u64,
+    ) -> Option<(SmtResult, Option<Model>)> {
         let conj = match lits {
             [] => return None,
             [l] => *l,
             _ => self.m.mk_and(lits),
         };
-        self.nlsat_decide_goal_limited(conj, sat_ok, Some(NLA_NRA_LIMIT))
+        self.nlsat_decide_goal_limited(conj, sat_ok, Some((nra_conflicts(work), work)))
     }
 
     /// An unsat core of the refuted conjunction of the arithmetic literals
@@ -38262,7 +38290,10 @@ impl Context {
         while i < core.len() && core.len() > 1 {
             let mut trial = core.clone();
             trial.remove(i);
-            if matches!(self.nra_check(&trial, false), Some((SmtResult::Unsat, _))) {
+            if matches!(
+                self.nra_check(&trial, false, NLA_NRA_LIMIT.1),
+                Some((SmtResult::Unsat, _))
+            ) {
                 core = trial;
             } else {
                 i += 1;
