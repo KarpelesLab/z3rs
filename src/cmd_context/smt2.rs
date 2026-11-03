@@ -874,6 +874,7 @@ fn render_int(v: &Int) -> String {
 }
 use super::decl_table::DeclTable;
 
+mod bv_bool;
 mod elim_uncnstr;
 mod ematch_search;
 use crate::util::symbol::{Symbol, smt2_symbol};
@@ -3232,6 +3233,9 @@ struct Context {
     disj_witness_depth: u32,
     /// Set while `decide_independent_components` decides one component.
     in_components: bool,
+    /// Set while a bit-vector goal reduced by bit-blasting into the Boolean
+    /// structure is decided (see `bv_bool`), so the reduction does not recurse.
+    in_bv_bool: bool,
     /// Set while [`Self::check_sat_components`] decides its groups.
     in_check_components: bool,
     /// `(as const …)` applications built so far in the current command.
@@ -4324,6 +4328,7 @@ impl Context {
             fp_defer_depth: 0,
             disj_witness_depth: 0,
             in_components: false,
+            in_bv_bool: false,
             in_check_components: false,
             as_const_seen: 0,
             in_guard_split: false,
@@ -36097,6 +36102,9 @@ impl Context {
             if let Some(r) = self.decide_bv_array_equalities(g) {
                 return r;
             }
+            if let Some(r) = self.decide_bv_bool_combined(goal) {
+                return r;
+            }
             return (SmtResult::Unknown, None);
         }
         // Arrays indexed by a *symbolic* Bool need the index's 2-valuedness: decide
@@ -43006,6 +43014,63 @@ mod tests {
             (check-sat)
         ";
         assert_eq!(run(script).unwrap(), alloc::vec!["sat"]);
+    }
+
+    #[test]
+    fn bit_vectors_combined_with_arithmetic_and_records() {
+        // Bit-vector atoms under the Boolean structure with arithmetic ones,
+        // and bit-vector fields of a record, decided by bit-blasting into the
+        // Boolean structure.
+        let script = "
+            (declare-const x (_ BitVec 4))
+            (declare-const i Int)
+            (assert (or (bvult x #x3) (> i 2)))
+            (assert (=> (> i 2) (= x #x5)))
+            (assert (< i 5))
+            (assert (not (bvult x #x3)))
+            (check-sat)
+            (get-value (x))
+            (reset)
+            (declare-datatype R ((mk (b Bool) (v (_ BitVec 4)) (n Int))))
+            (declare-const r R)
+            (declare-const s R)
+            (assert (= s (mk false #xd 0)))
+            (assert (= r s))
+            (assert (bvult (v r) #xe))
+            (check-sat)
+            (get-value ((v r) (b r)))
+            (assert (bvult (v r) #xd))
+            (check-sat)
+            (reset)
+            (declare-fun f (Int) (_ BitVec 4))
+            (declare-const j Int)
+            (declare-const y (_ BitVec 4))
+            (assert (= j 3))
+            (assert (or (= y #x1) (> j 7)))
+            (assert (not (= (f j) (f 3))))
+            (check-sat)
+        ";
+        let out = run(script).unwrap();
+        assert_eq!(out[0], "sat");
+        assert_eq!(out[1], "((x #x5))");
+        assert_eq!(out[2], "sat");
+        assert_eq!(out[3], "(((v r) #xd)\n ((b r) false))");
+        assert_eq!(out[4], "unsat");
+        assert_eq!(out[5], "unsat");
+    }
+
+    #[test]
+    fn bv2nat_is_not_a_free_function() {
+        let script = "
+            (declare-const v (_ BitVec 4))
+            (declare-const n Int)
+            (declare-const p Bool)
+            (assert (<= n (- 1)))
+            (assert (or p (bvult v #x2)))
+            (assert (= n (bv2nat (bvmul v (_ bv4 4)))))
+            (check-sat)
+        ";
+        assert_ne!(run(script).unwrap(), alloc::vec!["sat"]);
     }
 
     #[test]
