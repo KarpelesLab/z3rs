@@ -760,6 +760,8 @@ struct Solver {
     psc_cache: BTreeMap<(Var, Polynomial, Polynomial), Vec<Polynomial>>,
     /// Factorizations (`math::factor::factors`), memoized.
     factor_cache: BTreeMap<Polynomial, Vec<Polynomial>>,
+    /// Factorizations for projections (see [`Solver::projection_factors`]).
+    projection_factor_cache: BTreeMap<Polynomial, Vec<Polynomial>>,
     /// The Boolean variable of each atom.
     atom_bool: Vec<u32>,
     /// Each atom's factors with parity and constant sign (`atom_factors`).
@@ -809,6 +811,7 @@ impl Solver {
             sign_cache: BTreeMap::new(),
             psc_cache: BTreeMap::new(),
             factor_cache: BTreeMap::new(),
+            projection_factor_cache: BTreeMap::new(),
             atom_bool: Vec::new(),
             atom_factor_cache: Vec::new(),
             lower_stage_polys: Vec::new(),
@@ -1048,6 +1051,19 @@ impl Solver {
             .ok_or(Abort)?;
         let fs = crate::math::factor::factors(p);
         self.factor_cache.insert(p.clone(), fs.clone());
+        Ok(fs)
+    }
+
+    /// The factors of `p` for a projection, memoized apart from
+    /// [`Self::factors_cached`]: this charges every request and no fuel, so the
+    /// memo saves time without moving where a budget runs out.
+    fn projection_factors(&mut self, p: &Polynomial) -> Res<Vec<Polynomial>> {
+        self.spend(4)?;
+        if let Some(fs) = self.projection_factor_cache.get(p) {
+            return Ok(fs.clone());
+        }
+        let fs = crate::math::factor::factors(p);
+        self.projection_factor_cache.insert(p.clone(), fs.clone());
         Ok(fs)
     }
 
@@ -1883,8 +1899,7 @@ impl Solver {
         }
         // The irreducible factors replace `p`: the same zero set, smaller
         // projections.
-        self.spend(4)?;
-        for f in crate::math::factor::factors(&p) {
+        for f in self.projection_factors(&p)? {
             let f = self.elim_vanishing(f)?;
             if f.is_constant() {
                 continue;

@@ -25,6 +25,13 @@ use crate::math::resultant::resultant_fueled;
 use crate::math::upoly::{self, UPoly};
 use crate::nlsat::icp::eval_interval;
 
+/// Bisections of both isolating intervals [`Alg::compare`] tries before its
+/// exact equality test, when the sum of their defining degrees is above
+/// [`EXACT_FIRST_MAX_DEGREE`]: below it, the gcd costs less than the bisections.
+const PRE_EQUALITY_BISECTIONS: usize = 16;
+/// See [`PRE_EQUALITY_BISECTIONS`].
+const EXACT_FIRST_MAX_DEGREE: usize = 16;
+
 fn two() -> Rational {
     Rational::from_integer(2.into())
 }
@@ -557,46 +564,67 @@ impl Alg {
             (_, Alg::Rational(b)) => return self.locate(b).reverse(),
             _ => {}
         }
-        // Exact equality first: `self = other` iff `self` is a root of
-        // `other`'s defining polynomial lying in `other`'s isolating interval
-        // (which isolates a single root of it). Distinct numbers then separate
-        // under refinement.
+        // Disjoint isolating intervals decide most comparisons; a few
+        // bisections separate distinct numbers that are not too close, before
+        // the exact (gcd-based) equality test, which is costly on defining
+        // polynomials of high degree.
+        let mut a = self.clone();
+        let mut b = other.clone();
+        // The order when it is decided without an equality test: a rational
+        // (an interval collapsed onto a root) is located exactly.
+        let decided = |a: &Alg, b: &Alg| match (a, b) {
+            (Alg::Rational(x), Alg::Rational(y)) => Some(x.cmp(y)),
+            (Alg::Rational(x), _) => Some(b.locate(x)),
+            (_, Alg::Rational(y)) => Some(a.locate(y).reverse()),
+            _ => {
+                let (alo, ahi) = a.interval();
+                let (blo, bhi) = b.interval();
+                if ahi <= blo {
+                    Some(Ordering::Less)
+                } else if bhi <= alo {
+                    Some(Ordering::Greater)
+                } else {
+                    None
+                }
+            }
+        };
+        let degree = |x: &Alg| match x {
+            Alg::Irrational { poly, .. } => poly.degree(),
+            Alg::Rational(_) => 1,
+        };
+        let bisections = if degree(&a) + degree(&b) > EXACT_FIRST_MAX_DEGREE {
+            PRE_EQUALITY_BISECTIONS
+        } else {
+            0
+        };
+        for _ in 0..bisections {
+            if let Some(o) = decided(&a, &b) {
+                return o;
+            }
+            a.refine();
+            b.refine();
+        }
+        if let Some(o) = decided(&a, &b) {
+            return o;
+        }
+        // Exact equality, once: `a = b` iff `a` is a root of `b`'s defining
+        // polynomial lying in `b`'s isolating interval (which isolates a
+        // single root of it). Distinct numbers then separate under
+        // refinement.
         if let Alg::Irrational {
             poly: pb,
             lo: blo,
             hi: bhi,
-        } = other
-            && self.sign_of(pb) == 0
-            && self.locate(blo) == Ordering::Less
-            && self.locate(bhi) == Ordering::Greater
+        } = &b
+            && a.sign_of(pb) == 0
+            && a.locate(blo) == Ordering::Less
+            && a.locate(bhi) == Ordering::Greater
         {
             return Ordering::Equal;
         }
-        let mut a = self.clone();
-        let mut b = other.clone();
         for _ in 0..2000 {
-            let (alo, ahi) = a.interval();
-            let (blo, bhi) = b.interval();
-            if ahi <= blo {
-                return Ordering::Less;
-            }
-            if bhi <= alo {
-                return Ordering::Greater;
-            }
-            // Overlapping: check provable equality (containment + shared root).
-            if let Alg::Irrational { poly: pa, .. } = &a
-                && blo >= alo
-                && bhi <= ahi
-                && b.sign_of(pa) == 0
-            {
-                return Ordering::Equal;
-            }
-            if let Alg::Irrational { poly: pb, .. } = &b
-                && alo >= blo
-                && ahi <= bhi
-                && a.sign_of(pb) == 0
-            {
-                return Ordering::Equal;
+            if let Some(o) = decided(&a, &b) {
+                return o;
             }
             a.refine();
             b.refine();
@@ -662,6 +690,35 @@ mod tests {
         // (x − 1.40)(x − 1.42) = x² − 2.82x + 1.988, scaled by 2500.
         let q = p(&[4970, -7050, 2500]);
         assert_eq!(sqrt2.sign_of(&q), -1);
+    }
+
+    // A root isolated on a reducible polynomial collapses to a rational under
+    // bisection: two copies still compare equal, and distinct roots do not.
+    #[test]
+    fn compare_collapsing_roots() {
+        use core::cmp::Ordering;
+        // (x + 1)(x − 3/2) = x² − x/2 − 3/2, its root −1 isolated in (−4, 0).
+        let poly = UPoly::from_coeffs(alloc::vec![
+            Rational::new((-3).into(), 2.into()),
+            Rational::new((-1).into(), 2.into()),
+            r(1),
+        ]);
+        let a = Alg::Irrational {
+            poly: poly.clone(),
+            lo: r(-4),
+            hi: r(0),
+        };
+        assert_eq!(a.compare(&a.clone()), Ordering::Equal);
+        assert_eq!(a.compare(&Alg::Rational(r(-1))), Ordering::Equal);
+        let s2 = Alg::roots_of(&p(&[-2, 0, 1]));
+        assert_eq!(a.compare(&s2[0]), Ordering::Greater); // −1 > −√2
+        assert_eq!(s2[1].compare(&a), Ordering::Greater);
+        let b = Alg::Irrational {
+            poly,
+            lo: r(1),
+            hi: r(3),
+        };
+        assert_eq!(a.compare(&b), Ordering::Less);
     }
 
     // Locating a rational relative to √2: 1 < √2 < 2, and x^2-2's root value.

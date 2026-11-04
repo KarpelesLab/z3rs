@@ -162,6 +162,20 @@ pub struct Polynomial {
     terms: Vec<(Rational, Monomial)>,
 }
 
+/// `a / b` for a coefficient division expected to be exact: integers that
+/// divide exactly are divided directly, without the gcds of `Rational::div`
+/// (costly on the large coefficients of subresultant chains).
+fn div_coeff(a: &Rational, b: &Rational) -> Rational {
+    if a.is_integer()
+        && b.is_integer()
+        && let Some((q, r)) = a.numerator().div_rem(b.numerator())
+        && r.is_zero()
+    {
+        return Rational::from_integer(q);
+    }
+    a.div(b)
+}
+
 impl Polynomial {
     /// The zero polynomial.
     pub fn zero() -> Polynomial {
@@ -446,7 +460,7 @@ impl Polynomial {
                 return None;
             }
             let qe: Vec<u32> = rm.1.iter().zip(&dm.1).map(|(a, b)| a - b).collect();
-            let qc = rc.div(&dc);
+            let qc = div_coeff(&rc, &dc);
             for (c, (td, e)) in &div {
                 let key: (u32, Vec<u32>) = (
                     td + rm.0 - dm.0,

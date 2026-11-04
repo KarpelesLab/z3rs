@@ -160,8 +160,7 @@ impl Solver {
         if p.is_constant() {
             return Ok(());
         }
-        self.spend(4)?;
-        for f in crate::math::factor::factors(p) {
+        for f in self.projection_factors(p)? {
             let (f, _) = normalize(&f);
             if f.is_constant() || st.todo.contains(&f) || st.level_ps.contains(&f) {
                 continue;
