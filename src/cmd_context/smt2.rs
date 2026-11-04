@@ -1871,6 +1871,11 @@ const TERM_PREWARM_DEPTH: usize = 128;
 const NLA_FIRST_BUDGETS: (u64, usize, u64) = (200_000, 8, 20_000);
 /// The stages of [`Context::nla_decide_goal`].
 const NLA_STAGES: usize = 5;
+/// The conflicts of an unbounded nlsat call.
+const NLSAT_MAX_CONFLICTS: usize = 4000;
+/// The work budgets on which an unbounded nlsat call tries each encoding of
+/// the goal (see [`Context::nlsat_decide_goal_limited`]).
+const NLSAT_ENCODING_BUDGETS: [u64; 2] = [200_000, 1_600_000];
 /// The `(conflicts, work)` of the nlsat check of the literals an assignment
 /// rests on, in each refinement round.
 const NLA_NRA_LIMIT: (usize, u64) = (100, 4_000);
@@ -39919,55 +39924,104 @@ impl Context {
             cnf.clauses.push(cl);
             Some(())
         }
-        let mut cnf = Cnf {
-            clauses: Vec::new(),
-            bools: Vec::new(),
-            num_tseitin: 0,
-            memo: BTreeMap::new(),
-            var_map: BTreeMap::new(),
-        };
-        // Top-level conjuncts and disjunctions become clauses directly.
-        let mut conj = Vec::new();
-        self.icp_flatten_and(goal, &mut conj);
-        for c in conj {
-            // A valid axiom (the product sign and square rules added for the
-            // other procedures) holds at every point: dropping it changes
-            // neither verdict, and keeps it out of the search and projection.
-            if self.valid_axioms.contains(&c) {
-                continue;
+        // The goal's CNF: flattened as z3 does (`flatten`), or one clause per
+        // top-level conjunct with Tseitin variables for nested connectives.
+        fn build(ctx: &Context, goal: AstId, flatten: bool) -> Option<Cnf> {
+            let mut cnf = Cnf {
+                clauses: Vec::new(),
+                bools: Vec::new(),
+                num_tseitin: 0,
+                memo: BTreeMap::new(),
+                var_map: BTreeMap::new(),
+            };
+            // Top-level conjuncts and disjunctions become clauses directly.
+            let mut conj = Vec::new();
+            ctx.icp_flatten_and(goal, &mut conj);
+            for c in conj {
+                // A valid axiom (the product sign and square rules added for
+                // the other procedures) holds at every point: dropping it
+                // changes neither verdict, and keeps it out of the search and
+                // projection.
+                if ctx.valid_axioms.contains(&c) {
+                    continue;
+                }
+                if flatten {
+                    add_clauses(ctx, &mut cnf, c, false)?;
+                    continue;
+                }
+                let parts: Vec<AstId> = if ctx.m.is_or(c) {
+                    ctx.m.app_args(c).to_vec()
+                } else {
+                    alloc::vec![c]
+                };
+                let mut cl = Vec::with_capacity(parts.len());
+                for p in parts {
+                    cl.push(lit(ctx, &mut cnf, p)?);
+                }
+                cnf.clauses.push(cl);
             }
-            add_clauses(self, &mut cnf, c, false)?;
-        }
-        if cnf.var_map.is_empty() {
-            return None;
-        }
-        let nb = cnf.bools.len() as u32;
-        let fix = |l: &mut InLit| {
-            if let InLit::Bool(b, _) = l
-                && *b >= TSEITIN
-            {
-                *b = *b - TSEITIN + nb;
+            if cnf.var_map.is_empty() {
+                return None;
             }
+            let nb = cnf.bools.len() as u32;
+            let fix = |l: &mut InLit| {
+                if let InLit::Bool(b, _) = l
+                    && *b >= TSEITIN
+                {
+                    *b = *b - TSEITIN + nb;
+                }
+            };
+            for c in cnf.clauses.iter_mut() {
+                c.iter_mut().for_each(fix);
+            }
+            Some(cnf)
+        }
+        let flat = build(self, goal, true)?;
+        let run = |cnf: &Cnf, (max_conflicts, max_work): (usize, u64)| {
+            let num_bools = cnf.bools.len() + cnf.num_tseitin as usize;
+            // Integer constants range over the integers (nlsat's branch and
+            // bound).
+            let mut is_int = alloc::vec![false; cnf.var_map.len()];
+            for (&t, &v) in &cnf.var_map {
+                is_int[v as usize] =
+                    self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t));
+            }
+            check_with_ints_limited(
+                cnf.var_map.len(),
+                num_bools,
+                &cnf.clauses,
+                &is_int,
+                max_conflicts,
+                max_work,
+            )
         };
-        for c in cnf.clauses.iter_mut() {
-            c.iter_mut().for_each(fix);
+        // Unbounded, the two encodings take turns on growing budgets: over
+        // the same atoms they search in different orders, and either one can
+        // run into projections that explode where the other needs a few
+        // conflicts. The flattened goal, z3's encoding, goes first and has the
+        // last, unbounded run.
+        let tseitin = if limit.is_none() {
+            build(self, goal, false).filter(|t| t.num_tseitin > flat.num_tseitin)
+        } else {
+            None
+        };
+        let mut decided = None;
+        if let Some(t) = &tseitin {
+            'budgets: for work in NLSAT_ENCODING_BUDGETS {
+                for cnf in [&flat, t] {
+                    let r = run(cnf, (NLSAT_MAX_CONFLICTS, work));
+                    if !matches!(r, NlsatResult::Unknown) {
+                        decided = Some((r, cnf));
+                        break 'budgets;
+                    }
+                }
+            }
         }
-        let num_bools = (nb + cnf.num_tseitin) as usize;
-        // Integer constants range over the integers (nlsat's branch and bound).
-        let mut is_int = alloc::vec![false; cnf.var_map.len()];
-        for (&t, &v) in &cnf.var_map {
-            is_int[v as usize] =
-                self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t));
-        }
-        let (max_conflicts, max_work) = limit.unwrap_or((4000, u64::MAX));
-        match check_with_ints_limited(
-            cnf.var_map.len(),
-            num_bools,
-            &cnf.clauses,
-            &is_int,
-            max_conflicts,
-            max_work,
-        ) {
+        let (result, cnf) = decided.unwrap_or_else(|| {
+            let limit = limit.unwrap_or((NLSAT_MAX_CONFLICTS, u64::MAX));
+            (run(&flat, limit), &flat)
+        });
+        match result {
             NlsatResult::Unsat => Some((SmtResult::Unsat, None)),
             NlsatResult::Sat(values, bvals) if sat_ok => {
                 // Only real and integer constants as leaves: then the
