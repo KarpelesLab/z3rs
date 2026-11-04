@@ -439,6 +439,7 @@ impl SmtCore {
                     euf: Egraph::new(m, &[]),
                     bv: BTreeMap::new(),
                     alg: BTreeMap::new(),
+                    incomplete: false,
                     defaults: BTreeMap::new(),
                     cong_depth: 0,
                     zero_div: Default::default(),
@@ -492,6 +493,7 @@ impl SmtCore {
                         euf,
                         bv: BTreeMap::new(),
                         alg: BTreeMap::new(),
+                        incomplete: false,
                         defaults: BTreeMap::new(),
                         cong_depth: 0,
                         zero_div: Default::default(),
@@ -919,6 +921,9 @@ pub struct Model {
     /// Irrational real algebraic values of arithmetic leaf variables (e.g. an
     /// optimum on a nonlinear objective), overriding `arith`.
     alg: BTreeMap<AstId, puremp::Algebraic>,
+    /// A substituted variable has no value here: its exact value was too
+    /// costly to compute (see [`Model::alg_value_affordable`]).
+    incomplete: bool,
     /// The "else" value of uninterpreted functions at arguments no assigned
     /// application covers (set by model-based quantifier instantiation).
     defaults: BTreeMap<AstId, Value>,
@@ -1011,6 +1016,13 @@ const ALG_EXACT_MAX_DEGREE: usize = 32;
 /// The work [`Model::alg_holds`] spends on the exact sign of one polynomial
 /// comparison (see [`crate::nlsat::realclosure::sign_at_point_fueled`]).
 const ALG_SIGN_FUEL: u64 = 200_000;
+
+/// The largest degree bound (see [`alg_degree_product`]) of a term whose exact
+/// value [`Model::alg_value_affordable`] computes. puremp's sums and products
+/// take a characteristic polynomial of that degree by Faddeev-LeVerrier, about
+/// a quarter second at degree 64 and seven at 144 on small coefficients, and
+/// the cost multiplies along the term.
+const ALG_VALUE_MAX_DEGREE: usize = 64;
 
 /// `a` with an isolating interval whose lower end is not a root of its
 /// defining polynomial. puremp's sums and products keep a non-minimal
@@ -1274,6 +1286,7 @@ impl Model {
             euf: Egraph::new_empty(),
             bv,
             alg: BTreeMap::new(),
+            incomplete: false,
             defaults: BTreeMap::new(),
             cong_depth: 0,
             zero_div: Default::default(),
@@ -1563,6 +1576,23 @@ impl Model {
             })
         }
         go(self, m, t)
+    }
+
+    /// Whether [`Model::alg_value`] of `t` stays below
+    /// [`ALG_VALUE_MAX_DEGREE`].
+    pub fn alg_value_affordable(&self, m: &AstManager, t: AstId) -> bool {
+        alg_degree_product(self, m, t) <= ALG_VALUE_MAX_DEGREE
+    }
+
+    /// Records that a variable of this model has no value (see
+    /// [`Model::is_incomplete`]).
+    pub fn mark_incomplete(&mut self) {
+        self.incomplete = true;
+    }
+
+    /// Whether a variable went without a value: the model witnesses nothing.
+    pub fn is_incomplete(&self) -> bool {
+        self.incomplete
     }
 
     /// The exact truth value of the Boolean term `t` under this model when it

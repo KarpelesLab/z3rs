@@ -38303,7 +38303,12 @@ impl Context {
         let mark = self.fp_fold_pins.len();
         let (res, model) = self.decide_inner_core(goal);
         let pins = self.fp_fold_pins.split_off(mark);
-        (res, model.map(|m| self.complete_substituted(m, &pins)))
+        let model = model.map(|m| self.complete_substituted(m, &pins));
+        // A model missing a substituted variable witnesses nothing.
+        if model.as_ref().is_some_and(Model::is_incomplete) {
+            return (SmtResult::Unknown, None);
+        }
+        (res, model)
     }
 
     /// `goal` with its arithmetic term-level `ite`s lifted (see [`Self::lift`]):
@@ -39050,9 +39055,14 @@ impl Context {
     }
 
     /// Re-attach the variables [`Self::linearize_fixed_vars`] substituted away:
-    /// latest first, each from its defining term under the model.
+    /// latest first, each from its defining term under the model. A defining
+    /// term whose exact value is out of reach marks the model incomplete.
     fn complete_substituted(&self, mut model: Model, subst: &[(AstId, AstId)]) -> Model {
         for &(x, b) in subst.iter().rev() {
+            if !model.alg_value_affordable(&self.m, b) {
+                model.mark_incomplete();
+                break;
+            }
             if let Some(a) = model.alg_value(&self.m, b) {
                 model.set_alg(x, a);
             } else if let Value::Num(r, _) = model.eval_value(&self.m, b) {

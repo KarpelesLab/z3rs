@@ -142,3 +142,18 @@ fn smt2_deep_nesting_does_not_exhaust_the_stack() {
     );
     assert_eq!(run_on_default_stack(chain), vec!["sat", "3"]);
 }
+
+/// A square root equation whose nlsat model has values of degree 24: the
+/// exact value of a variable substituted away would be of degree in the
+/// thousands, so the goal stays undecided instead of running for minutes.
+#[test]
+fn smt2_nra_model_completion_is_bounded() {
+    let script = "(declare-const x Real)(declare-const y Real)
+        (assert (>= x 1.0))
+        (assert (>= y (- 1.0)))
+        (assert (= (+ (^ x 0.5) (+ 3.0 (^ (+ y y) 0.5))) x))
+        (assert (= (+ (* y 1.0) (* y x)) (^ (* 2.0 x) 0.5)))
+        (assert (< (+ x y) (+ (+ x y) (^ x 0.5))))
+        (check-sat)";
+    assert_eq!(run_smt2(script).unwrap(), vec!["unknown"]);
+}
