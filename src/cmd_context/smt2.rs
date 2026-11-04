@@ -1876,6 +1876,10 @@ const NLSAT_MAX_CONFLICTS: usize = 4000;
 /// The work budgets on which an unbounded nlsat call tries each encoding of
 /// the goal (see [`Context::nlsat_decide_goal_limited`]).
 const NLSAT_ENCODING_BUDGETS: [u64; 2] = [200_000, 1_600_000];
+/// The share of a stage's work (see [`Context::nla_decide_goal`]) that nlsat
+/// gets, on a goal mixing integers and reals, with the integers first in its
+/// variable order.
+const NLA_INTS_FIRST_SHARE: u64 = 8;
 /// The `(conflicts, work)` of the nlsat check of the literals an assignment
 /// rests on, in each refinement round.
 const NLA_NRA_LIMIT: (usize, u64) = (100, 4_000);
@@ -39592,6 +39596,10 @@ impl Context {
         if !has_int {
             return None;
         }
+        let has_real = self.m.postorder(goal).iter().any(|&t| {
+            let sort = self.m.get_sort(t);
+            self.m.is_uninterp_const(t) && self.m.is_arith_sort(sort) && !self.m.is_int_sort(sort)
+        });
         let mut search = NlaSearch::new(&mut self.m, goal);
         // The valid axioms (product signs, squares) hold at every point: the
         // goal does not rest on their literals.
@@ -39604,6 +39612,12 @@ impl Context {
         let mut tried = BTreeMap::new();
         let (mut work, mut rounds, mut check) = NLA_FIRST_BUDGETS;
         for _ in 0..NLA_STAGES {
+            let ints_first = Some((usize::MAX, work / NLA_INTS_FIRST_SHARE));
+            if has_real
+                && let Some(r) = self.nlsat_decide_goal_ordered(goal, sat_ok, ints_first, true)
+            {
+                return Some(r);
+            }
             if let Some(r) = self.nlsat_decide_goal_limited(goal, sat_ok, Some((usize::MAX, work)))
             {
                 return Some(r);
@@ -39745,6 +39759,18 @@ impl Context {
         goal: AstId,
         sat_ok: bool,
         limit: Option<(usize, u64)>,
+    ) -> Option<(SmtResult, Option<Model>)> {
+        self.nlsat_decide_goal_ordered(goal, sat_ok, limit, false)
+    }
+
+    /// [`Self::nlsat_decide_goal_limited`], with the integers first in nlsat's
+    /// variable order when `ints_first` (see [`check_with_ints_limited`]).
+    fn nlsat_decide_goal_ordered(
+        &self,
+        goal: AstId,
+        sat_ok: bool,
+        limit: Option<(usize, u64)>,
+        ints_first: bool,
     ) -> Option<(SmtResult, Option<Model>)> {
         use crate::nlsat::Rel as NRel;
         use crate::nlsat::solver::{InLit, Kind, NlsatResult, check_with_ints_limited};
@@ -39993,6 +40019,7 @@ impl Context {
                 &is_int,
                 max_conflicts,
                 max_work,
+                ints_first,
             )
         };
         // Unbounded, the two encodings take turns on growing budgets: over

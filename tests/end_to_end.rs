@@ -157,3 +157,25 @@ fn smt2_nra_model_completion_is_bounded() {
         (check-sat)";
     assert_eq!(run_smt2(script).unwrap(), vec!["unknown"]);
 }
+
+/// An equation fixes the real for each integer: with the integer first in
+/// nlsat's variable order the sample is a solution, with the real first branch
+/// and bound chases the integer root by root.
+#[test]
+fn smt2_mixed_integer_real_nlsat() {
+    let script = "(declare-fun x0 () Int)(declare-fun x1 () Real)
+        (assert (distinct (+ (+ (* (- 2.0) x1) 1.0) (* x0 x1))
+            (+ (* (+ (* (- 3.0) x0) (- 2.0)) (+ (* 4.0 x1) 5.0))
+               (+ (* (- 4.0) x0) (* 0.0 x0) 1.0))))
+        (assert (<= (+ (* x0 x0) (* x1 x1 x1) (* x0 x0 x0)) (- 3.0)))
+        (assert (<= (+ (+ (* (- 3.0) x0) 4.0) (* x0 x1 x0))
+            (+ (+ (* (- 4.0) x0) (* 0.0 x1) (- 5.0)) (+ (* (- 3.0) x1) (- 4.0))
+               (+ (* 0.0 x0) 9.0) (- 5.0))))
+        (assert (< (+ (* x1 x1 x0) (* (+ (* (- 4.0) x1) (* 1.0 x1) (- 3.0)) (+ (* 3.0 x1) (- 3.0))) 7.0)
+            7.0))
+        (assert (= (+ (* x0 x1) (* x0 x0 x1)
+                      (* (+ (* (- 2.0) x0) (- 9.0)) (+ (* (- 2.0) x0) (* (- 1.0) x1) (- 4.0))))
+            4.0))
+        (check-sat)";
+    assert_eq!(run_smt2(script).unwrap(), vec!["sat"]);
+}

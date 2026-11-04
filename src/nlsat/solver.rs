@@ -2478,7 +2478,7 @@ pub fn check_with_ints(
     clauses: &[Vec<InLit>],
     is_int: &[bool],
 ) -> NlsatResult {
-    check_with_ints_limited(num_vars, num_bools, clauses, is_int, 4000, u64::MAX)
+    check_with_ints_limited(num_vars, num_bools, clauses, is_int, 4000, u64::MAX, false)
 }
 
 /// [`check_with_ints`] giving up (`Unknown`) after `max_conflicts` conflicts
@@ -2486,7 +2486,11 @@ pub fn check_with_ints(
 /// isolation (see [`Fuel`]), and [`LIMITED_VISITS_PER_WORK`] clause visits
 /// per unit, as z3 bounds the nlsat calls of its arithmetic solver
 /// (`nra_solver`) by conflicts and its resource limit. `u64::MAX` is no
-/// bound.
+/// bound. With `ints_first`, the integer variables come first in the variable
+/// order (see [`Solver::search_check`]): each then samples an integer of its
+/// cell and the reals over it take sections, where a real assigned first
+/// leaves the integer an isolated root, fractional as a rule, for branch and
+/// bound to chase one integer at a time.
 pub fn check_with_ints_limited(
     num_vars: usize,
     num_bools: usize,
@@ -2494,6 +2498,7 @@ pub fn check_with_ints_limited(
     is_int: &[bool],
     max_conflicts: usize,
     max_work: u64,
+    ints_first: bool,
 ) -> NlsatResult {
     // Variable order.
     let polys: Vec<&Polynomial> = clauses
@@ -2504,7 +2509,10 @@ pub fn check_with_ints_limited(
             InLit::Bool(..) => None,
         })
         .collect();
-    let order = heuristic_order(num_vars, &polys);
+    let mut order = heuristic_order(num_vars, &polys);
+    if ints_first {
+        order.sort_by_key(|&v| !is_int.get(v as usize).copied().unwrap_or(false));
+    }
     let mut to_internal = alloc::vec![0 as Var; num_vars];
     for (k, &v) in order.iter().enumerate() {
         to_internal[v as usize] = k as Var;
