@@ -7,6 +7,235 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/z3rs/compare/v0.0.10...v0.0.11) - 2026-11-04
+
+### Other
+
+- nlsat also tries mixed goals with the integers first
+- the flattened goal and the Tseitin encoding take turns on small budgets
+- the same search at less cost per conflict
+- bound the exact value of a variable substituted away
+- fuzz_seq_lengths.py, differential fuzz of sequences of unbounded length
+- length-abstraction refutation, alias merging, and refutation without opaque terms
+- Sequences of unbounded length through their length abstraction
+- nth reads of symbolic sequences agree with the other reads on equal arguments
+- Integer equalities: gcd test after eliminating the unit-coefficient variables
+- Models over irrational values: exact, bounded readings of division-by-zero assertions
+- Regex membership of a literal: match first, and decide a regex's emptiness and universality once
+- axiomatize the terms the store-binding inlining creates
+- Rational disequalities by convexity when the case split runs out
+- evaluate int2bv over a symbolic integer from its argument
+- regress_check.py compares two z3rs binaries over every fuzzer's cases
+- Integer branching left to the search: z3's gcd test and patching first
+- Division by zero models: irrational re-solves read exactly, not by the rational evaluator
+- LRA models: replay z3's lar_solver for linear real conjunctions
+- Array models: assign an unassigned function-valued index before building the arrays
+- Bound the slow paths: a resource limit on instance-goal searches, integer conflict cores, shared witness budgets
+- the initial decision phase is per context, not a process-global flag
+- nonlinear cubes by CAD; CAD work weighted by degree; som in opt preprocessing
+- fuzz_nia.py, differential fuzz of nonlinear integer arithmetic
+- z3's binomial order lemmas and monomial bounds
+- objective names as z3 prints the parsed term; real objectives over integers
+- integer objectives certified unbounded by a ray of the model's cube
+- Nonlinear goals: bound the search of their linear abstraction
+- datatype and array binders, Skolem functions over strings, sequences and datatypes
+- objectives with term ites (wrong optima fixed); z3's pb-sum preprocessing
+- bound the final checks of each refinement round with its budget
+- the floor of an algebraic number by refinement, not by stepping
+- real objectives over SMT-guided cubes; scoped objectives; FM strictness
+- z3's monomial patching, on models
+- Square roots of possibly negative bases: refute with nlsat, sat only when unused
+- derived length bounds, and short values tried for a model
+- str.to_int / str.from_int axioms (z3's stoi/itos axioms)
+- open linear optima scale epsilon by the bounds solve-eqs leaves
+- cargo fmt
+- lia2card replayed on z3's preprocessed goal for unsat values
+- memberships in regexes over symbolic strings unfold into word constraints
+- flatten the goal's Boolean structure into clauses, as z3 does
+- nlsat checks every assignment's support, retried on larger budgets
+- wider CAD lifting caps; objective values laid out at 80 columns
+- array constants printed as store chains over constant arrays
+- z3's incremental linearization (nla_core lemmas) alongside nlsat
+- Fuzzers for MaxSMT (assert-soft) and bit-vector objectives
+- z3's preprocessing for unsat objective values; decimal soft weights
+- Lex after unbounded: z3's threshold search and geometric step
+- bounded-length variables decided by their elements
+- map/store/const goals decided by their element reduction
+- regex and length constraints on independent variables, decided exactly
+- MBQI over string and sequence binders; selector equations are not definitions
+- congruent datatype reads share their class's value; unmentioned functions always printed
+- Lifted arithmetic ite: bound the constant between numeral branches
+- one circuit for a symbolic rounding mode
+- blocker literals in the watch lists
+- String-valued user functions by purification
+- Division by zero models: fold free constants, eliminated definitions, irrational re-solves
+- bit-vector rules of z3's theory rewriter
+- test conjunctions over three variables against CAD
+- value the e-graph's argument-only arithmetic applications
+- z3's theory rewriter for Boolean and arithmetic terms
+- :factor: bound the work by coefficient size too
+- string literals and symbolic string operations in z3's spelling
+- Float reads and applications: congruence on their bit images; rounding-mode universals exhausted
+- normalize and simplify the conflict core (simplify_conflicts)
+- levelwise single-cell projection, quadratic roots, factored atoms
+- interpretations in z3's hash-map slot order
+- Model eval: real division over algebraic values
+- floats in arrays, strings with integers and UF
+- Datatype models: abstract values completed to constructor terms
+- Regexes over string variables: rebuilt from their recipe for witnesses
+- Regex simplify: z3's length residues and disjunction order
+- str.in_re of a universal constant regex folds to true
+- Universals over theory sorts: seed values to instantiate
+- datatype terms complete to constructors; functions' else values
+- stop on a runaway model value
+- run first on nonlinear goals; integers by branch and bound; factors
+- Bounded nonlinear enumeration: keep the enumerated values in the model
+- subresultant PRS, Descartes isolation, factorization; fix PSC and sign_of
+- seq.at / seq.extract by cases, operations distributed over ite
+- E-matching rounds: z3's instance cost and generation thresholds
+- Cooper forall-exists: a product over a binder is no free variable
+- seq.nth of a concrete sequence at a symbolic index, by cases
+- small terms cache by map, not a table over the whole manager
+- finite models before E-matching rounds; linear implied-equality scan; valid EUF literals
+- Bool-indexed arrays read pointwise before the array axioms
+- name (_ map f) terms used outside array equalities
+- Final check: proof closure on demand; quantifier definitions tried first
+- to_fp of a symbolic real: fresh bits tied by z3's rounding relation
+- fp.to_real of a symbolic float: its value read off the bits
+- clauses added mid-search, chronological backtracking; E-matching resumes its search
+- Bit-vector/integer conversions: sound models and their bit-blasted axioms
+- Bit-vectors combined with arithmetic, UF and records by bit-blasting into the Boolean structure
+- hashed congruence table, top-level matches by application, ground universals
+- content-interned concrete sequences, no sat without string values
+- Quantifier saturation soundness: range universals and E-matching after enumeration
+- fuzz scripts: optional seed-offset argument
+- also ignore a z3 symlink
+- Remove accidentally committed z3 symlink
+- Division by zero: keep a dividing definition used elsewhere as an assertion
+- port the conflict-driven nlsat solver; exact algebraic equality
+- E-matching inside one persistent DPLL(T) search
+- solve-eqs eliminates definitions with binders too
+- check-sat-using ... smt: decide bit-blasted bits false first, as z3's SMT kernel
+- check-sat-using (then elim-uncnstr smt): z3's model converter
+- apply elim-uncnstr: z3's tactic over the goal as parsed; bit-blasted models keep their Booleans
+- Division by zero: functional div0/mod0//0 in models, eval and decisions
+- E-matching rounds: bound the total goal size decided across rounds
+- list the solver's constants in z3's obj_map slot order
+- a datatype constant elim-uncnstr removes through a selector is that selector's constructor
+- Deep terms: linear product scan, uncopied replace expansion, buffered echo
+- relevancy-guided E-matching rounds; model evaluation and simplex fixes
+- Deep terms: iterative parser and passes, bottom-up term building
+- Seq models: pin open sequences to concrete values instead of Seq!val! placeholders
+- Deep terms: linear-time let scopes, DAG-shared linearization and algebraic folding
+- Seq witnesses: no sentinel-backed candidates; validate sat models against the assertions
+- no constant interpretation contradicting applications over arrays
+- Bit-vector arrays: decide array equalities by bit-blasting their axioms
+- refute with the instances at 0, 1, -1 alone when the full instance set is undecided
+- objective values after unsat follow z3's preprocessing
+- Nonlinear witnesses for wide goals; div/mod on Real operands
+- functions as z3's finite tables; Ackermannized BV applications keep their values
+- Array maps: decide map equalities through the array axioms; four soundness fixes
+- a function interpretation must also satisfy the universals over it
+- range-restricted integer universals by model ranges; sequence field reads in length splits
+- test patterns for binders by a tree walk, not a manager-sized postorder
+- Warn about unknown attributes in annotations as z3's parser does
+- Quantifier abstractions decide sat; finite model finding over enumerated sorts
+- Online DPLL(T): congruence closure and simplex follow the SAT trail
+- case splits on bounded lengths and read positions; nested quantifiers over small integer ranges
+- (str.in_re s (str.to_re t)) lowers to s = t for symbolic t
+- bound the instance budget, split independent universals, div0 under universals, MBQI model fixes
+- solve-eqs keeps definitions with binders
+- bounded position-level procedure for word equations
+- raise the instance budget to 800
+- UF over finite sorts as value tables
+- order the model's constants as z3's solver registers them
+- z3's regex rewriter and SMT2 pretty printer with let aliases
+- Quantifiers in ground assertions: skolemize negative universals, prenex positive ones
+- Pareto over nonlinear reals with irrational front points
+- bounded-length languages restrict the member's length
+- Boolean field atoms pin the witness; witness models carry the fields
+- concrete model values for every variable; eval folds over them
+- Bool-indexed reads at symbolic indices by case analysis on the index
+- square roots (^ b 1/2) as purified variables
+- read-only arrays under universals as functions; consistent model reads
+- list declarations as z3 does — model's first, then z3's declaration-dictionary slot order
+- seq.map/mapi/foldl/foldli
+- share only congruence-relevant terms; model-guided integer optimization
+- E-matching only without MBQI; DER and unused binders as z3
+- containment orders, symbolic str.at length, seq ops on strings
+- sound E-matching saturation, user patterns, matching modulo equalities
+- root-obj constants as pinned variables; qfnra-nlsat sin/cos purification
+- coordinate witness search; preprocessing-only check-sat-using
+- symbolic (fp s e m) fields; fp.to_real of NaN/inf is z3's unspecified value
+- derive producer-bound variables, symbolic substr lengths
+- LIA models: free-disequality completion ignores the variable's own term
+- abstract nested quantifiers by predicates of their free variables
+- fp.to_ieee_bv of NaN is one unspecified NaN pattern per format
+- eval without model completion; numeral-first sums; z3's bvudiv0 names
+- NRA models: CAD witness for model-less sat, pp.decimal algebraic values, reset undeclares
+- content equality with symbolic elements, guard case splits
+- *(T)* clone the interned e-graphs instead of rebuilding them per round
+- CEGAR instantiation over arithmetic binders
+- Macro finder: inline universal definitions where they are used
+- link marker constants to their side-table operands
+- Bit-vector universals by counterexample-guided instantiation
+- named cores, sound one-element universes, prenexing
+- Datalog front end: declare-rel, declare-var, rule, query
+- Report ill-sorted const arrays as z3 does and continue
+- case splits over short literals, ite distribution
+- additive concat lengths even without a str.len term
+- case-split literal reads at symbolic positions
+- emptiness links, sound index inlining, witness models
+- FP fma circuit for formats with eb > sb
+- Independent components, sort-correct extensionality, congruent models
+- Disjunction witness: allow one nested split
+- FP to_fp of constrained reals: witnesses with genuine models
+- blast to_fp reinterpretation of symbolic bit-vectors
+- Division witness: pin product variables, solve c·v = b for fixed reals
+- Real-division witness: pin the constants of compound divisors
+- Houdini inductive invariants over candidate bounds
+- Decide comparisons over ground transcendentals by rigorous interval evaluation
+- Prove sat through opaque atoms by polarity strengthening
+- symbolic rounding modes; recoverable model/proof/core errors
+- Decide mixed bit-vector goals by independent components
+- simplify DNFs between eliminations
+- BV arrays: store-chain equality over wide indices
+- BV arrays: fold const-array reads; finite-index extensionality
+- project degenerate reducta; ideal-membership refutation; sin/cos identity
+- range axioms on every check, as z3 5.3
+- strengthen dropped implications even with no plain constraints
+- disequalities contribute a boundary point; nested integer QE
+- Ferrante-Rackoff and propositional fallbacks; sentinels never confirmed
+- Quantified conjuncts become universals; witness models keep substituted variables
+- prove sat through division by strengthening dropped implications
+- decide universals over Bool/arith/BV/FP binders
+- FP instances substitute the binder's bit-vector image
+- fix wrong sat/unsat over theory-sorted binders
+- bit-blast fp.fma for significands shorter than 5 bits
+- eliminate nested linear quantifiers inside terms
+- sampled sat witnesses for 5-12 variable systems
+- use ? (clippy)
+- use ? (clippy)
+- congruence refinement and alternative defaults
+- model-based instantiation (MBQI)
+- Named assertions denote their term; (_ re.loop n) is at least n
+- Model eval: congruent predicate lookup; entailed Booleans
+- keep inlined literal bindings in the model; eval like get-value
+- exact nonlinear real optimization by CAD; algebraic models
+- lex after an unbounded objective takes the limit; soft groups by :id
+- keep the quoting helpers above the test module (clippy)
+- Print symbols |quoted| where z3 does
+- box and pareto priorities, iterated across repeated check-sat
+- Retarget upstream parity to Z3 5.3.2 (latest stable)
+- Retarget upstream parity from Z3 4.17.0 to 5.0.0
+- replace Fourier-Motzkin with a bounded simplex as the LRA core
+- state congruence and read-over-write so they survive folding
+- VSIDS heap for SAT decisions; one traversal for multi-root e-graphs
+- don't report unbounded / strict bounds from an LP relaxation
+- classify 4008 as a known z3 bug; pin z3rs's correct unsat
+- Bump puremp to 0.3
+- Stop tracking Cargo.lock
+
 ## [0.0.10](https://github.com/KarpelesLab/z3rs/compare/v0.0.9...v0.0.10) - 2026-09-01
 
 ### Other
