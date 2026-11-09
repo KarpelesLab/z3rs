@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Differential fuzz of nonlinear real arithmetic mixed with uninterpreted functions.
 
-Random goals over 1-3 reals with a unary `f` and a binary `g` (Real -> Real),
+Random goals over 1-3 reals with a unary `f` and a binary `g` (Real -> Real)
+and a predicate `p` (Real -> Bool),
 polynomial constraints over variables and applications (nested ones too), and
 argument equalities that make congruence matter (`x = y ∧ f(x) > f(y)`).
 z3rs and z3 must agree on every decided verdict (DISAGREE otherwise). A z3rs
@@ -61,6 +62,10 @@ def gen(r):
             return f"(= {a} {b})"
         if c < 0.2:
             return f"(distinct {app()} {app()})"
+        if c < 0.3:
+            neg = r.random() < 0.5
+            a = f"(p {arg(1)})"
+            return f"(not {a})" if neg else a
         op = r.choice(["<", "<=", "=", ">", ">=", "<=", "distinct"])
         return f"({op} {poly()} {num()})"
 
@@ -99,7 +104,7 @@ def model_defs(out):
     return defs
 
 
-HEAD = "(declare-fun f (Real) Real)\n(declare-fun g (Real Real) Real)\n"
+HEAD = "(declare-fun f (Real) Real)\n(declare-fun g (Real Real) Real)\n(declare-fun p (Real) Bool)\n"
 
 
 def one(i):
@@ -126,6 +131,8 @@ def one(i):
         src.append("(declare-fun f (Real) Real)")
     if "g" not in names:
         src.append("(declare-fun g (Real Real) Real)")
+    if "p" not in names:
+        src.append("(declare-fun p (Real) Bool)")
     src += [f"(declare-const {v} Real)" for v in vs if v not in names]
     q = f"{OUT}/u_{i}_replay.smt2"
     zr = run(Z3, "\n".join(src) + "\n" + "\n".join(asserts) + "\n(check-sat)\n", q).strip()

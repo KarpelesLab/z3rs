@@ -40121,7 +40121,11 @@ impl Context {
                 // `x = x` is true: a constant polynomial literal.
                 let p = crate::math::polynomial::Polynomial::zero();
                 InLit::Ineq(p, Kind::Eq, m.is_false(t))
-            } else if m.is_uninterp_const(t) && m.is_bool_sort(m.get_sort(t)) {
+            } else if (m.is_uninterp_const(t) || ctx.is_user_uf_app(t))
+                && m.is_bool_sort(m.get_sort(t))
+            {
+                // A Boolean constant, or an uninterpreted predicate
+                // application (congruence is checked on the model).
                 let b = match cnf.bools.iter().position(|&x| x == t) {
                     Some(i) => i as u32,
                     None => {
@@ -40374,16 +40378,28 @@ impl Context {
         // whose models are congruent by construction.
         let uf_apps = self.nlsat_uf_leaves(goal);
         let ackermann;
+        let is_bool = |t: AstId| self.m.is_bool_sort(self.m.get_sort(t));
+        let valued = |cnf: &Cnf, apps: &[AstId]| {
+            apps.iter().all(|&t| {
+                if is_bool(t) {
+                    cnf.bools.contains(&t)
+                } else {
+                    cnf.var_map.contains_key(&t)
+                }
+            })
+        };
         if sat_ok
-            && let NlsatResult::Sat(values, _) = &result
+            && let NlsatResult::Sat(values, bvals) = &result
             && let Some(apps) = &uf_apps
             && !apps.is_empty()
-            && (!apps.iter().all(|t| cnf.var_map.contains_key(t))
-                || !self.nlsat_uf_congruent(apps, &cnf.var_map, values))
+            && (!valued(cnf, apps)
+                || !self.nlsat_uf_congruent(apps, &cnf.var_map, values, &cnf.bools, bvals))
         {
             let mut ack = flat.clone();
             for &t in apps {
-                let _ = self.icp_to_poly(t, &mut ack.var_map);
+                if !is_bool(t) {
+                    let _ = self.icp_to_poly(t, &mut ack.var_map);
+                }
             }
             for (i, &a) in apps.iter().enumerate() {
                 for &b in &apps[i + 1..] {
@@ -40396,6 +40412,20 @@ impl Context {
                             .icp_to_poly(x, &mut ack.var_map)
                             .sub(&self.icp_to_poly(y, &mut ack.var_map));
                         cl.push(InLit::Ineq(d, Kind::Eq, true));
+                    }
+                    if is_bool(a) {
+                        // `args differ ∨ (p(a) ⇔ p(b))`.
+                        let pos = |t: AstId| ack.bools.iter().position(|&x| x == t);
+                        let (Some(pa), Some(pb)) = (pos(a), pos(b)) else {
+                            continue;
+                        };
+                        let (pa, pb) = (pa as u32, pb as u32);
+                        let mut c1 = cl.clone();
+                        c1.extend([InLit::Bool(pa, true), InLit::Bool(pb, false)]);
+                        cl.extend([InLit::Bool(pa, false), InLit::Bool(pb, true)]);
+                        ack.clauses.push(c1);
+                        ack.clauses.push(cl);
+                        continue;
                     }
                     let d = self
                         .icp_to_poly(a, &mut ack.var_map)
@@ -40418,8 +40448,14 @@ impl Context {
                         cnf.var_map
                             .keys()
                             .all(|&t| self.m.is_uninterp_const(t) || apps.contains(&t))
-                            && apps.iter().all(|t| cnf.var_map.contains_key(t))
-                            && self.nlsat_uf_congruent(apps, &cnf.var_map, &values)
+                            && valued(cnf, apps)
+                            && self.nlsat_uf_congruent(
+                                apps,
+                                &cnf.var_map,
+                                &values,
+                                &cnf.bools,
+                                &bvals,
+                            )
                     }
                     None => false,
                 };
@@ -40457,7 +40493,7 @@ impl Context {
     }
 
     /// The applications of user-declared functions in `goal`, when each one
-    /// maps arithmetic arguments to an arithmetic value (the leaves
+    /// maps arithmetic arguments to an arithmetic or Boolean value (the leaves
     /// [`Self::nlsat_decide_goal_ordered`] can interpret); `None` otherwise.
     fn nlsat_uf_leaves(&self, goal: AstId) -> Option<Vec<AstId>> {
         let mut apps = Vec::new();
@@ -40466,7 +40502,8 @@ impl Context {
                 continue;
             }
             let arith = |x: AstId| self.m.is_arith_sort(self.m.get_sort(x));
-            if !arith(t) || !self.m.app_args(t).iter().all(|&a| arith(a)) {
+            let value_ok = arith(t) || self.m.is_bool_sort(self.m.get_sort(t));
+            if !value_ok || !self.m.app_args(t).iter().all(|&a| arith(a)) {
                 return None;
             }
             apps.push(t);
@@ -40475,13 +40512,16 @@ impl Context {
     }
 
     /// Whether the nlsat assignment `values` (over `var_map`) gives equal
-    /// values to every two applications of one function with equal arguments.
-    /// A constant outside `var_map` reads as 0, as the model sets it.
+    /// values to every two applications of one function with equal arguments
+    /// (a predicate application's value is its Boolean among `bools`). A
+    /// constant outside `var_map` reads as 0, as the model sets it.
     fn nlsat_uf_congruent(
         &self,
         apps: &[AstId],
         var_map: &BTreeMap<AstId, u32>,
         values: &[crate::nlsat::realclosure::Alg],
+        bools: &[AstId],
+        bvals: &[bool],
     ) -> bool {
         use crate::nlsat::realclosure::{Alg, sign_at_point};
         let mut vm = var_map.clone();
@@ -40521,7 +40561,16 @@ impl Context {
                         None => return false,
                     }
                 }
-                if same && equal(a, b) != Some(true) {
+                if !same {
+                    continue;
+                }
+                if self.m.is_bool_sort(self.m.get_sort(a)) {
+                    let val = |t: AstId| bools.iter().position(|&x| x == t).map(|i| bvals[i]);
+                    match (val(a), val(b)) {
+                        (Some(x), Some(y)) if x == y => {}
+                        _ => return false,
+                    }
+                } else if equal(a, b) != Some(true) {
                     return false;
                 }
             }
@@ -48669,6 +48718,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, alloc::vec!["sat", "true"]);
+        // Predicates are Boolean leaves, congruent the same way.
+        assert_eq!(
+            run(
+                "(declare-const x Real)(declare-const y Real)(declare-fun p (Real) Bool)\
+                 (assert (= (* x y) 1.0))(assert (p (* x y)))(assert (not (p 1.0)))\
+                 (check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        let out = run(
+            "(declare-const x Real)(declare-const y Real)(declare-fun p (Real) Bool)\
+             (assert (= (* x y) 2.0))(assert (p (* x y)))(assert (not (p x)))(assert (> x 3.0))\
+             (check-sat)(eval (p (* x y)))(eval (p x))",
+        )
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat", "true", "false"]);
     }
 
     #[test]
