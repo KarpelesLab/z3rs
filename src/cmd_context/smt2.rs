@@ -30701,9 +30701,67 @@ impl Context {
     /// the problem [`nl_climb`] follows z3's optimizer on, maximizing `obj`
     /// (`−obj` for a minimization, an even power only).
     fn nl_power(&mut self, obj: AstId, maximize: bool, fixed: &[AstId]) -> Option<nl_climb::Power> {
+        match self.nl_power_sides(obj, maximize, fixed)? {
+            (p, false) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// An application of an uninterpreted function (not a constant).
+    fn is_uf_app(&self, t: AstId) -> bool {
+        self.m.app(t).is_some_and(|a| {
+            !a.args.is_empty()
+                && self
+                    .m
+                    .func_decl(a.decl)
+                    .is_some_and(|d| d.info.family_id == crate::ast::NULL_FAMILY_ID)
+        })
+    }
+
+    /// A side constraint [`nl_climb::Power::bisect_uf`] follows z3 under: a
+    /// (possibly negated) uninterpreted predicate application, or a
+    /// non-strict bound `a·f(…) + b ⋈ 0` on one uninterpreted function
+    /// application. Each such atom holds for some value of its application
+    /// whatever its arguments, so the side constraints restrict nothing
+    /// when every function symbol occurs once (`decls`).
+    fn nl_uf_side(&self, a: AstId, decls: &mut BTreeSet<AstId>) -> bool {
+        use crate::nlsat::Rel as NRel;
+        let (mut atom, mut negated) = (a, false);
+        while self.m.is_not(atom) {
+            atom = self.m.app_args(atom)[0];
+            negated = !negated;
+        }
+        let app = if self.is_uf_app(atom) {
+            atom
+        } else {
+            let mut var_map = BTreeMap::new();
+            let Some(c) = self.icp_atom(atom, negated, &mut var_map) else {
+                return false;
+            };
+            if !matches!(c.rel, NRel::Le | NRel::Ge) || var_map.len() != 1 {
+                return false;
+            }
+            let (&t, &v) = var_map.iter().next().unwrap();
+            if !self.is_uf_app(t) || c.poly.degree_of(v) != 1 {
+                return false;
+            }
+            t
+        };
+        decls.insert(self.m.app_decl(app))
+    }
+
+    /// [`Self::nl_power`], also accepting side assertions over uninterpreted
+    /// functions (see [`Self::nl_uf_side`]); the flag says whether there are
+    /// any.
+    fn nl_power_sides(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        fixed: &[AstId],
+    ) -> Option<(nl_climb::Power, bool)> {
         use crate::nlsat::Rel as NRel;
         if !fixed.is_empty()
-            || self.assertions.len() != 1
+            || self.assertions.is_empty()
             || self.objectives.len() != 1
             || !self.soft_formulas.is_empty()
             || !self.m.is_uninterp_const(obj)
@@ -30711,7 +30769,19 @@ impl Context {
         {
             return None;
         }
-        let (mut atom, mut negated) = (self.assertions[0], false);
+        let mut decls = BTreeSet::new();
+        let mut power = None;
+        for &a in &self.assertions {
+            if self.m.postorder(a).iter().any(|&t| self.is_uf_app(t)) {
+                if !self.nl_uf_side(a, &mut decls) {
+                    return None;
+                }
+            } else if power.replace(a).is_some() {
+                return None;
+            }
+        }
+        let sides = self.assertions.len() - 1;
+        let (mut atom, mut negated) = (power?, false);
         while self.m.is_not(atom) {
             atom = self.m.app_args(atom)[0];
             negated = !negated;
@@ -30741,11 +30811,14 @@ impl Context {
         if !a.is_positive() {
             return None;
         }
-        Some(nl_climb::Power {
-            k,
-            u: b.neg().div(&a),
-            strict,
-        })
+        Some((
+            nl_climb::Power {
+                k,
+                u: b.neg().div(&a),
+                strict,
+            },
+            sides > 0,
+        ))
     }
 
     /// z3's climb and `optsmt::bisect` for a nonlinear real objective in the
@@ -30760,21 +30833,33 @@ impl Context {
         fixed: &[AstId],
         model: &mut Option<Model>,
     ) -> Option<Result<Rational, (Rational, Option<Rational>)>> {
-        let p = self.nl_power(obj, maximize, fixed)?;
+        let (p, sides) = self.nl_power_sides(obj, maximize, fixed)?;
         let rounds = match self.params.get("opt.optsmt_bisect_rounds") {
             Some(crate::util::ParamValue::UInt(n)) => *n as usize,
             _ => 64,
         };
-        let outcome = match p.climb()? {
-            Err(opt) => nl_climb::Outcome::Optimum(opt),
-            Ok(climb) => p.bisect(&climb, rounds)?,
+        let outcome = match (p.climb()?, sides) {
+            (Err(opt), _) => nl_climb::Outcome::Optimum(opt),
+            (Ok(climb), true) if !climb.below_rational_root() => {
+                p.bisect_uf(&climb, rounds, !maximize)?
+            }
+            (Ok(climb), _) => p.bisect(&climb, rounds)?,
         };
         let (lo, res) = match outcome {
             nl_climb::Outcome::Optimum(v) => (v.clone(), Ok(v)),
             nl_climb::Outcome::Interval(lo, hi) => (lo.clone(), Err((lo, Some(hi)))),
         };
-        if let Some(md) = model.as_mut() {
-            md.set_arith(obj, if maximize { lo } else { lo.neg() });
+        let lo = if maximize { lo } else { lo.neg() };
+        if sides {
+            // The side constraints' functions must agree with the new point.
+            let rv = self.m.mk_numeral(lo.clone(), false);
+            let eq = self.m.mk_eq(obj, rv);
+            match self.check_with(&[eq]) {
+                (SmtResult::Sat, Some(md)) => *model = Some(md),
+                _ => return None,
+            }
+        } else if let Some(md) = model.as_mut() {
+            md.set_arith(obj, lo);
         }
         Some(res)
     }

@@ -42,6 +42,7 @@
 //! bound, `U` too small for the climb to start at `x = 1`, a climb that
 //! never overshoots) is left to the caller's general procedures.
 
+use alloc::vec::Vec;
 use puremp::{Int, Rational};
 
 /// `x^k ≤ U` (`< U` when `strict`), `k ≥ 2`, `U > 0`.
@@ -72,6 +73,9 @@ pub(super) struct Climb {
     /// nla's order lemma `x < c ∨ m − c·x ≥ 0` is in the LP (squares
     /// refuted by cuts).
     order_lemma: bool,
+    /// Rounds the climb's LP models advanced before the cuts (`None` for
+    /// the climb below a rational root).
+    steps: Option<usize>,
 }
 
 /// An `inf_rational` value `x + y·ε`.
@@ -79,6 +83,15 @@ type Impq = (Rational, Rational);
 
 const CHECK_ASSIGNMENT_MAX_FAIL: usize = 7;
 const MAX_CLIMB_ROUNDS: usize = 64;
+const MAX_CLIMB_BITS: u32 = 4096;
+
+impl Climb {
+    /// The climb below a rational root of a strict bound, whose LP bound
+    /// `x < r` is no lemma: side constraints leave its bisection unchanged.
+    pub fn below_rational_root(&self) -> bool {
+        self.steps.is_none()
+    }
+}
 
 impl Power {
     fn one() -> Rational {
@@ -165,7 +178,9 @@ impl Power {
         let mut rounds = 0;
         let w = loop {
             rounds += 1;
-            if rounds > MAX_CLIMB_ROUNDS {
+            // A climb converging below the root never overshoots, its
+            // denominators growing as the k-th power each round.
+            if rounds > MAX_CLIMB_ROUNDS || v.denominator().bit_len() > MAX_CLIMB_BITS {
                 return None;
             }
             let vk = v.pow(self.k as i32);
@@ -209,6 +224,7 @@ impl Power {
             cut,
             mono,
             order_lemma: self.k == 2,
+            steps: Some(rounds - 1),
         }))
     }
 
@@ -243,6 +259,7 @@ impl Power {
             start: v,
             cut: r.clone(),
             order_lemma: false,
+            steps: None,
         }))
     }
 
@@ -328,6 +345,164 @@ impl Power {
             Outcome::Interval(lo, hi)
         })
     }
+
+    /// `optsmt::bisect` over `[climb.start, climb.cut]` when side constraints
+    /// over uninterpreted functions are asserted too.
+    ///
+    /// Model-based theory combination then makes the search decide above the
+    /// base level, so the climb's cuts and lemmas are popped with the trial
+    /// scopes and each probe starts from the base LP: `x` bounded below by
+    /// the probe alone, the column `m = x^k` between nla's monomial bound and
+    /// `U`. Lemmas a probe learns live until its scope is popped. Each final
+    /// check of a probe is one `nla_core::check`:
+    ///
+    /// * the concrete point of the least `δ` of all strict bounds; an
+    ///   assignment with `m = x^k` is a model, and so is one whose `x^k` lies
+    ///   within `m`'s bounds (the patcher sets `m := x^k`);
+    /// * the bound squeeze (`optimize_nl_bounds`) while it is eager (fewer
+    ///   than three fruitless squeezes, one left from the climb; never when
+    ///   minimizing, where the objective is the term `−x`) or every fourth
+    ///   call: `m` moves to its upper bound and `x` to its upper bound
+    ///   if a lemma gave one, else to its lower bound;
+    /// * `bounded_nlsat` when its backoff allows (the climb's run left the
+    ///   delay at 4, each cheap run halves its bound): nlsat's model is the
+    ///   simplest dyadic in the cell `(b, r)`;
+    /// * otherwise an order or monotonicity lemma, which the core satisfies
+    ///   with `x < x₀` at the current value `x₀`: each kind once per scope
+    ///   (nla's throttle), the order lemma for squares only, neither over
+    ///   values past machine integers (a call without a lemma changes
+    ///   nothing).
+    ///
+    /// nla's calls count from the climb: 20 plus 5 per LP round the climb
+    /// advanced before its cuts.
+    pub fn bisect_uf(&self, climb: &Climb, rounds: usize, minimize: bool) -> Option<Outcome> {
+        let steps = climb.steps?;
+        let zero = Rational::from_integer(Int::from(0));
+        let one = Self::one();
+        let minus_one = one.neg();
+        let kk = self.k as i32;
+        let m_upper: Impq = (self.u.clone(), self.y_u());
+        let mut calls = 20 + 5 * steps;
+        let (mut delay, mut delay_bound) = (4u32, 5u32);
+        let mut squeeze_fails = if minimize { 3 } else { 1 };
+        // The climb's last trial `x ≥ lo + 1` left x there and m at U.
+        let mut x: Impq = (climb.start.add(&one), zero.clone());
+        let mut m: Impq = m_upper.clone();
+        let (mut lo, mut hi) = (climb.start.clone(), climb.cut.clone());
+        let two = Rational::from_integer(Int::from(2));
+        let mut strict = true;
+        for _ in 0..rounds {
+            if lo >= hi {
+                break;
+            }
+            let (b, by) = if strict {
+                (lo.clone(), one.clone())
+            } else {
+                (lo.add(&hi).div(&two), zero.clone())
+            };
+            let x_lower: Impq = (b.clone(), by.clone());
+            let m_lower: Impq = (b.pow(kk), by.clone());
+            let crossed = m_lower.0 > m_upper.0
+                || (m_lower.0 == m_upper.0 && (by.is_positive() || self.strict));
+            let mut model = None;
+            if !crossed {
+                if impq_lt(&x, &x_lower) {
+                    x = x_lower.clone();
+                }
+                if impq_lt(&m, &m_lower) {
+                    m = m_lower.clone();
+                }
+                let mut x_upper: Option<Impq> = None;
+                let (mut order_left, mut monotone_left) = (true, true);
+                // Points of the order lemmas, whose rows `m − x₀·x < 0` the
+                // LP keeps.
+                let mut order_rows: Vec<Rational> = Vec::new();
+                let t_upper: Impq = (zero.clone(), minus_one.clone());
+                let concrete =
+                    |x: &mut Impq, m: &mut Impq, x_upper: &Option<Impq>, rows: &[Rational]| {
+                        let mut delta = one.clone();
+                        update_delta(&mut delta, &x_lower, x);
+                        if let Some(u) = x_upper {
+                            update_delta(&mut delta, x, u);
+                        }
+                        update_delta(&mut delta, &m_lower, m);
+                        update_delta(&mut delta, m, &m_upper);
+                        for x0 in rows {
+                            let t: Impq = (m.0.sub(&x0.mul(&x.0)), m.1.sub(&x0.mul(&x.1)));
+                            update_delta(&mut delta, &t, &t_upper);
+                        }
+                        *x = (x.0.add(&delta.mul(&x.1)), zero.clone());
+                        *m = (m.0.add(&delta.mul(&m.1)), zero.clone());
+                    };
+                loop {
+                    calls += 1;
+                    if calls > 100_000 {
+                        return None;
+                    }
+                    concrete(&mut x, &mut m, &x_upper, &order_rows);
+                    let xk: Impq = (x.0.pow(kk), zero.clone());
+                    if xk.0 == m.0 {
+                        model = Some(x.0.clone());
+                        break;
+                    }
+                    if !impq_lt(&xk, &m_lower) && !impq_lt(&m_upper, &xk) {
+                        m = xk;
+                        model = Some(x.0.clone());
+                        break;
+                    }
+                    if squeeze_fails < 3 || calls.is_multiple_of(4) {
+                        squeeze_fails += 1;
+                        x = x_upper.clone().unwrap_or_else(|| x_lower.clone());
+                        m = m_upper.clone();
+                        concrete(&mut x, &mut m, &x_upper, &order_rows);
+                        if x.0.pow(kk) == m.0 {
+                            model = Some(x.0.clone());
+                            break;
+                        }
+                    }
+                    delay = delay.saturating_sub(1);
+                    if delay < 2 {
+                        delay_bound /= 2;
+                        delay = delay_bound;
+                        model = Some(self.select_below(&b));
+                        break;
+                    }
+                    if self.k == 2 && order_left && is_small(&x.0) {
+                        order_left = false;
+                        order_rows.push(x.0.clone());
+                    } else if monotone_left && is_small(&x.0) && is_small(&m.0) {
+                        monotone_left = false;
+                    } else {
+                        continue;
+                    }
+                    let u: Impq = (x.0.clone(), minus_one.clone());
+                    x = u.clone();
+                    x_upper = Some(u);
+                }
+            }
+            match model {
+                None if strict => return Some(Outcome::Optimum(lo)),
+                None => hi = b,
+                Some(q) => {
+                    if q > lo {
+                        lo = q;
+                    }
+                }
+            }
+            strict = !strict;
+        }
+        Some(if lo >= hi {
+            Outcome::Optimum(lo)
+        } else {
+            Outcome::Interval(lo, hi)
+        })
+    }
+}
+
+/// z3's `rational::is_small`: numerator and denominator fit in an `int`.
+fn is_small(q: &Rational) -> bool {
+    let lim = Int::from(i32::MAX as i64);
+    q.numerator().abs() <= lim && *q.denominator() <= lim
 }
 
 fn impq_lt(a: &Impq, b: &Impq) -> bool {
@@ -376,6 +551,33 @@ mod tests {
         let cl = p.climb().unwrap().unwrap();
         assert_eq!(cl.start, r(5, 4));
         assert_eq!(cl.cut, r(5793, 4096));
+    }
+
+    #[test]
+    fn uninterpreted_side_constraint() {
+        // opt_nlsat_uf_fallback: x*x <= 2 next to (f x) <= 5, 64 rounds.
+        let p = power(2, r(2, 1), false);
+        let cl = p.climb().unwrap().unwrap();
+        let big = |s: &str| Int::from_str_radix(s, 10).unwrap();
+        assert_eq!(
+            p.bisect_uf(&cl, 64, false),
+            Some(Outcome::Interval(
+                Rational::new(big("208701085205324515397"), big("147573952589676412928")),
+                Rational::new(big("417402170410709805943"), big("295147905179352825856"))
+            ))
+        );
+        // Minimizing: no eager squeeze, the lemmas start from lo + 1.
+        assert_eq!(
+            p.bisect_uf(&cl, 8, true),
+            Some(Outcome::Interval(r(92681, 65536), r(185365, 131072)))
+        );
+        // x^3 < 4: only the monotonicity lemma applies to a cube.
+        let p = power(3, r(4, 1), true);
+        let cl = p.climb().unwrap().unwrap();
+        assert_eq!(
+            p.bisect_uf(&cl, 8, false),
+            Some(Outcome::Interval(r(13003, 8192), r(1664511, 1048576)))
+        );
     }
 
     #[test]
