@@ -69,6 +69,31 @@ fn seq1(items: Vec<Fmt>, header: &str) -> Fmt {
     group(Fmt::Compose(vec![s("("), s(header), indent(ind, body)]))
 }
 
+/// A literal's format. z3's `pp_arith_literal` builds a fraction `(/ p q)`
+/// and a negation `(- v)` as `mk_seq1` groups, which break like any
+/// application when wider than the line; other literals are plain strings.
+fn literal(text: &str) -> Fmt {
+    let parts = |body: &str| -> Option<(String, String)> {
+        let (h, rest) = body.split_once(' ')?;
+        Some((String::from(h), String::from(rest)))
+    };
+    if let Some(body) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')'))
+        && let Some((head, rest)) = parts(body)
+    {
+        if head == "/"
+            && let Some((p, q)) = rest.split_once(' ')
+            && !p.contains(['(', ')', ' '])
+            && !q.contains(['(', ')', ' '])
+        {
+            return seq1(vec![s(p), s(q)], "/");
+        }
+        if head == "-" && (!rest.contains(['(', ')', ' ']) || rest.starts_with("(/ ")) {
+            return seq1(vec![literal(&rest)], "-");
+        }
+    }
+    Fmt::Str(String::from(text))
+}
+
 /// `mk_seq5` (= `mk_seq4` with indent 1): `(elem_1 elem_2 … elem_n)`.
 fn seq5(items: Vec<Fmt>) -> Fmt {
     if items.is_empty() {
@@ -193,7 +218,7 @@ impl Printer<'_> {
         let node = &self.nodes[n];
         if node.args.is_empty() {
             out.push((
-                Fmt::Str(node.head.clone()),
+                literal(&node.head),
                 Info {
                     lvl: 0,
                     weight: 1,

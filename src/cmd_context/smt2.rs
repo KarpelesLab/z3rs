@@ -415,6 +415,84 @@ fn render_alg_interval(a: &puremp::Algebraic) -> String {
     )
 }
 
+/// `floor(a · 2^k)`, exactly.
+fn alg_floor_scaled(a: &puremp::Algebraic, k: u32) -> Int {
+    let s = Rational::power_of_two(k as i32);
+    if a.is_rational() {
+        return a.interval().0.mul(&s).floor();
+    }
+    // An irrational `a` lies strictly inside its interval, so equal floors
+    // of both ends are the floor of `a`.
+    let mut a = a.clone();
+    loop {
+        let (lo, hi) = a.interval();
+        let (fl, fh) = (lo.mul(&s).floor(), hi.mul(&s).floor());
+        if fl == fh {
+            return fl;
+        }
+        a.refine();
+    }
+}
+
+/// `a > r`, exactly.
+fn alg_gt_rational(a: &puremp::Algebraic, r: &Rational) -> bool {
+    if a.is_rational() {
+        return a.interval().0 > r;
+    }
+    let mut a = a.clone();
+    loop {
+        let (lo, hi) = a.interval();
+        if lo > r {
+            return true;
+        }
+        if hi < r {
+            return false;
+        }
+        a.refine();
+    }
+}
+
+/// The value z3's nlsat assigns the objective (its first variable, assigned
+/// its maximal feasible value) in the cell `(v, sup)` below an open limit:
+/// `interval_set_manager::pick_max_in_complement`'s `select(v, sup)`, the
+/// dyadic `n / 2^k` with the least `k` strictly between them, and the least
+/// such `n` (`mpbq_manager::select_small_core`).
+fn nlsat_select_below(v: &Rational, sup: &puremp::Algebraic) -> Rational {
+    for k in 0u32.. {
+        let s = Rational::power_of_two(k as i32);
+        let n = v.mul(&s).floor().add(&Int::from(1));
+        let cand = Rational::new(n, Int::from(1)).div(&s);
+        if alg_gt_rational(sup, &cand) {
+            return cand;
+        }
+    }
+    unreachable!("a dyadic lies strictly between distinct reals")
+}
+
+/// The best value of z3's `nlsat_opt::search_models` after `rounds` rounds
+/// from the lower bound `start` below the open limit `sup`: each round's
+/// model takes [`nlsat_select_below`] the last one, which is then blocked.
+fn nlsat_max_rounds(start: &Rational, sup: &puremp::Algebraic, rounds: usize) -> Rational {
+    let mut v = start.clone();
+    for _ in 0..rounds {
+        v = nlsat_select_below(&v, sup);
+    }
+    v
+}
+
+/// The upper end of z3's rational bracket of a refuted limit
+/// (`nlsat_opt::set_value`): the limit itself when rational, otherwise
+/// `get_interval` at precision 40, i.e. the isolating interval bisected until
+/// narrower than `2^-160`, which leaves the dyadic cell of width `2^-161`
+/// around the limit.
+fn limit_bracket_upper(sup: &puremp::Algebraic) -> Rational {
+    if sup.is_rational() {
+        return sup.interval().0.clone();
+    }
+    let n = alg_floor_scaled(sup, 161).add(&Int::from(1));
+    Rational::new(n, Int::from(1)).div(&Rational::power_of_two(161))
+}
+
 /// The nlsat [`Alg`](crate::nlsat::realclosure::Alg) as a puremp
 /// [`Algebraic`](puremp::Algebraic).
 fn alg_to_algebraic(v: &crate::nlsat::realclosure::Alg) -> puremp::Algebraic {
@@ -3303,6 +3381,10 @@ struct Context {
     /// Set by [`Self::optimize_one`] when a nonlinear objective's optimum is
     /// an open limit (no model attains it, so nothing can be committed).
     opt_open_limit: bool,
+    /// Set by [`Self::optimize_one`] when a nonlinear objective is left with
+    /// an interval because its open limit could not be certified within
+    /// `opt.optsmt_nlsat_supremum_rlimit` (z3's incomplete nlsat outcome).
+    opt_incomplete: bool,
     /// Why the last `check-sat` answered `unknown`, when more specific than
     /// z3's generic `incomplete`.
     reason_unknown: Option<String>,
@@ -4527,6 +4609,7 @@ impl Context {
             objective_values: Vec::new(),
             opt_iter: OptIter::Fresh,
             opt_open_limit: false,
+            opt_incomplete: false,
             reason_unknown: None,
             string_sort: None,
             str_lits: BTreeMap::new(),
@@ -29169,8 +29252,18 @@ impl Context {
         for i in 0..n {
             let (obj, maximize) = objs[i];
             self.opt_open_limit = false;
+            self.opt_incomplete = false;
             let (v, unbounded) = self.optimize_one(obj, maximize, &mut fixed, &mut model);
             values[i] = v;
+            if self.opt_incomplete {
+                // As z3's `geometric_search` answering `l_undef`: the search
+                // stops at this objective's interval.
+                for (k, v) in values.iter_mut().enumerate().skip(i + 1) {
+                    *v = self.untouched_objective_value(k);
+                }
+                self.objective_values = values;
+                return (SmtResult::Unknown, model);
+            }
             if unbounded && i + 1 < n {
                 self.lex_after_unbounded(&objs, i, &mut fixed, &mut model, &mut values);
                 break;
@@ -29668,6 +29761,10 @@ impl Context {
                         (render_alg(&value), false)
                     }
                     Some(NraOpt::Limit(v, k)) => {
+                        if let Some(iv) = self.uncertified_limit(obj, maximize, &v, model) {
+                            self.opt_incomplete = true;
+                            return (iv, false);
+                        }
                         self.opt_open_limit = true;
                         let a = alg_to_algebraic(&v);
                         let zero = a.is_rational() && a.interval().0.is_zero();
@@ -30493,6 +30590,65 @@ impl Context {
             }
             _ => None,
         }
+    }
+
+    /// z3's `nlsat_opt::certify_result` for an open limit `lim` of `obj`: the
+    /// limit is accepted only if the projected approach check finishes within
+    /// `opt.optsmt_nlsat_supremum_rlimit` resource ticks. That query charges
+    /// at least two ticks whatever the problem (the loop checkpoint of
+    /// `solver::check_limit`, then the first search checkpoint of its
+    /// `check()`), so a budget of 0 (z3: the check is disabled) or 1 always
+    /// leaves the limit uncertified; a larger budget is taken as sufficient.
+    ///
+    /// Uncertified, z3's `optsmt::nlsat_cells` reports the incomplete outcome:
+    /// the `(interval lo hi)` rendered here, `lo` the best model value after
+    /// `opt.optsmt_bisect_rounds` nlsat rounds (see [`nlsat_max_rounds`]) from
+    /// the objective's value in `model`, `hi` the outward rational bound of
+    /// the refuted limit (see [`limit_bracket_upper`]). `None` when the limit
+    /// is certified, or with no rational model value to start from.
+    fn uncertified_limit(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        lim: &crate::nlsat::realclosure::Alg,
+        model: &mut Option<Model>,
+    ) -> Option<String> {
+        let budget = match self.params.get("opt.optsmt_nlsat_supremum_rlimit") {
+            Some(crate::util::ParamValue::UInt(n)) => *n,
+            _ => 100_000,
+        };
+        if budget >= 2 {
+            return None;
+        }
+        let rounds = match self.params.get("opt.optsmt_bisect_rounds") {
+            Some(crate::util::ParamValue::UInt(n)) => *n as usize,
+            _ => 64,
+        };
+        let Some(Value::Num(start, _)) = model.as_mut().map(|m| m.eval_value(&self.m, obj)) else {
+            return None;
+        };
+        // z3 maximizes `-obj` for a minimization.
+        let sup = alg_to_algebraic(lim);
+        let (sup, start) = if maximize {
+            (sup, start)
+        } else {
+            (sup.neg(), start.neg())
+        };
+        if !alg_gt_rational(&sup, &start) {
+            return None;
+        }
+        let best = nlsat_max_rounds(&start, &sup, rounds);
+        let upper = limit_bracket_upper(&sup);
+        let (lo, hi) = if maximize {
+            (best, upper)
+        } else {
+            (upper.neg(), best.neg())
+        };
+        Some(alloc::format!(
+            " (interval {} {})",
+            render_rational(&lo),
+            render_rational(&hi)
+        ))
     }
 
     /// Optimize a nonlinear real objective exactly by CAD (z3 5.3's nlsat-backed
@@ -49622,6 +49778,52 @@ mod tests {
              (assert (<= y 3.0))(maximize x)(maximize y)(check-sat)",
         );
         assert_eq!(out[0], "unknown");
+    }
+
+    #[test]
+    fn open_limit_certification_budget() {
+        // z3's nlsat rounds below sqrt(2) from 5/4, and its outward bracket.
+        let r = |n: i64, d: i64| Rational::new(Int::from(n), Int::from(d));
+        let sqrt2 = puremp::Algebraic::new(
+            puremp::Poly::new(alloc::vec![r(-2, 1), r(0, 1), r(1, 1)]),
+            r(1, 1),
+            r(2, 1),
+        );
+        assert_eq!(nlsat_select_below(&r(0, 1), &sqrt2), r(1, 1));
+        assert_eq!(nlsat_select_below(&r(181, 128), &sqrt2), r(11585, 8192));
+        assert_eq!(nlsat_max_rounds(&r(5, 4), &sqrt2, 8), r(741455, 524288));
+        let up = limit_bracket_upper(&sqrt2);
+        assert_eq!(
+            up.numerator().to_string(),
+            "4133750873887694826665497936027618045008388391659"
+        );
+        assert_eq!(
+            *up.denominator(),
+            Rational::power_of_two(161).numerator().clone()
+        );
+        // A rational limit is its own bracket; the cell excludes it.
+        assert_eq!(
+            nlsat_select_below(&r(0, 1), &puremp::Algebraic::from_rational(r(1, 1))),
+            r(1, 2)
+        );
+        // Budgets 0 and 1 leave the limit uncertified: unknown, with an interval.
+        let script = |b: u32| {
+            alloc::format!(
+                "(set-option :opt.optsmt_bisect_rounds 8)\
+                 (set-option :opt.optsmt_nlsat_supremum_rlimit {b})\
+                 (declare-const x Real)(assert (< (* x x) 2.0))(minimize (- x))\
+                 (check-sat)(get-objectives)"
+            )
+        };
+        for b in [0, 1] {
+            let out = run(&script(b)).unwrap();
+            assert_eq!(out[0], "unknown");
+            assert!(
+                out[1].starts_with("(objectives\n ((- x)  (interval (- (/ 41337508738876948266")
+            );
+        }
+        let out = run(&script(100_000)).unwrap();
+        assert_eq!(out[0], "sat");
     }
 
     #[test]
