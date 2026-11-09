@@ -1071,6 +1071,7 @@ mod elim_uncnstr;
 mod ematch_search;
 mod fp_real;
 mod lra_conj;
+mod nl_climb;
 mod re_len;
 mod re_sym;
 mod seq_bounded;
@@ -29802,7 +29803,8 @@ impl Context {
                             // and a certified bound; an open bracket leaves
                             // the objective (and the check) unknown.
                             let g = if maximize { obj } else { self.m.mk_uminus(obj) };
-                            match self.real_bisect(g, fixed, model) {
+                            let climbed = self.nl_climb_bisect(obj, maximize, fixed, model);
+                            match climbed.or_else(|| self.real_bisect(g, fixed, model)) {
                                 Some(Ok(r)) => {
                                     let r = if maximize { r } else { r.neg() };
                                     let rv = self.m.mk_numeral(r.clone(), false);
@@ -30667,11 +30669,15 @@ impl Context {
         };
         // z3 maximizes `-obj` for a minimization.
         let sup = alg_to_algebraic(lim);
-        let (sup, start) = if maximize {
+        let (sup, mut start) = if maximize {
             (sup, start)
         } else {
             (sup.neg(), start.neg())
         };
+        // z3 starts from where its optimizer's climb stopped.
+        if let Some(Some(Ok(climb))) = self.nl_power(obj, maximize, &[]).map(|p| p.climb()) {
+            start = climb.start;
+        }
         if !alg_gt_rational(&sup, &start) {
             return None;
         }
@@ -30687,6 +30693,89 @@ impl Context {
             render_rational(&lo),
             render_rational(&hi)
         ))
+    }
+
+    /// The single objective `obj` (a Real constant) under a single assertion
+    /// bounding a power of it, `a·obj^k + b ⋈ 0` read as `±obj^k ≤ U` (`<`):
+    /// the problem [`nl_climb`] follows z3's optimizer on, maximizing `obj`
+    /// (`−obj` for a minimization, an even power only).
+    fn nl_power(&mut self, obj: AstId, maximize: bool, fixed: &[AstId]) -> Option<nl_climb::Power> {
+        use crate::nlsat::Rel as NRel;
+        if !fixed.is_empty()
+            || self.assertions.len() != 1
+            || self.objectives.len() != 1
+            || !self.soft_formulas.is_empty()
+            || !self.m.is_uninterp_const(obj)
+            || self.m.is_int_sort(self.m.get_sort(obj))
+        {
+            return None;
+        }
+        let (mut atom, mut negated) = (self.assertions[0], false);
+        while self.m.is_not(atom) {
+            atom = self.m.app_args(atom)[0];
+            negated = !negated;
+        }
+        let mut var_map = BTreeMap::new();
+        let c = self.icp_atom(atom, negated, &mut var_map)?;
+        let v = *var_map.get(&obj)?;
+        if var_map.len() != 1 {
+            return None;
+        }
+        let (poly, strict) = match c.rel {
+            NRel::Le => (c.poly, false),
+            NRel::Lt => (c.poly, true),
+            NRel::Ge => (c.poly.neg(), false),
+            NRel::Gt => (c.poly.neg(), true),
+            _ => return None,
+        };
+        let k = poly.degree_of(v);
+        if k < 2 || (!maximize && k % 2 == 1) {
+            return None;
+        }
+        if (1..k).any(|i| !poly.coeff_of_var(v, i).is_zero()) {
+            return None;
+        }
+        let a = poly.coeff_of_var(v, k).as_constant()?;
+        let b = poly.coeff_of_var(v, 0).as_constant()?;
+        if !a.is_positive() {
+            return None;
+        }
+        Some(nl_climb::Power {
+            k,
+            u: b.neg().div(&a),
+            strict,
+        })
+    }
+
+    /// z3's climb and `optsmt::bisect` for a nonlinear real objective in the
+    /// [`nl_climb`] pattern: `Ok(optimum)` or `Err((lo, hi))` of the
+    /// maximized `obj` (`−obj` for a minimization), with `model` at `lo`,
+    /// as [`Self::real_bisect`] reports them.
+    #[allow(clippy::type_complexity)]
+    fn nl_climb_bisect(
+        &mut self,
+        obj: AstId,
+        maximize: bool,
+        fixed: &[AstId],
+        model: &mut Option<Model>,
+    ) -> Option<Result<Rational, (Rational, Option<Rational>)>> {
+        let p = self.nl_power(obj, maximize, fixed)?;
+        let rounds = match self.params.get("opt.optsmt_bisect_rounds") {
+            Some(crate::util::ParamValue::UInt(n)) => *n as usize,
+            _ => 64,
+        };
+        let outcome = match p.climb()? {
+            Err(opt) => nl_climb::Outcome::Optimum(opt),
+            Ok(climb) => p.bisect(&climb, rounds)?,
+        };
+        let (lo, res) = match outcome {
+            nl_climb::Outcome::Optimum(v) => (v.clone(), Ok(v)),
+            nl_climb::Outcome::Interval(lo, hi) => (lo.clone(), Err((lo, Some(hi)))),
+        };
+        if let Some(md) = model.as_mut() {
+            md.set_arith(obj, if maximize { lo } else { lo.neg() });
+        }
+        Some(res)
     }
 
     /// Optimize a nonlinear real objective exactly by CAD (z3 5.3's nlsat-backed
