@@ -48015,6 +48015,21 @@ mod tests {
              (check-sat)(get-model)")
         .unwrap();
         assert!(out[1].contains(&nth_u("3")), "{}", out[1]);
+        // The folded sequence's elements count: past 0..=2, 1, 3 and 4.
+        let out = run("(declare-const all (Seq Int))(declare-const e (Seq Int))\
+             (define-fun g ((p (Seq Int)) (x Int)) (Seq Int) (seq.++ (seq.unit (+ (seq.nth p 0) x)) p))\
+             (assert (= all (seq.foldl g (seq.unit 1) e)))(assert (= (seq.nth all 0) 4))\
+             (check-sat)(get-model)")
+        .unwrap();
+        assert!(out[1].contains(&nth_u("5")), "{}", out[1]);
+        // An empty folded sequence was first split as non-empty: past 0, 1
+        // (and the lengths 1 and 2 that split leaves) and 7.
+        let out = run("(declare-const all (Seq Int))(declare-const e (Seq Int))\
+             (define-fun g ((p (Seq Int)) (x Int)) (Seq Int) (seq.++ p (seq.unit x)))\
+             (assert (= all (seq.foldl g (seq.unit 7) e)))(assert (= (seq.nth all 0) 7))\
+             (check-sat)(get-model)")
+        .unwrap();
+        assert!(out[1].contains(&nth_u("3")), "{}", out[1]);
         // A read whose range guard an asserted length decides is gone.
         let out = run("(declare-const all (Seq Int))(declare-const e (Seq Int))\
              (define-fun inc ((x Int)) Int (+ x 1))(assert (= all (seq.map inc e)))\

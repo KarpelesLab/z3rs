@@ -312,19 +312,33 @@ impl Context {
 
     /// The fresh integer z3's arithmetic value factory hands out first: the
     /// least natural number no arithmetic value of the model took. Those are
-    /// approximated by the numerals of the assertions, the values of the
-    /// integer and integer-sequence constants (and those sequences' lengths),
-    /// and 0, 1 and 2 (z3's arithmetic solver always has the numerals 0 and 1,
-    /// and the sequence solver's unfolding the length 2 of a unit next to a
-    /// tail).
+    /// the numerals of the assertions, the values of the integer and
+    /// integer-sequence constants, the numerals 0 and 1 z3's arithmetic solver
+    /// always has, and the lengths the sequence solver's unfolding leaves:
+    /// a sequence of length `n` is split into units and tails, with
+    /// `|tail(s, i)| = n - i - 1` and `1 + |tail(s, i)| = n - i`, so every
+    /// length up to `n`. A folded (or mapped) sequence that ends up empty was
+    /// first split as non-empty (`tail(s, 0) = ε` is decided false, z3's
+    /// default phase), which introduces `tail(s, 1)`: the arithmetic values
+    /// `|tail(s, 0)| = 1 + |tail(s, 1)| = 1` and `1 + |tail(s, 0)| = 2` stay.
     fn seq_nth_u_fresh_int(&mut self, model: &mut Model) -> u64 {
-        let mut taken: BTreeSet<u64> = [0, 1, 2].into_iter().collect();
+        let mut taken: BTreeSet<u64> = [0, 1].into_iter().collect();
         for t in self.m.postorder_many(&self.assertions) {
             if self.m.is_int_sort(self.m.get_sort(t))
                 && let Some(v) = self.m.as_numeral(t)
                 && let Some(v) = v.to_integer().and_then(|v| v.to_u64())
             {
                 taken.insert(v);
+            }
+            if self.m.is_app(t)
+                && matches!(
+                    self.seqop_ops.get(&self.m.app_decl(t)).map(String::as_str),
+                    Some("seq.map" | "seq.mapi" | "seq.foldl" | "seq.foldli")
+                )
+                && let Some(&s) = self.m.app_args(t).last()
+                && self.seq_nth_model_elems(s).is_some_and(|(_, n)| n == 0)
+            {
+                taken.extend([1, 2]);
             }
         }
         let decls: Vec<AstId> = self
@@ -342,10 +356,12 @@ impl Context {
             if !self.m.is_int_sort(sort) && !int_seq {
                 continue;
             }
-            if int_seq && let Some((_, len)) = self.seq_nth_model_elems(c) {
-                taken.insert(len as u64);
+            let mut shown = c;
+            if int_seq && let Some((w, len)) = self.seq_nth_model_elems(c) {
+                taken.extend(0..=len as u64);
+                shown = w;
             }
-            let text = self.model_term_render(model, c);
+            let text = self.model_term_render(model, shown);
             let text = text.replace('(', " ( ").replace(')', " ) ");
             let toks: Vec<&str> = text.split_whitespace().collect();
             for (k, tok) in toks.iter().enumerate() {
