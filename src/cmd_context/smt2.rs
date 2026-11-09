@@ -40093,6 +40093,7 @@ impl Context {
     ) -> Option<(SmtResult, Option<Model>)> {
         use crate::nlsat::Rel as NRel;
         use crate::nlsat::solver::{InLit, Kind, NlsatResult, check_with_ints_limited};
+        #[derive(Clone)]
         struct Cnf {
             clauses: Vec<Vec<InLit>>,
             bools: Vec<AstId>,
@@ -40328,8 +40329,8 @@ impl Context {
             // bound).
             let mut is_int = alloc::vec![false; cnf.var_map.len()];
             for (&t, &v) in &cnf.var_map {
-                is_int[v as usize] =
-                    self.m.is_uninterp_const(t) && self.m.is_int_sort(self.m.get_sort(t));
+                is_int[v as usize] = (self.m.is_uninterp_const(t) || self.is_user_uf_app(t))
+                    && self.m.is_int_sort(self.m.get_sort(t));
             }
             check_with_ints_limited(
                 cnf.var_map.len(),
@@ -40363,16 +40364,65 @@ impl Context {
                 }
             }
         }
-        let (result, cnf) = decided.unwrap_or_else(|| {
-            let limit = limit.unwrap_or((NLSAT_MAX_CONFLICTS, u64::MAX));
-            (run(&flat, limit), &flat)
-        });
+        let run_limit = limit.unwrap_or((NLSAT_MAX_CONFLICTS, u64::MAX));
+        let (mut result, mut cnf) = decided.unwrap_or_else(|| (run(&flat, run_limit), &flat));
+        // Uninterpreted applications over arithmetic are leaves too, as z3's
+        // model-based theory combination reads them: a `sat` assignment is a
+        // model once it is congruent (equal arguments, equal values) and values
+        // every application (a nested one may only occur as an argument).
+        // Otherwise nlsat runs again with the Ackermann clauses `a ≠ b ∨ f(a) = f(b)`,
+        // whose models are congruent by construction.
+        let uf_apps = self.nlsat_uf_leaves(goal);
+        let ackermann;
+        if sat_ok
+            && let NlsatResult::Sat(values, _) = &result
+            && let Some(apps) = &uf_apps
+            && !apps.is_empty()
+            && (!apps.iter().all(|t| cnf.var_map.contains_key(t))
+                || !self.nlsat_uf_congruent(apps, &cnf.var_map, values))
+        {
+            let mut ack = flat.clone();
+            for &t in apps {
+                let _ = self.icp_to_poly(t, &mut ack.var_map);
+            }
+            for (i, &a) in apps.iter().enumerate() {
+                for &b in &apps[i + 1..] {
+                    if self.m.app_decl(a) != self.m.app_decl(b) {
+                        continue;
+                    }
+                    let mut cl: Vec<InLit> = Vec::new();
+                    for (&x, &y) in self.m.app_args(a).iter().zip(self.m.app_args(b)) {
+                        let d = self
+                            .icp_to_poly(x, &mut ack.var_map)
+                            .sub(&self.icp_to_poly(y, &mut ack.var_map));
+                        cl.push(InLit::Ineq(d, Kind::Eq, true));
+                    }
+                    let d = self
+                        .icp_to_poly(a, &mut ack.var_map)
+                        .sub(&self.icp_to_poly(b, &mut ack.var_map));
+                    cl.push(InLit::Ineq(d, Kind::Eq, false));
+                    ack.clauses.push(cl);
+                }
+            }
+            ackermann = ack;
+            result = run(&ackermann, run_limit);
+            cnf = &ackermann;
+        }
         match result {
             NlsatResult::Unsat => Some((SmtResult::Unsat, None)),
             NlsatResult::Sat(values, bvals) if sat_ok => {
-                // Only real and integer constants as leaves: then the
-                // assignment is a model.
-                let exact = cnf.var_map.keys().all(|&t| self.m.is_uninterp_const(t));
+                // Only real and integer constants and congruent uninterpreted
+                // applications as leaves: then the assignment is a model.
+                let exact = match &uf_apps {
+                    Some(apps) => {
+                        cnf.var_map
+                            .keys()
+                            .all(|&t| self.m.is_uninterp_const(t) || apps.contains(&t))
+                            && apps.iter().all(|t| cnf.var_map.contains_key(t))
+                            && self.nlsat_uf_congruent(apps, &cnf.var_map, &values)
+                    }
+                    None => false,
+                };
                 if !exact {
                     return None;
                 }
@@ -40396,6 +40446,87 @@ impl Context {
             }
             _ => None,
         }
+    }
+
+    /// Is `t` an application of a user-declared function?
+    fn is_user_uf_app(&self, t: AstId) -> bool {
+        self.m.app(t).is_some_and(|a| {
+            !a.args.is_empty()
+                && self.funcs.get(&self.decl_name(a.decl).unwrap_or_default()) == Some(&a.decl)
+        })
+    }
+
+    /// The applications of user-declared functions in `goal`, when each one
+    /// maps arithmetic arguments to an arithmetic value (the leaves
+    /// [`Self::nlsat_decide_goal_ordered`] can interpret); `None` otherwise.
+    fn nlsat_uf_leaves(&self, goal: AstId) -> Option<Vec<AstId>> {
+        let mut apps = Vec::new();
+        for t in self.m.postorder(goal) {
+            if !self.is_user_uf_app(t) {
+                continue;
+            }
+            let arith = |x: AstId| self.m.is_arith_sort(self.m.get_sort(x));
+            if !arith(t) || !self.m.app_args(t).iter().all(|&a| arith(a)) {
+                return None;
+            }
+            apps.push(t);
+        }
+        Some(apps)
+    }
+
+    /// Whether the nlsat assignment `values` (over `var_map`) gives equal
+    /// values to every two applications of one function with equal arguments.
+    /// A constant outside `var_map` reads as 0, as the model sets it.
+    fn nlsat_uf_congruent(
+        &self,
+        apps: &[AstId],
+        var_map: &BTreeMap<AstId, u32>,
+        values: &[crate::nlsat::realclosure::Alg],
+    ) -> bool {
+        use crate::nlsat::realclosure::{Alg, sign_at_point};
+        let mut vm = var_map.clone();
+        let mut point = values.to_vec();
+        let mut equal = |a: AstId, b: AstId| -> Option<bool> {
+            let d = self
+                .icp_to_poly(a, &mut vm)
+                .sub(&self.icp_to_poly(b, &mut vm));
+            for (&t, &v) in &vm {
+                if v as usize >= point.len() {
+                    if !self.m.is_uninterp_const(t) {
+                        return None;
+                    }
+                    point.resize(
+                        v as usize + 1,
+                        Alg::Rational(Rational::from_integer(0.into())),
+                    );
+                }
+            }
+            Some(sign_at_point(&d, &point)? == 0)
+        };
+        for (i, &a) in apps.iter().enumerate() {
+            for &b in &apps[i + 1..] {
+                if self.m.app_decl(a) != self.m.app_decl(b) {
+                    continue;
+                }
+                let args_a = self.m.app_args(a).to_vec();
+                let args_b = self.m.app_args(b).to_vec();
+                let mut same = true;
+                for (&x, &y) in args_a.iter().zip(&args_b) {
+                    match equal(x, y) {
+                        Some(true) => {}
+                        Some(false) => {
+                            same = false;
+                            break;
+                        }
+                        None => return false,
+                    }
+                }
+                if same && equal(a, b) != Some(true) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn decide_nonlinear_definite(&self, goal: AstId) -> Option<SmtResult> {
@@ -48505,6 +48636,39 @@ mod tests {
             .unwrap(),
             alloc::vec!["sat"]
         );
+    }
+
+    #[test]
+    fn nonlinear_uf_leaves_decided() {
+        // An uninterpreted application is an nlsat leaf: its value defines
+        // the function's table.
+        assert_eq!(
+            run("(declare-const x Real)(declare-fun f (Real) Real)\
+                 (assert (<= (* x x) 2.0))(assert (<= (f x) 5.0))(assert (> x 1.0))\
+                 (check-sat)(get-value ((f x)))")
+            .unwrap(),
+            alloc::vec!["sat", "(((f x) 0.0))"]
+        );
+        // Congruence: `x·y = 1` makes `f(x·y)` and `f(1)` one value.
+        assert_eq!(
+            run(
+                "(declare-const x Real)(declare-const y Real)(declare-fun f (Real) Real)\
+                 (assert (= (* x y) 1.0))(assert (< (f (* x y)) 0.0))(assert (> (f 1.0) 0.0))\
+                 (check-sat)"
+            )
+            .unwrap(),
+            alloc::vec!["unsat"]
+        );
+        // A first assignment that is not congruent is redone with the
+        // Ackermann clauses: the model gives `f(x·y)` and `f(1)` one value.
+        let out = run(
+            "(declare-const x Real)(declare-const y Real)(declare-fun f (Real) Real)\
+             (assert (= (* x y) 1.0))(assert (> (* (f x) (f y)) 3.0))\
+             (assert (< (f (* x y)) 0.0))(assert (> (f 1.0) (- 1.0)))\
+             (check-sat)(eval (= (f (* x y)) (f 1.0)))",
+        )
+        .unwrap();
+        assert_eq!(out, alloc::vec!["sat", "true"]);
     }
 
     #[test]
