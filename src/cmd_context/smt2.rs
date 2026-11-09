@@ -1077,6 +1077,7 @@ mod re_sym;
 mod seq_bounded;
 mod seq_lengths;
 mod seq_nth;
+mod seq_nth_model;
 mod simplify_th;
 use simplify_th::PreTerm;
 mod str_int;
@@ -42524,16 +42525,41 @@ impl Context {
             },
         );
         // z3 prints the model's constants before its functions.
-        let (consts, funs): (Vec<Decl>, Vec<Decl>) =
+        let (consts, mut funs): (Vec<Decl>, Vec<Decl>) =
             decls.into_iter().partition(|d| d.domain.is_empty());
+        // z3's `seq.nth_u` follows the functions the solver interprets.
+        let nth_u = self.seq_nth_u_listing(&mut model);
+        if let Some((d, _)) = &nth_u {
+            let used = self.asserted_names();
+            let at = funs
+                .iter()
+                .take_while(|f| used.contains(f.name.as_str()))
+                .count();
+            let fd = self.m.func_decl(*d).unwrap();
+            let nd = Decl {
+                name: seq_nth_model::NTH_U.to_string(),
+                d: *d,
+                domain: fd.domain.clone(),
+                range: fd.range,
+            };
+            funs.insert(at, nd);
+        }
         let funs = self.z3_fn_slot_order(
             funs,
             |d| &d.name,
             |d| {
+                use super::ast_hash::*;
                 let dom: Option<Vec<u32>> =
                     d.domain.iter().map(|&s| self.z3_sort_hash(s)).collect();
                 let r = self.z3_sort_hash(d.range)?;
-                Some(super::ast_hash::decl_hash(&d.name, &dom?, r, 0))
+                // `seq.nth_u` is the sequence plugin's (`func_decl_info(seq,
+                // OP_SEQ_NTH_U)`).
+                let info = if nth_u.as_ref().is_some_and(|(n, _)| *n == d.d) {
+                    info_hash(SEQ_FID, 11, &[])
+                } else {
+                    0
+                };
+                Some(decl_hash(&d.name, &dom?, r, info))
             },
         );
         let mut out = String::from("(");
@@ -42597,6 +42623,9 @@ impl Context {
                     "\n  (define-fun {} () {sort_name}\n    {v})",
                     smt2_symbol(&decl.name)
                 ));
+            } else if let Some((_, text)) = nth_u.as_ref().filter(|(n, _)| *n == decl.d) {
+                out.push('\n');
+                out.push_str(text);
             } else if let Some(text) = fn_tables.as_ref().and_then(|t| t.get(&decl.d)) {
                 out.push('\n');
                 out.push_str(text);
@@ -43382,7 +43411,7 @@ impl Context {
         let mut funs = funs;
         let n = funs
             .iter()
-            .take_while(|d| used.contains(name(d).as_str()))
+            .take_while(|d| used.contains(name(d).as_str()) || name(d) == seq_nth_model::NTH_U)
             .count();
         // Inserted in internalization order, arguments before their
         // application (predicates are not first, as the Boolean constants
@@ -47878,6 +47907,35 @@ mod tests {
             "{}",
             out[1]
         );
+    }
+
+    #[test]
+    fn get_model_lists_seq_nth_u() {
+        let nth_u = |body: &str| {
+            alloc::format!("(define-fun seq.nth_u ((x!0 (Seq Int)) (x!1 Int)) Int\n    {body})")
+        };
+        // An out-of-range read: the value it was constrained to.
+        let out = run("(declare-const s (Seq Int))(declare-const x Int)\
+             (assert (= x (seq.nth s 0)))(assert (> x 4))(check-sat)(get-model)")
+        .unwrap();
+        assert!(
+            out[1].ends_with(&alloc::format!("{}\n)", nth_u("5"))),
+            "{}",
+            out[1]
+        );
+        // An in-range read of a fold: a fresh value past 0, 1, 2 and 6.
+        let out = run("(declare-const all (Seq Int))(declare-const e (Seq Int))\
+             (define-fun g ((p (Seq Int)) (x Int)) (Seq Int) (seq.++ (seq.unit (+ (seq.nth p 0) x)) p))\
+             (assert (= all (seq.foldl g (seq.unit 0) e)))(assert (= (seq.nth all 0) 6))\
+             (check-sat)(get-model)")
+        .unwrap();
+        assert!(out[1].contains(&nth_u("3")), "{}", out[1]);
+        // A read whose range guard an asserted length decides is gone.
+        let out = run("(declare-const all (Seq Int))(declare-const e (Seq Int))\
+             (define-fun inc ((x Int)) Int (+ x 1))(assert (= all (seq.map inc e)))\
+             (assert (= 6 (seq.nth all 0)))(assert (> (seq.len e) 0))(check-sat)(get-model)")
+        .unwrap();
+        assert!(!out[1].contains("seq.nth_u"), "{}", out[1]);
     }
 
     #[test]
