@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/z3rs/compare/v0.0.11...v0.0.12) - 2026-11-09
+
+### Other
+
+- seq.nth_u's fresh value past the unfolded sequences' lengths
+- bisect beside uninterpreted side constraints as z3's base LP does
+- list seq.nth_u as z3's model generator interprets it
+- follow z3's climb, check_assignment cuts and bisection on one power bound
+- uninterpreted predicates over arithmetic as Boolean leaves
+- read uninterpreted applications over arithmetic as leaves of a sat model
+- bisect a nonlinear real objective left open, answer unknown with the interval
+- solve-eqs constants in the reverse slot order of its substitution
+- honor opt.optsmt_nlsat_supremum_rlimit for open nonlinear limits
+- sample between roots with z3's closed interval ends
+- puremp 0.3.3: drop the spurious-root workaround for algebraic values
+
 ## [0.0.11](https://github.com/KarpelesLab/z3rs/compare/v0.0.10...v0.0.11) - 2026-11-04
 
 ### Other
