@@ -662,47 +662,77 @@ fn int_in_open(l: &Rational, u: &Rational) -> Option<Int> {
     (lo <= hi).then_some(lo)
 }
 
-/// A dyadic rational strictly between `l < u` with the fewest fraction bits,
-/// the least such (z3's `select_small_core` on rationals).
-fn select_small(l: &Rational, u: &Rational) -> Rational {
-    if let Some(i) = int_in_open(l, u) {
-        return Rational::from_integer(i);
+/// The integer z3's `mpbq_manager::select_integer` picks between `l` and `u`,
+/// either end open (`l_open`, `u_open`) or closed. A closed end that is an
+/// integer is preferred (the lower first), else the least integer inside.
+fn select_integer(l: &Rational, l_open: bool, u: &Rational, u_open: bool) -> Option<Int> {
+    if !l_open && l.is_integer() {
+        return Some(l.numerator().clone());
     }
+    if !u_open && u.is_integer() {
+        return Some(u.numerator().clone());
+    }
+    let lo = if l_open && l.is_integer() {
+        l.numerator().add(&Int::from(1))
+    } else {
+        l.ceil()
+    };
+    let hi = if u_open && u.is_integer() {
+        u.numerator().sub(&Int::from(1))
+    } else {
+        u.floor()
+    };
+    (lo <= hi).then_some(lo)
+}
+
+/// A dyadic rational between `l < u` with the fewest fraction bits (z3's
+/// `select_small_core`): the ends of a rational (basic) number are open,
+/// those of an isolating interval closed (its endpoints are not roots).
+fn select_small(l: &Rational, l_open: bool, u: &Rational, u_open: bool) -> Rational {
     let two = rat(2);
     let mut scale = rat(1);
+    let (mut ls, mut us) = (l.clone(), u.clone());
     loop {
-        scale = scale.mul(&two);
-        if let Some(i) = int_in_open(&l.mul(&scale), &u.mul(&scale)) {
+        if let Some(i) = select_integer(&ls, l_open, &us, u_open) {
             return Rational::from_integer(i).div(&scale);
         }
+        scale = scale.mul(&two);
+        ls = ls.mul(&two);
+        us = us.mul(&two);
     }
 }
 
-/// A rational strictly between `a < b` (z3's `select`): the isolating
-/// intervals are separated first.
+/// A rational strictly between `a < b` (z3's `algebraic_numbers::select`):
+/// the isolating intervals are separated first (`separate`), then a small
+/// dyadic is chosen between the upper end of `a` and the lower end of `b`.
 fn select_between(a: &Alg, b: &Alg) -> Res<Rational> {
     let (mut a, mut b) = (a.clone(), b.clone());
+    let mut separated = false;
     for _ in 0..4000 {
-        let ahi = a.interval().1;
-        let blo = b.interval().0;
-        let ok = match (&a, &b) {
-            (Alg::Rational(_), Alg::Rational(_)) => ahi < blo,
-            _ => ahi <= blo && !(matches!(a, Alg::Rational(_)) && matches!(b, Alg::Rational(_))),
+        let overlap = match (&a, &b) {
+            (Alg::Rational(_), Alg::Rational(_)) => false,
+            (Alg::Rational(p), Alg::Irrational { lo, .. }) => lo <= p,
+            (Alg::Irrational { hi, .. }, Alg::Rational(q)) => hi >= q,
+            (Alg::Irrational { hi, .. }, Alg::Irrational { lo, .. }) => hi >= lo,
         };
-        if ok && ahi < blo {
-            return Ok(select_small(&ahi, &blo));
-        }
-        if ok {
-            // Touching endpoints: the shared endpoint is not a root of the
-            // irrational side, so it lies strictly between.
-            if matches!(a, Alg::Irrational { .. }) && matches!(b, Alg::Irrational { .. }) {
-                return Ok(ahi);
-            }
+        if !overlap {
+            separated = true;
+            break;
         }
         a.refine();
         b.refine();
     }
-    Err(Abort)
+    if !separated {
+        return Err(Abort);
+    }
+    let a_open = matches!(a, Alg::Rational(_));
+    let b_open = matches!(b, Alg::Rational(_));
+    Ok(select_small(
+        &a.interval().1,
+        a_open,
+        &b.interval().0,
+        b_open,
+    ))
 }
 
 /// The state of an nlsat search over internal variables `0..n` (assigned in
@@ -2610,6 +2640,27 @@ mod tests {
         };
         assert_eq!(alg_floor(&pos), Int::from(1));
         assert_eq!(alg_floor(&neg), Int::from(-2));
+    }
+
+    /// z3's `select` between a rational and an irrational: the interval
+    /// end of the irrational is closed and preferred when it is the
+    /// smallest dyadic (`x² ≤ 2 ∧ x > 5/4` gives z3's sample 11/8).
+    #[test]
+    fn select_between_takes_the_closed_interval_end() {
+        use crate::math::upoly::UPoly;
+        let p = UPoly::from_coeffs(alloc::vec![r(-2), r(0), r(1)]);
+        let sqrt2 = Alg::Irrational {
+            poly: p,
+            lo: r(1),
+            hi: r(2),
+        };
+        let q = |n: i64, d: i64| r(n).div(&r(d));
+        let pick = |a: Rational| select_between(&Alg::Rational(a), &sqrt2).ok();
+        assert_eq!(pick(q(5, 4)), Some(q(11, 8)));
+        assert_eq!(pick(q(6993, 4945)), Some(q(11585, 8192)));
+        // Both ends rational: the open interval's least smallest dyadic.
+        let open = select_between(&Alg::Rational(q(5, 4)), &Alg::Rational(q(3, 2))).ok();
+        assert_eq!(open, Some(q(11, 8)));
     }
 
     fn poly(terms: &[(i64, &[(Var, u32)])]) -> Polynomial {
