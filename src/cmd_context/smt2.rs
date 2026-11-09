@@ -42915,7 +42915,7 @@ impl Context {
             None => (usize::from(!is_bool(d)), pos(name(d))),
         });
         if self.z3_state.last_inc {
-            first = self.z3_model_slot_order(first, &is_bool, &hash);
+            first = self.z3_model_slot_order(first, Vec::new(), &is_bool, &hash);
         } else if self.objectives.is_empty() {
             // The solver's model is copied in slot order too; the constants
             // `solve-eqs` eliminated follow, re-added by its model converter.
@@ -42925,8 +42925,8 @@ impl Context {
                 .take_while(|d| solved(name(d)).is_none())
                 .count();
             let tail = first.split_off(k);
-            first = self.z3_model_slot_order(first, &is_bool, &hash);
-            first.extend(tail);
+            let tail = Self::z3_solved_slot_order(tail, &hash);
+            first = self.z3_model_slot_order(first, tail, &is_bool, &hash);
         }
         self.append_declared_rest(first, rest, &name)
     }
@@ -43225,16 +43225,43 @@ impl Context {
         None
     }
 
+    /// The constants `solve-eqs` eliminated (`tail`, most recent first) in
+    /// the order its model converter registers them: its substitution is an
+    /// `obj_map` keyed by the constant (whose hash is its declaration's),
+    /// filled in elimination order, and `generic_model_converter` replays
+    /// its entries, taken in slot order, from the last. Unchanged when a
+    /// constant's sort hash is unknown.
+    fn z3_solved_slot_order<T>(tail: Vec<T>, hash: &impl Fn(&T) -> Option<Option<u32>>) -> Vec<T> {
+        let mut tail = tail;
+        tail.reverse();
+        let Some(hashes) = tail
+            .iter()
+            .map(|d| hash(d).flatten())
+            .collect::<Option<Vec<u32>>>()
+        else {
+            tail.reverse();
+            return tail;
+        };
+        let order = super::ast_hash::obj_map_slot_order(&hashes, false);
+        let mut slots: Vec<Option<T>> = tail.into_iter().map(Some).collect();
+        order
+            .iter()
+            .rev()
+            .map(|&i| slots[i].take().unwrap())
+            .collect()
+    }
+
     /// Reorder the constants of `first` (the solver's model registration
     /// order: Booleans, then the others) as z3's incremental solver lists
     /// them: `proto_model::mk_model` copies them by the slot order of their
-    /// `obj_map`, then `model::compress` drops the `poly!N` skolem by moving
-    /// the last constant into its place. Unchanged when a constant's sort
-    /// hash is unknown (`hash` is `None` for a function, `Some(None)` for a
-    /// constant of such a sort).
+    /// `obj_map`, the model converter appends `tail`, then `model::compress`
+    /// drops the `poly!N` skolem by moving the last constant into its place.
+    /// Unchanged when a constant's sort hash is unknown (`hash` is `None` for
+    /// a function, `Some(None)` for a constant of such a sort).
     fn z3_model_slot_order<T>(
         &self,
         first: Vec<T>,
+        tail: Vec<T>,
         is_bool: &impl Fn(&T) -> bool,
         hash: &impl Fn(&T) -> Option<Option<u32>>,
     ) -> Vec<T> {
@@ -43243,6 +43270,8 @@ impl Context {
             .filter(|&i| hash(&first[i]).is_some())
             .collect();
         if consts.iter().any(|&i| hash(&first[i]) == Some(None)) {
+            let mut first = first;
+            first.extend(tail);
             return first;
         }
         // `mk_bool_model` registers the Boolean constants (the `poly!N`
@@ -43263,6 +43292,12 @@ impl Context {
             .into_iter()
             .map(|k| entries[k].0)
             .collect();
+        // The model converter appends the `tail` constants before
+        // `compress` runs.
+        let n_first = first.len();
+        let mut first = first;
+        first.extend(tail);
+        order.extend((n_first..first.len()).map(Some));
         if let Some(at) = order.iter().position(Option::is_none) {
             let last = order.pop().unwrap();
             if at < order.len() {
@@ -49666,6 +49701,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(names(&out[1]), ["c", "zz", "mm", "aa"], "{out:?}");
+        // The constants `solve-eqs` eliminated follow in the reverse slot
+        // order of its substitution: `b`, `bar`, `z` share slot 2 (probing
+        // to 3 and 5), `foo` sits in slot 4.
+        let out = run(
+            "(declare-const b Int)(declare-const foo Int)(declare-const q1 Int)\
+             (declare-const z Int)(declare-const bar Int)(assert (= foo 7))(assert (= b 0))\
+             (assert (= bar 4))(assert (= z 9))(assert (> q1 3))(check-sat)(get-model)",
+        )
+        .unwrap();
+        assert_eq!(names(&out[1]), ["q1", "z", "foo", "bar", "b"], "{out:?}");
     }
 
     #[test]
