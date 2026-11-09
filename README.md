@@ -3,7 +3,7 @@
 [![CI](https://github.com/KarpelesLab/z3rs/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/z3rs/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/z3rs.svg)](https://crates.io/crates/z3rs)
 [![docs.rs](https://img.shields.io/docsrs/z3rs)](https://docs.rs/z3rs)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](https://blog.rust-lang.org/)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-blue.svg)](https://blog.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 A **pure-Rust, `no_std`** port of the [Z3 theorem prover](https://github.com/Z3Prover/z3),

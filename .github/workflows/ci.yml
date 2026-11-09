@@ -72,17 +72,17 @@ jobs:
         run: cargo build --lib --target ${{ matrix.target }}
 
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (Rust 1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
       # Keep this pin in sync with `rust-version` in Cargo.toml. Compiling on the
       # declared minimum guards against accidentally using a std/library or
-      # language feature newer than 1.88 (behavior is covered by the stable `test`
+      # language feature newer than 1.95 (behavior is covered by the stable `test`
       # job, so this is compile-only).
-      - name: Install Rust 1.88 (declared MSRV)
-        uses: dtolnay/rust-toolchain@1.88
+      - name: Install Rust 1.95 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.95
 
       - name: Cache
         uses: Swatinem/rust-cache@v2

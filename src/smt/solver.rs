@@ -1024,31 +1024,9 @@ const ALG_SIGN_FUEL: u64 = 200_000;
 /// the cost multiplies along the term.
 const ALG_VALUE_MAX_DEGREE: usize = 64;
 
-/// `a` with an isolating interval whose lower end is not a root of its
-/// defining polynomial. puremp's sums and products keep a non-minimal
-/// polynomial (`√3 + √3` is a root of `x³ − 12x`) and its intervals are
-/// `(lo, hi]`: a spurious root at the excluded `lo` (`(0, 16]` there) becomes
-/// the included `hi` once the value is negated or scaled by a negative
-/// rational, which then reads as that root (`−2√3` as `0`). Refining moves
-/// `lo` off every spurious root.
-fn isolated(mut a: puremp::Algebraic) -> puremp::Algebraic {
-    for _ in 0..256 {
-        if a.is_rational() || !a.defining_polynomial().eval(a.interval().0).is_zero() {
-            break;
-        }
-        a.refine();
-    }
-    a
-}
-
 /// The exact value of the arithmetic term `t` under `md`, as
 /// [`Model::alg_holds`] reads it (see there).
 fn alg_num(md: &mut Model, m: &AstManager, t: AstId) -> Option<puremp::Algebraic> {
-    alg_num_raw(md, m, t).map(isolated)
-}
-
-/// [`alg_num`] before [`isolated`].
-fn alg_num_raw(md: &mut Model, m: &AstManager, t: AstId) -> Option<puremp::Algebraic> {
     use puremp::Algebraic;
     if let Some(a) = md.alg.get(&t) {
         return Some(a.clone());
@@ -1525,9 +1503,6 @@ impl Model {
             return None;
         }
         fn go(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
-            go_raw(md, m, t).map(isolated)
-        }
-        fn go_raw(md: &mut Model, m: &AstManager, t: AstId) -> Option<Algebraic> {
             if let Some(a) = md.alg.get(&t) {
                 return Some(a.clone());
             }
