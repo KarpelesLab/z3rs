@@ -29230,6 +29230,7 @@ impl Context {
         if boxed {
             // Independent objectives: each starts from the base constraints.
             let base = fixed.clone();
+            self.opt_incomplete = false;
             let mut box_models = Vec::with_capacity(n);
             for (i, &(obj, maximize)) in objs.iter().enumerate() {
                 let mut f = base.clone();
@@ -29247,6 +29248,10 @@ impl Context {
                 next: 1,
             };
             self.objective_values = values;
+            if self.opt_incomplete {
+                self.opt_iter = OptIter::Fresh;
+                return (SmtResult::Unknown, model);
+            }
             return (SmtResult::Sat, model);
         }
         for i in 0..n {
@@ -29792,7 +29797,40 @@ impl Context {
                             )
                         }
                         RealOpt::Unbounded => infinite(),
-                        RealOpt::Unknown => unknown(),
+                        RealOpt::Unknown => {
+                            // As z3's optsmt: bisect between the model's value
+                            // and a certified bound; an open bracket leaves
+                            // the objective (and the check) unknown.
+                            let g = if maximize { obj } else { self.m.mk_uminus(obj) };
+                            match self.real_bisect(g, fixed, model) {
+                                Some(Ok(r)) => {
+                                    let r = if maximize { r } else { r.neg() };
+                                    let rv = self.m.mk_numeral(r.clone(), false);
+                                    let eq = self.m.mk_eq(obj, rv);
+                                    fixed.push(eq);
+                                    (render_rational(&r), false)
+                                }
+                                Some(Err((lo, hi))) => {
+                                    self.opt_incomplete = true;
+                                    let (l, h) = if maximize {
+                                        (Some(lo), hi)
+                                    } else {
+                                        (hi.map(|h| h.neg()), Some(lo.neg()))
+                                    };
+                                    (
+                                        alloc::format!(
+                                            " (interval {} {})",
+                                            l.map_or("(* (- 1) oo)".to_string(), |l| {
+                                                render_rational(&l)
+                                            }),
+                                            h.map_or("oo".to_string(), |h| render_rational(&h)),
+                                        ),
+                                        false,
+                                    )
+                                }
+                                None => unknown(),
+                            }
+                        }
                     },
                 },
             };
@@ -31187,6 +31225,131 @@ impl Context {
             }
             OptOutcome::Exhausted => RealOpt::Unknown,
         }
+    }
+
+    /// A sound upper bound on `g` over the assertions plus `fixed` by interval
+    /// propagation: each top-level arithmetic literal becomes a polynomial
+    /// constraint (opaque subterms are free variables and other conjuncts are
+    /// dropped, both only enlarging the set), the variable box is narrowed,
+    /// and `g` is evaluated over it. Returns whether a literal or `g` is
+    /// nonlinear, with the bound (`None` when no finite bound follows).
+    fn icp_upper_bound(&mut self, g: AstId, fixed: &[AstId]) -> (bool, Option<Rational>) {
+        use crate::math::interval::{Bound, Interval};
+        let all: Vec<AstId> = self.assertions.iter().chain(fixed).copied().collect();
+        let mut conj = Vec::new();
+        for a in all {
+            let l = self.lift(a);
+            self.icp_flatten_and(l, &mut conj);
+        }
+        let mut var_map = BTreeMap::new();
+        let mut cons = Vec::new();
+        for c in conj {
+            let (atom, neg) = match self.m.app(c) {
+                Some(_) if self.m.is_not(c) => (self.m.app_args(c)[0], true),
+                _ => (c, false),
+            };
+            if let Some(k) = self.icp_atom(atom, neg, &mut var_map) {
+                cons.push(k);
+            }
+        }
+        let gp = self.icp_to_poly(g, &mut var_map);
+        let nonlinear = gp.total_degree() > 1 || cons.iter().any(|c| c.poly.total_degree() > 1);
+        let Some(bx) = crate::nlsat::icp::narrow_box(&cons, var_map.len()) else {
+            return (nonlinear, None);
+        };
+        let hi = match crate::nlsat::icp::eval_interval(&gp, &bx) {
+            Interval::Empty => None,
+            iv => match iv.bounds() {
+                Some((_, Bound::Finite { value, .. })) => Some(value.clone()),
+                _ => None,
+            },
+        };
+        (nonlinear, hi)
+    }
+
+    /// z3's `optsmt::bisect` for a real objective the exact procedures leave
+    /// open: maximize `g` (`obj` or `-obj`) from the value `lo` of the current
+    /// model below a certified upper bound `hi`, alternating a strict probe
+    /// `g > lo` (unsat proves `lo` optimal; sat raises `lo` to the new model's
+    /// value) and a midpoint probe `g ≥ (lo + hi)/2` (unsat lowers `hi`, sat
+    /// raises `lo`) for `opt.optsmt_bisect_rounds` rounds. Returns
+    /// `Ok(optimum)` (with `model` at it) or `Err((lo, hi))`, the proven
+    /// bracket left when the budget runs out or a probe is undecided
+    /// (`hi = None`: no finite upper bound is known). `None` without a
+    /// rational model value to start from, or for a linear problem (which
+    /// z3's arithmetic solver decides without bisecting).
+    #[allow(clippy::type_complexity)]
+    fn real_bisect(
+        &mut self,
+        g: AstId,
+        fixed: &[AstId],
+        model: &mut Option<Model>,
+    ) -> Option<Result<Rational, (Rational, Option<Rational>)>> {
+        let value = |ctx: &Self, md: &mut Model| match md.eval_value(&ctx.m, g) {
+            Value::Num(r, _) => Some(r),
+            _ => None,
+        };
+        let mut lo = value(self, model.as_mut()?)?;
+        let (nonlinear, hi) = self.icp_upper_bound(g, fixed);
+        if !nonlinear {
+            return None;
+        }
+        let Some(mut hi) = hi else {
+            return Some(Err((lo, None)));
+        };
+        if hi <= lo {
+            return Some(Ok(lo));
+        }
+        let rounds = match self.params.get("opt.optsmt_bisect_rounds") {
+            Some(crate::util::ParamValue::UInt(n)) => *n as usize,
+            _ => 64,
+        };
+        let two = Rational::from_integer(Int::from(2));
+        let mut strict = true;
+        for _ in 0..rounds {
+            if lo >= hi {
+                break;
+            }
+            let bound = if strict {
+                lo.clone()
+            } else {
+                lo.add(&hi).div(&two)
+            };
+            let bv = self.m.mk_numeral(bound.clone(), false);
+            let probe = if strict {
+                self.m.mk_gt(g, bv)
+            } else {
+                self.m.mk_ge(g, bv)
+            };
+            let mut ex = fixed.to_vec();
+            ex.push(probe);
+            match self.check_with(&ex) {
+                (SmtResult::Sat, Some(mut md)) => {
+                    // The model's own value when rational, else the bound
+                    // it is known to satisfy (only for `≥`).
+                    let v = match value(self, &mut md) {
+                        Some(q) if (strict && q > bound) || (!strict && q >= bound) => q,
+                        _ if strict => {
+                            strict = !strict;
+                            continue;
+                        }
+                        _ => bound,
+                    };
+                    if v > lo {
+                        lo = v;
+                        *model = Some(md);
+                    }
+                }
+                (SmtResult::Unsat, _) if strict => return Some(Ok(lo)),
+                (SmtResult::Unsat, _) => hi = bound,
+                _ => break,
+            }
+            strict = !strict;
+        }
+        if lo >= hi {
+            return Some(Ok(lo));
+        }
+        Some(Err((lo, Some(hi))))
     }
 
     /// Optimize the real objective `obj` over Boolean structure the cube
